@@ -1,12 +1,12 @@
 use agent_client_protocol_schema::v1::{
-    CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelect,
-    SessionConfigSelectOptions, SessionInfo, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, AGENT_METHOD_NAMES,
-    CLIENT_METHOD_NAMES,
+    AuthCapabilities, AuthMethod, AuthMethodTerminal, CancelNotification, ClientCapabilities,
+    CloseSessionRequest, ContentBlock, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, Meta,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelect, SessionConfigSelectOptions, SessionInfo, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    AGENT_METHOD_NAMES, CLIENT_METHOD_NAMES,
 };
 use agent_client_protocol_schema::ProtocolVersion;
 use anyhow::{anyhow, bail, Result};
@@ -47,6 +47,7 @@ const STDERR_WAIT: Duration = Duration::from_millis(200);
 const EXIT_WAIT: Duration = Duration::from_secs(5);
 const INVALID_PARAMS: i64 = -32602;
 const METHOD_NOT_FOUND: i64 = -32601;
+const AUTH_REQUIRED: i64 = -32000;
 
 pub(crate) enum Incoming {
     Update(String, Box<SessionUpdate>),
@@ -136,6 +137,17 @@ impl fmt::Display for Refused {
 }
 
 impl error::Error for Refused {}
+
+#[derive(Debug)]
+pub(crate) struct AuthRequired(String);
+
+impl fmt::Display for AuthRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl error::Error for AuthRequired {}
 
 #[derive(Clone)]
 pub(crate) struct Pick {
@@ -270,6 +282,9 @@ pub(crate) struct Client {
     connection: Arc<Connection>,
     child: Child,
     events: Sender<Incoming>,
+    command: Vec<String>,
+    /// The agent's terminal auth method, which smol runs in its own terminal
+    auth: Option<AuthMethodTerminal>,
     pub(crate) cwd: PathBuf,
     pub(crate) agent: Implementation,
 }
@@ -373,6 +388,7 @@ impl Client {
                                 let text = error["message"].as_str().unwrap_or("unknown error");
                                 let error = match error["code"].as_i64() {
                                     Some(INVALID_PARAMS) => Refused(text.to_owned()).into(),
+                                    Some(AUTH_REQUIRED) => AuthRequired(text.to_owned()).into(),
                                     _ => anyhow!("{text}"),
                                 };
                                 Err(error)
@@ -449,7 +465,8 @@ impl Client {
         let info = Implementation::new("smol", env!("CARGO_PKG_VERSION"));
         let queued = (QUEUED.to_owned(), json!(true));
         let meta = Meta::from_iter([queued]);
-        let capabilities = ClientCapabilities::new().meta(meta);
+        let auth = AuthCapabilities::new().terminal(true);
+        let capabilities = ClientCapabilities::new().auth(auth).meta(meta);
         let initialize = InitializeRequest::new(ProtocolVersion::V1)
             .client_capabilities(capabilities)
             .client_info(info);
@@ -459,14 +476,46 @@ impl Client {
         let unnamed = || Implementation::new("agent", "");
         let agent = initialized.agent_info.unwrap_or_else(unnamed);
 
+        let mut auth = None;
+        for method in initialized.auth_methods {
+            if let AuthMethod::Terminal(terminal) = method {
+                auth = Some(terminal);
+                break;
+            }
+        }
+
         let client = Self {
             connection,
             child,
             events,
+            command: command.to_vec(),
+            auth,
             cwd,
             agent,
         };
         Ok((client, inbox))
+    }
+
+    /// False when the agent offers no terminal auth or it failed
+    pub(crate) fn authenticate(&self) -> Result<bool> {
+        let Some(auth) = &self.auth else {
+            return Ok(false);
+        };
+
+        let (program, args) = self.command.split_first().expect("command");
+        let mut process = Command::new(program);
+        // Unlike the agent it must stay in the terminal's foreground process group to read input
+        process.args(args).args(&auth.args).envs(&auth.env);
+
+        let status = match process.status() {
+            Ok(status) => status,
+            Err(e) => {
+                let command = self.command.join(" ");
+                let reason = reaper::cause(&e);
+                bail!("agent: {command}: {reason}");
+            }
+        };
+        Ok(status.success())
     }
 
     /// On resume the agent replays the history as notifications before replying,

@@ -9,18 +9,25 @@ mod history;
 mod memory;
 mod model;
 mod prompt;
+mod setup;
 mod spawn;
 mod tools;
 mod utils;
 mod worker;
 
 pub use crate::acp::run;
+pub use crate::setup::{run as setup, SETUP_ARG};
 pub use crate::worker::{serve as worker, WORKER_ARG};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("config: {0}")]
     Config(String),
+    /// No model.toml, which clients recognize by -32000 and answer by running setup
+    #[error("config: {0}")]
+    Unconfigured(String),
+    #[error("setup: {0}")]
+    Setup(String),
     #[error("session: {0}: not found")]
     SessionNotFound(String),
     #[error("acp: {0}")]

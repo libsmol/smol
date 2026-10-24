@@ -1,5 +1,6 @@
 use crate::client::{
-    model_of, models, Asked, Client, Goal, GoalStatus, Incoming, McpState, McpStatus, Notice, Pick,
+    model_of, models, Asked, AuthRequired, Client, Goal, GoalStatus, Incoming, McpState, McpStatus,
+    Notice, Pick,
 };
 use agent_client_protocol_schema::v1::{
     ContentBlock, ResourceLink, SessionConfigOption, SessionUpdate, StopReason,
@@ -72,7 +73,17 @@ impl Session {
         resume: Option<&str>,
     ) -> Result<Self> {
         let (client, inbox) = Client::start(command)?;
-        let opened = client.open(resume, None)?;
+        let opened = client.open(resume, None);
+        let opened = match opened {
+            Err(e) if e.is::<AuthRequired>() => {
+                if !client.authenticate()? {
+                    return Err(e);
+                }
+                client.open(resume, None)?
+            }
+            opened => opened?,
+        };
+
         let options = match model {
             Some(model) => client.set_model(&opened.id, &opened.options, &model)?,
             None => opened.options,
@@ -481,7 +492,7 @@ fn mentions(text: &str, exists: impl Fn(&str) -> bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use crate::chat::*;
-    use crate::tests::fake;
+    use crate::tests::{fake, shell};
     use agent_client_protocol_schema::v1::SessionInfoUpdate;
     use std::cell::Cell;
     use std::thread;
@@ -740,6 +751,43 @@ mod tests {
         );
         session.open(Some("s1")).expect("resume");
         assert_eq!(session.model(), "m1");
+    }
+
+    #[test]
+    fn auth_before_open() {
+        let script = r#"
+if [ "$0" = setup ]; then
+    [ "$NOTE" = café ] || exit 2
+    exit EXIT
+fi
+while IFS= read -r line; do
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case $line in
+    *'"method":"initialize"'*'"terminal":true'*)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"authMethods":[{"type":"terminal","id":"setup","name":"Set up","args":["setup"],"env":{"NOTE":"café"}}]}}\n' "$id" ;;
+    *'"method":"initialize"'*)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+        if [ "$opened" ]; then
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id"
+        else
+            opened=1
+            printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"config: model.toml: not found"}}\n' "$id"
+        fi ;;
+    esac
+done
+"#;
+        let agent = |exit: &str| {
+            let script = script.replace("EXIT", exit);
+            shell(&script)
+        };
+
+        let session = Session::start(&agent("0"), None, None).expect("start");
+        assert_eq!(session.id, "s1");
+
+        let failed = Session::start(&agent("1"), None, None);
+        let error = failed.err().expect("error");
+        assert_eq!(error.to_string(), "config: model.toml: not found");
     }
 
     #[test]
