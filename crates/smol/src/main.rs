@@ -14,7 +14,7 @@ mod tui;
 const AGENT: &str = "libsmol";
 
 #[derive(Parser, Debug)]
-#[command(name = "smol", about)]
+#[command(name = "smol", version, about)]
 struct Cli {
     /// first task, optional
     prompt: Option<String>,
@@ -65,6 +65,7 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::Cli;
+    use clap::error::ErrorKind;
     use clap::Parser;
 
     const FAKE_AGENT: &str = r#"
@@ -145,6 +146,14 @@ done
 
     pub(crate) fn fake() -> Vec<String> {
         shell(FAKE_AGENT)
+    }
+
+    #[test]
+    fn version_shown() {
+        let shown = Cli::try_parse_from(["smol", "--version"]).expect_err("version");
+        assert_eq!(shown.kind(), ErrorKind::DisplayVersion);
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(shown.to_string(), format!("smol {version}\n"));
     }
 
     #[test]

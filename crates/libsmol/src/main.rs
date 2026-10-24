@@ -7,10 +7,14 @@ fn main() -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let ran = match args[..] {
         [] => libsmol::run(),
+        ["--version" | "-V"] => {
+            println!("libsmol {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         [SETUP_ARG] => libsmol::setup(),
         [WORKER_ARG] => libsmol::worker(),
         _ => {
-            eprintln!("libsmol: usage: libsmol [setup]");
+            eprintln!("libsmol: usage: libsmol [setup | --version]");
             return ExitCode::from(2);
         }
     };
