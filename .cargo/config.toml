@@ -1,0 +1,6 @@
+[env]
+CC_x86_64_pc_windows_gnu = { value = ".cargo/zig-cc", relative = true }
+AR_x86_64_pc_windows_gnu = { value = ".cargo/zig-ar", relative = true }
+
+AWS_LC_SYS_PREBUILT_NASM_x86_64_pc_windows_gnu = "1"
+AWS_LC_SYS_PREBUILT_NASM_x86_64_pc_windows_msvc = "1"
