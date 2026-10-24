@@ -1,0 +1,90 @@
+# AGENTS.md
+
+These rules apply whenever you write code, review code or change prompts in this repository.
+
+## Project
+
+A Rust workspace (edition 2021) with embedded Python.
+
+- `crates/libsmol`: the ACP agent library and the `libsmol` binary. `acp/` speaks ACP and manages sessions (serve reads and writes; rpc sends and receives JSON-RPC; session runs one task per session, and while a turn is in progress it only takes finished titles, so option changes, MCP toggles and the next request all wait for the turn to end; mcp manages a session's MCP connections; translator turns agent events into ACP messages). `agent/` works through a task step by step (step, compact for compaction, check for checking a `:goal`). `code.rs` is the agent's side of managing the worker, `worker/` is the worker process, and `worker/mod.rs` is the message protocol both sides share. Builtins are written in `worker/bootstrap/`, where builtins, mcp and run execute in that order in one set of globals; the Rust code they call (ls, grep, fetch, view) and the MCP client live in `tools/`. Each session has one worker: a `libsmol --worker` child process running RustPython exactly as published on crates.io, with no sandbox and no permission checks, so code can use everything on the machine. There is no memory snapshot: when the worker restarts its variables are gone, and the model is told before its next code.
+- The worker channel: the agent listens on a loopback address and passes the address and a token to the worker in `SMOL_CONTROL`. Messages in both directions go line by line over that TCP connection, all shaped like JSON-RPC (requests, replies and notifications; cancelling is a `cancel` notification). The worker's stdout and stderr share one pipe, and both are the code's output. After each snippet finishes, and before reporting back, the worker writes an `END` marker; only output before the marker belongs to that snippet. While code runs, the clipped output is forwarded to the client every 100 ms. Output sent to the model has terminal escape sequences removed, and progress redrawn with `\r` keeps only its last frame per line. `view()` is handled by the worker itself: it detects the format, writes a copy into the directory given by `SMOL_COPIES`, then sends a notification without waiting for a reply. On interrupt the worker's listener thread sends `SIGINT` to the thread running the code (on Windows it only sets the interpreter's interrupt flag); the agent resends it every 500 ms and kills and restarts the worker if it hasn't stopped after 3 seconds.
+- `crates/smol`: the ACP client and the `smol` binary. It is TUI only and exits with an error outside a terminal. `chat::Session` holds the protocol side of a session's state, and `tui/` only handles display and input. It reads no configuration, starts the `libsmol` next to it, and falls back to PATH when there is none. Input starting with `!` goes through `_smol/shell`: the agent runs it with the user's `$SHELL` (cmd on Windows) in the session directory, and programs left in the background end with the session. It is recorded as `MemoryStep::Shell` and sent to the model as a user message in the next turn. Like colon commands, it queues until the current turn ends. All TUI colors are in `tui/theme.rs` (Dracula). On entry the TUI replaces the terminal's default foreground and background and sets a steady cursor, and it restores them on exit. Every frame is wrapped in synchronized output, and terminals that don't report truecolor get 256 colors.
+- `crates/reaper`: the watchdog and process groups. However libsmol dies, the programs it started (the worker, MCP servers, `!` commands) are killed as whole groups. Programs that start a new session (`setsid`, `start_new_session`) leave the group; they are found in /proc by the `SMOL_REAPER` mark they inherit, which only works on Linux. Windows has no process groups: each program is started suspended, put in a Job Object that kills everything when its handle closes, then resumed, with no watchdog. Lookup of `.cmd` commands such as `npx` lives here too. Functions both smol and libsmol need also live here (system error text in `cause` and `described`, `terminal_view` for removing terminal escape sequences and keeping the last frame of `\r` redraws, `tilde` for writing the home directory as `~`), because smol must not depend on libsmol.
+
+## Process
+
+1. Look at the flow and the data first, not the files. Follow the data from a prompt coming in to the answer going out, and look for detours: one thing with two representations, two places that parse it, a layer that only forwards.
+2. For a large change, write the complete plan first and start only after it is approved. The plan states the invariants (features, the shape of ACP messages, the text sent to the model), what changes and what gets deleted.
+3. A claim of "no behavior change" must be proven with a black-box baseline diff: drive it with a mock model server, record the ACP message stream and the full text sent to the model, and capture the TUI with tmux screenshots. Every difference must be one the plan lists.
+4. Work in phases, and at the end of each phase run `cargo fmt`, `cargo clippy --all-targets`, `cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu` and `cargo test --workspace`.
+5. The order is design refactoring, then a line-by-line readability rewrite, then cleaning up comments and tests. Done in reverse, the work gets thrown away.
+6. Finish with a real model. Use deepseek for simple tasks; for long context, lower `context` in model.toml so compaction actually triggers. If the TUI changed, check it with tmux screenshots.
+7. After changing code, run `./build.sh` to install into `~/.local/bin` (`build.ps1` on Windows), or the user won't get the change. Keep build output in the project's `target/`; don't point `CARGO_TARGET_DIR` at `/tmp` (it is a RAM disk).
+8. Commit or push only when the user asks.
+
+## Design principles
+
+- Less code comes from putting responsibilities in the right place and deleting duplication, not from squeezing the formatting: don't widen rustfmt, don't cram expressions together, don't remove the blank lines between logical steps, don't add a flag to save a branch.
+- Do each thing in one place: one parser, one representation, one error message. Prefer fewer, cohesive modules with short names free of any language's flavor.
+- Put logic in the right layer. smol does not depend on libsmol, and `_smol/` extensions are added only when ACP isn't enough. A `_smol/` name means exactly one thing: the method, the marker on standard messages and the advertised capability share that name, and a key's value type never changes. Data fields use camelCase like ACP. Every `_smol/notice` carries `step` (it belongs to the step in progress) and `unsaved` (a save failed).
+- libsmol reads all configuration (`model.toml`, the `[mcp.*]` tables in `agent.toml`) each time a session opens, so `:new` picks up changes. When a session opens it also reads `AGENTS.md` (or `CLAUDE.md` when there is none) from the config directory and from every directory from the root down to the working directory, and appends them to the system prompt; files that can't be read are skipped with a notice. Skills are read at the same time: one `SKILL.md` per folder under `skills/` in the config directory and under `.smol/skills/` at every level, with deeper ones winning on a name clash. The prompt lists only `name` and `description` from the front matter plus the file path, and the model reads the file when it needs it.
+- Errors read `label: object: problem`, all lowercase, with no trailing period. Text for people uses `Display`; text for the model lives in `prompt.rs`.
+- Logs are English, one line per event, shaped `domain[qualifier]: event[, detail][ [key=value, ...]]`, lowercase with no trailing period. Lines from a session carry its id through the session's span. An error is logged once, where it ends the work it belongs to.
+- Never write compatibility logic for one particular model; solve problems in the prompt or the protocol.
+- Code runs only through native tool calls. Step requests declare a single `eval(code)` tool, the prompt only describes that tool, a reply without a call is the answer, and code blocks written in the message text are not run. When the tool is named `code`, models often send calls without arguments. The tool description doesn't mention tags; if it did, models would write the tags into the arguments. A call whose only argument is a string is treated as code even if that argument isn't named `code`. One reply can contain several calls; they run in order once all have arrived, and after one fails or is interrupted the rest don't run. Every call gets a reply, calls that didn't run say why, and `tool_call_id` matches each reply to its call. Calls with no readable code (another tool was called, or the eval arguments hold no code or only tags) stay in the history but don't run; they count as errors and their reply says why. Their arguments are always sent back as `{}` and characters the server rejects in tool names are replaced with `_`, so the bad content is never echoed and the server doesn't reject the request. Unreadable eval calls are mostly transient glitches, so the reply is first regenerated silently, up to 3 times, without using up error retries; only after that does each call get such a reply. In the history the code is the `tool_calls` on the assistant message, and results and errors are the `tool` messages replying to them. Images can't go in `tool` messages: once all replies of the step are sent, they go at the start of the next user message, or in a new user message when none follows, because the server rejects them in between. Call ids are numbered `call_N` in order of appearance and never change when later steps are added, which keeps the prompt cache matching. Calls in a stream arrive one after another, and each is handed over when the next one starts; once all calls have arrived, it doesn't matter how the stream ended. When the closing tags at the end of the code run past 256 tokens, the request is cut off and the code runs as usual (the worker strips the tags), and that step has no usage. Some models keep repeating closing tags after the code, and without the cutoff they would run to the output limit.
+- The output limit is set per model with `max_tokens` in model.toml, and the provider's default applies when it is unset. deepseek counts reasoning toward it, so a small value can cut a reply off mid-reasoning. Truncated replies don't go into the history, and when the worker repairs code it keeps a copy of the original (`unrepaired`), which is not sent to the model either.
+- Images and videos are enabled per model with `image` and `video` in model.toml. Whatever the current model doesn't accept is replaced with a one-line note, so the history still sends after switching models. When the model accepts neither, the system prompt doesn't list `view`, and calling it only returns that note.
+- These are deliberate and must not change: the worker has no sandbox or permissions, there is no maximum step count, and code execution has no timeout (the user interrupts).
+
+## Code rules
+
+1. Code used once is not split into a function; write it where it is used so it reads top to bottom. Exceptions: trait implementations, cross-module or public APIs, recursion, functions passed as values, pure functions with their own unit tests, and helpers shared by several tests.
+2. Don't pass call results or long expressions directly as arguments, as in `f(g(x), h(y)?)`; bind them to named locals first. Exceptions: constructing types and enum variants, and wrappers like `Box::new`/`Arc::new`, may be arguments or wrap a call directly; test helpers that build data, and accessors and conversions (`to_owned`, `join`, `clone` and the like), may be arguments; assert macros are exempt.
+3. Leave a blank line between logical steps (setup, work, cleanup, return), and keep line length and density even.
+4. Names have at most 3 words: functions, types, fields, constants and test names alike. Upper limits are `MAX_*` and lower limits `MIN_*`, with `_BYTES`, `_CHARS`, `_LINES` or `_ROWS` appended for units; waits and timeouts are `*_WAIT` and intervals `*_EVERY`; names that mirror a third-party library's parameters follow the library.
+5. Always `use crate::...`, never `use super::`, in test modules too. Prefer `pub(crate)`. Don't write multi-segment inline paths in code (`std::mem::take(..)`, `crate::history::new_id()`); a single module prefix (`fs::write`, `env::var_os`) is fine.
+6. Don't pass multi-line or nested closures to `map`/`map_err`/`and_then`/`ok_or_else`/`filter_map`. Use `match`, `let … else` or `for` instead, or name the mapping function first: `let failed = |e| …; .map_err(failed)?`.
+7. Read each file in full before changing it, and make every change by hand, never with regex or batch replacement.
+8. Check Unix and Windows `cfg` branches together; both targets must compile and be clippy-clean.
+
+## Comments
+
+- Write a comment only when deleting it could let a later reader silently break something: a hidden technical constraint (a panic, disk or API format compatibility, signal or thread semantics, an ordering a refactor could easily lose, a regression hit before, an ownership convention for callers).
+- Don't write product or behavioral rationale, and don't write docs that restate a name, a signature or a module's purpose. If a name can say it, let the name say it.
+- Write in English: one short sentence in plain, idiomatic English, starting with a capital letter and without a trailing period. Don't chain clauses with colons or semicolons, don't narrate purpose ("so that ..."), and don't paste examples.
+- Use `///` on items and `//` inside function bodies. The same rules apply to Rust and to the embedded Python (`#`).
+- Comments and tests the user deleted were deleted on purpose; don't add them back.
+
+## Tests
+
+- Tests always live in `#[cfg(test)] mod tests` inside the source file, never in a separate tests.rs. Shared helpers go in the parent module's `mod tests` as `pub(crate)`. Python helper scripts are the exception.
+- Test names have at most 3 words. Assert messages print only values (`"{logs}"`), never sentences, and `expect` texts are short ("evaluate", "error").
+- Test data is English. Bugs that use byte indices as character counts only show up with multibyte text, so data that goes through text handling includes accented words (café, naïve, résumé) and, where display width matters, emoji (🐍). The only Chinese in the repository is the full-width punctuation the code recognizes in model replies (such as '。' and '：') and the tests of that handling.
+- The worker in tests is the test binary re-executing itself and running only `code::tests::serving`, which acts as a worker only when it sees `SMOL_CONTROL`.
+
+## Text for the model (prompts, builtin docs, errors)
+
+- Priorities: accuracy first, then rules that make the model smarter, brevity last.
+- Don't mention things the model shouldn't use. Whatever gets mentioned, the model drifts toward.
+- Review each piece of text on its own first, then review the complete prompt as actually assembled.
+- Output in examples must be captured from real runs. Builtin signatures must be exact and complete.
+- After changing a prompt, test it with deepseek, and compare old against new when in doubt.
+
+## Safety and configuration
+
+- Don't change the user's real configuration (`~/.smol/`) without their consent.
+- Don't print secrets: the Authorization/Cookie headers in `agent.toml` and the API keys in `model.toml`.
+- When testing with a real model, copy the configuration into a temporary directory (`SMOL_CONFIG_DIR`), don't print its contents, and delete it right after. Don't write test sessions into the user's real history. The worker has no sandbox, so never give a real model tasks that need accounts or secrets.
+- In shell, `rm` of a variable path must be written as `"${VAR:?}"`.
+
+## Lessons learned
+
+- Edition 2021 has no let chains; use nested `if let` or `let … else` instead.
+- A closure stored in a local and then passed as `dyn FnMut(Event)` needs its parameter type annotated (`|event: Event|`).
+- Parts of rmcp's error chain don't set `source`; link them by type, then reuse `http_cause` to get the real cause.
+- Each level of RustPython recursion takes a lot of stack, so code runs on a thread with a 256 MiB stack; the main thread's stack overflows after a few levels.
+- RustPython installs its `SIGINT` handler when the bootstrap runs `import signal`, and `pthread_kill` only wakes a thread blocked in a system call. Waits on locks (`queue.get`, `Event.wait`) can't be woken, and neither can blocking calls on Windows; the only way out is the agent killing the worker.
+- glibc's `system()` makes the whole process ignore `SIGINT` while it waits for the child, so `os.system` can't be interrupted, and after 3 seconds the worker is killed and every variable is lost. Interrupting `subprocess.run(..., shell=True)` kills only `sh`; the command it started is orphaned and keeps running in the worker's group until the worker is killed or the session ends.
+- The worker writes `END` before reporting in, and the agent counts it as started only after receiving both. The test binary prints the libtest banner at the start of the worker's output, and without this step the banner would count as output of the first snippet.
+- While a builtin waits for the agent's reply it must release the interpreter with `allow_threads` and call `check_signals` every so often, or it can't be interrupted.
+- Proxies silently close idle HTTP connections, and the worker's tokio runtime only runs during calls such as builtins, so it never sees the close and reusing the connection fails. Every HTTP client goes through `utils::http_client`, which disables connection pool reuse (`pool_max_idle_per_host(0)`).

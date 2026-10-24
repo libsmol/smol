@@ -1,0 +1,10 @@
+#!/bin/sh
+for arg do
+    shift
+    case "$arg" in
+        --target=*) ;;
+        *) set -- "$@" "$arg" ;;
+    esac
+done
+
+exec zig cc -target x86_64-windows-gnu "$@"
