@@ -324,23 +324,26 @@ impl Translator {
         }
     }
 
+    /// The title carries the code too, since clients such as Zed show it as the command that runs
     fn code(&mut self, index: usize, text: &str) {
         let opened = self.calls.iter_mut().find(|call| call.index == index);
         let update = match opened {
             Some(call) => {
                 call.code.push_str(text);
+                let title = call.code.trim_matches('\n').to_owned();
                 let code = fenced(&call.code);
                 let content = vec![code];
-                let fields = ToolCallUpdateFields::new().content(content);
+                let fields = ToolCallUpdateFields::new().title(title).content(content);
                 let update = ToolCallUpdate::new(call.id.clone(), fields);
                 SessionUpdate::ToolCallUpdate(update)
             }
             None => {
                 self.ids += 1;
                 let id = format!("call_{}", self.ids);
+                let title = text.trim_matches('\n');
                 let code = fenced(text);
                 let content = vec![code];
-                let started = ToolCall::new(id.clone(), TOOL)
+                let started = ToolCall::new(id.clone(), title)
                     .kind(ToolKind::Execute)
                     .status(ToolCallStatus::Pending)
                     .content(content);
@@ -668,18 +671,25 @@ mod tests {
     #[test]
     fn output_streamed() {
         let (mut translator, mut sent) = translator(1000);
-        translator.translate(Event::Code(0, "for i in range(3):\n    print('item', i)\n"));
+        translator.translate(Event::Code(0, "\nfor i in range(3):\n"));
+        translator.translate(Event::Code(0, "    print('café', i)\n"));
         translator.translate(Event::Execute(0));
-        translator.translate(Event::Output("item 0\nitem 1\n"));
+        translator.translate(Event::Output("café 0\ncafé 1\n"));
 
         let messages = drained(&mut sent);
-        let running = &messages[2]["params"]["update"];
+        let titles = [
+            &messages[0]["params"]["update"]["title"],
+            &messages[1]["params"]["update"]["title"],
+        ];
+        let code = "for i in range(3):\n    print('café', i)";
+        assert_eq!(titles, [&json!("for i in range(3):"), &json!(code)]);
+        let running = &messages[3]["params"]["update"];
         assert_eq!(running["sessionUpdate"], "tool_call_update");
         assert!(running.get("status").is_none(), "{running}");
         let content = &running["content"];
-        let code = "```python\nfor i in range(3):\n    print('item', i)\n```";
-        assert_eq!(content[0]["content"]["text"], code);
-        assert_eq!(content[1]["content"]["text"], "item 0\nitem 1\n");
+        let fenced = format!("```python\n{code}\n```");
+        assert_eq!(content[0]["content"]["text"], fenced);
+        assert_eq!(content[1]["content"]["text"], "café 0\ncafé 1\n");
     }
 
     fn replayed(memory: &AgentMemory) -> Vec<Value> {
@@ -716,7 +726,7 @@ mod tests {
                     else {
                         continue;
                     };
-                    for field in ["status", "content"] {
+                    for field in ["title", "status", "content"] {
                         if let Some(value) = update.get(field) {
                             call[field] = value.clone();
                         }
@@ -1000,7 +1010,7 @@ mod tests {
         };
 
         let updates = replayed(&memory);
-        assert_eq!(updates[0]["title"], "eval");
+        assert_eq!(updates[0]["title"], "view('screenshot.png')");
         let ended = updates
             .iter()
             .rfind(|update| update["status"] == "completed");

@@ -14,6 +14,8 @@ but their files stay in `~/.smol/history` untouched.
   with the context window filled in when the list reports it, and writes the file.
   Other ACP clients that support terminal authentication offer it too.
 - `smol --version` and `libsmol --version`.
+- Each code call is titled with its code, so Zed shows the Python under "Run Command"
+  instead of `eval`.
 
 ## 0.1.0 - 2026-10-24
 
