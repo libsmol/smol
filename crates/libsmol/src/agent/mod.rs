@@ -9,7 +9,7 @@ use crate::model::{
     ChatMessage, Finish, Finished, MediaKind, Model, ModelError, Purpose, StreamDelta,
 };
 use crate::prompt;
-use crate::tools::attach::attach;
+use crate::tools::attach::{attach, Mention};
 use crate::utils::Interrupt;
 use crate::{Error, Result};
 use std::fs;
@@ -61,7 +61,7 @@ pub(crate) enum Event<'a> {
     Goal(Option<&'a Goal>),
 }
 
-type Updates = Vec<(String, Vec<PathBuf>)>;
+type Updates = Vec<(String, Vec<Mention>)>;
 pub(crate) type Asking<'a> = Pin<Box<dyn Future<Output = Updates> + Send + 'a>>;
 
 pub(crate) trait Sink: Send {
@@ -76,7 +76,7 @@ pub(crate) trait Sink: Send {
 
 pub(crate) struct Task {
     pub(crate) text: String,
-    pub(crate) files: Vec<PathBuf>,
+    pub(crate) mentions: Vec<Mention>,
     pub(crate) goal: bool,
 }
 
@@ -143,11 +143,13 @@ impl Agent {
     }
 
     /// Reading files and copying images and videos stays off the async runtime
-    async fn attached(&self, files: Vec<PathBuf>) -> Vec<Attachment> {
+    async fn attached(&self, mentions: Vec<Mention>) -> Vec<Attachment> {
         let cwd = self.cwd.clone();
         let copies = self.copies.clone();
         let attaching = move || {
-            let attached = files.iter().map(|path| attach(path, &cwd, &copies));
+            let attached = mentions
+                .iter()
+                .map(|mention| attach(mention, &cwd, &copies));
             attached.collect()
         };
         task::spawn_blocking(attaching).await.expect("attach")
@@ -173,7 +175,7 @@ impl Turn<'_> {
             self.sink.event(Event::Goal(Some(&active)));
         }
 
-        let files = self.agent.attached(task.files).await;
+        let files = self.agent.attached(task.mentions).await;
         let task = TaskStep {
             text,
             goal,
@@ -309,8 +311,8 @@ impl Turn<'_> {
 
             // Updates taken when a goal step answered are recorded even after an interrupt
             let received = !updates.is_empty();
-            for (text, files) in updates {
-                let files = self.agent.attached(files).await;
+            for (text, mentions) in updates {
+                let files = self.agent.attached(mentions).await;
                 let update = TaskStep {
                     text,
                     goal: false,
@@ -517,6 +519,7 @@ pub(crate) mod tests {
     };
     use crate::prompt::RESTARTED;
     use crate::tests::{content, temp_dir, write_file, Temp};
+    use crate::tools::attach::tests::mentioned;
     use crate::utils::{block_on, Interrupt};
     use crate::Result;
     use std::collections::VecDeque;
@@ -696,9 +699,10 @@ pub(crate) mod tests {
             files: &[PathBuf],
             goal: bool,
         ) -> Result<Option<String>> {
+            let mentions = files.iter().map(|path| mentioned(path)).collect();
             let task = Task {
                 text: task.to_owned(),
-                files: files.to_vec(),
+                mentions,
                 goal,
             };
             let probe = &mut self.probe;

@@ -371,8 +371,7 @@ pub(crate) mod tests {
         let lines = asked("First line\n\n  second line\t", false);
         let attached = Attachment {
             path: "screenshot.png".to_owned(),
-            content: String::new(),
-            media: None,
+            ..Attachment::default()
         };
         let files = TaskStep {
             text: " \n".to_owned(),

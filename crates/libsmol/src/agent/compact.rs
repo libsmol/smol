@@ -368,7 +368,7 @@ mod tests {
         let data = Attachment {
             path: "data.txt".to_owned(),
             content: "café ".repeat(1800),
-            media: None,
+            ..Attachment::default()
         };
         let task = TaskStep {
             files: vec![data],
@@ -695,7 +695,7 @@ mod tests {
         let data = Attachment {
             path: "big.txt".to_owned(),
             content: "crème brûlée ".repeat(3375),
-            media: None,
+            ..Attachment::default()
         };
         let update = TaskStep {
             files: vec![data],

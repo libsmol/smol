@@ -16,6 +16,10 @@ but their files stay in `~/.smol/history` untouched.
 - `smol --version` and `libsmol --version`.
 - Each code call is titled with its code, so Zed shows the Python under "Run Command"
   instead of `eval`.
+- Code added in Zed with "Add to Agent Thread" reaches the model as selected, with its
+  file and lines marked, instead of as the whole file. libsmol now takes context
+  embedded in prompts, so Zed's other `@` mentions work too, and a linked file with a
+  line range is attached as just those lines.
 
 ## 0.1.0 - 2026-10-24
 

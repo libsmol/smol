@@ -33,12 +33,54 @@ const MEDIA: [MediaType; 8] = [
     ("mov", MediaKind::Video, "video/quicktime"),
 ];
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Mention {
+    File {
+        path: PathBuf,
+        /// The first and last line, counted from 1
+        lines: Option<(u32, u32)>,
+        /// Sent along by the client and used instead of reading the file
+        text: Option<String>,
+    },
+    /// Something that is not a local file, so its text always comes along
+    Resource { uri: String, text: String },
+}
+
 /// Images and videos are copied into `copies` and the session keeps using the copy
-pub(crate) fn attach(path: &Path, cwd: &Path, copies: &Path) -> Attachment {
+pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment {
+    let (path, wanted) = match mention {
+        Mention::Resource { uri, text } => {
+            return Attachment {
+                path: uri.clone(),
+                content: truncated(text, MAX_OBSERVATION_CHARS),
+                resource: true,
+                ..Attachment::default()
+            };
+        }
+        // An editor sends what it shows, which may not be saved yet
+        Mention::File {
+            path,
+            lines,
+            text: Some(text),
+        } => {
+            return Attachment {
+                path: shown_path(path, cwd),
+                lines: *lines,
+                content: truncated(text, MAX_OBSERVATION_CHARS),
+                ..Attachment::default()
+            };
+        }
+        Mention::File {
+            path,
+            lines,
+            text: None,
+        } => (path, *lines),
+    };
+
     let mut shown = shown_path(path, cwd);
     let kind = kind_of(path);
     let limit = kind.map_or(MAX_ATTACH_BYTES, media_limit);
-
+    let mut lines = None;
     let mut media = None;
     let content = match fs::metadata(path) {
         Err(e) => ToolError::os("read", &shown, e).to_string(),
@@ -74,9 +116,13 @@ pub(crate) fn attach(path: &Path, cwd: &Path, copies: &Path) -> Attachment {
                         }
                         Err(e) => ToolError::os("copy", &shown, e).to_string(),
                     },
-                    None => match String::from_utf8(data) {
-                        Ok(text) => text,
-                        Err(_) => prompt::undecoded(meta.len()),
+                    None => match (String::from_utf8(data), wanted) {
+                        (Ok(text), Some(range)) => {
+                            lines = Some(range);
+                            lines_of(&text, range)
+                        }
+                        (Ok(text), None) => text,
+                        (Err(_), _) => prompt::undecoded(meta.len()),
                     },
                 }
             }
@@ -86,9 +132,19 @@ pub(crate) fn attach(path: &Path, cwd: &Path, copies: &Path) -> Attachment {
 
     Attachment {
         path: shown,
+        lines,
         content,
         media,
+        resource: false,
     }
+}
+
+/// Lines past the end of the text are left out
+fn lines_of(text: &str, (first, last): (u32, u32)) -> String {
+    let skipped = first.saturating_sub(1) as usize;
+    let count = last.saturating_sub(first) as usize + 1;
+    let picked: Vec<&str> = text.lines().skip(skipped).take(count).collect();
+    picked.join("\n")
 }
 
 pub(crate) fn viewed(path: &Path, copies: &Path) -> Result<Media, ToolError> {
@@ -233,7 +289,7 @@ fn media_limit(kind: MediaKind) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::memory::MAX_OBSERVATION_CHARS;
     use crate::tests::{temp_dir, write_file};
     use crate::tools::attach::*;
@@ -241,6 +297,55 @@ mod tests {
     use std::ffi::CString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
+
+    pub(crate) fn mentioned(path: &Path) -> Mention {
+        Mention::File {
+            path: path.to_owned(),
+            lines: None,
+            text: None,
+        }
+    }
+
+    fn attach_path(path: &Path, cwd: &Path, copies: &Path) -> Attachment {
+        let mention = mentioned(path);
+        attach(&mention, cwd, copies)
+    }
+
+    #[test]
+    fn mentions_attached() {
+        let dir = temp_dir("mentions");
+        let copies = dir.join("copies");
+        let path = dir.join("menu.txt");
+        write_file(&path, "café\ncrème\r\nbrûlée\npiñata\n".as_bytes());
+        let mention = |lines, text: Option<&str>| {
+            let file = Mention::File {
+                path: path.clone(),
+                lines: Some(lines),
+                text: text.map(str::to_owned),
+            };
+            attach(&file, &dir, &copies)
+        };
+
+        let middle = mention((2, 3), None);
+        assert_eq!(middle.lines, Some((2, 3)));
+        assert_eq!(middle.content, "crème\nbrûlée");
+        assert_eq!(mention((4, 9), None).content, "piñata");
+
+        let edited = mention((1, 1), Some("café au lait"));
+        let shown = (edited.path.as_str(), edited.content.as_str());
+        assert_eq!(shown, ("menu.txt", "café au lait"));
+        assert_eq!((edited.lines, edited.resource), (Some((1, 1)), false));
+
+        let uri = "zed:///agent/diagnostics?include_warnings=true";
+        let diagnostics = Mention::Resource {
+            uri: uri.to_owned(),
+            text: "error: unused café".to_owned(),
+        };
+        let resource = attach(&diagnostics, &dir, &copies);
+        assert_eq!((resource.path.as_str(), resource.resource), (uri, true));
+        assert_eq!(resource.content, "error: unused café");
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn attaches() {
@@ -253,7 +358,7 @@ mod tests {
         write_file(&dir.join("huge.txt"), huge.as_bytes());
         let copies = temp_dir("copies");
         let shown = |path: &str| {
-            let attached = attach(&dir.join(path), &dir, &copies);
+            let attached = attach_path(&dir.join(path), &dir, &copies);
             (attached.path, attached.content)
         };
 
@@ -272,7 +377,7 @@ mod tests {
         assert_eq!(huge, refused);
 
         let gone = dir.join("gone.txt");
-        let outside = attach(&gone, Path::new("/elsewhere"), &copies);
+        let outside = attach_path(&gone, Path::new("/elsewhere"), &copies);
         let path = slashed(&gone);
         assert_eq!(outside.path, path);
         // Windows words the reason in the system language
@@ -283,7 +388,7 @@ mod tests {
 
         let trailing = format!("{}/src/", dir.display());
         let trailing = PathBuf::from(trailing);
-        let trailing = attach(&trailing, Path::new("/elsewhere"), &copies);
+        let trailing = attach_path(&trailing, Path::new("/elsewhere"), &copies);
         assert!(trailing.path.ends_with("/src/"), "{}", trailing.path);
         assert!(!trailing.path.ends_with("//"), "{}", trailing.path);
 
@@ -311,7 +416,7 @@ mod tests {
         write_file(&dir.join("renamed.jpg"), &png);
         write_file(&dir.join("fake.png"), "not an image".as_bytes());
 
-        let image = attach(&dir.join("screenshot.PNG"), &dir, &copies);
+        let image = attach_path(&dir.join("screenshot.PNG"), &dir, &copies);
         let media = image.media.expect("image");
         assert_eq!(image.path, "screenshot.PNG");
         assert_eq!(
@@ -323,22 +428,22 @@ mod tests {
         let copied = fs::read(copies.join(&media.file)).expect("copy");
         assert_eq!(copied, png);
 
-        let renamed = attach(&dir.join("renamed.jpg"), &dir, &copies);
+        let renamed = attach_path(&dir.join("renamed.jpg"), &dir, &copies);
         let media = renamed.media.expect("renamed");
         assert_eq!(media.mime, "image/png");
         assert_eq!(media.file.extension(), Some("png".as_ref()));
-        let fake = attach(&dir.join("fake.png"), &dir, &copies);
+        let fake = attach_path(&dir.join("fake.png"), &dir, &copies);
         assert!(fake.media.is_none());
         assert_eq!(fake.content, "not an image");
 
-        let video = attach(&dir.join("clip.mp4"), &dir, &copies);
+        let video = attach_path(&dir.join("clip.mp4"), &dir, &copies);
         let media = video.media.expect("video");
         assert_eq!(
             (media.kind, media.mime.as_str()),
             (MediaKind::Video, "video/mp4")
         );
 
-        let large = attach(&dir.join("large.jpg"), &dir, &copies);
+        let large = attach_path(&dir.join("large.jpg"), &dir, &copies);
         assert!(large.media.is_none());
         let refused = "65 bytes, over the 64-byte limit for an attached image";
         assert_eq!(large.content, refused);

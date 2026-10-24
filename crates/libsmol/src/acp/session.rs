@@ -9,6 +9,7 @@ use crate::history::{Lock, SessionMeta, Settings};
 use crate::memory::{AgentMemory, Exit, MemoryStep, StepError, Verdict};
 use crate::prompt::{BLOCKED, MET, UNMET};
 use crate::spawn::{spawn_shell, Group};
+use crate::tools::attach::Mention;
 use crate::utils::Interrupt;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
@@ -48,7 +49,7 @@ pub(crate) enum Message {
 pub(crate) struct Prompt {
     pub(crate) id: Value,
     pub(crate) text: String,
-    pub(crate) files: Vec<PathBuf>,
+    pub(crate) mentions: Vec<Mention>,
     pub(crate) goal: bool,
     pub(crate) turn: u64,
 }
@@ -369,7 +370,7 @@ impl Session {
 
         let task = Task {
             text: prompt.text,
-            files: prompt.files,
+            mentions: prompt.mentions,
             goal: prompt.goal,
         };
         let servers = self.servers.installed();

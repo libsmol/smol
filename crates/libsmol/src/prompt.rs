@@ -153,16 +153,28 @@ fn request(label: &str, step: &TaskStep) -> Vec<Part> {
             continue;
         }
 
-        let tag = match path.ends_with('/') {
-            true => "directory",
-            false => "file",
+        let (tag, key) = match (file.resource, path.ends_with('/')) {
+            (true, _) => ("resource", "uri"),
+            (false, true) => ("directory", "path"),
+            (false, false) => ("file", "path"),
+        };
+        let lines = match file.lines {
+            Some(lines) => format!(" lines=\"{}\"", span(lines)),
+            None => String::new(),
         };
         let content = file.content.trim_end_matches('\n');
-        let block = format!("<{tag} path=\"{path}\">\n{content}\n</{tag}>");
+        let block = format!("<{tag} {key}=\"{path}\"{lines}>\n{content}\n</{tag}>");
         parts.push(Part::Text(block));
     }
 
     parts
+}
+
+fn span((first, last): (u32, u32)) -> String {
+    match first == last {
+        true => first.to_string(),
+        false => format!("{first}-{last}"),
+    }
 }
 
 pub(crate) fn result(printed: Option<&str>, viewed: &[(String, Media)]) -> Vec<Part> {
@@ -551,7 +563,11 @@ pub(crate) fn transcript(steps: &[&MemoryStep], max: usize) -> String {
                 None => {
                     let content = file.content.trim_end_matches('\n');
                     let content = truncated(content, max);
-                    format!("[Attached {path}]: {content}")
+                    let lines = match file.lines {
+                        Some(lines) => format!(", lines {}", span(lines)),
+                        None => String::new(),
+                    };
+                    format!("[Attached {path}{lines}]: {content}")
                 }
             };
             entries.push(attached);
