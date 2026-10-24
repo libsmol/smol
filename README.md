@@ -249,6 +249,7 @@ its `PATH`):
 {
   "agent_servers": {
     "smol": {
+      "type": "custom",
       "command": "libsmol",
       "args": []
     }
