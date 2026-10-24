@@ -382,8 +382,16 @@ impl Router {
 
     fn open(&mut self, id: &Value, session: String, cwd: PathBuf, loading: bool) -> Result<()> {
         // An unreadable config must not close the open session with the same id
-        let models = config::models(&self.app.config)?;
-        let servers = config::servers(&self.app.config)?;
+        let models = config::models(&self.app.config);
+        let servers = config::servers(&self.app.config);
+        let (models, servers) = match (models, servers) {
+            (Ok(models), Ok(servers)) => (models, servers),
+            (Err(error), _) | (_, Err(error)) => {
+                error!("session: open failed, {error}");
+                return Err(error);
+            }
+        };
+
         // A closed session may still be saving and must finish before it is read
         let previous = match self.sessions.remove(&session) {
             Some(old) => Some(old.close()),

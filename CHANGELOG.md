@@ -20,6 +20,8 @@ but their files stay in `~/.smol/history` untouched.
   file and lines marked, instead of as the whole file. libsmol now takes context
   embedded in prompts, so Zed's other `@` mentions work too, and a linked file with a
   line range is attached as just those lines.
+- A session that can't open because of `model.toml` or `agent.toml` is now logged
+  like other failures to open.
 
 ## 0.1.0 - 2026-10-24
 
