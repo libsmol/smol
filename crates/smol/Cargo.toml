@@ -1,9 +1,13 @@
 [package]
-name = "smol"
-description = "smol: a terminal client for ACP agents"
+name = "libsmol-tui"
+description = "smol, the terminal client for libsmol and other ACP agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["agent", "llm", "acp", "tui", "terminal"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 agent-client-protocol-schema = { version = "1", default-features = false }
@@ -16,7 +20,7 @@ mmdflux = { version = "2.6.1", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = "0.30"
 ratatui-textarea = "0.9"
-reaper = { path = "../reaper" }
+reaper.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 textwrap = "0.16"

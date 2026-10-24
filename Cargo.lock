@@ -567,9 +567,9 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "clipboard-win"
-version = "5.4.1"
+version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
+checksum = "052af7878466feccda12ba7a6a67d019d712f296809559b47c12c8cc196d3a9a"
 dependencies = [
  "error-code",
 ]
@@ -856,7 +856,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.6",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2325,7 +2325,7 @@ dependencies = [
  "html5ever",
  "ignore",
  "libc",
- "reaper",
+ "libsmol-reaper",
  "regex-syntax",
  "reqwest",
  "rmcp",
@@ -2344,6 +2344,38 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "libsmol-reaper"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "libsmol-tui"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol-schema",
+ "anyhow",
+ "chrono",
+ "clap",
+ "crossterm",
+ "ignore",
+ "libsmol-reaper",
+ "mmdflux",
+ "pulldown-cmark",
+ "ratatui",
+ "ratatui-textarea",
+ "serde",
+ "serde_json",
+ "textwrap",
+ "unicode-segmentation",
+ "unicode-width",
+ "url",
  "windows-sys 0.61.2",
 ]
 
@@ -3581,14 +3613,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reaper"
-version = "0.1.0"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4748,30 +4772,6 @@ name = "smawk"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8e2fb0f499abb4d162f2bedad68f5ef91a1682b5a03596ddb67efd37768d100"
-
-[[package]]
-name = "smol"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol-schema",
- "anyhow",
- "chrono",
- "clap",
- "crossterm",
- "ignore",
- "mmdflux",
- "pulldown-cmark",
- "ratatui",
- "ratatui-textarea",
- "reaper",
- "serde",
- "serde_json",
- "textwrap",
- "unicode-segmentation",
- "unicode-width",
- "url",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "socket2"
@@ -6150,9 +6150,9 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33811428bee40dbceb6d545e95754741d17a6aef9a4849f0fd62e2ba4f412a78"
+checksum = "ec8ebde2db3681e8c9980cc27822030e68752690ddfa9473e739aeb4dbde6d71"
 dependencies = [
  "proc-macro2",
  "quote",

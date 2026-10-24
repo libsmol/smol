@@ -32,3 +32,5 @@ Sessions are saved in format 6.
 - A daily log in `~/.smol/logs`, filtered with `SMOL_LOG`.
 - Release archives for Linux, macOS and Windows, with install scripts that
   download and verify them.
+- Packages on crates.io: `libsmol` (the agent), `libsmol-tui` (the `smol`
+  terminal UI) and `libsmol-reaper` (the process groups both use).

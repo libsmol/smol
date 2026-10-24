@@ -76,8 +76,17 @@ that folder is also added to your `PATH`). Set `SMOL_VERSION` (for example
 somewhere else. Running the script again upgrades.
 
 Releases are built for Linux (x86_64, arm64), macOS (Apple silicon, Intel)
-and Windows (x86_64). To build from source, install a recent stable Rust and
-run `./build.sh` (`build.ps1` on Windows).
+and Windows (x86_64).
+
+With a recent stable Rust you can also install from crates.io, where the
+agent is `libsmol` and the terminal UI is `libsmol-tui` (its program is still
+`smol`):
+
+```sh
+cargo install libsmol libsmol-tui
+```
+
+To build from a checkout, run `./build.sh` (`build.ps1` on Windows).
 
 ## Configure a model
 

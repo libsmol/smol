@@ -1,9 +1,12 @@
 [package]
-name = "reaper"
+name = "libsmol-reaper"
 description = "Kills the process groups a process started, however it dies"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["process", "process-group", "job-object", "watchdog"]
+categories = ["os"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
