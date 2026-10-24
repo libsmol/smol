@@ -9,7 +9,7 @@ use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodTerminal, CancelNotification, CloseSessionRequest,
     CloseSessionResponse, Implementation, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, NewSessionRequest, PromptRequest,
+    ListSessionsResponse, LoadSessionRequest, NewSessionRequest, PromptCapabilities, PromptRequest,
     SessionCapabilities, SessionCloseCapabilities, SessionInfo, SessionListCapabilities,
     SetSessionConfigOptionRequest, AGENT_METHOD_NAMES,
 };
@@ -259,8 +259,11 @@ impl Router {
                 let close = SessionCloseCapabilities::new();
                 let list = SessionListCapabilities::new();
                 let sessions = SessionCapabilities::new().close(close).list(list);
+                // Editors then send a selection as they show it, unsaved edits included
+                let prompts = PromptCapabilities::new().embedded_context(true);
                 let caps = AgentCapabilities::new()
                     .load_session(true)
+                    .prompt_capabilities(prompts)
                     .session_capabilities(sessions);
                 let info = Implementation::new("libsmol", env!("CARGO_PKG_VERSION"));
                 let mut response = InitializeResponse::new(ProtocolVersion::V1)
@@ -320,7 +323,7 @@ impl Router {
             }
             m if m == names.session_prompt => {
                 let request: PromptRequest = parsed(params)?;
-                let (text, files) = prompt_parts(&request.prompt);
+                let (text, mentions) = prompt_parts(&request.prompt);
                 let goal = request.meta.as_ref().and_then(|meta| meta.get(GOAL));
                 let goal = goal.and_then(Value::as_bool) == Some(true);
 
@@ -329,7 +332,7 @@ impl Router {
                 let prompt = Prompt {
                     id: id.clone(),
                     text,
-                    files,
+                    mentions,
                     goal,
                     turn,
                 };
@@ -527,6 +530,8 @@ mod tests {
         let answered = router.request(&json!(1), "initialize", plain);
         let answered = answered.expect("initialize").expect("result");
         assert_eq!(answered["authMethods"], json!([]));
+        let prompts = &answered["agentCapabilities"]["promptCapabilities"];
+        assert_eq!(prompts["embeddedContext"], true, "{answered}");
 
         let terminal = json!({
             "protocolVersion": 1,

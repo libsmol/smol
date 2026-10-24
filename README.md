@@ -258,7 +258,10 @@ its `PATH`):
 ```
 
 It supports loading, listing and closing sessions, a model option and an option
-per MCP server, and it reads the same `~/.smol` configuration as `smol`.
+per MCP server, and it reads the same `~/.smol` configuration as `smol`. Code
+added with **Add to Agent Thread** reaches the model as Zed shows it, unsaved
+edits included, with its file and lines marked; Zed's other `@` mentions, such
+as diagnostics, are passed on as well.
 
 ## Logs
 

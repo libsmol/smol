@@ -174,14 +174,20 @@ pub(crate) struct TaskStep {
     pub(crate) files: Vec<Attachment>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Attachment {
-    /// Directories end in /
+    /// Directories end in /, and a resource is named by its URI
     pub(crate) path: String,
+    /// The first and last line of the file that `content` holds, counted from 1
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lines: Option<(u32, u32)>,
     pub(crate) content: String,
     /// When set, `content` is empty
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) media: Option<Media>,
+    /// Text the client sent for something that is not a local file
+    #[serde(default, skip_serializing_if = "Not::not")]
+    pub(crate) resource: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -921,9 +927,27 @@ pub(crate) mod tests {
         let file = |path: &str, content: &str| Attachment {
             path: path.to_owned(),
             content: content.to_owned(),
-            media: None,
+            ..Attachment::default()
         };
-        let files = vec![file("src/main.rs", "fn main() {}\n"), file("docs/", "a.md")];
+        let picked = Attachment {
+            lines: Some((10, 12)),
+            ..file("src/lib.rs", "fn café() {}\n")
+        };
+        let one = Attachment {
+            lines: Some((3, 3)),
+            ..file("notes.md", "naïve")
+        };
+        let diagnostics = Attachment {
+            resource: true,
+            ..file("zed:///agent/diagnostics", "error: unused café")
+        };
+        let files = vec![
+            file("src/main.rs", "fn main() {}\n"),
+            file("docs/", "a.md"),
+            picked,
+            one,
+            diagnostics,
+        ];
         let task = TaskStep {
             files,
             ..asked("Look at @src/main.rs", false)
@@ -931,8 +955,14 @@ pub(crate) mod tests {
         let asked = MemoryStep::Task(task);
         let text = "New task:\nLook at @src/main.rs\n\nAttached files:\n\
             <file path=\"src/main.rs\">\nfn main() {}\n</file>\n\
-            <directory path=\"docs/\">\na.md\n</directory>";
+            <directory path=\"docs/\">\na.md\n</directory>\n\
+            <file path=\"src/lib.rs\" lines=\"10-12\">\nfn café() {}\n</file>\n\
+            <file path=\"notes.md\" lines=\"3\">\nnaïve\n</file>\n\
+            <resource uri=\"zed:///agent/diagnostics\">\nerror: unused café\n</resource>";
         assert_eq!(content(&asked.messages(&mut 0)[0]), text);
+        let transcript = prompt::transcript(&[&asked], usize::MAX);
+        let ranged = "[Attached src/lib.rs, lines 10-12]: fn café() {}";
+        assert!(transcript.contains(ranged), "{transcript}");
 
         let ran = AgentStep {
             usage: metered(100, 20),
@@ -941,7 +971,7 @@ pub(crate) mod tests {
         let memory = AgentMemory {
             steps: vec![MemoryStep::Action(Box::new(ran)), asked],
         };
-        assert_eq!(tokens(&memory), 120 + estimate(text.len()));
+        assert_eq!(tokens(&memory), 120 + estimate(text_bytes(text)));
     }
 
     #[test]
@@ -949,13 +979,13 @@ pub(crate) mod tests {
         let media = png("/history/s1/a.png");
         let image = Attachment {
             path: "screenshot.png".to_owned(),
-            content: String::new(),
             media: Some(media.clone()),
+            ..Attachment::default()
         };
         let notes = Attachment {
             path: "notes.txt".to_owned(),
             content: "Crème brûlée\n".to_owned(),
-            media: None,
+            ..Attachment::default()
         };
         let update = TaskStep {
             files: vec![image, notes],
