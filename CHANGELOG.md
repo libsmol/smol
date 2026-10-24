@@ -13,6 +13,7 @@ but their files stay in `~/.smol/history` untouched.
   OpenAI-compatible endpoint, its key and a model picked from the endpoint's list,
   with the context window filled in when the list reports it, and writes the file.
   Other ACP clients that support terminal authentication offer it too.
+- `smol --version` and `libsmol --version`.
 
 ## 0.1.0 - 2026-10-24
 
