@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.1.1 - 2026-10-24
 
 - When `model.toml` is missing, `smol` runs `libsmol setup`, which asks for an
   OpenAI-compatible endpoint, its key and a model picked from the endpoint's list,
