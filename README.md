@@ -6,21 +6,9 @@ variables, functions and imports from step to step.
 
 Inspired by [smolagents](https://github.com/huggingface/smolagents).
 
-```
-❯ how many orders per city, by total amount?
-  │ import csv
-  │ from collections import defaultdict
-  │ rows = list(csv.DictReader(open('orders.csv')))
-  │ totals = defaultdict(lambda: [0, 0.0])
-  │ for row in rows:
-  │     totals[row['city']][0] += 1
-  │     totals[row['city']][1] += float(row['amount'])
-  │ for city, (count, amount) in sorted(totals.items(), key=lambda kv: -kv[1][1]):
-  │     print(f'{city:10} {count:5} {amount:10,.0f}')
-  ╰ Shanghai      92     46,662
-    Shenzhen      76     40,356
-    ...
-```
+A real run with DeepSeek on smol's own source:
+
+![smol counting the lines of its own source](https://raw.githubusercontent.com/libsmol/smol/main/docs/demo.gif)
 
 ## Why smol
 
