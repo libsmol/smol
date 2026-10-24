@@ -26,6 +26,7 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 html5ever = "0.39"
 ignore = "0.4"
+inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
 reaper.workspace = true
 regex-syntax = "0.8"
 reqwest = { version = "0.13", features = ["json"] }

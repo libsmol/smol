@@ -1,4 +1,4 @@
-use libsmol::WORKER_ARG;
+use libsmol::{SETUP_ARG, WORKER_ARG};
 use std::env;
 use std::process::ExitCode;
 
@@ -7,9 +7,10 @@ fn main() -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let ran = match args[..] {
         [] => libsmol::run(),
+        [SETUP_ARG] => libsmol::setup(),
         [WORKER_ARG] => libsmol::worker(),
         _ => {
-            eprintln!("libsmol: usage: libsmol");
+            eprintln!("libsmol: usage: libsmol [setup]");
             return ExitCode::from(2);
         }
     };

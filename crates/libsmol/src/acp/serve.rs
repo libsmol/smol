@@ -3,14 +3,15 @@ use crate::acp::session::{self, Message, Opening, Prompt, Shell};
 use crate::acp::{prompt_parts, rfc3339, to_value, App, CLEAR_GOAL, GOAL, QUEUED, SHELL};
 use crate::config;
 use crate::history::HistoryStore;
+use crate::setup::SETUP_ARG;
 use crate::utils::{block_on, new_id, Interrupt};
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
-    AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-    Implementation, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, NewSessionRequest, PromptRequest, SessionCapabilities,
-    SessionCloseCapabilities, SessionInfo, SessionListCapabilities, SetSessionConfigOptionRequest,
-    AGENT_METHOD_NAMES,
+    AgentCapabilities, AuthMethod, AuthMethodTerminal, CancelNotification, CloseSessionRequest,
+    CloseSessionResponse, Implementation, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, NewSessionRequest, PromptRequest,
+    SessionCapabilities, SessionCloseCapabilities, SessionInfo, SessionListCapabilities,
+    SetSessionConfigOptionRequest, AGENT_METHOD_NAMES,
 };
 use agent_client_protocol_schema::ProtocolVersion;
 use reaper::cause;
@@ -253,6 +254,7 @@ impl Router {
                 let client = &params["clientCapabilities"];
                 let queued = client["_meta"][QUEUED].as_bool() == Some(true);
                 self.app.peer.set_queued(queued);
+                let terminal = client["auth"]["terminal"].as_bool() == Some(true);
 
                 let close = SessionCloseCapabilities::new();
                 let list = SessionListCapabilities::new();
@@ -261,9 +263,19 @@ impl Router {
                     .load_session(true)
                     .session_capabilities(sessions);
                 let info = Implementation::new("libsmol", env!("CARGO_PKG_VERSION"));
-                let response = InitializeResponse::new(ProtocolVersion::V1)
+                let mut response = InitializeResponse::new(ProtocolVersion::V1)
                     .agent_capabilities(caps)
                     .agent_info(info);
+
+                // ACP allows terminal methods only for clients that declared support for them
+                if terminal {
+                    let args = vec![SETUP_ARG.to_owned()];
+                    let setup = AuthMethodTerminal::new(SETUP_ARG, "Set up a model")
+                        .description("Choose an OpenAI-compatible endpoint and a model")
+                        .args(args);
+                    let methods = vec![AuthMethod::Terminal(setup)];
+                    response = response.auth_methods(methods);
+                }
                 Some(to_value(response))
             }
             m if m == names.session_new => {
@@ -478,6 +490,7 @@ mod tests {
     use crate::memory::tests::one_task;
     use crate::tests::temp_dir;
     use crate::utils::{block_on, Interrupt};
+    use crate::Error;
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::fs;
@@ -503,6 +516,38 @@ mod tests {
             closing: HashMap::new(),
         };
         (router, sent)
+    }
+
+    #[test]
+    fn setup_offered() {
+        let dir = temp_dir("setup-offered");
+        let (mut router, _sent) = router(&dir);
+
+        let plain = json!({"protocolVersion": 1, "clientCapabilities": {}});
+        let answered = router.request(&json!(1), "initialize", plain);
+        let answered = answered.expect("initialize").expect("result");
+        assert_eq!(answered["authMethods"], json!([]));
+
+        let terminal = json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"auth": {"terminal": true}},
+        });
+        let answered = router.request(&json!(2), "initialize", terminal);
+        let answered = answered.expect("initialize").expect("result");
+        let setup = json!({
+            "type": "terminal",
+            "id": "setup",
+            "name": "Set up a model",
+            "description": "Choose an OpenAI-compatible endpoint and a model",
+            "args": ["setup"],
+        });
+        assert_eq!(answered["authMethods"], json!([setup]));
+
+        let opening = json!({"cwd": "/", "mcpServers": []});
+        let refused = router.request(&json!(3), "session/new", opening);
+        let refused = refused.expect_err("unconfigured");
+        assert!(matches!(refused, Error::Unconfigured(_)), "{refused:?}");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

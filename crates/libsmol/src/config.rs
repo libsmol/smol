@@ -6,15 +6,21 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
-use std::io;
+#[cfg(unix)]
+use std::fs::Permissions;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{self, Path, PathBuf};
+use toml::Value;
 
 /// Testing compaction shrinks the window a lot, so this only catches 0 and obvious typos
-const MIN_CONTEXT: u64 = 1024;
+pub(crate) const MIN_CONTEXT: u64 = 1024;
 /// Only the first one found in each directory is used
 const INSTRUCTION_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 const SKILL_FILE: &str = "SKILL.md";
+pub(crate) const MODEL_FILE: &str = "model.toml";
 const MODEL_EXAMPLE: &str = r#"[model.deepseek]
 type = "openai-completions"
 api = "https://api.deepseek.com/v1"
@@ -95,13 +101,16 @@ impl Models {
 }
 
 pub(crate) fn models(dir: &Path) -> Result<Models> {
-    let path = dir.join("model.toml");
+    let path = dir.join(MODEL_FILE);
     let invalid = invalid(&path);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let problem = format!("not found; create it, for example:\n{MODEL_EXAMPLE}");
-            return Err(invalid(problem));
+            let shown = tilde(&path);
+            let message = format!(
+                "{shown}: not found; run `libsmol setup` or create it, for example:\n{MODEL_EXAMPLE}"
+            );
+            return Err(Error::Unconfigured(message));
         }
         Err(e) => {
             let reason = cause(&e);
@@ -146,6 +155,62 @@ pub(crate) fn models(dir: &Path) -> Result<Models> {
     }
 
     Ok(Models(providers))
+}
+
+pub(crate) fn save_model(
+    dir: &Path,
+    name: &str,
+    api: &str,
+    key: &str,
+    spec: &ModelSpec,
+) -> Result<()> {
+    let quoted = |text: &str| Value::String(text.to_owned()).to_string();
+    let bare = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let plain = !name.is_empty() && name.chars().all(bare);
+    let name = match plain {
+        true => name.to_owned(),
+        false => quoted(name),
+    };
+    let key = match key.is_empty() {
+        true => "none",
+        false => key,
+    };
+    let api = quoted(api);
+    let key = quoted(key);
+    let entry = Value::try_from(spec).expect("serialize");
+
+    let lines = [
+        format!("[model.{name}]"),
+        "type = \"openai-completions\"".to_owned(),
+        format!("api = {api}"),
+        format!("api_key = {key}"),
+        format!("models = [{entry}]"),
+    ];
+    let text = lines.join("\n") + "\n";
+
+    let path = dir.join(MODEL_FILE);
+    let invalid = invalid(&path);
+    let unwritable = |e: io::Error| {
+        let reason = cause(&e);
+        invalid(reason)
+    };
+    fs::create_dir_all(dir).map_err(unwritable)?;
+
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // The file holds the key in plain text
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path).map_err(unwritable)?;
+    // The mode only applies to a new file
+    #[cfg(unix)]
+    {
+        let private = Permissions::from_mode(0o600);
+        file.set_permissions(private).map_err(unwritable)?;
+    }
+    file.write_all(text.as_bytes()).map_err(unwritable)?;
+
+    Ok(())
 }
 
 /// The global file comes first, then each directory from the root down to `project`,
@@ -349,7 +414,7 @@ fn unreadable(e: &io::Error) -> String {
 #[serde(deny_unknown_fields)]
 struct AgentFile {
     #[serde(default)]
-    mcp: BTreeMap<String, toml::Value>,
+    mcp: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -458,12 +523,7 @@ pub(crate) fn servers(dir: &Path) -> Result<Vec<McpConfig>> {
                 }
 
                 // The URL may carry a secret, so it is never shown
-                let problem = match Url::parse(&url) {
-                    Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => None,
-                    Ok(_) => Some("expected http:// or https://".to_owned()),
-                    Err(e) => Some(e.to_string()),
-                };
-                if let Some(problem) = problem {
+                if let Err(problem) = parse_url(&url) {
                     let problem = format!("[mcp.{name}]: url: {problem}");
                     return Err(invalid(problem));
                 }
@@ -481,6 +541,14 @@ pub(crate) fn servers(dir: &Path) -> Result<Vec<McpConfig>> {
     }
 
     Ok(servers)
+}
+
+pub(crate) fn parse_url(url: &str) -> Result<Url, String> {
+    match Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => Ok(parsed),
+        Ok(_) => Err("expected http:// or https://".to_owned()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn invalid(path: &Path) -> impl Fn(String) -> Error {
@@ -516,13 +584,18 @@ fn parsed<T: DeserializeOwned>(text: &str) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        instructions, models, servers, skills, McpConfig, McpKind, Skill, MODEL_EXAMPLE,
+        instructions, models, save_model, servers, skills, McpConfig, McpKind, Skill, MODEL_EXAMPLE,
     };
-    use crate::model::MediaKind;
+    use crate::model::{MediaKind, ModelSpec};
     use crate::tests::temp_dir;
+    use crate::Error;
     use reaper::tilde;
     use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     fn written(text: &str) -> (PathBuf, String) {
@@ -606,9 +679,56 @@ models = [{ id = "m3" }]
 
         let (dir, shown) = written("");
         fs::remove_file(dir.join("model.toml")).expect("remove");
-        let error = models(&dir).err().expect("error").to_string();
-        let problem = format!("not found; create it, for example:\n{MODEL_EXAMPLE}");
-        assert_eq!(error, format!("config: {shown}: {problem}"));
+        let error = models(&dir).err().expect("error");
+        assert!(matches!(error, Error::Unconfigured(_)), "{error:?}");
+        let problem =
+            format!("not found; run `libsmol setup` or create it, for example:\n{MODEL_EXAMPLE}");
+        assert_eq!(error.to_string(), format!("config: {shown}: {problem}"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn saved_model_loads() {
+        let dir = temp_dir("saved-model");
+        let path = dir.join("model.toml");
+        let tricky = r#"sk-"café"\🐍"#;
+        let spec = ModelSpec {
+            id: "piñata-2".to_owned(),
+            effort: Some("high".to_owned()),
+            context: Some(8192),
+            image: true,
+            ..ModelSpec::default()
+        };
+        let api = "http://127.0.0.1:1/v1";
+        save_model(&dir, "über café.v2", api, tricky, &spec).expect("save");
+        let read = models(&dir).expect("load");
+        assert_eq!(read.names(), ["über café.v2/piñata-2"]);
+        let built = read.make("über café.v2/piñata-2").expect("make");
+        assert_eq!(built.context_window(), Some(8192));
+        assert!(built.takes(MediaKind::Image) && !built.takes(MediaKind::Video));
+        let text = fs::read_to_string(&path).expect("read");
+        let parsed: toml::Table = toml::from_str(&text).expect("parse");
+        let key = parsed["model"]["über café.v2"]["api_key"].as_str();
+        assert_eq!(key, Some(tricky));
+
+        #[cfg(unix)]
+        fs::set_permissions(&path, Permissions::from_mode(0o644)).expect("chmod");
+        let spec = ModelSpec {
+            id: "qwen3:32b".to_owned(),
+            ..ModelSpec::default()
+        };
+        save_model(&dir, "local-1", api, "", &spec).expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        let expected = "[model.local-1]\ntype = \"openai-completions\"\napi = \"http://127.0.0.1:1/v1\"\napi_key = \"none\"\nmodels = [{ id = \"qwen3:32b\" }]\n";
+        assert_eq!(text, expected);
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let read = models(&dir).expect("load");
+        let built = read.make("local-1/qwen3:32b").expect("make");
+        assert_eq!(built.context_window(), None);
         fs::remove_dir_all(&dir).ok();
     }
 

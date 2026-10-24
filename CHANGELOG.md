@@ -7,6 +7,13 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- When `model.toml` is missing, `smol` runs `libsmol setup`, which asks for an
+  OpenAI-compatible endpoint, its key and a model picked from the endpoint's list,
+  with the context window filled in when the list reports it, and writes the file.
+  Other ACP clients that support terminal authentication offer it too.
+
 ## 0.1.0 - 2026-10-24
 
 The first public release: the `smol` terminal UI and the `libsmol` ACP agent.

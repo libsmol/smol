@@ -94,6 +94,26 @@ To build from a checkout, run `./build.sh` (`build.ps1` on Windows).
 Configuration lives in `~/.smol` (or the directory in `SMOL_CONFIG_DIR`). It is
 read each time a session opens, so `:new` picks up changes.
 
+When `~/.smol/model.toml` doesn't exist, `smol` first runs `libsmol setup`. It
+asks for the base URL of an OpenAI-compatible endpoint, its API key and a model,
+picked from the endpoint's model list or typed in, and writes the file. The
+context window is filled in when the list reports it. Run `libsmol setup` again
+to replace it. Other ACP clients that support terminal authentication offer the
+same setup; with the rest, run it in a terminal.
+
+Base URLs of some common providers:
+
+| Provider | Base URL |
+| --- | --- |
+| OpenAI | `https://api.openai.com/v1` |
+| DeepSeek | `https://api.deepseek.com/v1` |
+| OpenRouter | `https://openrouter.ai/api/v1` |
+| Moonshot (Kimi) | `https://api.moonshot.ai/v1`, in China `https://api.moonshot.cn/v1` |
+| Alibaba Cloud Model Studio (Qwen) | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| Zhipu (GLM) | `https://open.bigmodel.cn/api/paas/v4`, Z.ai `https://api.z.ai/api/paas/v4` |
+| SiliconFlow | `https://api.siliconflow.com/v1`, in China `https://api.siliconflow.cn/v1` |
+| Ollama (local) | `http://localhost:11434/v1` |
+
 `~/.smol/model.toml` lists the models. Each `[model.<provider>]` table is one
 OpenAI-compatible chat completions endpoint:
 

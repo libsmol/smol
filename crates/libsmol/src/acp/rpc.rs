@@ -157,6 +157,7 @@ impl From<Error> for RpcError {
             Error::MethodNotFound(_) => ErrorCode::MethodNotFound,
             Error::InvalidParams(_) | Error::Refused(_) => ErrorCode::InvalidParams,
             Error::SessionNotFound(_) => ErrorCode::ResourceNotFound,
+            Error::Unconfigured(_) => ErrorCode::AuthRequired,
             _ => ErrorCode::InternalError,
         };
         let code = i32::from(code);
@@ -182,6 +183,7 @@ mod tests {
             (Error::InvalidParams("bad".to_owned()), -32602),
             (Error::Refused("too long".to_owned()), -32602),
             (Error::SessionNotFound("s1".to_owned()), -32002),
+            (Error::Unconfigured("no model.toml".to_owned()), -32000),
             (Error::History("disk full".to_owned()), -32603),
         ];
 

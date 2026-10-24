@@ -29,6 +29,8 @@ const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 const ARGUMENT: &str = "code";
 /// Servers only accept tool names of letters, digits, `_` and `-` up to this length
 const MAX_NAME_CHARS: usize = 64;
+pub(crate) const DEFAULT_API: &str = "https://api.openai.com/v1";
+const LIST_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ChatMessage {
@@ -229,7 +231,7 @@ pub(crate) trait Model: Send + Sync {
     }
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelSpec {
     pub(crate) id: String,
@@ -237,9 +239,9 @@ pub(crate) struct ModelSpec {
     pub(crate) context: Option<u64>,
     /// DeepSeek counts reasoning toward it, and a small value cuts the reply off mid-reasoning
     pub(crate) max_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Not::not")]
     pub(crate) image: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Not::not")]
     pub(crate) video: bool,
 }
 
@@ -266,8 +268,8 @@ impl OpenAIModel {
             true => key,
             false => key.or_else(|| env::var("OPENAI_API_KEY").ok()),
         };
-        let key = key.filter(|key| !key.is_empty() && key != "none");
-        let api = api.unwrap_or_else(|| "https://api.openai.com/v1".to_owned());
+        let key = key.filter(|key| real_key(key));
+        let api = api.unwrap_or_else(|| DEFAULT_API.to_owned());
 
         let builder = Client::builder()
             .read_timeout(IDLE_WAIT)
@@ -570,6 +572,91 @@ impl Model for OpenAIModel {
             MediaKind::Video => self.video,
         }
     }
+}
+
+/// Whether the key, the address or something else made listing fail
+#[derive(Debug, PartialEq)]
+pub(crate) enum ListError {
+    Key(String),
+    Address(String),
+    Other(String),
+}
+
+pub(crate) async fn listed(api: &str, key: &str) -> Result<Vec<ModelSpec>, ListError> {
+    let builder = Client::builder().timeout(LIST_WAIT);
+    let client = http_client(builder).map_err(ListError::Other)?;
+    let api = api.trim_end_matches('/');
+    let url = format!("{api}/models");
+    let mut request = client.get(&url);
+    if real_key(key) {
+        request = request.bearer_auth(key);
+    }
+
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            let reason = http_cause(&e);
+            let message = format!("models: {url}: {reason}");
+            let error = match e.is_connect() {
+                true => ListError::Address(message),
+                false => ListError::Other(message),
+            };
+            return Err(error);
+        }
+    };
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let json: Value = serde_json::from_str(&text).unwrap_or_default();
+    if !status.is_success() {
+        // A page from a web server or proxy is only useful for its status
+        let said = match json.is_null() {
+            true => status.canonical_reason().unwrap_or_default().to_owned(),
+            false => error_text(&json, &text),
+        };
+        let code = status.as_u16();
+        let reason = prompt::http_status(code, &said);
+        let message = format!("models: {url}: {reason}");
+        let error = match code {
+            401 | 403 => ListError::Key(message),
+            404 => ListError::Address(message),
+            _ => ListError::Other(message),
+        };
+        return Err(error);
+    }
+
+    let Some(entries) = json["data"].as_array() else {
+        let message = format!("models: {url}: not a model list");
+        return Err(ListError::Address(message));
+    };
+    let mut specs = Vec::new();
+    for entry in entries {
+        let Some(id) = entry["id"].as_str() else {
+            continue;
+        };
+        // OpenAI's own list has no window, and other endpoints each name it their own way
+        let windows = [
+            &entry["context_window"],
+            &entry["context_length"],
+            &entry["max_context_length"],
+            &entry["max_model_len"],
+        ];
+        let context = windows.into_iter().find_map(Value::as_u64);
+        let spec = ModelSpec {
+            id: id.to_owned(),
+            context,
+            ..ModelSpec::default()
+        };
+        specs.push(spec);
+    }
+    if specs.is_empty() {
+        let message = format!("models: {url}: none listed");
+        return Err(ListError::Other(message));
+    }
+
+    specs.sort_by(|a, b| a.id.cmp(&b.id));
+    specs.dedup_by(|a, b| a.id == b.id);
+    Ok(specs)
 }
 
 #[derive(Default)]
@@ -922,6 +1009,11 @@ fn unescaped(text: &str) -> Option<(char, usize)> {
     Some((simple, length))
 }
 
+/// An empty key and `none` both stand for no key
+fn real_key(key: &str) -> bool {
+    !key.is_empty() && key != "none"
+}
+
 fn error_text(json: &Value, raw: &str) -> String {
     let fields = [
         &json["error"]["message"],
@@ -1057,6 +1149,42 @@ pub(crate) mod tests {
 
     fn hello() -> [ChatMessage; 1] {
         [ChatMessage::user("Hello")]
+    }
+
+    /// Answers one request with `response` and returns what was listed and the request head
+    fn listing(response: &str, key: &str) -> (Result<Vec<ModelSpec>, ListError>, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let response = response.to_owned();
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut buffer = [0; 8192];
+            while !request.ends_with(b"\r\n\r\n") {
+                let Ok(read @ 1..) = connection.read(&mut buffer) else {
+                    break;
+                };
+                request.extend_from_slice(&buffer[..read]);
+            }
+
+            connection.write_all(response.as_bytes()).ok();
+            connection.shutdown(Shutdown::Write).ok();
+            while connection.read(&mut buffer).is_ok_and(|read| read > 0) {}
+            String::from_utf8_lossy(&request).into_owned()
+        });
+
+        let api = format!("http://{address}/v1/");
+        let listing = listed(&api, key);
+        let result = block_on(listing);
+        let request = server.join().expect("server");
+        (result, request.to_lowercase())
+    }
+
+    fn reply(status: &str, mime: &str, body: &str) -> String {
+        let length = body.len();
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: {mime}\r\ncontent-length: {length}\r\n\r\n{body}"
+        )
     }
 
     #[test]
@@ -1574,6 +1702,97 @@ pub(crate) mod tests {
         let mut stream = Stream::default();
         stream.feed(lines.as_bytes(), &mut on_delta).expect("feed");
         assert_eq!(thoughts, ["", "Hmm"]);
+    }
+
+    #[test]
+    fn models_listed() {
+        let body = r#"{"object":"list","data":[
+            {"id":"zeta-piñata","context_window":1048576},
+            {"id":"alpha-café","context_length":8192},
+            {"id":"alpha-café"},
+            {"id":"mid-naïve","max_model_len":32768},
+            {"id":"mistral-crème","max_context_length":131072},
+            {"id":"gpt-plain","owned_by":"system"},
+            {"object":"model"}
+        ]}"#;
+        let response = reply("200 OK", "application/json", body);
+        let (listed, request) = listing(&response, "sk-test");
+        let specs = listed.expect("listed");
+        let found: Vec<(&str, Option<u64>)> = specs
+            .iter()
+            .map(|spec| (spec.id.as_str(), spec.context))
+            .collect();
+        let expected = [
+            ("alpha-café", Some(8192)),
+            ("gpt-plain", None),
+            ("mid-naïve", Some(32768)),
+            ("mistral-crème", Some(131072)),
+            ("zeta-piñata", Some(1048576)),
+        ];
+        assert_eq!(found, expected);
+        assert!(request.starts_with("get /v1/models http/1.1"), "{request}");
+        assert!(
+            request.contains("authorization: bearer sk-test"),
+            "{request}"
+        );
+
+        for key in ["", "none"] {
+            let (_, request) = listing(&response, key);
+            assert!(!request.contains("authorization"), "{request}");
+        }
+    }
+
+    #[test]
+    fn listing_failures() {
+        let refused = reply(
+            "401 Unauthorized",
+            "application/json",
+            r#"{"error":{"message":"Invalid key for café"}}"#,
+        );
+        let missing = reply("404 Not Found", "text/plain", "404 page not found");
+        let page = reply("200 OK", "text/html", "<html>Welcome to the café</html>");
+        let empty = reply("200 OK", "application/json", r#"{"data":[]}"#);
+        let broken = reply("500 Internal Server Error", "text/plain", "");
+        let cases = [
+            (refused, "http 401: Invalid key for café"),
+            (missing, "http 404: Not Found"),
+            (page, "not a model list"),
+            (empty, "none listed"),
+            (broken, "http 500: Internal Server Error"),
+        ];
+
+        let mut kinds = Vec::new();
+        for (response, said) in cases {
+            let (listed, _) = listing(&response, "sk-test");
+            let error = listed.expect_err("error");
+            let (kind, message) = match &error {
+                ListError::Key(message) => ("key", message),
+                ListError::Address(message) => ("address", message),
+                ListError::Other(message) => ("other", message),
+            };
+            assert!(
+                message.starts_with("models: http://127.0.0.1:"),
+                "{message}"
+            );
+            assert!(
+                message.ends_with(&format!("/v1/models: {said}")),
+                "{message}"
+            );
+            kinds.push(kind);
+        }
+        assert_eq!(kinds, ["key", "address", "address", "other", "other"]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        drop(listener);
+        let api = format!("http://{address}/v1");
+        let listing = listed(&api, "");
+        let error = block_on(listing).expect_err("closed");
+        let ListError::Address(message) = error else {
+            panic!("{error:?}");
+        };
+        let expected = format!("models: {api}/models: cannot connect to {address}:");
+        assert!(message.starts_with(&expected), "{message}");
     }
 
     #[test]
