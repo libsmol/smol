@@ -80,10 +80,11 @@ and Windows (x86_64).
 
 With a recent stable Rust you can also install from crates.io, where the
 agent is `libsmol` and the terminal UI is `libsmol-tui` (its program is still
-`smol`):
+`smol`). Keep `--locked`, which builds with the dependency versions the release
+was tested with:
 
 ```sh
-cargo install libsmol libsmol-tui
+cargo install --locked libsmol libsmol-tui
 ```
 
 To build from a checkout, run `./build.sh` (`build.ps1` on Windows).
