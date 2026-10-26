@@ -25,6 +25,9 @@ use tokio::sync::{oneshot, watch};
 #[cfg(windows)]
 use windows_sys::Win32::Globalization::GetACP;
 
+/// Must hold `MAX_OBSERVATION_CHARS` characters at up to 4 bytes each
+pub(crate) const KEPT_BYTES: usize = 256 * 1024;
+pub(crate) const SHOWN_EVERY: Duration = Duration::from_millis(100);
 const MAX_EXCERPT_CHARS: usize = 300;
 /// The read timeout starts when the request is sent,
 /// so only a shorter connect wait reports an unreachable host as a connect failure

@@ -252,6 +252,6 @@ def _run(code):
     except BaseException:
         pass
 
-    # Undecodable filename bytes become lone surrogates that Rust can't accept
+    # Strings passed to the host can't hold lone surrogates
     clean = lambda text: text if text is None else text.encode("utf-8", "backslashreplace").decode()
     return {"error": clean(error), "code": clean(repaired)}

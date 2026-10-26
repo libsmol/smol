@@ -17,7 +17,6 @@ interface tools {
     variant tool-error {
         os(os-error),
         failed(string),
-        /// The interrupt stays pending for the next `interrupted` check to report
         interrupted,
     }
 

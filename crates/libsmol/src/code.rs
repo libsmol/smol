@@ -2,14 +2,12 @@ use crate::config::Skill;
 use crate::memory::{CallError, MAX_OBSERVATION_CHARS};
 use crate::model::Media;
 use crate::prompt::{self, NO_SERVER};
-use crate::spawn::SHOWN_EVERY;
-use crate::tools::mcp::{Called, Calling, Server};
-use crate::utils::Interrupt;
+use crate::tools::mcp::{Called, Server};
+use crate::utils::{Interrupt, SHOWN_EVERY};
 use crate::worker::sandbox::Sandbox;
-use crate::worker::{Function, Guest, Installed, ToolCall};
+use crate::worker::{Function, Guest, ToolCall};
 use crate::{Error, Result};
 use reaper::terminal_view;
-use std::future;
 use std::mem;
 use std::path::Path;
 use std::pin::pin;
@@ -48,7 +46,6 @@ pub(crate) struct Worker {
     live: Option<Live>,
 }
 
-/// Dropping it stops the Python
 struct Live {
     guest: Guest,
     /// MCP calls the code is waiting on
@@ -99,23 +96,35 @@ impl Worker {
 
         let started = Guest::start(&self.sandbox, &self.interrupt).await;
         let (guest, functions) = started.map_err(|reason| prompt::unstarted(&reason))?;
-        let live = Live {
+        for added in servers {
+            match guest.add_server(&added.server).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(reason)) => return Err(reason),
+                Err(lost) => return Err(prompt::lost(&lost)),
+            }
+        }
+
+        self.functions = functions;
+        self.live = Some(Live {
             guest,
             calls: JoinSet::new(),
-        };
-        for added in servers {
-            live.install(&added.server).await?;
-        }
-        self.functions = functions;
-        self.live = Some(live);
+        });
         Ok(())
     }
 
     /// `servers` are already installed, and a replacement for a lost worker gets them back first
     pub(crate) async fn add_server(&mut self, server: Server, servers: &[&Added]) -> Result<Added> {
         self.connect(servers).await.map_err(Error::Python)?;
-        let live = self.live.as_mut().expect("connected");
-        let installed = live.install(&server).await.map_err(Error::Python)?;
+        let live = self.live.as_ref().expect("connected");
+        let installed = match live.guest.add_server(&server).await {
+            Ok(installed) => installed.map_err(Error::Python)?,
+            Err(lost) => {
+                self.live = None;
+                self.restarted = true;
+                let reason = prompt::lost(&lost);
+                return Err(Error::Python(reason));
+            }
+        };
 
         let name = installed.name;
         if let Some(other) = installed.server {
@@ -180,26 +189,19 @@ impl Worker {
                         called,
                         mut reply,
                     } = call;
-                    let found = servers.iter().find(|added| added.name == server);
-                    let calling: Calling = match found {
-                        Some(added) => (added.server.call)(tool, args, called),
-                        None => {
-                            let reply = Err(NO_SERVER.to_owned());
-                            let called = Called::from(reply);
-                            let ready = future::ready(called);
-                            Box::pin(ready)
-                        }
+                    let Some(added) = servers.iter().find(|added| added.name == server) else {
+                        let missing = Err(NO_SERVER.to_owned());
+                        reply.send(Called::from(missing)).ok();
+                        continue;
                     };
-                    let shared = Arc::clone(&live.guest.shared);
+                    let calling = (added.server.call)(tool, args, called);
                     // The guest gives up on the reply when interrupted, which stops the call
                     let answering = async move {
                         let called = select! {
                             called = calling => called,
                             () = reply.closed() => return,
                         };
-                        let mut shared = shared.lock().expect("shared lock");
-                        shared.media.extend(called.media);
-                        reply.send(called.result).ok();
+                        reply.send(called).ok();
                     };
                     live.calls.spawn(answering);
                 }
@@ -229,44 +231,24 @@ impl Worker {
             ..Evaluated::default()
         };
 
-        match replied {
-            Ok(ran) if !killed => {
-                let judged = |error: String| match interrupt.triggered() {
-                    true => CallError::Interrupted,
-                    false => CallError::Execution(error),
-                };
-                output.error = ran.error.map(judged);
+        let error = match replied {
+            Ok(ran) => {
                 output.code = ran.code;
-            }
-            // A kill as the code finished still leaves this Python unusable
-            Ok(_) => {
-                self.live = None;
-                self.restarted = true;
-                output.error = Some(CallError::Interrupted);
+                ran.error
             }
             Err(lost) => {
                 self.live = None;
                 self.restarted = true;
-                let error = match interrupt.triggered() {
-                    true => CallError::Interrupted,
-                    false => failed(prompt::lost(&lost)),
-                };
-                output.error = Some(error);
+                let reason = prompt::lost(&lost);
+                Some(prompt::python(&reason))
             }
-        }
+        };
+        let judged = |error: String| match interrupt.triggered() {
+            true => CallError::Interrupted,
+            false => CallError::Execution(error),
+        };
+        output.error = error.map(judged);
         Ok(output)
-    }
-}
-
-impl Live {
-    async fn install(&self, server: &Server) -> Result<Installed, String> {
-        let installing = self
-            .guest
-            .add_server(&server.name, &server.description, &server.tools);
-        match installing.await {
-            Ok(installed) => installed,
-            Err(lost) => Err(prompt::lost(&lost)),
-        }
     }
 }
 
@@ -460,7 +442,7 @@ mod tests {
         assert_eq!(output.logs, "ran\n");
     }
 
-    /// With a small thread stack, deep recursion crashes once the limit is raised
+    /// With a small stack, deep recursion crashes once the limit is raised
     #[test]
     fn deep_recursion() {
         let code = "import sys\n\
@@ -988,7 +970,6 @@ mod tests {
 
     #[test]
     fn surrogates_replaced() {
-        // Undecodable file names on Linux look like this
         let output = run("raise ValueError('bad file ' + chr(0xdcff))");
         let message = error(output);
         assert!(
@@ -1552,8 +1533,8 @@ mod tests {
 
         let short = "zzzzz\n[90 characters cut; print(..., limit=None) skips this cut]\nzzzzz\n";
         assert!(logs.ends_with(short));
-        // Text files end lines with \r\n on Windows
-        assert_eq!(written.trim_end(), "w".repeat(10000));
+        let line = format!("{}\n", "w".repeat(10000));
+        assert_eq!(written, line);
 
         let captured = "import contextlib, io\nbuf = io.StringIO()\nwith contextlib.redirect_stdout(buf):\n    print('c' * 10000)\nlen(buf.getvalue())";
         let captured = run(captured);
@@ -1669,7 +1650,8 @@ mod tests {
             os.symlink(up + 'etc', 'out')\nos.symlink(up + 'etc/hosts', 'hosts.png')\n\
             def tried(attempt):\n    try:\n        attempt()\n    except OSError as e:\n        return f'{type(e).__name__} {e.errno}'\n\
             attempts = [lambda: open('/etc/hosts'), lambda: ls('/etc'), lambda: open('out/hosts'),\n    \
-                lambda: ls('out'), lambda: grep('localhost', 'out'), lambda: view('hosts.png')]\n\
+                lambda: ls('out'), lambda: grep('localhost', 'out'), lambda: view('hosts.png'),\n    \
+                lambda: open('out/missing'), lambda: ls('out/missing')]\n\
             print([tried(attempt) for attempt in attempts])\nprint(ls())";
         let output = worker.eval(code);
         fs::remove_dir_all(&dir).ok();
@@ -1677,9 +1659,11 @@ mod tests {
         assert_eq!(output.error, None);
         let missing = "'FileNotFoundError 44'";
         let escaped = "'PermissionError 63'";
-        let tried = format!("[{missing}, {missing}, {escaped}, {escaped}, {escaped}, {escaped}]");
+        let mut tried = vec![missing; 2];
+        tried.extend([escaped; 6]);
+        let tried = tried.join(", ");
         // A link out of the mounts isn't followed to tell whether it is a folder
-        let expected = format!("{tried}\n['hosts.png', 'out']\n");
+        let expected = format!("[{tried}]\n['hosts.png', 'out']\n");
         assert_eq!(output.logs, expected);
     }
 

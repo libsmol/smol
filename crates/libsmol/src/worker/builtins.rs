@@ -8,7 +8,7 @@ use crate::worker::wit::smol::host::tools::{self, Found, OsError};
 use crate::worker::{Host, ToolCall};
 use serde_json::{Map, Value};
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::select;
@@ -24,10 +24,7 @@ impl tools::Host for Host {
         path: String,
         recursive: bool,
     ) -> Result<Vec<String>, Refused> {
-        let base = host_path(&cwd);
-        let root = host_path(&path);
-        let full = base.join(&root);
-        reached(&self.sandbox, &full, &path)?;
+        let (base, root) = resolved(&self.sandbox, &cwd, &path)?;
 
         let sandbox = Arc::clone(&self.sandbox);
         let listing = move |stop: &AtomicBool| {
@@ -45,10 +42,7 @@ impl tools::Host for Host {
         path: String,
         glob: Option<String>,
     ) -> Result<Vec<Found>, Refused> {
-        let base = host_path(&cwd);
-        let root = host_path(&path);
-        let full = base.join(&root);
-        reached(&self.sandbox, &full, &path)?;
+        let (base, root) = resolved(&self.sandbox, &cwd, &path)?;
 
         let searching =
             move |stop: &AtomicBool| files::grep(&pattern, &base, &root, glob.as_deref(), stop);
@@ -78,10 +72,8 @@ impl tools::Host for Host {
     }
 
     async fn view(&mut self, cwd: String, path: String) -> Result<(), Refused> {
-        let base = host_path(&cwd);
-        let root = host_path(&path);
+        let (base, root) = resolved(&self.sandbox, &cwd, &path)?;
         let full = base.join(&root);
-        reached(&self.sandbox, &full, &path)?;
         let copies = &self.sandbox.copies;
         let media = viewed(&full, &path, copies).map_err(|e| refused(e, &path))?;
 
@@ -125,30 +117,38 @@ impl tools::Host for Host {
             answered = replied => answered,
             () = self.interrupt.wait() => return Err(Refused::Interrupted),
         };
-        match answered {
-            Ok(Ok(result)) => Ok(result.to_string()),
-            Ok(Err(reason)) => Err(Refused::Failed(reason)),
-            Err(_) => Err(Refused::Failed(NO_SERVER.to_owned())),
+        let Ok(called) = answered else {
+            return Err(Refused::Failed(NO_SERVER.to_owned()));
+        };
+
+        let mut shared = self.shared.lock().expect("shared lock");
+        shared.media.extend(called.media);
+        match called.result {
+            Ok(result) => Ok(result.to_string()),
+            Err(reason) => Err(Refused::Failed(reason)),
         }
     }
 }
 
-/// Fails as the guest's own `open()` would for a path that leads out of the mounts
-fn reached(sandbox: &Sandbox, path: &Path, written: &str) -> Result<(), Refused> {
-    let errno = match sandbox.reach(path) {
-        Ok(Reach::Inside) => return Ok(()),
+/// `cwd` and `path` in host form, failing as the guest's own `open()` would when `path` leads
+/// out of the mounts
+fn resolved(sandbox: &Sandbox, cwd: &str, path: &str) -> Result<(PathBuf, PathBuf), Refused> {
+    let base = host_path(cwd);
+    let root = host_path(path);
+    let full = base.join(&root);
+    let errno = match sandbox.reach(&full) {
+        Ok(Reach::Inside) => return Ok((base, root)),
         Ok(Reach::Escaped) => "EPERM",
         Ok(Reach::Outside) => "ENOENT",
-        // The builtin itself reports a missing path, after checks of its own such as view's extension
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => {
-            let error = ToolError::os("read", written, e);
-            return Err(refused(error, written));
+            let error = ToolError::os("read", path, e);
+            return Err(refused(error, path));
         }
     };
+
     let error = OsError {
         errno: errno.to_owned(),
-        path: written.to_owned(),
+        path: path.to_owned(),
     };
     Err(Refused::Os(error))
 }
@@ -171,8 +171,6 @@ async fn blocking<T: Send + 'static>(
     }
 }
 
-/// Python picks the `OSError` subclass from the errno, which goes by name to the guest
-/// because it numbers errors its own way. `written` is the path or URL as the code wrote it
 fn refused(error: ToolError, written: &str) -> Refused {
     let ToolError::Os { source, .. } = &error else {
         return Refused::Failed(error.to_string());
@@ -198,6 +196,7 @@ fn refused(error: ToolError, written: &str) -> Refused {
         _ if source.raw_os_error().is_some() => "EIO",
         _ => return Refused::Failed(error.to_string()),
     };
+
     let error = OsError {
         errno: errno.to_owned(),
         path: written.to_owned(),

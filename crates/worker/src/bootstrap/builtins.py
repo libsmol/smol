@@ -31,8 +31,7 @@ class _LineStream(_io.TextIOWrapper):
 
 def _stream(fd):
     buffered = _REAL_OPEN(fd, "wb", closefd=False)
-    # Windows would write \r\n, and every \r would count toward cut output
-    return _LineStream(buffered, encoding="utf-8", errors="backslashreplace", newline="\n")
+    return _LineStream(buffered, encoding="utf-8", errors="backslashreplace")
 
 _STDOUT, _STDERR = _stream(1), _stream(2)
 # Only prints to this stream are capped, not ones captured by redirect_stdout

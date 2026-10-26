@@ -5,24 +5,27 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use reaper::cause;
 use std::env;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, ErrorKind};
 #[cfg(windows)]
 use std::path::Prefix;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
-use tracing::warn;
+use tracing::{info, warn};
 use wasmtime_wasi::{FsPerms, WasiCtx};
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 const ZONEINFO: &str = "/usr/share/zoneinfo";
 const PEM_LINE_CHARS: usize = 64;
+const TEMP_PREFIX: &str = "smol-";
+/// The sandbox holds a lock on this file in its temporary folder while it lives
+const LOCK: &str = "lock";
 
 /// The guest can't read the system's certificate store, so it gets the roots as one PEM file
 static ROOTS: LazyLock<Option<String>> = LazyLock::new(|| {
     let found = rustls_native_certs::load_native_certs();
     if let Some(error) = found.errors.first() {
-        warn!("worker: root certificates partly unread, {error}");
+        warn!("worker: some root certificates not read, {error}");
     }
     if found.certs.is_empty() {
         return None;
@@ -48,6 +51,7 @@ pub(crate) struct Sandbox {
     mounts: Vec<Mount>,
     env: Vec<(String, String)>,
     temp: PathBuf,
+    lock: Option<File>,
 }
 
 struct Mount {
@@ -67,26 +71,33 @@ impl Sandbox {
         }
 
         let id = new_id();
-        let name = format!("smol-{id}");
+        let name = format!("{TEMP_PREFIX}{id}");
         let temp = env::temp_dir().join(name);
         let scratch = temp.join("tmp");
-        if let Err(e) = fs::create_dir_all(&scratch) {
+        let failed = |e: io::Error| {
             let reason = cause(&e);
-            return Err(format!("{}: {reason}", temp.display()));
-        }
+            format!("{}: {reason}", temp.display())
+        };
+        fs::create_dir_all(&scratch).map_err(failed)?;
+        // Dropping it when a step below fails removes the temporary folder
         let mut sandbox = Self {
             cwd: cwd.to_owned(),
             copies: copies.to_owned(),
             mounts: Vec::new(),
             env: Vec::new(),
             temp: temp.clone(),
+            lock: None,
         };
+        let lock = File::create(temp.join(LOCK)).map_err(failed)?;
+        lock.lock().map_err(failed)?;
+        sandbox.lock = Some(lock);
 
         sandbox.mount(cwd, FsPerms::ReadWrite)?;
         for skill in skills {
             let Some(folder) = skill.path.parent() else {
                 continue;
             };
+            // A folder mounted inside another mount would take over its access
             let real = dunce::canonicalize(folder).unwrap_or_default();
             let covered = sandbox
                 .mounts
@@ -129,9 +140,9 @@ impl Sandbox {
             vars.push(("TZ".to_owned(), zone));
         }
 
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         let zones = Path::new(ZONEINFO);
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         if zones.is_dir() && sandbox.mount(zones, FsPerms::ReadOnly).is_ok() {
             vars.push(("TZDIR".to_owned(), ZONEINFO.to_owned()));
             vars.push(("PYTHONTZPATH".to_owned(), ZONEINFO.to_owned()));
@@ -144,7 +155,7 @@ impl Sandbox {
                 Ok(()) => vars.push(("SSL_CERT_FILE".to_owned(), guest_path(&roots))),
                 Err(e) => {
                     let reason = cause(&e);
-                    warn!("worker: root certificates unwritten, {reason}");
+                    warn!("worker: root certificates not written, {reason}");
                 }
             }
         }
@@ -152,7 +163,7 @@ impl Sandbox {
         Ok(sandbox)
     }
 
-    /// Mounts the folder at its own path, so the code sees the paths the prompt shows
+    /// The guest sees the folder at its host path, which the prompt shows
     fn mount(&mut self, host: &Path, perms: FsPerms) -> Result<(), String> {
         let real = match dunce::canonicalize(host) {
             Ok(real) => real,
@@ -193,8 +204,19 @@ impl Sandbox {
         Ok(builder.build())
     }
 
+    /// A missing path leads where its nearest existing parent does
     pub(crate) fn reach(&self, path: &Path) -> io::Result<Reach> {
-        let real = dunce::canonicalize(path)?;
+        let mut existing = path;
+        let real = loop {
+            match dunce::canonicalize(existing) {
+                Ok(real) => break real,
+                Err(e) if e.kind() == ErrorKind::NotFound => match existing.parent() {
+                    Some(parent) => existing = parent,
+                    None => return Err(e),
+                },
+                Err(e) => return Err(e),
+            }
+        };
         let inside = self
             .mounts
             .iter()
@@ -241,16 +263,48 @@ pub(crate) fn normalized(path: &Path) -> PathBuf {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        // Windows can't remove the lock file while it is open
+        self.lock.take();
         fs::remove_dir_all(&self.temp).ok();
     }
 }
 
-#[cfg(not(windows))]
+/// Removes the temporary folders of sandboxes whose libsmol died without dropping them
+pub(crate) fn sweep() {
+    let temp = env::temp_dir();
+    let Ok(entries) = fs::read_dir(&temp) else {
+        return;
+    };
+
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(TEMP_PREFIX) {
+            continue;
+        }
+        let folder = entry.path();
+        let Ok(lock) = File::open(folder.join(LOCK)) else {
+            continue;
+        };
+        if lock.try_lock().is_err() {
+            continue;
+        }
+        drop(lock);
+        if fs::remove_dir_all(&folder).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        info!("worker: stale sandboxes removed [count={removed}]");
+    }
+}
+
+#[cfg(unix)]
 pub(crate) fn guest_path(host: &Path) -> String {
     host.to_string_lossy().into_owned()
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 pub(crate) fn host_path(guest: &str) -> PathBuf {
     PathBuf::from(guest)
 }
@@ -294,4 +348,35 @@ pub(crate) fn host_path(guest: &str) -> PathBuf {
     let rest = parts.next().unwrap_or_default().replace('/', "\\");
     let letter = letter.to_ascii_uppercase();
     PathBuf::from(format!("{letter}:\\{rest}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::temp_dir;
+    use crate::utils::new_id;
+    use crate::worker::sandbox::{sweep, Sandbox, LOCK, TEMP_PREFIX};
+    use std::env;
+    use std::fs;
+
+    /// Only folders whose lock nobody holds are removed
+    #[test]
+    fn stale_sandboxes_swept() {
+        let cwd = temp_dir("swept");
+        fs::create_dir_all(&cwd).expect("dir");
+        let live = Sandbox::new(&cwd, &cwd.join("copies"), &[]).expect("sandbox");
+        let id = new_id();
+        let name = format!("{TEMP_PREFIX}{id}");
+        let stale = env::temp_dir().join(name);
+        fs::create_dir_all(stale.join("tmp")).expect("dir");
+        fs::write(stale.join(LOCK), "").expect("lock");
+
+        sweep();
+        let kept = [cwd.exists(), live.temp.exists(), stale.exists()];
+        let temp = live.temp.clone();
+        drop(live);
+        fs::remove_dir_all(&cwd).ok();
+
+        assert_eq!(kept, [true, true, false]);
+        assert!(!temp.exists());
+    }
 }

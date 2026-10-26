@@ -1,9 +1,8 @@
-#[cfg(not(test))]
 use crate::config;
 use crate::model::Media;
 use crate::prompt;
-use crate::spawn::KEPT_BYTES;
-use crate::utils::{Clip, Interrupt, Reply};
+use crate::tools::mcp::{Called, Server};
+use crate::utils::{Clip, Interrupt, KEPT_BYTES};
 use crate::worker::sandbox::Sandbox;
 use crate::worker::wit::smol::host::control;
 use crate::worker::wit::{Worker, WorkerPre};
@@ -66,12 +65,11 @@ static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
 });
 
 static PREPARED: LazyLock<Result<WorkerPre<Host>, String>> = LazyLock::new(|| {
-    #[cfg(not(test))]
     let dir = config::dir().join("cache");
-    #[cfg(not(test))]
-    let cache = Some(dir.as_path());
-    #[cfg(test)]
-    let cache: Option<&Path> = None;
+    let cache = match cfg!(test) {
+        true => None,
+        false => Some(dir.as_path()),
+    };
     let component = compiled(cache)?;
 
     let failed = |e: wasmtime::Error| e.to_string();
@@ -82,9 +80,10 @@ static PREPARED: LazyLock<Result<WorkerPre<Host>, String>> = LazyLock::new(|| {
     WorkerPre::new(pre).map_err(failed)
 });
 
-/// Compiles the guest now, which the first session would otherwise wait for
+/// Compiles the guest before the first session waits for it, and removes stale sandboxes
 pub(crate) fn prepare() {
     thread::spawn(|| LazyLock::force(&PREPARED));
+    thread::spawn(sandbox::sweep);
 }
 
 /// Loads the compiled guest from `cache`, or compiles it and saves it there
@@ -102,11 +101,7 @@ fn compiled(cache: Option<&Path>) -> Result<Component, String> {
     }
 
     let started = Instant::now();
-    let failed = |e: io::Error| {
-        let reason = cause(&e);
-        format!("worker: {reason}")
-    };
-    let wasm = zstd::decode_all(WORKER).map_err(failed)?;
+    let wasm = zstd::decode_all(WORKER).map_err(|e| cause(&e))?;
     let component = Component::new(&ENGINE, &wasm).map_err(|e| e.to_string())?;
     let secs = started.elapsed().as_secs_f64();
     info!("worker: compiled [secs={secs:.1}]");
@@ -145,9 +140,9 @@ fn compiled(cache: Option<&Path>) -> Result<Component, String> {
 }
 
 /// What the code printed and the media it viewed, during the call running now
-pub(crate) struct Shared {
-    pub(crate) output: Clip,
-    pub(crate) media: Vec<(String, Media)>,
+struct Shared {
+    output: Clip,
+    media: Vec<(String, Media)>,
 }
 
 /// An MCP call made by the code, which the session runs and answers through `reply`
@@ -156,7 +151,7 @@ pub(crate) struct ToolCall {
     pub(crate) tool: String,
     pub(crate) args: Map<String, Value>,
     pub(crate) called: String,
-    pub(crate) reply: oneshot::Sender<Reply>,
+    pub(crate) reply: oneshot::Sender<Called>,
 }
 
 /// Why a Python is gone, after which its variables are lost
@@ -186,7 +181,7 @@ enum Command {
 pub(crate) struct Guest {
     commands: mpsc::UnboundedSender<Command>,
     pub(crate) calls: mpsc::UnboundedReceiver<ToolCall>,
-    pub(crate) shared: Arc<Mutex<Shared>>,
+    shared: Arc<Mutex<Shared>>,
     kill: watch::Sender<bool>,
 }
 
@@ -253,15 +248,13 @@ impl Guest {
 
     pub(crate) async fn add_server(
         &self,
-        source: &str,
-        description: &str,
-        tools: &[Value],
+        server: &Server,
     ) -> Result<Result<Installed, String>, Lost> {
         let (reply, replied) = oneshot::channel();
-        let tools = Value::Array(tools.to_vec());
+        let tools = Value::Array(server.tools.clone());
         let command = Command::AddServer {
-            source: source.to_owned(),
-            description: description.to_owned(),
+            source: server.name.clone(),
+            description: server.description.clone(),
             tools: tools.to_string(),
             reply,
         };
@@ -363,10 +356,12 @@ fn serve(
                         ran = running => Some(ran),
                         _ = stopped => None,
                     };
+                    // A kill as the code finished still leaves this Python unusable
+                    let usable = !*killed.borrow();
                     let ran = match finished {
-                        Some(Ok(ran)) => Ok(ran),
+                        Some(Ok(ran)) if usable => Ok(ran),
                         Some(Err(e)) => Err(lost(e, store.data())),
-                        None => Err(Lost::Stopped),
+                        _ => Err(Lost::Stopped),
                     };
                     let gone = ran.is_err();
                     reply.send(ran).ok();
@@ -402,7 +397,7 @@ fn serve(
     });
 }
 
-/// The thread ends without replying only when the host itself panicked
+/// A command goes unanswered only when the host panicked or removing a server lost the guest
 fn vanished<T>(_: RecvError) -> Result<T, Lost> {
     let reason = prompt::ABORTED.to_owned();
     Err(Lost::Crashed(reason))

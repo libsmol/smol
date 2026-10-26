@@ -39,7 +39,7 @@ impl Guest for Worker {
             let moved = env::set_current_dir(&cwd);
             if let Err(e) = moved {
                 let reason = e.kind();
-                return Err(format!("worker: {cwd}: {reason}"));
+                return Err(format!("{cwd}: {reason}"));
             }
         }
         set_interrupt_check(control::interrupted).ok();

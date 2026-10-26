@@ -357,12 +357,8 @@ pub(crate) const OUT_OF_STACK: &str = "out of stack";
 pub(crate) const OUT_OF_MEMORY: &str = "out of memory";
 pub(crate) const ABORTED: &str = "aborted";
 
-/// `said` is the output or error from before the worker came up
-pub(crate) fn unstarted(said: &str) -> String {
-    match said {
-        "" => "did not start".to_owned(),
-        said => format!("did not start: {said}"),
-    }
+pub(crate) fn unstarted(reason: &str) -> String {
+    format!("did not start: {reason}")
 }
 
 /// Errors from MCP functions, which the Python side prefixes with `server.function:`

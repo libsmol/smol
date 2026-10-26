@@ -1,5 +1,5 @@
 use crate::memory::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
-use crate::utils::{Clip, Interrupt};
+use crate::utils::{Clip, Interrupt, KEPT_BYTES, SHOWN_EVERY};
 use reaper::{cause, Mark};
 use std::env;
 use std::io::{self, PipeReader, Read};
@@ -19,15 +19,12 @@ use tokio::sync::watch;
 use tokio::task;
 use tokio::time::{self, Instant};
 
-/// Must hold `MAX_OBSERVATION_CHARS` characters at up to 4 bytes each
-pub(crate) const KEPT_BYTES: usize = 256 * 1024;
 const CHUNK_BYTES: usize = 64 * 1024;
 /// Unread pieces past this stop the relay, so a fast program waits on the full pipe
 /// instead of piling output up in memory
 const MAX_QUEUED_PIECES: usize = 4;
 /// Gives up when a program left in the background keeps the pipe open
 const DRAIN_WAIT: Duration = Duration::from_secs(2);
-pub(crate) const SHOWN_EVERY: Duration = Duration::from_millis(100);
 
 /// Dropping it kills the whole group
 pub(crate) struct Group {
@@ -180,7 +177,6 @@ pub(crate) async fn spawn_shell(
         }
     };
 
-    // Collects what is left without waiting forever on background programs holding the pipe open
     let draining = async {
         while let Some(piece) = pieces.recv().await {
             kept.push(&piece);

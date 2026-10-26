@@ -108,7 +108,7 @@ fn finish<T>(vm: &VirtualMachine, result: Result<T, ToolError>) -> PyResult<T> {
 
     match result {
         Ok(value) => Ok(value),
-        // Python picks the `OSError` subclass from the errno, which the guest numbers its own way
+        // `OSError` picks its subclass from the errno
         Err(ToolError::Os(error)) => {
             let codes = vm.import("errno", 0)?;
             let name = vm.ctx.new_str(error.errno);
@@ -126,7 +126,7 @@ fn finish<T>(vm: &VirtualMachine, result: Result<T, ToolError>) -> PyResult<T> {
             Err(exception)
         }
         Err(ToolError::Failed(message)) => Err(vm.new_value_error(message)),
-        // Only a SIGINT handler that returns gets here, and the host has already stopped the call
+        // The check above raises nothing when it isn't due or the code's own SIGINT handler returns
         Err(ToolError::Interrupted) => {
             let interrupt = vm.ctx.exceptions.keyboard_interrupt.to_owned();
             Err(vm.new_exception_empty(interrupt))

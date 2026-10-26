@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_GREP_BYTES: usize = 32 * 1024 * 1024;
 
-/// Lists `path`, resolved against `cwd`, and follows a link to tell whether it is a folder
-/// only where `follows` allows. Once `stop` is set it returns early with a result nobody reads
+/// Shows a link as a folder only when `follows` allows following it,
+/// and once `stop` is set returns early with a result nobody reads
 pub(crate) fn ls(
     cwd: &Path,
     path: &Path,
@@ -66,8 +66,8 @@ pub(crate) fn ls(
     Ok(names)
 }
 
-/// Searches `path`, resolved against `cwd`, and names files the way `path` is written.
-/// Once `stop` is set it returns early with a result nobody reads
+/// Names files the way `path` is written,
+/// and once `stop` is set returns early with a result nobody reads
 pub(crate) fn grep(
     pattern: &str,
     cwd: &Path,

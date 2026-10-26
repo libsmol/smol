@@ -31,7 +31,7 @@ fn main() {
     let path = PathBuf::from(out).join("worker.wasm.zst");
     fs::write(&path, packed).expect("write");
 
-    // Names the compiled copy in the cache, so a rebuilt guest never loads an old one
+    // A rebuilt guest must not load the compiled copy an old one left in the cache
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in &wasm {
         hash ^= u64::from(*byte);
