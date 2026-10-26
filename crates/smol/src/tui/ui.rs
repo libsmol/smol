@@ -300,8 +300,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let marks = "❯ ".width() + QUEUED.width();
         let room = width.saturating_sub(marks).max(1);
         for message in &app.queued {
-            let shown = clipped(message, room, 1);
-            let first = shown.first().map_or("", String::as_str);
+            let first = first_row(message, room);
             let text = format!("❯ {first}{QUEUED}");
             queued.push(Line::styled(text, DIM));
         }
@@ -560,28 +559,20 @@ fn widths(label: usize, detail: usize, room: usize) -> (usize, usize) {
     (label, detail)
 }
 
-fn clipped(text: &str, width: usize, rows: usize) -> Vec<String> {
+fn first_row(text: &str, width: usize) -> String {
     let text = text.trim();
-    if text.is_empty() {
-        return Vec::new();
-    }
-
     let wrapped = wrap_ranges(text, width);
-    let mut lines = Vec::new();
-    for (range, _) in wrapped.iter().take(rows) {
-        let line = text[range.clone()].to_owned();
-        lines.push(line);
-    }
+    let Some((range, _)) = wrapped.first() else {
+        return String::new();
+    };
 
-    if wrapped.len() > rows {
-        let last = lines.pop().unwrap_or_default();
-        let last = format!("{last}…");
-        let last = fitted(&last, width);
-        let last = last.trim_end().to_owned();
-        lines.push(last);
+    let first = &text[range.clone()];
+    if wrapped.len() == 1 {
+        return first.to_owned();
     }
-
-    lines
+    let marked = format!("{first}…");
+    let marked = fitted(&marked, width);
+    marked.trim_end().to_owned()
 }
 
 fn tail(text: &str, width: usize) -> String {
@@ -780,21 +771,17 @@ mod tests {
     }
 
     #[test]
-    fn clipped_rows() {
-        let short = clipped("build the backend", 28, 3);
-        assert_eq!(short, ["build the backend"]);
-        assert!(clipped("  ", 28, 3).is_empty());
+    fn first_row_cut() {
+        assert_eq!(first_row("build the backend", 28), "build the backend");
+        assert_eq!(first_row("  ", 28), "");
 
         let long = "Own the frontend 🎨: components, styles and interactions, pages from the designs 📐, unit tests 🧪";
-        let lines = clipped(long, 10, 3);
-        assert_eq!(lines.len(), 3, "{lines:?}");
-        assert!(lines[2].ends_with('…'), "{lines:?}");
-        assert!(lines.iter().all(|line| line.width() <= 10), "{lines:?}");
-        let exact = clipped("naïve café 🐍 crème brûlée", 10, 3);
-        assert_eq!(exact, ["naïve café", "🐍 crème", "brûlée"]);
+        let first = first_row(long, 10);
+        assert!(first.ends_with('…') && first.width() <= 10, "{first}");
+        assert_eq!(first_row("naïve café 🐍 crème brûlée", 10), "naïve caf…");
 
-        let emoji = clipped("⚠️ careful ✔️ done", 13, 3);
-        assert!(emoji.iter().all(|line| line.width() <= 13), "{emoji:?}");
+        let emoji = first_row("⚠️ careful ✔️ done", 13);
+        assert!(emoji.width() <= 13, "{emoji}");
     }
 
     #[test]

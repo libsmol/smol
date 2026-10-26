@@ -2,8 +2,8 @@ use crate::code::{Added, Worker};
 use crate::config::Skill;
 use crate::history::MAX_TITLE_CHARS;
 use crate::memory::{
-    bytes, estimate, AgentMemory, AgentStep, Attachment, Call, MemoryStep, StepError, SummaryStep,
-    TaskStep, Usage,
+    bytes, estimate, AgentMemory, AgentStep, Call, MemoryStep, StepError, SummaryStep, TaskStep,
+    Usage,
 };
 use crate::model::{
     ChatMessage, Finish, Finished, MediaKind, Model, ModelError, Purpose, StreamDelta,
@@ -56,8 +56,7 @@ pub(crate) enum Event<'a> {
     CompactEnd(Result<&'a SummaryStep, &'a StepError>),
 }
 
-type Updates = Vec<(String, Vec<Mention>)>;
-pub(crate) type Asking<'a> = Pin<Box<dyn Future<Output = Updates> + Send + 'a>>;
+pub(crate) type Asking<'a> = Pin<Box<dyn Future<Output = Vec<Task>> + Send + 'a>>;
 
 pub(crate) trait Sink: Send {
     fn event(&mut self, event: Event);
@@ -130,26 +129,28 @@ impl Agent {
     }
 
     /// Reading files and copying images and videos stays off the async runtime
-    async fn attached(&self, mentions: Vec<Mention>) -> Vec<Attachment> {
+    async fn attached(&self, task: Task) -> TaskStep {
         let cwd = self.cwd.clone();
         let copies = self.copies.clone();
+        let mentions = task.mentions;
         let attaching = move || {
             let attached = mentions
                 .iter()
                 .map(|mention| attach(mention, &cwd, &copies));
             attached.collect()
         };
-        task::spawn_blocking(attaching).await.expect("attach")
+        let files = task::spawn_blocking(attaching).await.expect("attach");
+
+        TaskStep {
+            text: task.text,
+            files,
+        }
     }
 }
 
 impl Turn<'_> {
     async fn run(&mut self, task: Task) -> Result<Option<String>> {
-        let files = self.agent.attached(task.mentions).await;
-        let task = TaskStep {
-            text: task.text,
-            files,
-        };
+        let task = self.agent.attached(task).await;
 
         // The task text survives compaction verbatim, so a task over half the window can never fit
         let copies = &self.agent.copies;
@@ -232,9 +233,8 @@ impl Turn<'_> {
 
             let updates = self.queued().await;
             let received = !updates.is_empty();
-            for (text, mentions) in updates {
-                let files = self.agent.attached(mentions).await;
-                let update = TaskStep { text, files };
+            for update in updates {
+                let update = self.agent.attached(update).await;
                 self.memory.steps.push(MemoryStep::Update(update));
             }
             if received {
@@ -244,7 +244,7 @@ impl Turn<'_> {
     }
 
     /// Stays interruptible when the client never replies
-    async fn queued(&mut self) -> Updates {
+    async fn queued(&mut self) -> Vec<Task> {
         let asking = self.sink.queued();
         select! {
             // The client already dequeued these, so they win over a cancel arriving with them
@@ -417,7 +417,7 @@ pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<Stri
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::agent::{title_of, Agent, Asking, Event, Sink, Task, Turn, Updates, RETRY_WAIT};
+    use crate::agent::{title_of, Agent, Asking, Event, Sink, Task, Turn, RETRY_WAIT};
     use crate::code::Worker;
     use crate::history::MAX_TITLE_CHARS;
     use crate::memory::{AgentMemory, MemoryStep};
@@ -567,7 +567,7 @@ pub(crate) mod tests {
 
     pub(crate) struct Probe {
         events: Box<dyn FnMut(Event) + Send>,
-        pub(crate) updates: Box<dyn FnMut() -> Updates + Send>,
+        pub(crate) updates: Box<dyn FnMut() -> Vec<Task> + Send>,
         /// Step count at each save
         pub(crate) saves: Vec<usize>,
     }

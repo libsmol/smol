@@ -1,6 +1,6 @@
 use crate::acp::rpc::{Lines, Out, Peer};
 use crate::acp::session::{self, Message, Opening, Prompt, Shell};
-use crate::acp::{prompt_parts, rfc3339, to_value, App, QUEUED, SHELL};
+use crate::acp::{rfc3339, task_of, to_value, App, QUEUED, SHELL};
 use crate::config;
 use crate::history::HistoryStore;
 use crate::sandbox;
@@ -319,14 +319,13 @@ impl Router {
             }
             m if m == names.session_prompt => {
                 let request: PromptRequest = parsed(params)?;
-                let (text, mentions) = prompt_parts(&request.prompt);
+                let task = task_of(&request.prompt);
 
                 let session = &request.session_id.0;
                 let turn = self.next_turn(session)?;
                 let prompt = Prompt {
                     id: id.clone(),
-                    text,
-                    mentions,
+                    task,
                     turn,
                 };
                 self.send(session, Message::Prompt(prompt))?;

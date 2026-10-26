@@ -3,7 +3,7 @@ use crate::utils::{Clip, Interrupt};
 use crate::worker::END;
 use reaper::{cause, Mark};
 use std::env;
-use std::io::{self, PipeReader, Read};
+use std::io::{self, Read};
 use std::mem;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -71,6 +71,50 @@ impl Group {
         Ok(Self { group, ended })
     }
 
+    /// Replaces the command's stdout and stderr with one pipe
+    pub(crate) fn start(mut command: Command) -> io::Result<(Self, Receiver<Piece>)> {
+        // Reading stdout and stderr separately would scramble the order of interleaved writes
+        let (mut output, writer) = io::pipe()?;
+        let copied = writer.try_clone()?;
+        command.stdout(copied).stderr(writer);
+        let std = command.as_std_mut();
+        let mark = reaper::prepare(std);
+        let child = command.spawn()?;
+        // Holding the write end here would keep the pipe open after the program exits
+        drop(command);
+        let group = Self::new(child, mark)?;
+
+        // Waits while the receiver falls behind, but once the receiver is gone it keeps reading
+        // until the pipe closes, because a full pipe blocks the program
+        let (pieces, received) = mpsc::channel(MAX_QUEUED_PIECES);
+        thread::spawn(move || {
+            let mut buffer = vec![0; CHUNK_BYTES];
+            let mut held = Vec::new();
+            while let Ok(count @ 1..) = output.read(&mut buffer) {
+                held.extend_from_slice(&buffer[..count]);
+                while let Some(at) = held.windows(END.len()).position(|window| window == END) {
+                    let rest = held.split_off(at + END.len());
+                    held.truncate(at);
+                    let before = mem::replace(&mut held, rest);
+                    pieces.blocking_send(Piece::Output(before)).ok();
+                    pieces.blocking_send(Piece::End).ok();
+                }
+
+                // The marker may span two reads, so a tail that starts it waits for the next one
+                let partial = (1..END.len())
+                    .rev()
+                    .find(|size| held.ends_with(&END[..*size]));
+                let at = held.len() - partial.unwrap_or(0);
+                let rest = held.split_off(at);
+                let before = mem::replace(&mut held, rest);
+                pieces.blocking_send(Piece::Output(before)).ok();
+            }
+            pieces.blocking_send(Piece::Output(held)).ok();
+        });
+
+        Ok((group, received))
+    }
+
     pub(crate) async fn exited(&mut self) -> Option<Exit> {
         let ended = self.ended.wait_for(Option::is_some).await;
         ended.ok().and_then(|end| end.clone()).flatten()
@@ -95,37 +139,6 @@ pub(crate) enum Piece {
     Output(Vec<u8>),
     /// The END marker the worker writes after each snippet
     End,
-}
-
-/// Waits while the receiver falls behind, but once the receiver is gone it keeps reading
-/// until the pipe closes, because a full pipe blocks the program
-pub(crate) fn relay(mut output: PipeReader) -> Receiver<Piece> {
-    let (pieces, received) = mpsc::channel(MAX_QUEUED_PIECES);
-    thread::spawn(move || {
-        let mut buffer = vec![0; CHUNK_BYTES];
-        let mut held = Vec::new();
-        while let Ok(count @ 1..) = output.read(&mut buffer) {
-            held.extend_from_slice(&buffer[..count]);
-            while let Some(at) = held.windows(END.len()).position(|window| window == END) {
-                let rest = held.split_off(at + END.len());
-                held.truncate(at);
-                let before = mem::replace(&mut held, rest);
-                pieces.blocking_send(Piece::Output(before)).ok();
-                pieces.blocking_send(Piece::End).ok();
-            }
-
-            // The marker can span two reads, so a tail matching its start waits for the next one
-            let partial = (1..END.len())
-                .rev()
-                .find(|size| held.ends_with(&END[..*size]));
-            let at = held.len() - partial.unwrap_or(0);
-            let rest = held.split_off(at);
-            let before = mem::replace(&mut held, rest);
-            pieces.blocking_send(Piece::Output(before)).ok();
-        }
-        pieces.blocking_send(Piece::Output(held)).ok();
-    });
-    received
 }
 
 /// Collects what is left in the pipe without waiting forever on background programs holding it open
@@ -168,38 +181,18 @@ pub(crate) async fn spawn_shell(
     let arg = format!("/d /s /c \"chcp 65001>nul & cmd /d /s /c \"{line}\"\"");
     #[cfg(windows)]
     process.as_std_mut().raw_arg(arg);
-    // Reading stdout and stderr separately would scramble the order of interleaved writes
-    let pipe = io::pipe().and_then(|(output, writer)| Ok((output, writer.try_clone()?, writer)));
-    let (output, copied, writer) = match pipe {
-        Ok(pipe) => pipe,
-        Err(e) => {
-            step.end = Exit::Unstarted(cause(&e));
-            return (step, None);
-        }
-    };
     // Stdin is empty so a program waiting for input reads EOF and moves on
-    process
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(copied)
-        .stderr(writer);
+    process.current_dir(cwd).stdin(Stdio::null());
     // Otherwise a spawned CPython uses GBK on the pipes and fails on characters outside it
     #[cfg(windows)]
     process.env("PYTHONUTF8", "1");
-    let std = process.as_std_mut();
-    let mark = reaper::prepare(std);
-    let spawned = process.spawn();
-    // Holding the write end here would keep the pipe open after the program exits
-    drop(process);
-    let started = spawned.and_then(|child| Group::new(child, mark));
-    let mut group = match started {
-        Ok(group) => group,
+    let (mut group, mut pieces) = match Group::start(process) {
+        Ok(started) => started,
         Err(e) => {
             step.end = Exit::Unstarted(cause(&e));
             return (step, None);
         }
     };
-    let mut pieces = relay(output);
 
     let mut kept = Clip::new(KEPT_BYTES);
     let mut show_at = Instant::now() + SHOWN_EVERY;

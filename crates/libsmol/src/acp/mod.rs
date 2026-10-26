@@ -1,4 +1,5 @@
 use crate::acp::rpc::Peer;
+use crate::agent::Task;
 use crate::history::HistoryStore;
 use crate::tools::attach::Mention;
 use agent_client_protocol_schema::v1::{ContentBlock, EmbeddedResourceResource};
@@ -31,7 +32,7 @@ pub(crate) struct App {
     pub(crate) config: PathBuf,
 }
 
-fn prompt_parts(blocks: &[ContentBlock]) -> (String, Vec<Mention>) {
+fn task_of(blocks: &[ContentBlock]) -> Task {
     let mut texts = Vec::new();
     let mut mentions = Vec::new();
     for block in blocks {
@@ -72,7 +73,7 @@ fn prompt_parts(blocks: &[ContentBlock]) -> (String, Vec<Mention>) {
     }
 
     let text = texts.join("\n");
-    (text, mentions)
+    Task { text, mentions }
 }
 
 /// A line range in a URI fragment, written L10, L10-20, L10-L20 or L10:20
@@ -102,7 +103,7 @@ fn rfc3339(epoch: f64) -> String {
 #[cfg(test)]
 mod tests {
     use crate::acp::rpc::Lines;
-    use crate::acp::{line_range, prompt_parts};
+    use crate::acp::{line_range, task_of};
     use crate::tools::attach::Mention;
     use agent_client_protocol_schema::v1::{
         ContentBlock, EmbeddedResource, EmbeddedResourceResource, ResourceLink,
@@ -132,14 +133,14 @@ mod tests {
             ContentBlock::ResourceLink(file),
             ContentBlock::ResourceLink(page),
         ];
-        let (text, mentions) = prompt_parts(&blocks);
-        assert_eq!(text, "Summarize these\nhttps://example.com/café");
+        let task = task_of(&blocks);
+        assert_eq!(task.text, "Summarize these\nhttps://example.com/café");
         let file = Mention::File {
             path,
             lines: None,
             text: None,
         };
-        assert_eq!(mentions, [file]);
+        assert_eq!(task.mentions, [file]);
     }
 
     #[test]
@@ -162,7 +163,7 @@ mod tests {
             sent(diagnostics, "error: unused café"),
         ];
 
-        let (_, mentions) = prompt_parts(&blocks);
+        let task = task_of(&blocks);
         let file = |text: Option<&str>| Mention::File {
             path: path.clone(),
             lines: Some((10, 12)),
@@ -172,7 +173,7 @@ mod tests {
             uri: diagnostics.to_owned(),
             text: "error: unused café".to_owned(),
         };
-        assert_eq!(mentions, [file(None), file(Some(selected)), resource]);
+        assert_eq!(task.mentions, [file(None), file(Some(selected)), resource]);
     }
 
     #[test]

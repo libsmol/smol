@@ -2,7 +2,7 @@ use crate::memory::{CallError, MAX_OBSERVATION_CHARS};
 use crate::model::Media;
 use crate::prompt::{self, NO_SERVER};
 use crate::sandbox::Sandbox;
-use crate::spawn::{drain, relay, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
+use crate::spawn::{drain, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
 use crate::tools::mcp::{Called, Calling, Server};
 use crate::utils::{new_id, Clip, Interrupt, Reply};
 #[cfg(not(test))]
@@ -165,8 +165,6 @@ impl Worker {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(failed)?;
         let address = listener.local_addr().map_err(failed)?;
         let token = new_id();
-        let (output, writer) = io::pipe().map_err(failed)?;
-        let copied = writer.try_clone().map_err(failed)?;
 
         // On Linux this still starts the original binary after it is replaced
         #[cfg(target_os = "linux")]
@@ -183,16 +181,8 @@ impl Worker {
         command
             .env(CONTROL_ENV, control)
             .env(COPIES_ENV, &self.sandbox.copies)
-            .stdin(Stdio::null())
-            .stdout(copied)
-            .stderr(writer);
-        let std = command.as_std_mut();
-        let mark = reaper::prepare(std);
-        let child = command.spawn().map_err(failed)?;
-        // Holding the write end here would keep the pipe open after the worker exits
-        drop(command);
-        let mut group = Group::new(child, mark).map_err(failed)?;
-        let pieces = relay(output);
+            .stdin(Stdio::null());
+        let (mut group, pieces) = Group::start(command).map_err(failed)?;
 
         let accepting = async {
             let (stream, _) = listener.accept().await?;

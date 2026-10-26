@@ -1,7 +1,7 @@
 use crate::acp::mcp::McpPool;
 use crate::acp::rpc::{Notice, Peer};
 use crate::acp::translator::Translator;
-use crate::acp::{prompt_parts, rfc3339, to_value, App, QUEUED};
+use crate::acp::{rfc3339, task_of, to_value, App, QUEUED};
 use crate::agent::{title_of, Agent, Asking, Event, Sink, Task};
 use crate::code::Worker;
 use crate::config::{self, Access, McpConfig, Models};
@@ -9,7 +9,6 @@ use crate::history::{Lock, SessionMeta, Settings};
 use crate::memory::{AgentMemory, Exit, MemoryStep, StepError};
 use crate::sandbox::Sandbox;
 use crate::spawn::{spawn_shell, Group};
-use crate::tools::attach::Mention;
 use crate::utils::Interrupt;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
@@ -46,8 +45,7 @@ pub(crate) enum Message {
 
 pub(crate) struct Prompt {
     pub(crate) id: Value,
-    pub(crate) text: String,
-    pub(crate) mentions: Vec<Mention>,
+    pub(crate) task: Task,
     pub(crate) turn: u64,
 }
 
@@ -350,13 +348,13 @@ impl Session {
 
         // A session with no task yet gets its title from the model without waiting for it
         let untitled = self.keeper.meta.settings.name.is_empty();
-        let worded = !prompt.text.trim().is_empty();
+        let worded = !prompt.task.text.trim().is_empty();
         let tasked = |step: &MemoryStep| matches!(step, MemoryStep::Task(_));
         let first = !self.memory.steps.iter().any(tasked);
         let titling = first && untitled && worded && self.keeper.titling.is_none();
         if titling {
             let model = Arc::clone(&self.agent.model);
-            let task = prompt.text.clone();
+            let task = prompt.task.text.clone();
             let (sender, receiver) = oneshot::channel();
             let naming = task::spawn(async move {
                 let title = title_of(model, task).await;
@@ -365,16 +363,12 @@ impl Session {
             self.keeper.titling = Some((receiver, naming.abort_handle()));
         }
 
-        let task = Task {
-            text: prompt.text,
-            mentions: prompt.mentions,
-        };
         let servers = self.servers.installed();
         let worker = &mut self.worker;
         let memory = &mut self.memory;
         let running = self
             .agent
-            .run(worker, &servers, memory, task, &mut self.keeper);
+            .run(worker, &servers, memory, prompt.task, &mut self.keeper);
         let answer = running.await;
 
         // A refused task stays out of the record and so must the title made from it
@@ -569,12 +563,12 @@ impl Sink for Keeper {
                 return Vec::new();
             };
 
-            let mut prompts = Vec::new();
+            let mut tasks = Vec::new();
             for blocks in &queued.prompts {
-                let prompt = prompt_parts(blocks);
-                prompts.push(prompt);
+                let task = task_of(blocks);
+                tasks.push(task);
             }
-            prompts
+            tasks
         })
     }
 }

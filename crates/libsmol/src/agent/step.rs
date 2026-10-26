@@ -285,6 +285,7 @@ impl Reply {
 mod tests {
     use crate::agent::step::*;
     use crate::agent::tests::{called, recorded, reply, scripted, Script, ScriptedModel, Tested};
+    use crate::agent::Task;
     use crate::memory::{AgentMemory, MemoryStep};
     use crate::model::{ModelError, TokenUsage};
     use crate::tests::{content, Temp};
@@ -785,7 +786,11 @@ mod tests {
     #[test]
     fn updates_join_turn() {
         let mut agent = running(&["print(1)"]);
-        let mut pending = vec![("Reply in French".to_owned(), Vec::new())];
+        let update = Task {
+            text: "Reply in French".to_owned(),
+            mentions: Vec::new(),
+        };
+        let mut pending = vec![update];
         agent.probe.updates = Box::new(move || mem::take(&mut pending));
 
         let mut memory = AgentMemory::default();
@@ -940,7 +945,11 @@ mod tests {
         let interrupt = agent.agent.interrupt.clone();
         agent.probe.updates = Box::new(move || {
             interrupt.cancel(u64::MAX);
-            vec![("One more thing".to_owned(), Vec::new())]
+            let update = Task {
+                text: "One more thing".to_owned(),
+                mentions: Vec::new(),
+            };
+            vec![update]
         });
 
         let mut memory = AgentMemory::default();
