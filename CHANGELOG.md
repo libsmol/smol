@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.3.0 - 2026-10-26
 
 Sessions are saved in format 7, so sessions from 0.2.0 and earlier are no longer
 listed.
