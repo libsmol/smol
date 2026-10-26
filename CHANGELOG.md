@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.2.0 - 2026-10-26
 
 - Python and the programs it starts run in a sandbox. On Linux (with Landlock) and
   macOS (with `sandbox-exec`) they can write only in the working directory and a
