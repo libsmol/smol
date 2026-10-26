@@ -16,6 +16,8 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::info;
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
 const TEMP_PREFIX: &str = "smol-";
 /// The sandbox holds a lock on this file in its temporary folder while it lives
@@ -88,7 +90,7 @@ type Isolation = Infallible;
 
 /// What a session's worker and the programs it starts can see, kept across restarts
 pub(crate) struct Sandbox {
-    pub(crate) cwd: PathBuf,
+    cwd: PathBuf,
     pub(crate) copies: PathBuf,
     temp: PathBuf,
     lock: Option<File>,
@@ -275,7 +277,7 @@ fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation
     let ruleset: Option<OwnedFd> = match created {
         Ok(ruleset) => ruleset.into(),
         Err(e) => {
-            info!("sandbox: not enforced, {e}");
+            warn!("sandbox: not enforced, {e}");
             return None;
         }
     };
@@ -290,10 +292,10 @@ fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation
 /// so a folder holding a hidden path is granted entry by entry
 #[cfg(target_os = "linux")]
 fn spread(path: &Path, write: bool, hidden: &[PathBuf], allowed: &mut Vec<(PathBuf, bool)>) {
-    if hidden.iter().any(|inner| inner == path) {
+    if hidden.iter().any(|spot| spot == path) {
         return;
     }
-    let holds = hidden.iter().any(|inner| inner.starts_with(path));
+    let holds = hidden.iter().any(|spot| spot.starts_with(path));
     if !holds {
         allowed.push((path.to_owned(), write));
         return;
@@ -316,7 +318,7 @@ fn spread(path: &Path, write: bool, hidden: &[PathBuf], allowed: &mut Vec<(PathB
         };
         let near = hidden
             .iter()
-            .any(|hidden| real.starts_with(hidden) || hidden.starts_with(&real));
+            .any(|spot| real.starts_with(spot) || spot.starts_with(&real));
         if !near {
             allowed.push((real, write));
         }

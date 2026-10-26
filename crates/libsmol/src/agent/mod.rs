@@ -922,10 +922,10 @@ pub(crate) mod tests {
     fn restart_told_once() {
         let replies = vec![Ok(called("print('reading the orders again')"))];
         let mut run = recorded(replies, None, "", Box::new(|_| {}));
-        let agent = &run.agent.agent;
-        let sandbox = opened(&agent.cwd, &agent.copies);
-        let restarting = Worker::new(&agent.interrupt, sandbox, true);
-        run.agent.worker = block_on(restarting).expect("worker");
+        let mut ignore = |_: &str| {};
+        let code = "import os\nos._exit(1)";
+        let exiting = run.agent.worker.evaluate(code, &[], &mut ignore);
+        block_on(exiting).expect("evaluate");
 
         let mut memory = AgentMemory::default();
         run.agent.turn(&mut memory, "Read the orders").expect("run");
