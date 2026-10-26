@@ -1,0 +1,66 @@
+package smol:host;
+
+interface control {
+    /// True once per resend interval while the user is interrupting the running code
+    interrupted: func() -> bool;
+}
+
+/// Relative paths resolve against `cwd`, and paths outside the mounts are not found
+/// Results and errors show paths the way the code wrote them, never resolved against `cwd`
+interface tools {
+    record os-error {
+        /// A POSIX name such as ENOENT, since the guest numbers errors differently
+        errno: string,
+        message: string,
+        path: string,
+    }
+
+    variant tool-error {
+        os(os-error),
+        failed(string),
+        /// The interrupt stays pending for the next `interrupted` check to report
+        interrupted,
+    }
+
+    record found {
+        path: string,
+        line: u64,
+        text: string,
+    }
+
+    ls: func(cwd: string, path: string, recursive: bool) -> result<list<string>, tool-error>;
+    grep: func(cwd: string, pattern: string, path: string, glob: option<string>) -> result<list<found>, tool-error>;
+    fetch: func(url: string) -> result<string, tool-error>;
+    view: func(cwd: string, path: string) -> result<_, tool-error>;
+    /// `args` and the result are JSON, and `called` is the name the code used
+    call: func(server: string, tool: string, args: string, called: string) -> result<string, tool-error>;
+}
+
+world worker {
+    import control;
+    import tools;
+
+    record function {
+        name: string,
+        header: string,
+        summary: string,
+    }
+
+    record ran {
+        error: option<string>,
+        code: option<string>,
+    }
+
+    record installed {
+        name: string,
+        /// Another server that already holds this name, which leaves `headers` empty
+        server: option<string>,
+        headers: list<string>,
+    }
+
+    export start: func() -> result<list<function>, string>;
+    export run: func(code: string) -> ran;
+    /// `tools` is the server's MCP tool list as JSON
+    export add-server: func(source: string, description: string, tools: string) -> result<installed, string>;
+    export remove-server: func(name: string);
+}

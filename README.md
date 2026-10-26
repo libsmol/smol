@@ -75,7 +75,9 @@ was tested with:
 cargo install --locked libsmol libsmol-tui
 ```
 
-To build from a checkout, run `./build.sh` (`build.ps1` on Windows).
+To build from a checkout, run `./build.sh` (`build.ps1` on Windows). It also
+needs clang and llvm-ar with the WebAssembly target: Homebrew's `llvm` on macOS,
+the `clang` and `llvm` packages on Linux, and LLVM on Windows.
 
 ## Configure a model
 

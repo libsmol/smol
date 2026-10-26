@@ -46,3 +46,22 @@ jobs:
           python-version: "3.12"
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked --no-fail-fast
+
+  # rustup installs the worker's toolchain from its rust-toolchain.toml
+  worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/worker
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/worker -> ../../target/worker
+          cache-on-failure: true
+      - run: cargo fmt --check
+      # build.sh builds without --locked and would quietly update a stale lock file
+      - run: cargo fetch --locked
+      # Also downloads the wasi-libc that clippy needs to build the C dependencies
+      - run: ../../build.sh worker
+      - run: cargo clippy --all-targets --locked -- -D warnings

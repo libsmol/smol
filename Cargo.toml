@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/libsmol", "crates/reaper", "crates/smol"]
+exclude = ["crates/worker"]
 resolver = "2"
 
 [workspace.package]

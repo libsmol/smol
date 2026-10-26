@@ -1,0 +1,5 @@
+[toolchain]
+# 1.100 moves to Unicode 18, which breaks stringprep and idna
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-wasip2"]

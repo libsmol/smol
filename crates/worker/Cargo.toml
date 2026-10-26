@@ -1,0 +1,45 @@
+[package]
+name = "libsmol-worker"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+rustpython-pylib = { git = "https://github.com/libsmol/RustPython", rev = "0a4acff147365941c949d2248633dd666d7d90c2", features = [
+    "freeze-stdlib",
+] }
+rustpython-stdlib = { git = "https://github.com/libsmol/RustPython", rev = "0a4acff147365941c949d2248633dd666d7d90c2", default-features = false, features = [
+    "compiler",
+    "doc",
+    "host_env",
+    "sqlite",
+    "ssl-rustls",
+    "ucd_3_2_0",
+] }
+rustpython-vm = { git = "https://github.com/libsmol/RustPython", rev = "0a4acff147365941c949d2248633dd666d7d90c2", default-features = false, features = [
+    "compiler",
+    "doc",
+    "freeze-stdlib",
+    "gc",
+    "host_env",
+    "serde",
+    "stdio",
+] }
+serde_json = { version = "1", features = ["preserve_order"] }
+wasip2 = "1"
+wit-bindgen = "0.57"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Keeps the name section, which names the functions in a trap's backtrace
+strip = "debuginfo"

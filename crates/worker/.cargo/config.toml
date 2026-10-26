@@ -1,0 +1,22 @@
+[build]
+target = "wasm32-wasip2"
+target-dir = "../../target/worker"
+
+# Links the patched wasi-libc that build.sh downloads instead of the one Rust bundles
+[target.wasm32-wasip2]
+rustflags = [
+    "-C",
+    "link-self-contained=no",
+    "-L",
+    "native=../../target/wasi-sysroot/lib/wasm32-wasip2",
+    "-C",
+    "link-arg=../../target/wasi-sysroot/lib/wasm32-wasip2/crt1-reactor.o",
+    # A smaller stack stops deep Python recursion short of the native depth
+    "-C",
+    "link-arg=-zstack-size=268435456",
+]
+
+[env]
+WASI_SYSROOT = { value = "../../target/wasi-sysroot", relative = true }
+# Positioned reads and writes keep SQLite clear of wasi-libc's stream state
+LIBSQLITE3_FLAGS = "-DHAVE_PREAD=1 -DHAVE_PWRITE=1"
