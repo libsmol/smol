@@ -28,7 +28,8 @@ A real run with DeepSeek on smol's own source:
   works, the built-in functions and a few rules. No persona, no imposed
   workflow, nothing that holds a capable model back.
 - **No permission prompts.** It never stops to ask before running code,
-  writing a file or calling a program. See the warning below.
+  writing a file or calling a program; a sandbox sets the limits instead. See
+  the warning below.
 - **Standard ACP.** `libsmol` speaks the
   [Agent Client Protocol](https://agentclientprotocol.com), so Zed or any other
   ACP client can drive it; `smol` is just one such client. The few extras that
@@ -36,12 +37,15 @@ A real run with DeepSeek on smol's own source:
   extensions, which other clients ignore as the protocol requires.
 
 > [!WARNING]
-> **There is no sandbox and no permission prompt.** The model's code runs on
-> your machine, as you, in the session's working directory, with access to
-> everything you can access: your files, your network, your credentials and
-> the programs on your `PATH`. Use it in directories and on machines where
-> that is acceptable, and never give it tasks that need accounts or secrets
-> you would not hand to the model.
+> **The sandbox guards your credentials and keeps other files from being
+> changed, but there is no permission prompt.** On Linux and macOS the model's
+> code, and every program it starts, can write only in the session's working
+> directory and its own temporary folder, can't read the usual credential
+> locations and gets only a few of your environment variables. It can still
+> read your other files, use the network and run the programs on your `PATH`.
+> On Windows files are not isolated at all. Never give it tasks that need
+> accounts or secrets you would not hand to the model. See
+> [Sandbox](#sandbox).
 
 ## Install
 
@@ -202,6 +206,49 @@ enabled = false
 | `url`, `headers` | For `http`. |
 | `description` | Added to the prompt next to the server's functions. |
 | `enabled` | `false` to keep it off until `:mcp on <server>`. |
+
+## Sandbox
+
+On Linux (with Landlock, kernel 5.13 or later) and macOS (with
+`sandbox-exec`), the Python process and the programs it starts:
+
+- can write only in the working directory, in a temporary folder of their own
+  (`TMPDIR`) and in the session's copies of viewed images;
+- can read everything else except these credential locations, which they can
+  neither read nor list: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`,
+  `~/.docker`, `~/.config/gcloud`, `~/.config/gh`, `~/.netrc`,
+  `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials.toml`,
+  `~/.cargo/credentials`, `~/.password-store`, `~/.local/share/keyrings`,
+  `~/Library/Keychains`, `~/.smol`, `~/.claude`, `~/.claude.json`, `~/.codex`,
+  and the configuration directory when `SMOL_CONFIG_DIR` moves it;
+- get only `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `LANG`, `LC_ALL`,
+  `LC_CTYPE`, `TERM` and `TZ` from your environment.
+
+The network is not restricted, and MCP servers and `!` commands run outside the
+sandbox. Package managers can't write their caches (`~/.cargo/registry`,
+`~/.npm` and the like), so a download fails unless it is already cached; run
+the install as a `!` command, or open the cache in `~/.smol/agent.toml`:
+
+```toml
+[allow]
+env = ["GITHUB_TOKEN"]                    # more environment variables to pass on
+write = ["~/.cargo/registry", "~/.npm"]   # more places the code may write
+
+[deny]
+read = ["~/work/secrets"]                 # more places the code can't read or write
+```
+
+Paths are absolute or start with `~`. Where rules overlap, the deeper path
+wins: with `~/.cargo` in `write`, `~/.cargo/credentials.toml` stays hidden.
+On Linux a folder that holds a hidden path is opened entry by entry, so files
+created or replaced directly in it after the session opens can't be read, and
+when the working directory is your home folder, new files go into its
+subfolders.
+
+On Windows, and on Linux kernels without Landlock, files are not isolated; the
+environment is still cut down, on Windows to the system variables programs
+need. The log says `sandbox: enforced (landlock)` or
+`sandbox: enforced (seatbelt)` when a session's sandbox applies.
 
 ## Instructions and skills
 

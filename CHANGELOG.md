@@ -7,6 +7,15 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- Python and the programs it starts run in a sandbox. On Linux (with Landlock) and
+  macOS (with `sandbox-exec`) they can write only in the working directory and a
+  temporary folder of their own, and can't read common credential locations such as
+  `~/.ssh` or the smol configuration. On every platform they get only a few of your
+  environment variables. `[allow]` and `[deny]` in `agent.toml` widen or narrow it;
+  see Sandbox in the README.
+
 ## 0.1.1 - 2026-10-24
 
 - When `model.toml` is missing, `smol` runs `libsmol setup`, which asks for an

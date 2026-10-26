@@ -9,6 +9,7 @@ mod history;
 mod memory;
 mod model;
 mod prompt;
+mod sandbox;
 mod setup;
 mod spawn;
 mod tools;

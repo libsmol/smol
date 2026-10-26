@@ -27,6 +27,7 @@ pub(crate) fn system(
     servers: &[&Added],
     skills: &[Skill],
     cwd: &Path,
+    sandboxed: bool,
     instructions: &[String],
 ) -> String {
     let mut lines = Vec::new();
@@ -90,6 +91,10 @@ pub(crate) fn system(
     };
 
     let cwd = cwd.display();
+    let sandbox = match sandboxed {
+        true => format!("\n- Your code runs in a sandbox: writing outside {cwd} and $TMPDIR, or reading some private files, fails with PermissionError. $TMPDIR is removed when the session ends. When a tool fails because it can't write its cache, rerun it with the cache in $TMPDIR."),
+        false => String::new(),
+    };
     let date = Utc::now().format("%Y-%m-%d");
     format!(
         "You do tasks by running Python code with the {TOOL} tool. Each reply does one of two things:
@@ -124,7 +129,7 @@ These need no import. Prefer them to your own code: ls lists directories, grep s
 
 # Environment
 
-- Your code runs on the user's computer ({OS}) in {cwd}; the files and programs a task mentions are there.
+- Your code runs on the user's computer ({OS}) in {cwd}; the files and programs a task mentions are there.{sandbox}
 - Today is {date} (UTC).{instructions}",
     )
 }
@@ -642,8 +647,9 @@ mod tests {
         }];
         let cwd = Path::new("/home/zoë/work");
 
-        let text = system(&[], &[], &skills, cwd, &instructions);
-        let place = ") in /home/zoë/work; the files and programs a task mentions are there.\n";
+        let text = system(&[], &[], &skills, cwd, false, &instructions);
+        let place =
+            ") in /home/zoë/work; the files and programs a task mentions are there.\n- Today";
         assert!(text.contains(place), "{text}");
         let skill = "\n\n# Skills\n\n\
                      When a task matches a skill below, read its SKILL.md first and follow it; paths in it are relative to its folder. Run its Python scripts with a `.venv` in that folder, creating it with `python3 -m venv .venv` if missing.\n\n\
@@ -655,9 +661,11 @@ mod tests {
                      <instructions>\nIndent with tabs\n</instructions>";
         assert!(text.ends_with(files), "{text}");
 
-        let plain = system(&[], &[], &[], cwd, &[]);
+        let plain = system(&[], &[], &[], cwd, true, &[]);
         assert!(!plain.contains("<instructions"), "{plain}");
         assert!(!plain.contains("# Skills"), "{plain}");
+        let sandbox = "are there.\n- Your code runs in a sandbox: writing outside /home/zoë/work and $TMPDIR, ";
+        assert!(plain.contains(sandbox), "{plain}");
     }
 
     /// The model cannot tell from the record how far it got before the interrupt

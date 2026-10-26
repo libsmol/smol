@@ -120,6 +120,7 @@ impl Agent {
             servers,
             &self.skills,
             &self.cwd,
+            worker.sandboxed(),
             &self.instructions,
         );
 
@@ -353,7 +354,6 @@ fn discard(task: &TaskStep, copies: &Path) {
             fs::remove_file(copy).ok();
         }
     }
-    fs::remove_dir(copies).ok();
 }
 
 /// Reports a retryable error to `sink` and waits, returning true early on interrupt
@@ -518,11 +518,13 @@ pub(crate) mod tests {
         StreamDelta, TokenUsage, Unread,
     };
     use crate::prompt::RESTARTED;
+    use crate::sandbox::tests::opened;
     use crate::tests::{content, temp_dir, write_file, Temp};
     use crate::tools::attach::tests::mentioned;
     use crate::utils::{block_on, Interrupt};
     use crate::Result;
     use std::collections::VecDeque;
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -733,7 +735,8 @@ pub(crate) mod tests {
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let dir = temp_dir("session");
         let copies = dir.join("copies");
-        let starting = Worker::new(&interrupt, &cwd, &copies, false);
+        let sandbox = opened(&cwd, &copies);
+        let starting = Worker::new(&interrupt, sandbox, false);
         let worker = block_on(starting).expect("worker");
 
         let agent = Agent {
@@ -834,7 +837,8 @@ pub(crate) mod tests {
             .pursue(&mut memory, &huge, &files, false)
             .expect_err("refused");
         let copies = run.agent.agent.copies.clone();
-        assert!(!copies.exists());
+        let left = fs::read_dir(&copies).expect("copies").count();
+        assert_eq!(left, 0);
 
         let answer = run.agent.pursue(&mut memory, "Watch it", &files, false);
         let answer = answer.expect("run");
@@ -919,7 +923,8 @@ pub(crate) mod tests {
         let replies = vec![Ok(called("print('reading the orders again')"))];
         let mut run = recorded(replies, None, "", Box::new(|_| {}));
         let agent = &run.agent.agent;
-        let restarting = Worker::new(&agent.interrupt, &agent.cwd, &agent.copies, true);
+        let sandbox = opened(&agent.cwd, &agent.copies);
+        let restarting = Worker::new(&agent.interrupt, sandbox, true);
         run.agent.worker = block_on(restarting).expect("worker");
 
         let mut memory = AgentMemory::default();

@@ -4,10 +4,11 @@ use crate::acp::translator::Translator;
 use crate::acp::{prompt_parts, rfc3339, to_value, App, QUEUED};
 use crate::agent::{title_of, Agent, Asking, Event, Sink, Task};
 use crate::code::Worker;
-use crate::config::{self, McpConfig, Models};
+use crate::config::{self, Access, McpConfig, Models};
 use crate::history::{Lock, SessionMeta, Settings};
 use crate::memory::{AgentMemory, Exit, MemoryStep, StepError, Verdict};
 use crate::prompt::{BLOCKED, MET, UNMET};
+use crate::sandbox::Sandbox;
 use crate::spawn::{spawn_shell, Group};
 use crate::tools::attach::Mention;
 use crate::utils::Interrupt;
@@ -71,6 +72,7 @@ pub(crate) struct Opening {
     pub(crate) previous: Option<JoinHandle<()>>,
     pub(crate) models: Models,
     pub(crate) servers: Vec<McpConfig>,
+    pub(crate) access: Access,
     pub(crate) app: Arc<App>,
     pub(crate) interrupt: Interrupt,
     /// Only `Router` holds the sender, and dropping it closes the session
@@ -140,6 +142,7 @@ async fn start(opening: Opening) -> Result<Session> {
         previous,
         models,
         servers,
+        access,
         app,
         interrupt,
         inbox,
@@ -205,9 +208,11 @@ async fn start(opening: Opening) -> Result<Session> {
     let mut translator = Translator::new(meta.id.clone(), Arc::clone(peer), window, copies.clone());
     translator.replay(&memory);
 
+    let sandbox = Sandbox::new(&cwd, &copies, &app.config, &skills, &access);
+    let sandbox = sandbox.map_err(Error::Python)?;
     // No restart notice again when no code has run since the last restart
     let ran = memory.ran_code();
-    let worker = Worker::new(&interrupt, &cwd, &copies, ran).await?;
+    let worker = Worker::new(&interrupt, sandbox, ran).await?;
 
     let response = match loading {
         true => {

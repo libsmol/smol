@@ -3,6 +3,7 @@ use crate::acp::session::{self, Message, Opening, Prompt, Shell};
 use crate::acp::{prompt_parts, rfc3339, to_value, App, CLEAR_GOAL, GOAL, QUEUED, SHELL};
 use crate::config;
 use crate::history::HistoryStore;
+use crate::sandbox;
 use crate::setup::SETUP_ARG;
 use crate::utils::{block_on, new_id, Interrupt};
 use crate::{Error, Result};
@@ -88,6 +89,7 @@ pub fn run() -> Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let pid = process::id();
     info!("agent: started [version={version}, os={OS}, pid={pid}]");
+    thread::spawn(sandbox::sweep);
 
     let app = App {
         peer: Peer::new(Out::Stdout),
@@ -383,9 +385,9 @@ impl Router {
     fn open(&mut self, id: &Value, session: String, cwd: PathBuf, loading: bool) -> Result<()> {
         // An unreadable config must not close the open session with the same id
         let models = config::models(&self.app.config);
-        let servers = config::servers(&self.app.config);
-        let (models, servers) = match (models, servers) {
-            (Ok(models), Ok(servers)) => (models, servers),
+        let agent = config::agent(&self.app.config);
+        let (models, (servers, access)) = match (models, agent) {
+            (Ok(models), Ok(agent)) => (models, agent),
             (Err(error), _) | (_, Err(error)) => {
                 error!("session: open failed, {error}");
                 return Err(error);
@@ -408,6 +410,7 @@ impl Router {
             previous,
             models,
             servers,
+            access,
             app: Arc::clone(&self.app),
             interrupt: interrupt.clone(),
             inbox,

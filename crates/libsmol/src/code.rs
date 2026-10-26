@@ -1,6 +1,7 @@
 use crate::memory::{CallError, MAX_OBSERVATION_CHARS};
 use crate::model::Media;
 use crate::prompt::{self, NO_SERVER};
+use crate::sandbox::Sandbox;
 use crate::spawn::{drain, relay, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
 use crate::tools::mcp::{Called, Calling, Server};
 use crate::utils::{new_id, Clip, Interrupt, Reply};
@@ -19,13 +20,13 @@ use std::env;
 use std::future;
 use std::io;
 use std::mem;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpListener;
-use tokio::process::Command;
 use tokio::select;
 use tokio::sync::mpsc::{self, Receiver, UnboundedSender};
 use tokio::task::{self, AbortHandle, JoinSet};
@@ -58,8 +59,7 @@ pub(crate) struct Added {
 
 /// Callers keep track of the installed MCP servers and pass them in on every call
 pub(crate) struct Worker {
-    cwd: PathBuf,
-    copies: PathBuf,
+    sandbox: Sandbox,
     interrupt: Interrupt,
     functions: Vec<Function>,
     restarted: bool,
@@ -115,13 +115,11 @@ impl Worker {
     /// `restarted` means earlier code in the session defined names this new worker lacks
     pub(crate) async fn new(
         interrupt: &Interrupt,
-        cwd: &Path,
-        copies: &Path,
+        sandbox: Sandbox,
         restarted: bool,
     ) -> Result<Self> {
         let mut worker = Self {
-            cwd: cwd.to_owned(),
-            copies: copies.to_owned(),
+            sandbox,
             interrupt: interrupt.clone(),
             functions: Vec::new(),
             restarted,
@@ -133,6 +131,10 @@ impl Worker {
 
     pub(crate) fn functions(&self) -> &[Function] {
         &self.functions
+    }
+
+    pub(crate) fn sandboxed(&self) -> bool {
+        self.sandbox.enforced()
     }
 
     /// Takes the flag, which turns true again only when the worker is replaced
@@ -171,7 +173,7 @@ impl Worker {
         let program = PathBuf::from("/proc/self/exe");
         #[cfg(not(target_os = "linux"))]
         let program = env::current_exe().map_err(failed)?;
-        let mut command = Command::new(program);
+        let mut command = self.sandbox.command(&program);
         #[cfg(not(test))]
         command.arg(WORKER_ARG);
         // Tests rerun the test binary itself with only the test that serves as the worker
@@ -179,9 +181,8 @@ impl Worker {
         command.args(["code::tests::serving", "--exact", "--nocapture"]);
         let control = format!("{address}/{token}");
         command
-            .current_dir(&self.cwd)
             .env(CONTROL_ENV, control)
-            .env(COPIES_ENV, &self.copies)
+            .env(COPIES_ENV, &self.sandbox.copies)
             .stdin(Stdio::null())
             .stdout(copied)
             .stderr(writer);
@@ -560,6 +561,7 @@ mod tests {
     use crate::code::{Added, Evaluated, Worker, STOP_WAIT};
     use crate::memory::CallError;
     use crate::prompt::system;
+    use crate::sandbox::tests::opened;
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
     use crate::tools::mcp::tests::{fake, started};
     use crate::tools::mcp::{Called, Calling, Server};
@@ -633,7 +635,8 @@ mod tests {
     fn build(interrupt: Interrupt, cwd: PathBuf) -> Temp<Tried> {
         let dir = temp_dir("session");
         let copies = dir.join("copies");
-        let building = Worker::new(&interrupt, &cwd, &copies, false);
+        let sandbox = opened(&cwd, &copies);
+        let building = Worker::new(&interrupt, sandbox, false);
         let worker = block_on(building).expect("worker");
         let value = Tried {
             worker,
@@ -1075,16 +1078,8 @@ mod tests {
 
     #[test]
     fn views_copied() {
-        let dir = temp_dir("views");
-        fs::create_dir_all(&dir).expect("dir");
-        let copies = dir.join("copies");
-        let interrupt = Interrupt::default();
-        let building = Worker::new(&interrupt, &dir, &copies, false);
-        let worker = block_on(building).expect("worker");
-        let mut worker = Tried {
-            worker,
-            servers: Vec::new(),
-        };
+        let (mut worker, dir) = workspace("views");
+        let copies = worker.sandbox.copies.clone();
 
         // Rewriting the file later doesn't change the image viewed first
         let code = "import os\n\
@@ -1603,7 +1598,7 @@ mod tests {
 
         let servers: Vec<&Added> = worker.servers.iter().collect();
         let cwd = Path::new("/work");
-        let text = system(&[], &servers, &[], cwd, &[]);
+        let text = system(&[], &servers, &[], cwd, false, &[]);
         let listed = "\n\n## MCP `news_web`\n\nSearches the web and the news\n\nRead-only\n\n\
                       - news_web.echo_text(the_text: str = None) -> str\n\n\
                       ## MCP `notes`\n\n\

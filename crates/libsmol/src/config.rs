@@ -415,6 +415,36 @@ fn unreadable(e: &io::Error) -> String {
 struct AgentFile {
     #[serde(default)]
     mcp: BTreeMap<String, Value>,
+    #[serde(default)]
+    allow: Allow,
+    #[serde(default)]
+    deny: Deny,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Allow {
+    #[serde(default)]
+    env: Vec<String>,
+    #[serde(default)]
+    write: Vec<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Deny {
+    #[serde(default)]
+    read: Vec<String>,
+}
+
+/// How agent.toml widens or narrows what the sandbox lets the code reach
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Access {
+    /// Names of more environment variables to pass on
+    pub(crate) env: Vec<String>,
+    pub(crate) write: Vec<PathBuf>,
+    /// More places the code can neither read nor write
+    pub(crate) hidden: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -466,12 +496,14 @@ pub(crate) enum McpKind {
     },
 }
 
-pub(crate) fn servers(dir: &Path) -> Result<Vec<McpConfig>> {
+pub(crate) fn agent(dir: &Path) -> Result<(Vec<McpConfig>, Access)> {
     let path = dir.join("agent.toml");
     let invalid = invalid(&path);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Access::default()));
+        }
         Err(e) => {
             let reason = cause(&e);
             return Err(invalid(reason));
@@ -540,7 +572,34 @@ pub(crate) fn servers(dir: &Path) -> Result<Vec<McpConfig>> {
         servers.push(server);
     }
 
-    Ok(servers)
+    let home = env::home_dir().unwrap_or_default();
+    let absolute = |key: &str, texts: Vec<String>| {
+        let mut paths = Vec::new();
+        for text in texts {
+            let path = match text.strip_prefix('~') {
+                Some(rest) if rest.is_empty() || rest.starts_with(path::is_separator) => {
+                    let rest = rest.trim_start_matches(path::is_separator);
+                    home.join(rest)
+                }
+                _ => PathBuf::from(&text),
+            };
+            if !path.is_absolute() {
+                let problem = format!("{key}: {text}: not an absolute path");
+                return Err(invalid(problem));
+            }
+            paths.push(path);
+        }
+        Ok(paths)
+    };
+    let write = absolute("[allow]: write", file.allow.write)?;
+    let hidden = absolute("[deny]: read", file.deny.read)?;
+    let access = Access {
+        env: file.allow.env,
+        write,
+        hidden,
+    };
+
+    Ok((servers, access))
 }
 
 pub(crate) fn parse_url(url: &str) -> Result<Url, String> {
@@ -584,13 +643,15 @@ fn parsed<T: DeserializeOwned>(text: &str) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        instructions, models, save_model, servers, skills, McpConfig, McpKind, Skill, MODEL_EXAMPLE,
+        agent, instructions, models, save_model, skills, Access, McpConfig, McpKind, Skill,
+        MODEL_EXAMPLE,
     };
     use crate::model::{MediaKind, ModelSpec};
     use crate::tests::temp_dir;
     use crate::Error;
     use reaper::tilde;
     use std::collections::BTreeMap;
+    use std::env;
     use std::fs;
     #[cfg(unix)]
     use std::fs::Permissions;
@@ -859,12 +920,14 @@ models = [{ id = "m3" }]
     fn servers_read() {
         let dir = temp_dir("mcp-config");
         fs::create_dir_all(&dir).expect("create");
-        assert!(servers(&dir).expect("missing").is_empty());
+        let (servers, access) = agent(&dir).expect("missing");
+        assert!(servers.is_empty());
+        assert_eq!(access, Access::default());
 
         let text = "[mcp.\"workspace\"]\ntype = \"stdio\"\ncommand = \"desktop-mcp\"\nargs = [\"--quiet\"]\nenv = { LANG = \"en_US.UTF-8\" }\n\n\
             [mcp.web]\ntype = \"http\"\nurl = \"http://127.0.0.1:1/mcp\"\nenabled = false\ndescription = \"Search the web\"\n";
         fs::write(dir.join("agent.toml"), text).expect("write");
-        let read = servers(&dir).expect("servers");
+        let (read, _) = agent(&dir).expect("servers");
         let http = McpKind::Http {
             url: "http://127.0.0.1:1/mcp".to_owned(),
             headers: BTreeMap::new(),
@@ -912,13 +975,57 @@ models = [{ id = "m3" }]
                 "[mcp.web]: url: relative URL without a base",
             ),
             (
-                "[allow]\nnet = true\n",
-                "line 1: unknown field `allow`, expected `mcp`",
+                "[sandbox]\nnet = true\n",
+                "line 1: unknown field `sandbox`, expected one of `mcp`, `allow`, `deny`",
             ),
         ];
         for (text, problem) in cases {
             fs::write(dir.join("agent.toml"), text).expect("write");
-            let error = servers(&dir).expect_err("error").to_string();
+            let error = agent(&dir).expect_err("error").to_string();
+            assert_eq!(error, format!("config: {shown}: {problem}"));
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn access_read() {
+        let dir = temp_dir("access-config");
+        fs::create_dir_all(&dir).expect("create");
+        let home = env::home_dir().expect("home");
+        #[cfg(unix)]
+        let absolute = "/srv/café";
+        #[cfg(windows)]
+        let absolute = r"C:\srv\café";
+        let text = format!(
+            "[allow]\nenv = [\"GITHUB_TOKEN\"]\nwrite = [\"~/.npm\", '{absolute}']\n\n[deny]\nread = [\"~\"]\n"
+        );
+        fs::write(dir.join("agent.toml"), text).expect("write");
+        let (_, access) = agent(&dir).expect("access");
+        let expected = Access {
+            env: vec!["GITHUB_TOKEN".to_owned()],
+            write: vec![home.join(".npm"), PathBuf::from(absolute)],
+            hidden: vec![home.clone()],
+        };
+        assert_eq!(access, expected);
+
+        let shown = tilde(&dir.join("agent.toml"));
+        let cases = [
+            (
+                "[deny]\nread = [\"résumé\"]\n",
+                "[deny]: read: résumé: not an absolute path",
+            ),
+            (
+                "[allow]\nwrite = [\"~naïve/notes\"]\n",
+                "[allow]: write: ~naïve/notes: not an absolute path",
+            ),
+            (
+                "[allow]\nnet = true\n",
+                "line 2: unknown field `net`, expected `env` or `write`",
+            ),
+        ];
+        for (text, problem) in cases {
+            fs::write(dir.join("agent.toml"), text).expect("write");
+            let error = agent(&dir).expect_err("error").to_string();
             assert_eq!(error, format!("config: {shown}: {problem}"));
         }
         fs::remove_dir_all(&dir).ok();
