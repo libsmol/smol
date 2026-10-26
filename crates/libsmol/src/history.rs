@@ -18,7 +18,7 @@ const META_PREFIX: &[u8; 8] = br#"{"meta":"#;
 pub(crate) const MAX_TITLE_CHARS: usize = 50;
 /// Bump it whenever the saved session format changes,
 /// as sessions in any other format are neither listed nor opened
-const FORMAT: u32 = 6;
+const FORMAT: u32 = 7;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionMeta {
@@ -368,7 +368,7 @@ pub(crate) mod tests {
         let titles: Vec<&str> = listed.iter().map(|meta| meta.title.as_str()).collect();
         assert!(titles.contains(&"Clean up the date helpers"), "{titles:?}");
 
-        let lines = asked("First line\n\n  second line\t", false);
+        let lines = asked("First line\n\n  second line\t");
         let attached = Attachment {
             path: "screenshot.png".to_owned(),
             ..Attachment::default()
@@ -376,7 +376,6 @@ pub(crate) mod tests {
         let files = TaskStep {
             text: " \n".to_owned(),
             files: vec![attached],
-            ..lines.clone()
         };
         for (task, expected) in [(lines, "First line second line"), (files, "screenshot.png")] {
             let memory = AgentMemory {
@@ -397,10 +396,7 @@ pub(crate) mod tests {
             MemoryStep::Shell(ran)
         };
         let shelled = vec![typed("echo  café\n"), typed("ls")];
-        let tasked = vec![
-            typed("ls"),
-            MemoryStep::Task(asked("Count the lines", false)),
-        ];
+        let tasked = vec![typed("ls"), MemoryStep::Task(asked("Count the lines"))];
         for (steps, expected) in [(shelled, "! echo café"), (tasked, "Count the lines")] {
             let memory = AgentMemory { steps };
             let meta = saved(&store, &memory, "d5", &settings);

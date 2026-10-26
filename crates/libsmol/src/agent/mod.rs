@@ -2,8 +2,8 @@ use crate::code::{Added, Worker};
 use crate::config::Skill;
 use crate::history::MAX_TITLE_CHARS;
 use crate::memory::{
-    bytes, estimate, AgentMemory, AgentStep, Attachment, Call, Check, Goal, GoalStatus, MemoryStep,
-    StepError, SummaryStep, TaskStep, Unchecked, Usage, Verdict,
+    bytes, estimate, AgentMemory, AgentStep, Attachment, Call, MemoryStep, StepError, SummaryStep,
+    TaskStep, Usage,
 };
 use crate::model::{
     ChatMessage, Finish, Finished, MediaKind, Model, ModelError, Purpose, StreamDelta,
@@ -22,7 +22,6 @@ use tokio::select;
 use tokio::sync::Notify;
 use tokio::{task, time};
 
-mod check;
 mod compact;
 mod step;
 
@@ -55,10 +54,6 @@ pub(crate) enum Event<'a> {
     StepEnd(&'a AgentStep),
     Compact,
     CompactEnd(Result<&'a SummaryStep, &'a StepError>),
-    Check,
-    CheckEnd(Result<&'a Check, &'a StepError>),
-    /// Goal status, reported once when a turn starts and once when it ends
-    Goal(Option<&'a Goal>),
 }
 
 type Updates = Vec<(String, Vec<Mention>)>;
@@ -77,7 +72,6 @@ pub(crate) trait Sink: Send {
 pub(crate) struct Task {
     pub(crate) text: String,
     pub(crate) mentions: Vec<Mention>,
-    pub(crate) goal: bool,
 }
 
 pub(crate) struct Agent {
@@ -124,7 +118,6 @@ impl Agent {
             &self.instructions,
         );
 
-        let goal = task.goal;
         let mut turn = Turn {
             agent: self,
             worker,
@@ -133,14 +126,7 @@ impl Agent {
             system,
             sink,
         };
-        let answer = turn.run(task).await;
-
-        // A plain task also counts as an update to the goal
-        let current = turn.memory.goal();
-        if goal || current.is_some() {
-            turn.sink.event(Event::Goal(current.as_ref()));
-        }
-        answer
+        turn.run(task).await
     }
 
     /// Reading files and copying images and videos stays off the async runtime
@@ -159,28 +145,9 @@ impl Agent {
 
 impl Turn<'_> {
     async fn run(&mut self, task: Task) -> Result<Option<String>> {
-        let goal = task.goal;
-        let mut text = task.text;
-        let mut carried = Vec::new();
-        if goal {
-            text = text.trim().to_owned();
-            // A resent goal resumes with its updates, as the checker sees only the last task
-            let earlier = self.memory.goal();
-            let same = earlier.filter(|earlier| earlier.objective == text);
-            carried = same.map(|earlier| earlier.updates).unwrap_or_default();
-            let active = Goal {
-                objective: text.clone(),
-                status: GoalStatus::Active,
-                updates: carried.clone(),
-            };
-            self.sink.event(Event::Goal(Some(&active)));
-        }
-
         let files = self.agent.attached(task.mentions).await;
         let task = TaskStep {
-            text,
-            goal,
-            carried,
+            text: task.text,
             files,
         };
 
@@ -202,14 +169,14 @@ impl Turn<'_> {
             }
         }
 
-        // A task whose turn hit a model error stays for `AgentMemory::goal` until it is resent
+        // A task whose turn hit a model error stays in the record, so resending it replaces it
         let steps = &mut self.memory.steps;
         let last = steps
             .iter()
             .rposition(|step| !matches!(step, MemoryStep::Restarted | MemoryStep::Summary(_)));
         if let Some(at) = last {
             if let MemoryStep::Task(old) = &steps[at] {
-                if old.text == task.text && old.goal == task.goal {
+                if old.text == task.text {
                     discard(old, copies);
                     steps.remove(at);
                     // Summaries after it count it among their `kept` steps
@@ -235,53 +202,12 @@ impl Turn<'_> {
                 self.sink.saved(self.memory);
             }
 
-            let mut step = self.step().await;
+            let step = self.step().await;
             if let Some(StepError::Model(error)) = &step.error {
                 self.sink.event(Event::StepEnd(&step));
                 return Err(error.clone().into());
             }
 
-            let answered = step.answer().is_some() && !self.agent.interrupt.triggered();
-            // Updates sent before the answer belong to the goal,
-            // so take them and keep working before any check
-            let fetched = goal && answered;
-            let mut updates = Vec::new();
-            if fetched {
-                updates = self.queued().await;
-            }
-
-            let mut failed = None;
-            if fetched && updates.is_empty() {
-                match self.check(&step).await {
-                    Ok(check) => {
-                        step.check = Some(check);
-                        // Updates sent during the check also resume this goal, whatever the verdict
-                        updates = self.queued().await;
-                    }
-                    Err(error) => {
-                        let unchecked = match &error {
-                            StepError::Interrupted => Unchecked::Interrupted,
-                            error => {
-                                let shown = error.to_string();
-                                Unchecked::Failed(shown)
-                            }
-                        };
-                        step.unchecked = Some(unchecked);
-                        failed = Some(error);
-                    }
-                }
-            }
-
-            let unmet = step.check.as_ref().map(|check| check.verdict) == Some(Verdict::Unmet);
-            // An unmet answer right after another unmet one would get the same verdict again
-            let unmet_before = match self.memory.steps.last() {
-                Some(MemoryStep::Action(last)) => {
-                    let verdict = last.check.as_ref().map(|check| check.verdict);
-                    verdict == Some(Verdict::Unmet)
-                }
-                _ => false,
-            };
-            let stalled = unmet && unmet_before;
             let answer = step.answer().map(str::to_owned);
             self.memory.steps.push(MemoryStep::Action(step));
 
@@ -296,41 +222,23 @@ impl Turn<'_> {
             self.sink.event(Event::StepEnd(step));
             self.sink.saved(self.memory);
 
-            if let Some(error) = failed {
-                let StepError::Model(error) = error else {
-                    return Ok(None);
-                };
-                return Err(error.into());
-            }
-
             // An interrupt that arrives after the answer still ends the turn as interrupted
-            let interrupted = self.agent.interrupt.triggered();
-            let finished = answer.is_some() && (!unmet || stalled) && updates.is_empty();
-            if !interrupted && !finished && !fetched {
-                updates = self.queued().await;
+            if self.agent.interrupt.triggered() {
+                return Ok(None);
+            }
+            if answer.is_some() {
+                return Ok(answer);
             }
 
-            // Updates taken when a goal step answered are recorded even after an interrupt
+            let updates = self.queued().await;
             let received = !updates.is_empty();
             for (text, mentions) in updates {
                 let files = self.agent.attached(mentions).await;
-                let update = TaskStep {
-                    text,
-                    goal: false,
-                    carried: Vec::new(),
-                    files,
-                };
+                let update = TaskStep { text, files };
                 self.memory.steps.push(MemoryStep::Update(update));
             }
             if received {
                 self.sink.saved(self.memory);
-            }
-
-            if interrupted {
-                return Ok(None);
-            }
-            if finished {
-                return Ok(answer);
             }
         }
     }
@@ -691,21 +599,19 @@ pub(crate) mod tests {
             memory: &mut AgentMemory,
             task: &str,
         ) -> Result<Option<String>> {
-            self.pursue(memory, task, &[], false)
+            self.turn_attached(memory, task, &[])
         }
 
-        pub(crate) fn pursue(
+        pub(crate) fn turn_attached(
             &mut self,
             memory: &mut AgentMemory,
             task: &str,
             files: &[PathBuf],
-            goal: bool,
         ) -> Result<Option<String>> {
             let mentions = files.iter().map(|path| mentioned(path)).collect();
             let task = Task {
                 text: task.to_owned(),
                 mentions,
-                goal,
             };
             let probe = &mut self.probe;
             let running = self.agent.run(&mut self.worker, &[], memory, task, probe);
@@ -834,13 +740,13 @@ pub(crate) mod tests {
         assert!(memory.steps.is_empty());
 
         run.agent
-            .pursue(&mut memory, &huge, &files, false)
+            .turn_attached(&mut memory, &huge, &files)
             .expect_err("refused");
         let copies = run.agent.agent.copies.clone();
         let left = fs::read_dir(&copies).expect("copies").count();
         assert_eq!(left, 0);
 
-        let answer = run.agent.pursue(&mut memory, "Watch it", &files, false);
+        let answer = run.agent.turn_attached(&mut memory, "Watch it", &files);
         let answer = answer.expect("run");
         assert_eq!(answer, Some("Watched it".to_owned()));
         let MemoryStep::Task(task) = &memory.steps[0] else {

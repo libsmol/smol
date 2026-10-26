@@ -6,8 +6,7 @@ use crate::agent::{title_of, Agent, Asking, Event, Sink, Task};
 use crate::code::Worker;
 use crate::config::{self, Access, McpConfig, Models};
 use crate::history::{Lock, SessionMeta, Settings};
-use crate::memory::{AgentMemory, Exit, MemoryStep, StepError, Verdict};
-use crate::prompt::{BLOCKED, MET, UNMET};
+use crate::memory::{AgentMemory, Exit, MemoryStep, StepError};
 use crate::sandbox::Sandbox;
 use crate::spawn::{spawn_shell, Group};
 use crate::tools::attach::Mention;
@@ -43,15 +42,12 @@ pub(crate) enum Message {
     Prompt(Prompt),
     Shell(Shell),
     Option(Value, SetSessionConfigOptionRequest),
-    /// Replied to only after the goal is cleared and the notification is sent
-    ClearGoal(Value),
 }
 
 pub(crate) struct Prompt {
     pub(crate) id: Value,
     pub(crate) text: String,
     pub(crate) mentions: Vec<Mention>,
-    pub(crate) goal: bool,
     pub(crate) turn: u64,
 }
 
@@ -243,9 +239,6 @@ async fn start(opening: Opening) -> Result<Session> {
     let peer = Arc::clone(&app.peer);
     let pool = McpPool::new(servers, &meta.settings, &copies, peer, meta.id.clone());
     pool.report();
-    if let Some(goal) = memory.goal() {
-        translator.goal(Some(&goal));
-    }
 
     let agent = Agent {
         model: Arc::from(built),
@@ -313,12 +306,11 @@ impl Session {
             match message {
                 Message::Prompt(prompt) => self.prompt(prompt).await,
                 Message::Shell(shell) => self.shell(shell).await,
-                Message::ClearGoal(id) | Message::Option(id, _) if closed => {
+                Message::Option(id, _) if closed => {
                     let session = self.keeper.meta.id.clone();
                     let error = Error::SessionNotFound(session);
                     self.keeper.app.peer.respond(&id, Err(error));
                 }
-                Message::ClearGoal(id) => self.clear_goal(id),
                 Message::Option(id, option) => {
                     let result = self.option(option);
                     self.keeper.app.peer.respond(&id, result);
@@ -376,7 +368,6 @@ impl Session {
         let task = Task {
             text: prompt.text,
             mentions: prompt.mentions,
-            goal: prompt.goal,
         };
         let servers = self.servers.installed();
         let worker = &mut self.worker;
@@ -435,15 +426,6 @@ impl Session {
         self.keeper.save(&self.memory);
 
         finish(&self.keeper.app.peer, &shell.id, stop);
-    }
-
-    fn clear_goal(&mut self, id: Value) {
-        if self.memory.goal().is_some() {
-            self.memory.steps.push(MemoryStep::Cleared);
-            self.keeper.save(&self.memory);
-        }
-        self.keeper.translator.goal(None);
-        self.keeper.app.peer.respond(&id, Ok(json!({})));
     }
 
     /// Only handled between turns
@@ -533,7 +515,7 @@ impl Keeper {
 
 impl Sink for Keeper {
     fn event(&mut self, event: Event) {
-        // Checker reasons and code errors contain task content and are not logged
+        // Code errors contain task content and are not logged
         // A model error fails the turn and is logged only by the turn failure line
         match event {
             Event::Retry { reason, wait } => {
@@ -562,16 +544,6 @@ impl Sink for Keeper {
             }
             Event::CompactEnd(Err(StepError::Interrupted)) => info!("compact: interrupted"),
             Event::CompactEnd(Err(_)) => warn!("compact: failed"),
-            Event::CheckEnd(Ok(check)) => {
-                let verdict = match check.verdict {
-                    Verdict::Met => MET,
-                    Verdict::Unmet => UNMET,
-                    Verdict::Blocked => BLOCKED,
-                };
-                info!("check: done ({verdict})");
-            }
-            Event::CheckEnd(Err(StepError::Interrupted)) => info!("check: interrupted"),
-            Event::CheckEnd(Err(_)) => warn!("check: failed"),
             Event::Restarted => warn!("python: restarted"),
             _ => {}
         }
@@ -657,8 +629,8 @@ mod tests {
     use crate::history::tests::saved;
     use crate::history::{HistoryStore, Settings};
     use crate::memory::tests::{asked, coded, one_task, replied};
-    use crate::memory::{AgentMemory, AgentStep, Check, GoalStatus, MemoryStep, Usage, Verdict};
-    use crate::prompt::{CHECKER, NAMER, RESTARTED};
+    use crate::memory::{AgentMemory, MemoryStep};
+    use crate::prompt::{NAMER, RESTARTED};
     use crate::tests::temp_dir;
     use crate::tools::mcp::tests::{PYTHON, SCRIPT};
     use crate::utils::block_on;
@@ -807,12 +779,8 @@ mod tests {
             session.expect("session").to_owned()
         }
 
-        async fn prompt(&mut self, session: &str, text: &str, goal: bool) -> Value {
-            let mut params =
-                json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]});
-            if goal {
-                params["_meta"] = json!({ "_smol/goal": true });
-            }
+        async fn prompt(&mut self, session: &str, text: &str) -> Value {
+            let params = json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]});
             self.request("session/prompt", params).await
         }
 
@@ -863,9 +831,7 @@ mod tests {
         let running = async {
             let mut connection = Connection::open(&dir, &api, "");
             let session = connection.new_session().await;
-            connection
-                .prompt(&session, "Make a snake game", false)
-                .await;
+            connection.prompt(&session, "Make a snake game").await;
             let seen = connection.close().await;
             (session, seen)
         };
@@ -911,11 +877,9 @@ mod tests {
         let running = async {
             let mut connection = Connection::open(&dir, &api, ", context = 1024");
             let session = connection.new_session().await;
-            let refused = connection.prompt(&session, &huge, false).await;
+            let refused = connection.prompt(&session, &huge).await;
             assert!(refused["error"].is_object(), "{refused}");
-            connection
-                .prompt(&session, "Make a snake game", false)
-                .await;
+            connection.prompt(&session, "Make a snake game").await;
             connection.close().await;
             session
         };
@@ -941,10 +905,11 @@ mod tests {
             let session = connection.new_session().await;
             let text = json!([{"type": "text", "text": "Make a snake game"}]);
             let prompt = json!({"sessionId": session, "prompt": text});
+            let option = json!({"sessionId": session, "configId": "model", "value": "mock/m1"});
             let queued = [
                 (100, "session/prompt", prompt.clone()),
                 (101, "session/prompt", prompt),
-                (102, "_smol/clear_goal", json!({"sessionId": session})),
+                (102, "session/set_config_option", option),
             ];
             for (id, method, params) in queued {
                 let request =
@@ -996,7 +961,7 @@ mod tests {
             let params = json!({"sessionId": session});
             let cancel = json!({"jsonrpc": "2.0", "method": "session/cancel", "params": params});
             connection.send(cancel);
-            connection.prompt(&session, "Second task", false).await;
+            connection.prompt(&session, "Second task").await;
             let seen = connection.close().await;
             (session, seen)
         };
@@ -1024,36 +989,6 @@ mod tests {
         let last = requests.last().expect("request");
         let told = "The user interrupted you before you replied.";
         assert!(last.contains(told), "{last}");
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Clearing without a goal leaves the saved session untouched but still reports once
-    #[test]
-    fn clear_without_goal() {
-        let dir = temp_dir("clear-goal");
-        let memory = one_task("Take a look");
-        let settings = Settings::default();
-        saved(&stored(&dir), &memory, "s1", &settings);
-        // A parsed float can land one unit off the value kept in memory
-        let (first, _) = stored(&dir).load("s1").expect("load");
-
-        let running = async {
-            let mut connection = Connection::open(&dir, "http://127.0.0.1:1/v1", "");
-            let load = json!({"sessionId": "s1", "cwd": CWD, "mcpServers": []});
-            connection.request("session/load", load).await;
-            let clear = json!({"sessionId": "s1"});
-            connection.request("_smol/clear_goal", clear).await;
-            connection.close().await
-        };
-        let seen = block_on(running);
-
-        let (meta, memory) = stored(&dir).load("s1").expect("load");
-        assert_eq!(meta.updated_at, first.updated_at);
-        assert_eq!(memory.steps.len(), 1);
-        let reported = |message: &Value| message["method"] == "_smol/goal";
-        let reports: Vec<&Value> = seen.iter().filter(|message| reported(message)).collect();
-        assert_eq!(reports.len(), 1, "{seen:?}");
-        assert!(reports[0]["params"]["goal"].is_null());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1089,124 +1024,10 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    fn judging() -> String {
-        model_server(|body| {
-            let system = system_prompt(body);
-            let whole = body["messages"].to_string();
-            let messages = body["messages"].as_array().cloned().unwrap_or_default();
-            let last = messages.last().cloned().unwrap_or_default();
-            let asked = last["content"].as_str().unwrap_or_default();
-            if system == NAMER {
-                Ok("Title".to_owned())
-            } else if system == CHECKER && whole.contains("dead end") {
-                Ok("blocked: needs the database password".to_owned())
-            } else if system == CHECKER {
-                Ok("met".to_owned())
-            } else if asked.contains("will fail") {
-                Err(400)
-            } else {
-                Ok("Done.".to_owned())
-            }
-        })
-    }
-
-    #[test]
-    fn goal_settled() {
-        let dir = temp_dir("goal-settled");
-        let api = judging();
-        let huge = "too long ".repeat(1000);
-        let running = async {
-            let mut connection = Connection::open(&dir, &api, ", context = 1024");
-            let session = connection.new_session().await;
-            for text in [
-                "Fix the parser",
-                "Migrate the database, hit a dead end",
-                &huge,
-                "This one will fail",
-            ] {
-                connection.prompt(&session, text, true).await;
-            }
-            connection.prompt(&session, "Quick question", false).await;
-            let clear = json!({"sessionId": session});
-            connection.request("_smol/clear_goal", clear).await;
-            let seen = connection.close().await;
-            (session, seen)
-        };
-        let (session, seen) = block_on(running);
-
-        let mut reported = Vec::new();
-        let mut updates = Vec::new();
-        for message in seen {
-            if message["method"] == "_smol/goal" {
-                let goal = &message["params"]["goal"];
-                let status = goal["status"].as_str();
-                reported.push(status.unwrap_or("none").to_owned());
-                updates.push(goal["updates"].clone());
-            }
-        }
-        let expected = [
-            "active", "complete", "active", "blocked", "active", "blocked", "active", "paused",
-            "paused", "none",
-        ];
-        assert_eq!(reported, expected);
-        assert_eq!(updates[8], json!(["Quick question"]));
-
-        let (_, memory) = stored(&dir).load(&session).expect("load");
-        assert_eq!(memory.goal(), None);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn goal_keeps_updates() {
-        let dir = temp_dir("goal-updates");
-        let check = Check {
-            verdict: Verdict::Unmet,
-            reason: "Not tested yet".to_owned(),
-            usage: Usage::default(),
-        };
-        let checked = AgentStep {
-            check: Some(check),
-            ..AgentStep::default()
-        };
-        let answered = replied("OK");
-        let memory = AgentMemory {
-            steps: vec![
-                MemoryStep::Task(asked("Fix the parser", true)),
-                MemoryStep::Update(asked("Add tests too", false)),
-                MemoryStep::Action(Box::new(checked)),
-                MemoryStep::Task(asked("Leave the API alone", false)),
-                MemoryStep::Action(Box::new(answered)),
-            ],
-        };
-        let settings = Settings::default();
-        saved(&stored(&dir), &memory, "s1", &settings);
-
-        let api = judging();
-        let running = async {
-            let mut connection = Connection::open(&dir, &api, "");
-            let load = json!({"sessionId": "s1", "cwd": CWD, "mcpServers": []});
-            connection.request("session/load", load).await;
-            connection.prompt("s1", "Fix the parser", true).await;
-            connection.close().await;
-        };
-        block_on(running);
-
-        let (_, memory) = stored(&dir).load("s1").expect("load");
-        let Some(MemoryStep::Task(task)) = memory.steps.get(5) else {
-            panic!("{:?}", memory.steps);
-        };
-        let updates = ["Add tests too", "Leave the API alone"];
-        assert_eq!(task.carried, updates);
-        let goal = memory.goal().expect("goal");
-        assert_eq!(goal.status, GoalStatus::Complete);
-        assert_eq!(goal.updates, updates);
-        fs::remove_dir_all(&dir).ok();
-    }
-
     #[test]
     fn restart_not_repeated() {
         let dir = temp_dir("restart-notice");
-        let task = |text: &str| MemoryStep::Task(asked(text, false));
+        let task = |text: &str| MemoryStep::Task(asked(text));
         let ran = coded("print(orders)", Some("Three orders".to_owned()));
         let answered = replied("Checked");
         let unrestarted = vec![task("Read the orders"), MemoryStep::Action(Box::new(ran))];
@@ -1235,7 +1056,7 @@ mod tests {
             for session in ["s1", "s2"] {
                 let load = json!({"sessionId": session, "cwd": CWD, "mcpServers": []});
                 connection.request("session/load", load).await;
-                connection.prompt(session, "Anything else?", false).await;
+                connection.prompt(session, "Anything else?").await;
             }
             connection.close().await;
         };
@@ -1267,7 +1088,7 @@ mod tests {
             let mut connection = Connection::open(&dir, &api, "");
             let session = connection.new_session().await;
             // The turn starts only after the servers finish connecting
-            connection.prompt(&session, "Hello", false).await;
+            connection.prompt(&session, "Hello").await;
             connection.close().await
         };
         let seen = block_on(running);
@@ -1339,7 +1160,7 @@ mod tests {
         // An unreadable instructions file is skipped and the session still opens
         fs::write(dir.join("AGENTS.md"), b"\xff\xfe").expect("write");
         let memory = AgentMemory {
-            steps: vec![MemoryStep::Task(asked("Read the orders", false))],
+            steps: vec![MemoryStep::Task(asked("Read the orders"))],
         };
         let settings = Settings {
             model: "mock/old-model".to_owned(),
@@ -1415,7 +1236,7 @@ mod tests {
             fs::write(dir.join("model.toml"), "[model.broken\n").expect("write");
             let params = json!({"sessionId": session, "cwd": CWD, "mcpServers": []});
             let reloaded = connection.request("session/load", params).await;
-            let answered = connection.prompt(&session, "Still there?", false).await;
+            let answered = connection.prompt(&session, "Still there?").await;
 
             connection.close().await;
             (reloaded, answered)

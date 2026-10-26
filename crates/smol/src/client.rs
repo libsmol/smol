@@ -37,8 +37,6 @@ const QUEUED: &str = "_smol/queued";
 const NOTICE: &str = "_smol/notice";
 const MCP: &str = "_smol/mcp";
 pub(crate) const UPDATE: &str = "_smol/update";
-pub(crate) const GOAL: &str = "_smol/goal";
-const CLEAR_GOAL: &str = "_smol/clear_goal";
 /// Also set in the `_meta` of the tool calls it produces
 pub(crate) const SHELL: &str = "_smol/shell";
 const MAX_STDERR_LINES: usize = 20;
@@ -53,7 +51,6 @@ pub(crate) enum Incoming {
     Update(String, Box<SessionUpdate>),
     Notice(String, Notice),
     Mcp(String, Vec<McpStatus>),
-    Goal(String, Option<Goal>),
     Queued(String, Asked),
     /// Sent only when no request is waiting for a reply
     Exited(String),
@@ -95,35 +92,6 @@ impl fmt::Display for McpState {
             McpState::Connected { tools } => write!(f, "connected, {tools} tools"),
             McpState::Failed { error } => write!(f, "failed: {error}"),
         }
-    }
-}
-
-/// Must match the format libsmol sends
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub(crate) struct Goal {
-    pub(crate) objective: String,
-    pub(crate) status: GoalStatus,
-    pub(crate) updates: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum GoalStatus {
-    Active,
-    Paused,
-    Blocked,
-    Complete,
-}
-
-impl fmt::Display for GoalStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = match self {
-            GoalStatus::Active => "active",
-            GoalStatus::Paused => "paused",
-            GoalStatus::Blocked => "blocked",
-            GoalStatus::Complete => "complete",
-        };
-        f.write_str(text)
     }
 }
 
@@ -433,11 +401,6 @@ impl Client {
                         Err(_) => continue,
                     },
 
-                    (None, Some(GOAL)) => match Option::<Goal>::deserialize(&params["goal"]) {
-                        Ok(goal) => Incoming::Goal(session, goal),
-                        Err(_) => continue,
-                    },
-
                     _ => continue,
                 };
                 sender.send(incoming).ok();
@@ -589,14 +552,9 @@ impl Client {
         Ok(listed.sessions)
     }
 
-    pub(crate) fn prompt(&self, session: &str, blocks: Vec<ContentBlock>, goal: bool) {
+    pub(crate) fn prompt(&self, session: &str, blocks: Vec<ContentBlock>) {
         let session = session.to_owned();
-        let mut request = PromptRequest::new(session, blocks);
-        if goal {
-            let flag = (GOAL.to_owned(), json!(true));
-            let meta = Meta::from_iter([flag]);
-            request = request.meta(meta);
-        }
+        let request = PromptRequest::new(session, blocks);
 
         let method = AGENT_METHOD_NAMES.session_prompt;
         self.start_turn(method, request);
@@ -627,13 +585,6 @@ impl Client {
 
     pub(crate) fn exited(&self) -> bool {
         self.connection.exited.load(Ordering::Relaxed)
-    }
-
-    /// The agent clears it only between turns and then sends a separate notification
-    pub(crate) fn clear_goal(&self, session: &str) -> Result<()> {
-        let params = json!({ "sessionId": session });
-        self.connection.call::<Value>(CLEAR_GOAL, params)?;
-        Ok(())
     }
 
     pub(crate) fn cancel(&self, session: &str) {
@@ -763,7 +714,7 @@ mod tests {
         let (client, inbox) = Client::start(&agent).expect("fake agent");
         let opened = client.open(None, None).expect("open");
         let blocks = vec![ContentBlock::from("exit")];
-        client.prompt(&opened.id, blocks, false);
+        client.prompt(&opened.id, blocks);
 
         let Ok(Incoming::Done(Err(error))) = inbox.recv() else {
             panic!("no failure");

@@ -7,6 +7,15 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+Sessions are saved in format 7, so sessions from 0.2.0 and earlier are no longer
+listed.
+
+- `:goal` is gone, along with its checker, its status and `:goal resume` and
+  `:goal clear`. The `_smol/goal` notification and the `_smol/clear_goal` method are
+  removed, and a `_smol/goal` flag on a prompt is ignored.
+
 ## 0.2.0 - 2026-10-26
 
 - Python and the programs it starts run in a sandbox. On Linux (with Landlock) and

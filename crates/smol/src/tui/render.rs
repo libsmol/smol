@@ -1,9 +1,7 @@
 use crate::tui::highlight;
 use crate::tui::markdown::{self, Block, Text, LINK};
 use crate::tui::transcript::{Entry, Item, Retry, Step};
-use crate::tui::{
-    goal_color, in_out, joined, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG,
-};
+use crate::tui::{in_out, joined, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG};
 use pulldown_cmark::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -17,8 +15,6 @@ const TASK_TAIL: usize = 2;
 const MAX_THOUGHT_ROWS: usize = 3;
 const MIN_COLUMN: usize = 6;
 
-const GOAL_TAG: &str = "goal · ";
-const GOAL_STYLE: Style = BOLD.fg(theme::ORANGE);
 const THINKING: Style = DIM.add_modifier(Modifier::ITALIC);
 const DIAGRAM: Style = Style::new().fg(theme::CYAN);
 
@@ -133,46 +129,9 @@ impl Render {
             Entry::Failure(text) => self.paragraph(FAILURE, text, RED),
             Entry::Step(step) => self.step(step),
 
-            Entry::Task { text, goal } => {
-                let mut lines = highlight::plain(text.trim(), BOLD);
-                if *goal {
-                    if let Some(first) = lines.first_mut() {
-                        first.insert(0, (GOAL_TAG.to_owned(), GOAL_STYLE));
-                    }
-                }
+            Entry::Task(text) => {
+                let lines = highlight::plain(text.trim(), BOLD);
                 self.band(TASK, lines);
-            }
-
-            Entry::Goal(goal) => {
-                self.rows.push(Row::default());
-                let color = goal_color(goal.status);
-                let status = Style::new().fg(color);
-                let mut head = vec![
-                    (GOAL_TAG.to_owned(), GOAL_STYLE),
-                    (goal.status.to_string(), status),
-                ];
-                let count = goal.updates.len();
-                let counted = match count {
-                    0 => None,
-                    1 => Some(" · 1 update".to_owned()),
-                    count => Some(format!(" · {count} updates")),
-                };
-                if let Some(counted) = counted {
-                    head.push((counted, DIM));
-                }
-                self.push_lines(BODY, &[head]);
-
-                let objective = highlight::plain(goal.objective.trim(), Style::new());
-                self.fold(BODY, objective, TASK_HEAD, TASK_TAIL);
-                let last = count.saturating_sub(1);
-                for (index, update) in goal.updates.iter().enumerate() {
-                    let mark = match index == last {
-                        true => LAST_BRANCH,
-                        false => BRANCH,
-                    };
-                    let lines = highlight::plain(update.trim(), Style::new());
-                    self.fold(mark, lines, OUTPUT_HEAD, 0);
-                }
             }
 
             Entry::Shell(shell) => {
@@ -790,16 +749,14 @@ fn last_sentence(text: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use crate::client::{Goal, GoalStatus};
     use crate::tui::render::*;
     use crate::tui::transcript::{Attachment, Call, Shell, StepStats};
-    use agent_client_protocol_schema::v1::{ToolCallStatus, ToolKind};
+    use agent_client_protocol_schema::v1::ToolCallStatus;
 
     fn call(content: &[&str], status: ToolCallStatus) -> Call {
         Call {
             id: "call_1".to_owned(),
             title: "Read file".to_owned(),
-            kind: ToolKind::Read,
             status,
             content: content.iter().map(|text| text.to_string()).collect(),
             attachments: Vec::new(),
@@ -881,7 +838,7 @@ mod tests {
     #[test]
     fn long_task_folds() {
         let lines: Vec<String> = (1..=20).map(|n| format!("line {n}")).collect();
-        let asked = |text: String| Entry::Task { text, goal: false };
+        let asked = Entry::Task;
         let task = asked(lines.join("\n"));
         let mut render = Render::new(40, false);
         render.entry(&task);
@@ -952,53 +909,6 @@ mod tests {
         assert_eq!(stopped[4].line.spans[0].style, STOPPED.style);
         let done = rendered(shell(Some(""), false));
         assert_eq!(text(&done)[2..], ["  ╰ first line", "    second line"]);
-    }
-
-    #[test]
-    fn goal_drawn() {
-        let goal = |updates: &[&str]| Goal {
-            objective: "migrate the database".to_owned(),
-            status: GoalStatus::Blocked,
-            updates: updates.iter().map(|update| update.to_string()).collect(),
-        };
-        let rendered = |goal: Goal, width: u16| {
-            let mut render = Render::new(width, false);
-            render.entry(&Entry::Goal(goal));
-            render.rows
-        };
-
-        let rows = rendered(
-            goal(&["the password is in .env", "keep the schema\nas it is\n"]),
-            40,
-        );
-        let expected = [
-            "",
-            "  goal · blocked · 2 updates",
-            "  migrate the database",
-            "  ├ the password is in .env",
-            "  ╰ keep the schema",
-            "    as it is",
-        ];
-        assert_eq!(text(&rows), expected);
-        let mut spans = rows[1].line.spans.iter();
-        let status = spans.find(|span| span.content == "blocked");
-        assert_eq!(status.and_then(|span| span.style.fg), Some(theme::RED));
-
-        let long = "🍕🍕🍕🍕🍕".repeat(4);
-        let rows = rendered(goal(&[&long, "the last one"]), 24);
-        let tail = &text(&rows)[rows.len() - 3..];
-        let expected = [
-            "  ├ 🍕🍕🍕🍕🍕🍕🍕🍕🍕🍕",
-            "  │ 🍕🍕🍕🍕🍕🍕🍕🍕🍕🍕",
-            "  ╰ the last one",
-        ];
-        assert_eq!(tail, expected);
-
-        let alone = rendered(goal(&[]), 40);
-        assert_eq!(
-            text(&alone),
-            ["", "  goal · blocked", "  migrate the database"]
-        );
     }
 
     #[test]

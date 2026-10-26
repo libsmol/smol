@@ -1,11 +1,11 @@
 use crate::acp::rpc::{Notice, Peer};
-use crate::acp::{GOAL, SHELL, UPDATE};
+use crate::acp::{SHELL, UPDATE};
 use crate::agent::Event;
 use crate::memory::{
-    estimate, text_bytes, AgentMemory, AgentStep, Call, CallError, Check, Exit, Goal, MemoryStep,
-    ShellStep, StepError, SummaryStep, TaskStep, Unchecked, Usage, Verdict,
+    estimate, text_bytes, AgentMemory, AgentStep, Call, CallError, Exit, MemoryStep, ShellStep,
+    StepError, SummaryStep, TaskStep, Usage,
 };
-use crate::prompt::{self, TOOL};
+use crate::prompt::TOOL;
 use agent_client_protocol_schema::v1::{
     ContentBlock, ContentChunk, MessageId, Meta, ResourceLink, SessionUpdate, ToolCall,
     ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 const ESTIMATE_EVERY: Duration = Duration::from_secs(1);
 const COMPACTING: &str = "Compact context";
-const CHECKING: &str = "Check goal";
 const RESTARTED: &str = "python: restarted, earlier variables are gone";
 const SKIPPED: &str = "skipped: an earlier call failed";
 
@@ -33,7 +32,7 @@ pub(crate) struct Translator {
     calls: Vec<Opened>,
     /// Index within this step of the call whose code is running
     running: Option<usize>,
-    /// The open compaction or goal check call
+    /// The open compaction call
     thinking: Option<String>,
     /// The call for the user command that is running
     shell: Option<String>,
@@ -97,7 +96,6 @@ impl Translator {
                     self.shell_end(shell);
                 }
                 MemoryStep::Restarted => self.notice(RESTARTED, None),
-                MemoryStep::Cleared => {}
             }
         }
     }
@@ -150,23 +148,12 @@ impl Translator {
                     self.update(SessionUpdate::ToolCallUpdate(update));
                 }
                 self.notice(reason, Some(wait));
-                // When the goal check is retried the answer step still counts
-                if self.thinking.is_none() {
-                    self.withdraw();
-                }
+                self.withdraw();
             }
             Event::StepEnd(step) => self.step_end(step),
             Event::Compact => self.think(COMPACTING),
             Event::CompactEnd(result) => self.compact_end(result),
-            Event::Check => self.think(CHECKING),
-            Event::CheckEnd(result) => self.check_end(result),
-            Event::Goal(goal) => self.goal(goal),
         }
-    }
-
-    pub(crate) fn goal(&self, goal: Option<&Goal>) {
-        let params = json!({ "sessionId": self.session, "goal": goal });
-        self.peer.notify(GOAL, params);
     }
 
     /// Without metrics the client doesn't count it as a step
@@ -235,15 +222,9 @@ impl Translator {
         self.tasks += 1;
         let id = format!("task_{}", self.tasks);
         let id = MessageId::new(id);
-        // Updates carried over by a continued goal were already shown where they first arrived
         let mut chunk = chunk(&asked.text).message_id(id);
-        let flag = match (appended, asked.goal) {
-            (true, _) => Some(UPDATE),
-            (false, true) => Some(GOAL),
-            (false, false) => None,
-        };
-        if let Some(flag) = flag {
-            let flag = (flag.to_owned(), json!(true));
+        if appended {
+            let flag = (UPDATE.to_owned(), json!(true));
             let meta = Meta::from_iter([flag]);
             chunk = chunk.meta(meta);
         }
@@ -278,19 +259,6 @@ impl Translator {
         }
         let rest = step.text.get(said..).unwrap_or_default();
         self.said(rest);
-
-        if let Some(check) = &step.check {
-            self.think(CHECKING);
-            self.check_end(Ok(check));
-        }
-        if let Some(unchecked) = &step.unchecked {
-            let error = match unchecked {
-                Unchecked::Failed(error) => error.clone(),
-                Unchecked::Interrupted => StepError::Interrupted.to_string(),
-            };
-            self.think(CHECKING);
-            self.think_end(ToolCallStatus::Failed, &error);
-        }
         self.step_end(step);
     }
 
@@ -488,19 +456,8 @@ impl Translator {
         }
         self.progress = Progress::default();
 
-        // Goal check usage only adds to the token totals
-        let mut usage = step.usage;
-        if let Some(check) = &step.check {
-            usage.add(&check.usage);
-        }
-        let stopped = match (error, &step.unchecked) {
-            (Some(StepError::Interrupted), _) | (_, Some(Unchecked::Interrupted)) => {
-                Some("interrupted")
-            }
-            (_, Some(Unchecked::Failed(_))) => Some("failed"),
-            _ => None,
-        };
-        self.report_usage(&usage, step.used, stopped);
+        let interrupted = error == Some(&StepError::Interrupted);
+        self.report_usage(&step.usage, step.used, interrupted);
     }
 
     /// Takes back the reported estimate of a step that was thrown away
@@ -523,19 +480,8 @@ impl Translator {
         self.think_end(status, &text);
 
         if let Ok(summary) = result {
-            self.report_usage(&summary.usage, summary.used, None);
+            self.report_usage(&summary.usage, summary.used, false);
         }
-    }
-
-    fn check_end(&mut self, result: Result<&Check, &StepError>) {
-        let (status, text) = match result {
-            Ok(check) if check.verdict == Verdict::Blocked => {
-                (ToolCallStatus::Failed, prompt::verdict(check))
-            }
-            Ok(check) => (ToolCallStatus::Completed, prompt::verdict(check)),
-            Err(error) => (ToolCallStatus::Failed, error.to_string()),
-        };
-        self.think_end(status, &text);
     }
 
     fn update(&self, update: SessionUpdate) {
@@ -572,7 +518,7 @@ impl Translator {
         self.update(SessionUpdate::ToolCallUpdate(update));
     }
 
-    fn report_usage(&mut self, usage: &Usage, used: Option<u64>, stopped: Option<&str>) {
+    fn report_usage(&mut self, usage: &Usage, used: Option<u64>, interrupted: bool) {
         if let Some(used) = used {
             self.used = used;
         }
@@ -586,10 +532,9 @@ impl Translator {
         if let Some(decode) = usage.decode_duration {
             meta.insert("decodeDuration".to_owned(), decode.into());
         }
-        // Replay has no stop reason for the turn,
-        // so interrupts and failed goal checks can only go on the step
-        if let Some(stopped) = stopped {
-            meta.insert(stopped.to_owned(), true.into());
+        // Replay has no stop reason for the turn, so interrupts can only go on the step
+        if interrupted {
+            meta.insert("interrupted".to_owned(), true.into());
         }
 
         let update = UsageUpdate::new(self.used, self.window).meta(meta);
@@ -1100,68 +1045,6 @@ mod tests {
         assert_eq!(ended[0]["_meta"]["estimatedOutput"], Value::Null);
     }
 
-    #[test]
-    fn check_retried() {
-        let (mut translator, mut sent) = translator(1000);
-        translator.used = 100;
-        let earlier = Instant::now().checked_sub(ESTIMATE_EVERY);
-        translator.progress.since = Some(earlier.expect("instant"));
-        translator.translate(Event::Text("Wrote the café notes."));
-
-        translator.translate(Event::Check);
-        let busy = ModelError::transient("busy");
-        let busy = StepError::Model(busy);
-        let reason = busy.to_string();
-        let wait = Duration::from_secs(2);
-        let retried = Event::Retry {
-            reason: &reason,
-            wait,
-        };
-        translator.translate(retried);
-        let check = Check {
-            verdict: Verdict::Blocked,
-            reason: "needs the database password".to_owned(),
-            usage: Usage::default(),
-        };
-        translator.translate(Event::CheckEnd(Ok(&check)));
-        let answered = AgentStep {
-            usage: metered(100, 30),
-            used: Some(130),
-            ..replied("Wrote the café notes.")
-        };
-        translator.translate(Event::StepEnd(&answered));
-
-        // The answer's estimate stands until the step ends because only the check was retried
-        let messages = drained(&mut sent);
-        assert_eq!(messages.len(), 6, "{messages:?}");
-        let estimated = json!({
-            "sessionUpdate": "usage_update",
-            "used": 107,
-            "size": 1000,
-            "_meta": { "estimatedOutput": 7 },
-        });
-        assert_eq!(messages[0]["params"]["update"], estimated);
-        let started = &messages[2]["params"]["update"];
-        assert_eq!(
-            (&started["title"], &started["status"]),
-            (&json!("Check goal"), &json!("in_progress"))
-        );
-        let notice = json!({
-            "sessionId": "session-1",
-            "text": "model: busy",
-            "retryIn": 2.0,
-            "step": true,
-            "unsaved": false,
-        });
-        assert_eq!(messages[3]["params"], notice);
-        let ended = &messages[4]["params"]["update"];
-        assert_eq!(ended["status"], "failed");
-        let text = &ended["content"][0]["content"]["text"];
-        assert_eq!(text, "blocked: needs the database password");
-        let usage = &messages[5]["params"]["update"];
-        assert_eq!(usage["used"], 130, "{usage}");
-    }
-
     /// A step the model failed doesn't count, so it sends no usage
     #[test]
     fn failed_step_quiet() {
@@ -1200,69 +1083,13 @@ mod tests {
         assert_eq!(messages[2]["params"]["text"], "model: connection dropped");
     }
 
-    #[test]
-    fn goal_replayed() {
-        let task = TaskStep {
-            carried: vec!["Add tests too".to_owned()],
-            ..asked("Fix the parser", true)
-        };
-        let check = Check {
-            verdict: Verdict::Unmet,
-            reason: "the tests were not run".to_owned(),
-            usage: metered(50, 5),
-        };
-        let answered = AgentStep {
-            usage: metered(100, 20),
-            used: Some(120),
-            check: Some(check),
-            ..replied("Fixed.")
-        };
-        let memory = AgentMemory {
-            steps: vec![
-                MemoryStep::Task(task),
-                MemoryStep::Action(Box::new(answered)),
-            ],
-        };
-        let updates = replayed(&memory);
-        let kinds: Vec<&Value> = updates
-            .iter()
-            .map(|update| &update["sessionUpdate"])
-            .collect();
-        let expected = [
-            "user_message_chunk",
-            "agent_message_chunk",
-            "tool_call",
-            "tool_call_update",
-            "usage_update",
-        ];
-        assert_eq!(kinds, expected, "{updates:?}");
-        assert_eq!(updates[0]["_meta"]["_smol/goal"], true);
-        assert_eq!(updates[0]["content"]["text"], "Fix the parser");
-
-        let checking = &updates[2];
-        assert_eq!(checking["title"], "Check goal");
-        assert_eq!(
-            (&checking["kind"], &checking["status"]),
-            (&json!("think"), &json!("in_progress"))
-        );
-        let checked = &updates[3];
-        assert_eq!(checked["status"], "completed");
-        let text = &checked["content"][0]["content"]["text"];
-        assert_eq!(text, "not met: the tests were not run");
-
-        let usage = &updates[4];
-        assert_eq!(usage["used"], 120);
-        assert_eq!(usage["_meta"]["inputTokens"], 150);
-        assert_eq!(usage["_meta"]["outputTokens"], 25);
-    }
-
     /// The client keeps user chunks with the same message id in one message
     #[test]
     fn tasks_replayed() {
         let memory = AgentMemory {
             steps: vec![
-                MemoryStep::Task(asked("Fix the café parser", false)),
-                MemoryStep::Update(asked("Add tests too", false)),
+                MemoryStep::Task(asked("Fix the café parser")),
+                MemoryStep::Update(asked("Add tests too")),
             ],
         };
         let updates = replayed(&memory);
@@ -1274,55 +1101,6 @@ mod tests {
         assert_eq!(update["messageId"], "task_2");
         assert_eq!(update["_meta"], json!({ "_smol/update": true }));
         assert_eq!(update["content"]["text"], "Add tests too");
-    }
-
-    /// A step whose goal check reached no verdict replays as it ran live,
-    /// with usage marked by how the turn stopped
-    #[test]
-    fn unchecked_replayed() {
-        let broken = ModelError::new("http 500: internal error");
-        let broken = StepError::Model(broken);
-        let said = broken.to_string();
-        let failed = Unchecked::Failed(said);
-        let cases = [
-            (broken, failed, "failed"),
-            (
-                StepError::Interrupted,
-                Unchecked::Interrupted,
-                "interrupted",
-            ),
-        ];
-        for (error, unchecked, stopped) in cases {
-            let answered = AgentStep {
-                usage: metered(100, 10),
-                unchecked: Some(unchecked),
-                ..replied("Wrote notes.txt.")
-            };
-            let (mut live, mut sent) = translator(1000);
-            live.translate(Event::Text("Wrote notes.txt."));
-            live.translate(Event::Check);
-            live.translate(Event::CheckEnd(Err(&error)));
-            live.translate(Event::StepEnd(&answered));
-            let told = drained(&mut sent);
-
-            let memory = AgentMemory {
-                steps: vec![MemoryStep::Action(Box::new(answered))],
-            };
-            let (mut replaying, mut sent) = translator(1000);
-            replaying.replay(&memory);
-            let again = drained(&mut sent);
-            assert_eq!(shown(&again), shown(&told));
-
-            let checking = &again[1]["params"]["update"];
-            assert_eq!(checking["title"], "Check goal");
-            let checked = &again[2]["params"]["update"];
-            assert_eq!(checked["status"], "failed");
-            let text = &checked["content"][0]["content"]["text"];
-            let error = error.to_string();
-            assert_eq!(text, error.as_str());
-            let usage = &again[3]["params"]["update"];
-            assert_eq!(usage["_meta"][stopped], true, "{usage}");
-        }
     }
 
     #[test]

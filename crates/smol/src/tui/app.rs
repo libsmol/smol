@@ -1,4 +1,4 @@
-use crate::chat::{opens_mention, resolved, List, Output, Session, NO_GOAL};
+use crate::chat::{opens_mention, resolved, List, Output, Session};
 use crate::client::{models, McpState, Pick};
 use crate::tui::render::Target;
 use crate::tui::select::{self, Point, Selection};
@@ -25,7 +25,6 @@ const RESUME_PREFIX: &str = ":resume ";
 const MODEL_PREFIX: &str = ":model ";
 const MCP_PREFIX: &str = ":mcp ";
 const SHELL_USAGE: &str = "!<command>";
-const NOTHING_RESUMED: &str = "goal: nothing to resume";
 const MAX_UNFOLDED_LINES: usize = 5;
 /// On Windows, characters typed with AltGr carry Ctrl and Alt
 const ALTGR: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::ALT);
@@ -126,10 +125,6 @@ impl Choice {
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     New,
-    ShowGoal,
-    Goal(String),
-    ResumeGoal,
-    ClearGoal,
     List(List),
     Resume(String),
     Model(String),
@@ -153,14 +148,9 @@ impl Command {
             return None;
         }
 
-        // A multi-line goal often starts on a new line right after the command
         let (name, arg) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
         let parsed = match (name, arg.trim()) {
             (":new", "") => Some(Self::New),
-            (":goal", "") => Some(Self::ShowGoal),
-            (":goal", "resume") => Some(Self::ResumeGoal),
-            (":goal", "clear") => Some(Self::ClearGoal),
-            (":goal", goal) => Some(Self::Goal(goal.to_owned())),
             (":resume", "") => Some(Self::List(List::Sessions)),
             (":resume", id) => Some(Self::Resume(id.to_owned())),
             (":model", "") => Some(Self::List(List::Models)),
@@ -205,14 +195,10 @@ impl Hint {
     }
 }
 
-const HINTS: [Hint; 6] = [
+const HINTS: [Hint; 5] = [
     Hint {
         usage: ":new",
         summary: "start a new session",
-    },
-    Hint {
-        usage: ":goal <goal|resume|clear>",
-        summary: "keep working until the goal is met",
     },
     Hint {
         usage: ":resume <session>",
@@ -307,25 +293,13 @@ impl App {
 
     pub(crate) fn submit_text(&mut self, text: &str) {
         let Some(command) = Command::parse(text) else {
-            return self.send(text, false);
+            return self.send(text);
         };
 
         // A queued command may run while a draft sits in the input box,
         // and then the list goes into the transcript
         let drafting = !self.draft().is_empty();
         let result = match &command {
-            Command::Goal(goal) => return self.send(goal, true),
-            Command::ResumeGoal => {
-                let Some(goal) = self.session.goal.clone() else {
-                    return self.failure(NOTHING_RESUMED);
-                };
-                return self.send(&goal.objective, true);
-            }
-            Command::ShowGoal => match self.session.goal.clone() {
-                Some(goal) => return self.transcript.push(Entry::Goal(goal)),
-                None => Ok(NO_GOAL.to_owned()),
-            },
-            Command::ClearGoal => self.session.clear_goal(),
             Command::List(list) if drafting => self.session.list(*list),
             Command::List(List::Sessions) => return self.complete(RESUME_PREFIX),
             Command::List(List::Models) if models(&self.session.options).is_empty() => {
@@ -378,10 +352,10 @@ impl App {
         }
     }
 
-    fn send(&mut self, task: &str, goal: bool) {
-        self.transcript.task(task, goal);
+    fn send(&mut self, task: &str) {
+        self.transcript.task(task);
         self.begin();
-        self.session.prompt(task, goal);
+        self.session.prompt(task);
     }
 
     fn begin(&mut self) {
@@ -650,8 +624,7 @@ impl App {
 
     pub(crate) fn pump(&mut self) {
         let mut changed = false;
-        // Goal status reported after the turn shows first,
-        // and queued messages go out only once every output is drained
+        // Queued messages go out only once every output is drained
         let mut finished = false;
         while let Some(outputs) = self.session.poll() {
             self.dirty = true;
@@ -1060,7 +1033,7 @@ impl App {
         self.set_input("");
         self.pastes.clear();
 
-        let waits = self.run.is_some() && command != Some(Command::ShowGoal);
+        let waits = self.run.is_some();
         match waits {
             true => self.queued.push_back(text),
             false => self.submit_text(&text),
@@ -1292,7 +1265,7 @@ fn hints(input: &str) -> Vec<&'static Hint> {
 
 #[cfg(test)]
 mod tests {
-    use crate::client::{Goal, GoalStatus, McpStatus};
+    use crate::client::McpStatus;
     use crate::tui::app::*;
     use crate::tui::tests::{app, draw, fill};
     use crate::tui::{theme, ui, ACCENT};
@@ -1497,33 +1470,20 @@ mod tests {
     }
 
     #[test]
-    fn goal_hint_runs() {
+    fn hints_run() {
         let mut app = app();
-        let objective = "fix the parser".to_owned();
-        let status = GoalStatus::Paused;
-        let updates = vec!["add the missing tests".to_owned()];
-        app.session.goal = Some(Goal {
-            objective,
-            status,
-            updates,
-        });
-        for typed in ":go".chars() {
-            key(&mut app, KeyCode::Char(typed));
-        }
-        key(&mut app, KeyCode::Enter);
-        let expected = [
-            "",
-            "  goal · paused · 1 update",
-            "  fix the parser",
-            "  ╰ add the missing tests",
-        ];
-        assert_eq!(shown(&mut app), expected);
-
         for typed in ":mo".chars() {
             key(&mut app, KeyCode::Char(typed));
         }
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.input.lines(), [":model "]);
+
+        app.set_input("");
+        for typed in ":qu".chars() {
+            key(&mut app, KeyCode::Char(typed));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert!(app.quit);
     }
 
     #[test]
@@ -1776,63 +1736,6 @@ mod tests {
     }
 
     #[test]
-    fn goal_sent() {
-        let mut app = app();
-        let submit = |app: &mut App, text: &str| {
-            app.set_input(text);
-            key(app, KeyCode::Enter);
-        };
-        submit(&mut app, ":goal resume");
-        submit(&mut app, ":goal fix the parser");
-        settle(&mut app, |app| app.run.is_none());
-
-        assert_eq!(app.transcript.sent(), [":goal fix the parser"]);
-        let goal = app.session.goal.as_ref().map(|goal| goal.status);
-        assert_eq!(goal, Some(GoalStatus::Complete));
-        submit(&mut app, ":goal");
-        let expected = [
-            "",
-            "✗ goal: nothing to resume",
-            "",
-            "❯ goal · fix the parser",
-            "",
-            "◆ goal",
-            "  1.0s",
-            "",
-            "  goal: complete",
-            "",
-            "  goal · complete · 1 update",
-            "  fix the parser",
-            "  ╰ add the missing tests",
-        ];
-        assert_eq!(shown(&mut app), expected);
-
-        submit(&mut app, ":goal resume");
-        assert!(app.run.is_some());
-        submit(&mut app, ":goal");
-        assert!(app.queued.is_empty());
-        settle(&mut app, |app| app.run.is_none());
-        submit(&mut app, ":goal clear");
-        settle(&mut app, |app| app.session.goal.is_none());
-        submit(&mut app, ":goal clear");
-        let shown = shown(&mut app);
-        assert_eq!(shown.last().map(String::as_str), Some("  no goal"));
-    }
-
-    #[test]
-    fn goal_before_queued() {
-        let mut app = app();
-        app.submit_text(":goal fix the parser");
-        app.queued.push_back("next task".to_owned());
-        settle(&mut app, |app| app.queued.is_empty());
-
-        let shown = shown(&mut app);
-        let settled = shown.iter().position(|row| row == "  goal: complete");
-        let next = shown.iter().position(|row| row == "❯ next task");
-        assert!(settled.is_some() && settled < next, "{shown:?}");
-    }
-
-    #[test]
     fn path_completions() {
         let text = |path| match Choice::path(path, 1).completion {
             Completion::Mention { text, .. } | Completion::Input(text) => text,
@@ -2030,15 +1933,6 @@ mod tests {
         let resume = Command::parse(":resume  abc-123 ");
         assert_eq!(resume, Some(Command::Resume("abc-123".to_owned())));
         assert_eq!(Command::parse(":quit"), Some(Command::Quit));
-        let goal = Command::parse(":goal fix the parser, all tests pass ");
-        let text = "fix the parser, all tests pass".to_owned();
-        assert_eq!(goal, Some(Command::Goal(text)));
-        assert_eq!(Command::parse(":goal  "), Some(Command::ShowGoal));
-        assert_eq!(Command::parse(":goal resume"), Some(Command::ResumeGoal));
-        assert_eq!(Command::parse(":goal clear"), Some(Command::ClearGoal));
-        let lines = Command::parse(":goal\nfirst line\nsecond line");
-        let text = "first line\nsecond line".to_owned();
-        assert_eq!(lines, Some(Command::Goal(text)));
 
         let models = Some(Command::List(List::Models));
         assert_eq!(Command::parse(":model"), models);
@@ -2065,11 +1959,15 @@ mod tests {
             assert_eq!(Command::parse(line), mcp, "{line}");
         }
 
-        let commands = ":new, :goal <goal|resume|clear>, :resume <session>, :model <name>, :mcp <on|off> <server>, :quit, !<command>";
+        let commands =
+            ":new, :resume <session>, :model <name>, :mcp <on|off> <server>, :quit, !<command>";
         for name in [":help", ":", ":)"] {
             let unknown = format!("command: {name}: unknown (commands: {commands})");
             assert_eq!(Command::parse(name), usage(&unknown), "{name}");
         }
+        let goal = format!("command: :goal: unknown (commands: {commands})");
+        let parsed = Command::parse(":goal fix the café parser");
+        assert_eq!(parsed, usage(&goal));
     }
 
     #[test]
@@ -2079,7 +1977,7 @@ mod tests {
             found.iter().map(|hint| hint.name()).collect::<Vec<_>>()
         };
 
-        let all = [":new", ":goal", ":resume", ":model", ":mcp", ":quit"];
+        let all = [":new", ":resume", ":model", ":mcp", ":quit"];
         assert_eq!(names(":"), all);
         assert_eq!(names(":res"), [":resume"]);
         assert_eq!(names(":m"), [":model", ":mcp"]);

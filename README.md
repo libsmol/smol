@@ -33,7 +33,7 @@ A real run with DeepSeek on smol's own source:
 - **Standard ACP.** `libsmol` speaks the
   [Agent Client Protocol](https://agentclientprotocol.com), so Zed or any other
   ACP client can drive it; `smol` is just one such client. The few extras that
-  ACP has no message for (goals, `!` commands, queued updates) use `_smol/`
+  ACP has no message for (`!` commands, queued updates) use `_smol/`
   extensions, which other clients ignore as the protocol requires.
 
 > [!WARNING]
@@ -153,7 +153,6 @@ Run `smol` in the directory you want to work in, then type a task.
 
 | Command | What it does |
 | --- | --- |
-| `:goal <text>` | Keep working until a checker agrees the goal is met, or decides it needs something only you can give. `:goal` shows it, `:goal resume` continues, `:goal clear` drops it. |
 | `:new` | Start a new session (re-reads the configuration). |
 | `:resume <session>` | Resume an earlier session. `:resume` lists them. |
 | `:model <name>` | Switch the model. `:model` lists them. |
@@ -303,8 +302,8 @@ as diagnostics, are passed on as well.
 `libsmol` writes a log to `~/.smol/logs/libsmol.<date>.log`, one file
 per day (UTC) with the last 5 kept. It records the program starting and
 exiting, sessions opening and closing, each step's tool calls, tokens and
-duration, retries, interrupts, compaction, goal verdicts, Python restarts, MCP
-connections, failures and crashes. It does not record your prompts, the
+duration, retries, interrupts, compaction, Python restarts, MCP connections,
+failures and crashes. It does not record your prompts, the
 model's replies, code, program output, shell commands or keys; an error message
 may quote the first words of a reply the model got wrong. Times are UTC, and
 lines from a session carry its id:

@@ -1,9 +1,7 @@
 use crate::client::{McpState, McpStatus};
 use crate::tui::app::App;
 use crate::tui::render::wrap_ranges;
-use crate::tui::{
-    goal_color, in_out, kilo, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG,
-};
+use crate::tui::{in_out, kilo, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG};
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -19,7 +17,6 @@ const SIDEBAR_WIDTH: u16 = 32;
 const MIN_WIDE_SCREEN: u16 = 100;
 const MAX_INPUT_ROWS: usize = 10;
 const MAX_CHOICE_ROWS: usize = 10;
-const MAX_GOAL_ROWS: usize = 2;
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SPIN_EVERY: Duration = Duration::from_millis(80);
 const PINK: Style = Style::new().fg(theme::PINK);
@@ -80,10 +77,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                 None => "?%".to_owned(),
             };
             usage += &format!(" · context {share}");
-        }
-
-        if let Some(goal) = &app.session.goal {
-            usage += &format!(" · goal {}", goal.status);
         }
 
         // Startup failures are not reported in the conversation,
@@ -155,19 +148,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             context,
             bar,
         ];
-
-        if let Some(goal) = &app.session.goal {
-            let section = heading("goal");
-            let color = goal_color(goal.status);
-            let style = Style::new().fg(color);
-            let state = goal.status.to_string();
-            let state = Span::styled(state, style);
-            let header = spread(section.spans, vec![state], width);
-            lines.extend([Line::default(), header]);
-            for line in clipped(&goal.objective, width, MAX_GOAL_ROWS) {
-                lines.push(Line::raw(line));
-            }
-        }
 
         if !app.session.mcp.is_empty() {
             let section = heading("mcp");

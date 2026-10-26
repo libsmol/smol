@@ -1,12 +1,11 @@
 use crate::chat::Session;
-use crate::client::GoalStatus;
 use crate::tui::app::{pasted, App};
 use crate::tui::screen::Screen;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use std::env;
 use std::io::stdout;
 use std::time::{Duration, Instant};
@@ -78,15 +77,6 @@ pub(crate) fn kilo(n: u64) -> String {
         false => &value,
     };
     format!("{value}{unit}")
-}
-
-pub(crate) fn goal_color(status: GoalStatus) -> Color {
-    match status {
-        GoalStatus::Active => theme::PURPLE,
-        GoalStatus::Paused => theme::YELLOW,
-        GoalStatus::Blocked => theme::RED,
-        GoalStatus::Complete => theme::GREEN,
-    }
 }
 
 pub(crate) fn run(

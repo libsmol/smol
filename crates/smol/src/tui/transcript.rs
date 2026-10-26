@@ -1,7 +1,7 @@
-use crate::client::{Goal, Notice, Refused, GOAL, SHELL, UPDATE};
+use crate::client::{Notice, Refused, SHELL, UPDATE};
 use crate::tui::render::{Render, Row};
 use agent_client_protocol_schema::v1::{
-    ContentBlock, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus, ToolKind,
+    ContentBlock, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
 };
 use anyhow::Result;
 use serde_json::Value;
@@ -11,10 +11,9 @@ use std::time::{Duration, Instant};
 pub(crate) enum Entry {
     Info(String),
     Failure(String),
-    Task { text: String, goal: bool },
+    Task(String),
     Step(Step),
     Shell(Shell),
-    Goal(Goal),
 }
 
 pub(crate) struct Shell {
@@ -105,14 +104,12 @@ pub(crate) struct Transcript {
     /// The task or latest step that this turn may still change, and the entries after it
     held: Vec<Entry>,
     live: Option<Step>,
-    /// Updates received before the step ended, placed after it
-    amended: Vec<Entry>,
     stats: Stats,
     rows: Vec<Row>,
     /// Where the first row of each laid-out entry in `entries` sits in `rows`
     starts: Vec<usize>,
     held_rows: Vec<Row>,
-    /// Anything that touches `held`, `live` or `amended` must set this
+    /// Anything that touches `held` or `live` must set this
     changed: bool,
     layout: (u16, bool),
     task_id: Option<String>,
@@ -138,23 +135,18 @@ impl Transcript {
         }
     }
 
-    pub(crate) fn task(&mut self, text: &str, goal: bool) {
+    pub(crate) fn task(&mut self, text: &str) {
         self.changed = true;
         self.finish_turn(Outcome::Answered);
         self.stats.turns += 1;
         let text = text.to_owned();
-        self.held.push(Entry::Task { text, goal });
+        self.held.push(Entry::Task(text));
         self.task_id = None;
     }
 
     pub(crate) fn amend(&mut self, text: &str) {
-        self.changed = true;
         let text = text.to_owned();
-        let entry = Entry::Task { text, goal: false };
-        match self.live {
-            Some(_) => self.amended.push(entry),
-            None => self.push(entry),
-        }
+        self.push(Entry::Task(text));
         self.task_id = None;
     }
 
@@ -164,7 +156,7 @@ impl Transcript {
     }
 
     pub(crate) fn unstarted(&self) -> bool {
-        let asked = matches!(self.held[..], [Entry::Task { .. }]);
+        let asked = matches!(self.held[..], [Entry::Task(_)]);
         asked && self.live.is_none()
     }
 
@@ -183,10 +175,9 @@ impl Transcript {
 
     pub(crate) fn sent(&self) -> Vec<String> {
         let mut sent: Vec<String> = Vec::new();
-        for entry in self.entries.iter().chain(&self.held).chain(&self.amended) {
+        for entry in self.entries.iter().chain(&self.held) {
             let text = match entry {
-                Entry::Task { text, goal: true } => format!(":goal {}", text.trim()),
-                Entry::Task { text, goal: false } => text.trim().to_owned(),
+                Entry::Task(text) => text.trim().to_owned(),
                 Entry::Shell(shell) => format!("! {}", shell.command),
                 _ => continue,
             };
@@ -214,15 +205,14 @@ impl Transcript {
                 let id = chunk.message_id.as_ref().map(|id| id.0.to_string());
                 let meta = chunk.meta.as_ref();
                 let amends = meta.is_some_and(|meta| meta.contains_key(UPDATE));
-                let goal = meta.is_some_and(|meta| meta.contains_key(GOAL));
                 match (&self.live, self.held.last_mut()) {
-                    (None, Some(Entry::Task { text: task, .. })) if id == self.task_id => {
+                    (None, Some(Entry::Task(task))) if id == self.task_id => {
                         task.push_str(&text);
                     }
                     _ => {
                         match amends {
                             true => self.amend(&text),
-                            false => self.task(&text, goal),
+                            false => self.task(&text),
                         }
                         self.task_id = id;
                     }
@@ -315,10 +305,8 @@ impl Transcript {
 
                 let flag = |key: &str| get(key).and_then(Value::as_bool).unwrap_or(false);
                 let mut step = self.live.take().unwrap_or_default();
-                // A replayed turn has no stop reason,
-                // which leaves this as the only sign of an interrupt or a failed goal check
+                // A replayed turn has no stop reason, which leaves this as the only sign of an interrupt
                 step.interrupted = flag("interrupted");
-                step.failed = flag("failed");
                 step.stats = Some(stats);
                 self.hold(step);
                 return true;
@@ -334,7 +322,6 @@ impl Transcript {
     fn hold(&mut self, step: Step) {
         self.entries.append(&mut self.held);
         self.held.push(Entry::Step(step));
-        self.held.append(&mut self.amended);
     }
 
     pub(crate) fn notice(&mut self, notice: &Notice) {
@@ -344,7 +331,7 @@ impl Transcript {
             let wait = Duration::from_secs_f64(seconds);
             self.retry_at = Some(Instant::now() + wait);
 
-            // An open call means compaction or the goal check is retrying its request,
+            // An open call means compaction is retrying its request,
             // otherwise the step is retried and the failed reply is discarded
             let step = self.live.get_or_insert_default();
             if let Some(Item::Call(call)) = step.items.last_mut() {
@@ -362,7 +349,7 @@ impl Transcript {
 
         // A notice arriving after a step ends doesn't belong to the next one,
         // and counting it there would displace the answer
-        let asked = matches!(self.held.last(), Some(Entry::Task { .. }));
+        let asked = matches!(self.held.last(), Some(Entry::Task(_)));
         if self.live.is_none() && !asked && !notice.step {
             return self.push(Entry::Failure(text));
         }
@@ -379,11 +366,10 @@ impl Transcript {
         }
 
         if let Some(Entry::Step(step)) = self.held.first_mut() {
-            // A replayed turn that stopped at this step has no answer either
-            let stopped = step.interrupted || step.failed;
+            // A replayed turn interrupted at this step has no answer either
             match outcome {
                 Outcome::Cancelled => step.interrupted = true,
-                Outcome::Answered if !stopped => step.mark_answer(),
+                Outcome::Answered if !step.interrupted => step.mark_answer(),
                 Outcome::Answered | Outcome::Failed => {}
             }
         }
@@ -424,7 +410,7 @@ impl Transcript {
         }
         self.finish_turn(Outcome::Failed);
 
-        // Compaction or the goal check in the turn's last step may have shown this error already
+        // Compaction in the turn's last step may have shown this error already
         let mut last = None;
         for entry in self.entries.iter().rev() {
             match entry {
@@ -432,7 +418,7 @@ impl Transcript {
                     last = Some(step);
                     break;
                 }
-                Entry::Task { .. } => break,
+                Entry::Task(_) => break,
                 _ => {}
             }
         }
@@ -486,9 +472,6 @@ impl Transcript {
             if let Some(step) = &self.live {
                 render.step(step);
             }
-            for entry in &self.amended {
-                render.entry(entry);
-            }
             self.held_rows = render.rows;
         }
 
@@ -516,8 +499,6 @@ pub(crate) struct Step {
     pub(crate) items: Vec<Item>,
     pub(crate) stats: Option<StepStats>,
     pub(crate) interrupted: bool,
-    /// The goal check failed and the turn stopped at this step
-    pub(crate) failed: bool,
 }
 
 #[derive(Debug)]
@@ -535,16 +516,15 @@ pub(crate) struct Retry {
 }
 
 /// Code is in the first block and the error of a failed call in the last,
-/// while compaction and goal check calls have no code
+/// while compaction calls have no code
 #[derive(Debug)]
 pub(crate) struct Call {
     pub(crate) id: String,
     pub(crate) title: String,
-    pub(crate) kind: ToolKind,
     pub(crate) status: ToolCallStatus,
     pub(crate) content: Vec<String>,
     pub(crate) attachments: Vec<Attachment>,
-    /// Retries of the request that compaction or the goal check makes
+    /// Retries of the request that compaction makes
     pub(crate) retries: Vec<Retry>,
 }
 
@@ -614,7 +594,6 @@ impl Step {
                 let call = Call {
                     id: call.tool_call_id.0.to_string(),
                     title: call.title.clone(),
-                    kind: call.kind,
                     status: call.status,
                     content,
                     attachments,
@@ -664,15 +643,10 @@ impl Step {
         }
     }
 
-    /// The answer follows the last call or notice, ignoring trailing goal check `think` calls
+    /// The answer follows the last call or notice
     fn answer_start(&self) -> usize {
-        let checked =
-            |item: &&Item| matches!(item, Item::Call(call) if call.kind == ToolKind::Think);
-        let trailing = self.items.iter().rev().take_while(checked).count();
-        let replied = &self.items[..self.items.len() - trailing];
-
         let block = |item: &Item| matches!(item, Item::Call(_) | Item::Notice(_));
-        let found = replied.iter().rposition(block);
+        let found = self.items.iter().rposition(block);
         found.map_or(0, |index| index + 1)
     }
 }
@@ -741,10 +715,9 @@ fn fenced(text: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use crate::tui::transcript::*;
-    use crate::tui::{DIM, RED};
     use agent_client_protocol_schema::v1::{
         ContentChunk, MessageId, Meta, ResourceLink, ToolCall, ToolCallUpdate,
-        ToolCallUpdateFields, UsageUpdate,
+        ToolCallUpdateFields, ToolKind, UsageUpdate,
     };
     use anyhow::anyhow;
     use serde_json::json;
@@ -801,7 +774,7 @@ mod tests {
     #[test]
     fn retries_folded() {
         let mut transcript = Transcript::default();
-        transcript.task("Hello", false);
+        transcript.task("Hello");
         let reply = message("Half done");
         transcript.update(&reply);
         transcript.notice(&retrying("model: busy: req_1"));
@@ -824,49 +797,10 @@ mod tests {
     }
 
     #[test]
-    fn check_retry_inside() {
-        let mut transcript = Transcript::default();
-        transcript.task("Write notes.txt", true);
-        transcript.update(&message("Wrote notes.txt."));
-        let checking = ToolCall::new("call_1", "Check goal")
-            .kind(ToolKind::Think)
-            .status(ToolCallStatus::InProgress);
-        transcript.update(&SessionUpdate::ToolCall(checking));
-        for error in [
-            "http 429: rate limited",
-            "http 500: internal error",
-            "http 500: internal error",
-        ] {
-            let text = format!("model: {error}");
-            transcript.notice(&retrying(&text));
-        }
-        let met = ToolCallUpdateFields::new()
-            .status(ToolCallStatus::Completed)
-            .content(vec![content("met")]);
-        let met = ToolCallUpdate::new("call_1", met);
-        transcript.update(&SessionUpdate::ToolCallUpdate(met));
-        end_step(&mut transcript, 10, 1);
-        transcript.finish_turn(Outcome::Answered);
-
-        let expected = [
-            "",
-            "❯ goal · Write notes.txt",
-            "",
-            "◆ Wrote notes.txt.",
-            "  ⚙ Check goal",
-            "  ↻ model: http 429: rate limited",
-            "  ↻ model: http 500: internal error ×2",
-            "  ╰ met",
-            "  0.2s · ⇡10 ⇣1 · 2 t/s",
-        ];
-        assert_eq!(rows(&mut transcript), expected);
-    }
-
-    #[test]
     fn notice_survives_retry() {
         let restart = "python: restarted, variables lost";
         let started = |transcript: &mut Transcript| {
-            transcript.task("Read the orders", false);
+            transcript.task("Read the orders");
             let restarted = Notice {
                 step: true,
                 ..told(restart)
@@ -911,67 +845,9 @@ mod tests {
     }
 
     #[test]
-    fn unchecked_replayed() {
-        let cases = [
-            ("failed", "model: http 500: internal error", RED),
-            ("interrupted", "interrupted", DIM),
-        ];
-        for (stopped, error, style) in cases {
-            let answered = |transcript: &mut Transcript| {
-                transcript.task("Write todo.txt", true);
-                transcript.update(&message("Wrote todo.txt."));
-                let checking = ToolCall::new("call_1", "Check goal")
-                    .kind(ToolKind::Think)
-                    .status(ToolCallStatus::InProgress);
-                transcript.update(&SessionUpdate::ToolCall(checking));
-                let failed = ToolCallUpdateFields::new()
-                    .status(ToolCallStatus::Failed)
-                    .content(vec![content(error)]);
-                let failed = ToolCallUpdate::new("call_1", failed);
-                transcript.update(&SessionUpdate::ToolCallUpdate(failed));
-                let mut meta = Meta::new();
-                meta.insert("duration".to_owned(), json!(0.25));
-                meta.insert(stopped.to_owned(), json!(true));
-                let usage = UsageUpdate::new(110, 1000).meta(meta);
-                transcript.update(&SessionUpdate::UsageUpdate(usage));
-            };
-
-            let mut live = Transcript::default();
-            answered(&mut live);
-            let ended = match stopped {
-                "failed" => Err(anyhow!("{error}")),
-                _ => Ok(StopReason::Cancelled),
-            };
-            live.done(ended);
-            // On replay both the next task and opening the session finish the turn as answered
-            let mut replayed = Transcript::default();
-            answered(&mut replayed);
-            replayed.finish_turn(Outcome::Answered);
-
-            let marked = format!("  ✗ {error}");
-            let expected = [
-                "",
-                "❯ goal · Write todo.txt",
-                "",
-                "  Wrote todo.txt.",
-                "  ⚙ Check goal",
-                &marked,
-                "  0.2s",
-            ];
-            for transcript in [&mut live, &mut replayed] {
-                let rows = transcript.rows(40, false);
-                let texts: Vec<String> = rows.iter().map(|row| row.line.to_string()).collect();
-                assert_eq!(texts, expected);
-                let mark = rows.get(5).map(|row| row.line.spans[0].style);
-                assert_eq!(mark, Some(style), "{stopped}");
-            }
-        }
-    }
-
-    #[test]
     fn failure_shown_once() {
         let mut transcript = Transcript::default();
-        transcript.task("Count the lines", false);
+        transcript.task("Count the lines");
         let compacting = ToolCall::new("call_1", "Compact context")
             .kind(ToolKind::Think)
             .status(ToolCallStatus::InProgress);
@@ -1010,7 +886,7 @@ mod tests {
         let closed = ToolCallUpdate::new("call_1", closed);
 
         let mut transcript = Transcript::default();
-        transcript.task("Read the menu", false);
+        transcript.task("Read the menu");
         transcript.update(&SessionUpdate::ToolCall(started));
         transcript.update(&SessionUpdate::ToolCallUpdate(closed));
         transcript.notice(&retrying("model: http 503: busy"));
@@ -1042,7 +918,7 @@ mod tests {
         let finished = ToolCallUpdate::new("call_1", finished);
 
         let mut transcript = Transcript::default();
-        transcript.task("Check it", false);
+        transcript.task("Check it");
         transcript.update(&SessionUpdate::ToolCall(started));
         transcript.update(&SessionUpdate::ToolCallUpdate(finished));
         end_step(&mut transcript, 10, 1);
@@ -1079,8 +955,8 @@ mod tests {
         transcript.update(&user("second", Some("task_2")));
         transcript.update(&user("old ", None));
         transcript.update(&user("chunks", None));
-        transcript.task("second", false);
-        transcript.task("now", false);
+        transcript.task("second");
+        transcript.task("now");
 
         let expected = ["first part", "second", "old chunks", "second", "now"];
         assert_eq!(transcript.sent(), expected);
@@ -1089,28 +965,13 @@ mod tests {
     #[test]
     fn repeats_sent_once() {
         let mut transcript = Transcript::default();
-        transcript.task("Run the tests", false);
-        transcript.task("Run the tests\n", false);
-        transcript.task("Fix the café menu", false);
-        transcript.task("Run the tests", false);
+        transcript.task("Run the tests");
+        transcript.task("Run the tests\n");
+        transcript.task("Fix the café menu");
+        transcript.task("Run the tests");
 
         let expected = ["Run the tests", "Fix the café menu", "Run the tests"];
         assert_eq!(transcript.sent(), expected);
-    }
-
-    #[test]
-    fn goal_recalled() {
-        let mut transcript = Transcript::default();
-        transcript.task("Fix the parser", true);
-        let flag = (GOAL.to_owned(), json!(true));
-        let meta = Meta::from_iter([flag]);
-        let id = MessageId::new("task_2");
-        let replayed = chunk("All tests pass").message_id(id).meta(meta);
-        transcript.update(&SessionUpdate::UserMessageChunk(replayed));
-
-        let expected = [":goal Fix the parser", ":goal All tests pass"];
-        assert_eq!(transcript.sent(), expected);
-        assert_eq!(rows(&mut transcript)[1], "❯ goal · Fix the parser");
     }
 
     #[test]
@@ -1133,32 +994,24 @@ mod tests {
             "  0.2s · ⇡20 ⇣2 · 4 t/s",
         ];
 
-        // Goal mode takes the update before the step ends
-        for early in [false, true] {
-            let mut transcript = Transcript::default();
-            transcript.task("Do this first", false);
-            transcript.update(&message("Working on it"));
-            if early {
-                transcript.update(&added);
-            }
-            end_step(&mut transcript, 10, 1);
-            if !early {
-                transcript.update(&added);
-            }
-            transcript.update(&message("Done"));
-            end_step(&mut transcript, 20, 2);
-            transcript.finish_turn(Outcome::Answered);
+        let mut transcript = Transcript::default();
+        transcript.task("Do this first");
+        transcript.update(&message("Working on it"));
+        end_step(&mut transcript, 10, 1);
+        transcript.update(&added);
+        transcript.update(&message("Done"));
+        end_step(&mut transcript, 20, 2);
+        transcript.finish_turn(Outcome::Answered);
 
-            assert_eq!(transcript.stats().turns, 1);
-            assert_eq!(transcript.sent(), ["Do this first", "Add one more"]);
-            assert_eq!(rows(&mut transcript), expected, "{early}");
-        }
+        assert_eq!(transcript.stats().turns, 1);
+        assert_eq!(transcript.sent(), ["Do this first", "Add one more"]);
+        assert_eq!(rows(&mut transcript), expected);
     }
 
     #[test]
     fn cancelled_no_answer() {
         let mut transcript = Transcript::default();
-        transcript.task("First", false);
+        transcript.task("First");
         let thought = SessionUpdate::AgentThoughtChunk(chunk("Think it through.\nThen"));
         transcript.update(&thought);
         let reply = message("Working on it");
@@ -1166,7 +1019,7 @@ mod tests {
         // Sent by the agent for the interrupted step
         transcript.notice(&told("interrupted"));
         transcript.finish_turn(Outcome::Cancelled);
-        transcript.task("Second", false);
+        transcript.task("Second");
 
         let expected = [
             "",
@@ -1184,12 +1037,12 @@ mod tests {
     #[test]
     fn failed_no_answer() {
         let mut transcript = Transcript::default();
-        transcript.task("First", false);
+        transcript.task("First");
         let reply = message("Working on it");
         transcript.update(&reply);
         end_step(&mut transcript, 10, 1);
         transcript.finish_turn(Outcome::Failed);
-        transcript.task("Second", false);
+        transcript.task("Second");
 
         let rows = rows(&mut transcript);
         assert_eq!(rows[3], "  Working on it", "{rows:?}");
@@ -1199,7 +1052,7 @@ mod tests {
     fn notice_outside_step() {
         let mut transcript = Transcript::default();
         transcript.notice(&told("Retry later"));
-        transcript.task("Work it out", false);
+        transcript.task("Work it out");
         transcript.notice(&told("Retrying"));
         transcript.update(&message("The answer is 42"));
         end_step(&mut transcript, 10, 1);
@@ -1225,7 +1078,7 @@ mod tests {
     #[test]
     fn step_notice_kept() {
         let mut transcript = Transcript::default();
-        transcript.task("Count the lines", false);
+        transcript.task("Count the lines");
         let reply = message("Counting the first part");
         transcript.update(&reply);
         end_step(&mut transcript, 10, 1);
@@ -1263,7 +1116,7 @@ mod tests {
         let mut transcript = Transcript::default();
         for n in 1..=3 {
             let task = format!("Task {n}");
-            transcript.task(&task, false);
+            transcript.task(&task);
             let lines: Vec<String> = (1..=20)
                 .map(|line| format!("Output {n}, line {line}"))
                 .collect();
@@ -1300,7 +1153,7 @@ mod tests {
     #[test]
     fn transcript_stats() {
         let mut transcript = Transcript::default();
-        transcript.task("Tally", false);
+        transcript.task("Tally");
         end_step(&mut transcript, 10, 1);
         end_step(&mut transcript, 20, 2);
 
@@ -1324,7 +1177,7 @@ mod tests {
     #[test]
     fn estimate_replaced() {
         let mut transcript = Transcript::default();
-        transcript.task("Estimate it", false);
+        transcript.task("Estimate it");
         end_step(&mut transcript, 10, 1);
 
         let meta = json!({ "estimatedOutput": 7 });
@@ -1450,15 +1303,6 @@ mod tests {
             }
         }
         assert_eq!(marked, [false, true]);
-
-        let checked = ToolCall::new("call_2", "Check goal")
-            .kind(ToolKind::Think)
-            .status(ToolCallStatus::Failed)
-            .content(vec![content("not met: the tests were not run")]);
-        step.update(&SessionUpdate::ToolCall(checked));
-        assert_eq!(replied(&step), "The answer is 42.");
-        step.update(&message("Added the tests."));
-        assert_eq!(replied(&step), "Added the tests.");
 
         step.items.push(Item::Notice("Retrying".to_owned()));
         assert_eq!(replied(&step), "");

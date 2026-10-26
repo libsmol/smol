@@ -22,9 +22,6 @@ const NOTICE: &str = "_smol/notice";
 const MCP: &str = "_smol/mcp";
 const QUEUED: &str = "_smol/queued";
 const UPDATE: &str = "_smol/update";
-/// Marks prompts and replayed tasks in `_meta`, and also names the goal state notification
-const GOAL: &str = "_smol/goal";
-const CLEAR_GOAL: &str = "_smol/clear_goal";
 /// Replied to like a prompt, and the tool calls it opens carry the same marker in `_meta`
 const SHELL: &str = "_smol/shell";
 

@@ -1,6 +1,6 @@
 use crate::acp::rpc::{Lines, Out, Peer};
 use crate::acp::session::{self, Message, Opening, Prompt, Shell};
-use crate::acp::{prompt_parts, rfc3339, to_value, App, CLEAR_GOAL, GOAL, QUEUED, SHELL};
+use crate::acp::{prompt_parts, rfc3339, to_value, App, QUEUED, SHELL};
 use crate::config;
 use crate::history::HistoryStore;
 use crate::sandbox;
@@ -236,12 +236,6 @@ impl Handle {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GoalParams {
-    session_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ShellParams {
     session_id: String,
     command: String,
@@ -326,8 +320,6 @@ impl Router {
             m if m == names.session_prompt => {
                 let request: PromptRequest = parsed(params)?;
                 let (text, mentions) = prompt_parts(&request.prompt);
-                let goal = request.meta.as_ref().and_then(|meta| meta.get(GOAL));
-                let goal = goal.and_then(Value::as_bool) == Some(true);
 
                 let session = &request.session_id.0;
                 let turn = self.next_turn(session)?;
@@ -335,7 +327,6 @@ impl Router {
                     id: id.clone(),
                     text,
                     mentions,
-                    goal,
                     turn,
                 };
                 self.send(session, Message::Prompt(prompt))?;
@@ -357,12 +348,6 @@ impl Router {
                 }
                 let response = CloseSessionResponse::new();
                 Some(to_value(response))
-            }
-            CLEAR_GOAL => {
-                let request: GoalParams = parsed(params)?;
-                let session = &request.session_id;
-                self.send(session, Message::ClearGoal(id.clone()))?;
-                None
             }
             SHELL => {
                 let request: ShellParams = parsed(params)?;

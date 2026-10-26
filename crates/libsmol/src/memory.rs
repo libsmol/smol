@@ -85,18 +85,6 @@ pub(crate) struct AgentStep {
     /// The context estimate after this step, computed the same way as for deciding compaction
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) used: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) check: Option<Check>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) unchecked: Option<Unchecked>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Unchecked {
-    /// The error the user saw at the time
-    Failed(String),
-    Interrupted,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -128,21 +116,6 @@ pub(crate) struct CodeResult {
     pub(crate) media: Vec<(String, Media)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Check {
-    pub(crate) verdict: Verdict,
-    pub(crate) reason: String,
-    pub(crate) usage: Usage,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Verdict {
-    Met,
-    Unmet,
-    Blocked,
-}
-
 impl AgentStep {
     pub(crate) fn answer(&self) -> Option<&str> {
         let text = self.text.trim();
@@ -165,11 +138,6 @@ impl Call {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TaskStep {
     pub(crate) text: String,
-    #[serde(default, skip_serializing_if = "Not::not")]
-    pub(crate) goal: bool,
-    /// Updates received earlier for the same goal
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) carried: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) files: Vec<Attachment>,
 }
@@ -248,27 +216,7 @@ pub(crate) enum MemoryStep {
     Action(Box<AgentStep>),
     Summary(SummaryStep),
     Shell(ShellStep),
-    /// The user cleared the goal
-    Cleared,
     Restarted,
-}
-
-/// Also the format of the `_smol/goal` notification
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct Goal {
-    pub(crate) objective: String,
-    pub(crate) status: GoalStatus,
-    pub(crate) updates: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum GoalStatus {
-    /// Only exists during the turn working on it and is never saved
-    Active,
-    Paused,
-    Blocked,
-    Complete,
 }
 
 impl MemoryStep {
@@ -289,7 +237,7 @@ impl MemoryStep {
             }
             MemoryStep::Restarted => return vec![ChatMessage::user(prompt::RESTARTED)],
             MemoryStep::Action(step) => step,
-            MemoryStep::Summary(_) | MemoryStep::Cleared => return Vec::new(),
+            MemoryStep::Summary(_) => return Vec::new(),
         };
 
         let mut messages = Vec::new();
@@ -343,18 +291,6 @@ impl MemoryStep {
             }
         }
 
-        if let Some(check) = &step.check {
-            let reason = &check.reason;
-            let told = match check.verdict {
-                Verdict::Met => None,
-                Verdict::Unmet => Some(prompt::unmet(reason)),
-                Verdict::Blocked => Some(prompt::blocked(reason)),
-            };
-            if let Some(text) = told {
-                messages.push(ChatMessage::user(text));
-            }
-        }
-
         messages
     }
 }
@@ -390,7 +326,6 @@ impl AgentMemory {
                     MemoryStep::Action(_)
                     | MemoryStep::Summary(_)
                     | MemoryStep::Shell(_)
-                    | MemoryStep::Cleared
                     | MemoryStep::Restarted => {}
                 }
             }
@@ -432,7 +367,6 @@ impl AgentMemory {
                 MemoryStep::Task(_)
                 | MemoryStep::Update(_)
                 | MemoryStep::Shell(_)
-                | MemoryStep::Cleared
                 | MemoryStep::Restarted => None,
                 MemoryStep::Action(action) => {
                     let said = !action.text.is_empty() || !action.calls.is_empty();
@@ -464,51 +398,6 @@ impl AgentMemory {
         let conversation = self.conversation(system, window);
         let sent = bytes(&conversation, takes);
         estimate(sent)
-    }
-
-    /// The last goal task sets the goal, everything the user says after it is an update,
-    /// and the last step recorded in its turns sets the status, ignoring unrecorded later failures
-    pub(crate) fn goal(&self) -> Option<Goal> {
-        let mut goal: Option<Goal> = None;
-        let mut working = false;
-        for step in &self.steps {
-            match step {
-                MemoryStep::Task(task) => {
-                    working = task.goal;
-                    if task.goal {
-                        goal = Some(Goal {
-                            objective: task.text.clone(),
-                            status: GoalStatus::Paused,
-                            updates: task.carried.clone(),
-                        });
-                    } else if let Some(goal) = &mut goal {
-                        goal.updates.push(task.text.clone());
-                    }
-                }
-                MemoryStep::Cleared => {
-                    goal = None;
-                    working = false;
-                }
-                MemoryStep::Update(update) => {
-                    if let Some(goal) = &mut goal {
-                        goal.updates.push(update.text.clone());
-                    }
-                }
-                MemoryStep::Action(action) if working => {
-                    let verdict = action.check.as_ref().map(|check| check.verdict);
-                    let status = match verdict {
-                        Some(Verdict::Met) => GoalStatus::Complete,
-                        Some(Verdict::Blocked) => GoalStatus::Blocked,
-                        _ => GoalStatus::Paused,
-                    };
-                    if let Some(goal) = &mut goal {
-                        goal.status = status;
-                    }
-                }
-                _ => {}
-            }
-        }
-        goal
     }
 
     /// Only looks at steps since the last restart
@@ -547,8 +436,7 @@ impl Visible<'_> {
             .iter()
             .any(|step| matches!(step, MemoryStep::Task(_)));
         let task = self.task.filter(|_| !tasked);
-        let task = task.map(|task| prompt::resumed(&task.text, &task.carried));
-        let task = task.as_deref();
+        let task = task.map(|task| task.text.as_str());
 
         // Updates aren't refused when oversized like tasks are,
         // so once they and the task pass half the window only the latest that fit come back
@@ -645,29 +533,27 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn asked(text: &str, goal: bool) -> TaskStep {
+    pub(crate) fn asked(text: &str) -> TaskStep {
         TaskStep {
             text: text.to_owned(),
-            goal,
-            carried: Vec::new(),
             files: Vec::new(),
         }
     }
 
     pub(crate) fn one_task(text: &str) -> AgentMemory {
-        let task = asked(text, false);
+        let task = asked(text);
         AgentMemory {
             steps: vec![MemoryStep::Task(task)],
         }
     }
 
     fn task(text: &str) -> MemoryStep {
-        let asked = asked(text, false);
+        let asked = asked(text);
         MemoryStep::Task(asked)
     }
 
     fn update(text: &str) -> MemoryStep {
-        let asked = asked(text, false);
+        let asked = asked(text);
         MemoryStep::Update(asked)
     }
 
@@ -823,61 +709,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn goal_derived() {
-        let goal = |text: &str| {
-            let carried = vec!["Add tests".to_owned()];
-            let task = TaskStep {
-                carried,
-                ..asked(text, true)
-            };
-            MemoryStep::Task(task)
-        };
-        let checked = |verdict| Check {
-            verdict,
-            reason: String::new(),
-            usage: Usage::default(),
-        };
-        let ran = |verdict: Option<Verdict>| {
-            let check = verdict.map(checked);
-            let step = AgentStep {
-                check,
-                ..AgentStep::default()
-            };
-            MemoryStep::Action(Box::new(step))
-        };
-
-        let mut memory = AgentMemory {
-            steps: vec![
-                MemoryStep::Task(asked("Fix the parser", true)),
-                update("Add tests"),
-                ran(Some(Verdict::Blocked)),
-                goal("Fix the parser"),
-                ran(None),
-                task("Drop the match"),
-                ran(Some(Verdict::Met)),
-                update("Switch to automatic signing"),
-            ],
-        };
-        let updates = ["Add tests", "Drop the match", "Switch to automatic signing"];
-        let expected = Goal {
-            objective: "Fix the parser".to_owned(),
-            status: GoalStatus::Paused,
-            updates: updates.map(str::to_owned).to_vec(),
-        };
-        assert_eq!(memory.goal(), Some(expected));
-        assert_eq!(AgentMemory::default().goal(), None);
-
-        memory.steps.push(MemoryStep::Cleared);
-        assert_eq!(memory.goal(), None);
-        let renewed = MemoryStep::Task(asked("Migrate the database", true));
-        memory.steps.extend([renewed, ran(Some(Verdict::Met))]);
-        let renewed = memory.goal().expect("goal");
-        assert_eq!(renewed.objective, "Migrate the database");
-        assert_eq!(renewed.status, GoalStatus::Complete);
-        assert!(renewed.updates.is_empty());
-    }
-
-    #[test]
     fn context_estimate() {
         let printed = "x".repeat(300);
         let ran = AgentStep {
@@ -950,7 +781,7 @@ pub(crate) mod tests {
         ];
         let task = TaskStep {
             files,
-            ..asked("Look at @src/main.rs", false)
+            ..asked("Look at @src/main.rs")
         };
         let asked = MemoryStep::Task(task);
         let text = "New task:\nLook at @src/main.rs\n\nAttached files:\n\
@@ -989,7 +820,7 @@ pub(crate) mod tests {
         };
         let update = TaskStep {
             files: vec![image, notes],
-            ..asked("Look at this one", false)
+            ..asked("Look at this one")
         };
 
         let asked = MemoryStep::Update(update);

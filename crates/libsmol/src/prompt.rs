@@ -1,8 +1,8 @@
 use crate::code::Added;
 use crate::config::Skill;
 use crate::memory::{
-    exit_code, AgentStep, Call, CallError, Check, Exit, MemoryStep, ShellStep, StepError, TaskStep,
-    Verdict, MAX_OBSERVATION_CHARS,
+    exit_code, AgentStep, Call, CallError, Exit, MemoryStep, ShellStep, StepError, TaskStep,
+    MAX_OBSERVATION_CHARS,
 };
 use crate::model::{Media, Part};
 use crate::utils::truncated;
@@ -143,7 +143,7 @@ pub(crate) fn update(step: &TaskStep) -> Vec<Part> {
 }
 
 fn request(label: &str, step: &TaskStep) -> Vec<Part> {
-    let task = resumed(&step.text, &step.carried);
+    let task = &step.text;
     let mut text = format!("{label}:\n{task}");
     if !step.files.is_empty() {
         text.push_str("\n\nAttached files:");
@@ -286,27 +286,13 @@ pub(crate) fn summarized(summary: &str, task: Option<&str>, updates: &[&str]) ->
         return text;
     };
 
-    let current = resumed(task, updates);
-    let current = format!("\n\nCurrent task:\n{current}");
+    let current = format!("\n\nCurrent task:\n{task}");
     text.push_str(&current);
-    text
-}
-
-pub(crate) fn resumed(task: &str, updates: &[impl AsRef<str>]) -> String {
-    let mut text = task.to_owned();
     for update in updates {
-        let update = format!("\n\n{UPDATE}:\n{}", update.as_ref());
+        let update = format!("\n\n{UPDATE}:\n{update}");
         text.push_str(&update);
     }
     text
-}
-
-pub(crate) fn unmet(reason: &str) -> String {
-    format!("Check:\nThe task is not done yet: {reason}\nKeep working and answer again when it is done.")
-}
-
-pub(crate) fn blocked(reason: &str) -> String {
-    format!("Check:\nThe task needs something from the user: {reason}\nThe user has been told; continue once they provide it.")
 }
 
 pub(crate) fn unseen(label: &str, media: &Media) -> String {
@@ -442,45 +428,9 @@ pub(crate) fn unviewable(path: &str, images: &str, videos: &str) -> String {
 pub(crate) const RESTARTED: &str =
     "Python was restarted: variables, functions and imports from earlier calls are gone.";
 
-pub(crate) const CHECKER: &str = "You check whether an AI agent has finished the user's task. Only judge; do not do the work.
-
-In the conversation, [Agent] is the agent's message, [Code] the Python code it ran, [Observation] what the code printed, [Error] what failed and [Check] an earlier check. A summary of earlier work may come first; what it reports as done counts as shown.
-
-Judge the last task with all its updates. A requirement is done only if output in the conversation or the summary proves it; missing or indirect evidence, and claims no output confirms, do not count.
-
-Verdicts:
-- met: every requirement is done.
-- not met: the agent can still do part of what is left; name only that part.
-- blocked: everything left needs something only the user can give (information, access, a decision), including what to do about a requirement that can no longer be met. Hard or long work is not blocked.";
-
-pub(crate) const MET: &str = "met";
-pub(crate) const UNMET: &str = "not met";
-pub(crate) const BLOCKED: &str = "blocked";
-
-pub(crate) fn check(transcript: &str, earlier: Option<&str>) -> String {
-    let conversation = format!("<conversation>\n{transcript}\n</conversation>");
-    let forms = format!("Reply with one line in one of these forms:\n{MET}\n{UNMET}: <what the agent can still do, specific enough to act on>\n{BLOCKED}: <what only the user can give>");
-
-    let mut parts = Vec::new();
-    if let Some(earlier) = earlier {
-        parts.push(earlier.to_owned());
-    }
-    parts.push(conversation);
-    parts.push(forms);
-    parts.join("\n\n")
-}
-
-pub(crate) fn verdict(check: &Check) -> String {
-    match check.verdict {
-        Verdict::Met => MET.to_owned(),
-        Verdict::Unmet => format!("{UNMET}: {}", check.reason),
-        Verdict::Blocked => format!("{BLOCKED}: {}", check.reason),
-    }
-}
-
 pub(crate) const NAMER: &str = "Reply with a short title for a conversation that starts with the message below: a few words in its language, without quotes or ending punctuation. Do not answer the message.";
 
-pub(crate) const SUMMARIZER: &str = "You summarize an AI agent's work so it can continue after its earlier messages are removed. In the conversation, [Agent] is the agent's message, [Code] the Python code it ran, [Observation] what the code printed, [Error] what failed and [Check] a check of whether the task is done. Write only the summary, in the language of the tasks; do not continue the work or answer the tasks.";
+pub(crate) const SUMMARIZER: &str = "You summarize an AI agent's work so it can continue after its earlier messages are removed. In the conversation, [Agent] is the agent's message, [Code] the Python code it ran, [Observation] what the code printed and [Error] what failed. Write only the summary, in the language of the tasks; do not continue the work or answer the tasks.";
 
 const SUMMARY_FORMAT: &str = "Use exactly this format with every section (\"(none)\" if empty), in short bullets with exact paths, names and values:
 
@@ -541,11 +491,6 @@ pub(crate) fn transcript(steps: &[&MemoryStep], max: usize) -> String {
                     let error = format!("[Error]: {error}");
                     entries.push(error);
                 }
-                if let Some(check) = &step.check {
-                    let check = verdict(check);
-                    let check = format!("[Check]: {check}");
-                    entries.push(check);
-                }
                 continue;
             }
             MemoryStep::Shell(ran) => {
@@ -555,10 +500,10 @@ pub(crate) fn transcript(steps: &[&MemoryStep], max: usize) -> String {
                 entries.push(entry);
                 continue;
             }
-            MemoryStep::Summary(_) | MemoryStep::Cleared | MemoryStep::Restarted => continue,
+            MemoryStep::Summary(_) | MemoryStep::Restarted => continue,
         };
 
-        let text = resumed(&task.text, &task.carried);
+        let text = &task.text;
         let asked = format!("[{label}]: {text}");
         entries.push(asked);
         for file in &task.files {
@@ -610,32 +555,13 @@ pub(crate) fn summary(transcript: &str, previous: Option<&str>, trailing: bool) 
 #[cfg(test)]
 mod tests {
     use crate::config::Skill;
-    use crate::memory::tests::asked;
     use crate::memory::{
-        AgentStep, Call, CallError, CodeResult, Exit, MemoryStep, ShellStep, StepError, TaskStep,
+        AgentStep, Call, CallError, CodeResult, Exit, MemoryStep, ShellStep, StepError,
     };
     use crate::model::tests::png;
     use crate::model::Media;
     use crate::prompt::{call_error, error, media_tag, shell, system, transcript, unseen};
-    use crate::tests::content;
     use std::path::{Path, PathBuf};
-
-    #[test]
-    fn carried_updates() {
-        let task = TaskStep {
-            carried: vec!["Add tests".to_owned(), "Use API v2".to_owned()],
-            ..asked("Fix parsing\n\nIn two steps", true)
-        };
-        let task = MemoryStep::Task(task);
-        let text =
-            "Fix parsing\n\nIn two steps\n\nTask update:\nAdd tests\n\nTask update:\nUse API v2";
-        assert_eq!(
-            content(&task.messages(&mut 0)[0]),
-            format!("New task:\n{text}")
-        );
-        let transcript = transcript(&[&task], usize::MAX);
-        assert_eq!(transcript, format!("[Task]: {text}"));
-    }
 
     #[test]
     fn system_sections() {
@@ -743,7 +669,7 @@ mod tests {
         let missing = shell(&ran("", Exit::Unstarted("fish not found".to_owned())));
         assert_eq!(missing, format!("{head}It did not start: fish not found"));
 
-        // Summaries and checks see the same text
+        // Summaries see the same text
         let step = MemoryStep::Shell(ran("", Exit::Exited(1)));
         let text = transcript(&[&step], usize::MAX);
         assert_eq!(text, format!("[Shell]: {head}Output: none\nExit code: 1"));

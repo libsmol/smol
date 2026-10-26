@@ -117,15 +117,6 @@ while IFS= read -r line; do
     *'"method":"session/prompt"'*'"text":"exit"'*)
         echo goodbye >&2
         exit 0 ;;
-    *'"method":"session/prompt"'*'"_smol/goal":true'*)
-        printf '%s\n' '{"jsonrpc":"2.0","method":"_smol/goal","params":{"sessionId":"s1","goal":{"objective":"fix the parser","status":"active","updates":[]}}}'
-        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"goal"}}}}'
-        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"usage_update","used":10,"size":100,"_meta":{"duration":1.0}}}}'
-        printf '%s\n' '{"jsonrpc":"2.0","method":"_smol/goal","params":{"sessionId":"s1","goal":{"objective":"fix the parser","status":"complete","updates":["add the missing tests"]}}}'
-        result='{"stopReason":"end_turn"}' ;;
-    *'"method":"_smol/clear_goal"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","method":"_smol/goal","params":{"sessionId":"s1","goal":null}}'
-        result='{}' ;;
     *'"method":"_smol/shell"'*)
         printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"call_9","title":"ls docs","kind":"execute","status":"in_progress","_meta":{"_smol/shell":true}}}}'
         printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_9","status":"failed","content":[{"type":"content","content":{"type":"text","text":"alpha\nbeta"}}],"_meta":{"error":"exit 2"}}}}'

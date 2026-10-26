@@ -153,7 +153,6 @@ impl TokenUsage {
 pub(crate) enum Purpose {
     Step,
     Summary,
-    Check,
     Title,
 }
 
@@ -1469,7 +1468,7 @@ pub(crate) mod tests {
             id: id.to_owned(),
             parts: vec![Part::Text("No such tool".to_owned())],
         };
-        let checked = ChatMessage::user("Check:\nNot done yet");
+        let update = ChatMessage::user("Task update:\nUse the café colors");
         let conversation = [
             asked,
             printed,
@@ -1478,7 +1477,7 @@ pub(crate) mod tests {
             second,
             refused("call_4"),
             refused("call_5"),
-            checked,
+            update,
         ];
 
         let spec = ModelSpec {
@@ -1513,7 +1512,7 @@ pub(crate) mod tests {
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}},
                 {"type": "text", "text": "<image path=\"chart.png\"/>"},
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}},
-                {"type": "text", "text": "Check:\nNot done yet"},
+                {"type": "text", "text": "Task update:\nUse the café colors"},
             ]},
         ]);
         assert_eq!(body["messages"], expected);

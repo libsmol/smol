@@ -1,6 +1,5 @@
 use crate::client::{
-    model_of, models, Asked, AuthRequired, Client, Goal, GoalStatus, Incoming, McpState, McpStatus,
-    Notice, Pick,
+    model_of, models, Asked, AuthRequired, Client, Incoming, McpState, McpStatus, Notice, Pick,
 };
 use agent_client_protocol_schema::v1::{
     ContentBlock, ResourceLink, SessionConfigOption, SessionUpdate, StopReason,
@@ -13,7 +12,6 @@ use std::path::{is_separator, Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use url::Url;
 
-pub(crate) const NO_GOAL: &str = "no goal";
 /// No file name or path is longer than these
 const MAX_NAME_BYTES: usize = 255;
 const MAX_PATH_BYTES: usize = 4096;
@@ -57,9 +55,6 @@ pub(crate) struct Session {
     asked: Vec<String>,
     /// Servers that dropped while running and are reconnecting, reported if they fail
     dropped: Vec<String>,
-    pub(crate) goal: Option<Goal>,
-    /// Why the goal stopped, reported only after this turn's result is out
-    settled: Option<String>,
     /// Set only once the agent reports a save time,
     /// since the first message may be refused or cancelled before it goes out
     saved: bool,
@@ -98,8 +93,6 @@ impl Session {
             mcp: Vec::new(),
             asked: Vec::new(),
             dropped: Vec::new(),
-            goal: None,
-            settled: None,
             saved: resume.is_some(),
             unsaved: false,
         })
@@ -135,8 +128,6 @@ impl Session {
         self.mcp.clear();
         self.asked.clear();
         self.dropped.clear();
-        self.goal = None;
-        self.settled = None;
         self.saved = resume.is_some();
         self.unsaved = false;
 
@@ -248,14 +239,6 @@ impl Session {
         Ok(format!("mcp: {name}: {state}"))
     }
 
-    pub(crate) fn clear_goal(&self) -> Result<String> {
-        if self.goal.is_none() {
-            return Ok(NO_GOAL.to_owned());
-        }
-        self.client.clear_goal(&self.id)?;
-        Ok("goal: cleared".to_owned())
-    }
-
     pub(crate) fn parting(&self) -> Option<String> {
         if self.client.exited() {
             return None;
@@ -271,9 +254,9 @@ impl Session {
         Some(line)
     }
 
-    pub(crate) fn prompt(&self, text: &str, goal: bool) {
+    pub(crate) fn prompt(&self, text: &str) {
         let blocks = self.blocks(text);
-        self.client.prompt(&self.id, blocks, goal);
+        self.client.prompt(&self.id, blocks);
     }
 
     pub(crate) fn blocks(&self, text: &str) -> Vec<ContentBlock> {
@@ -319,29 +302,6 @@ impl Session {
 
             Incoming::Queued(session, asked) if session == self.id => vec![Output::Queued(asked)],
 
-            Incoming::Goal(session, goal) if session == self.id => {
-                // A refused goal reverts to the old one, so a change of objective is never reported
-                if let (Some(old), Some(new)) = (&self.goal, &goal) {
-                    let same = old.objective == new.objective;
-                    if same && old.status != new.status && new.status != GoalStatus::Active {
-                        let text = match new.status {
-                            GoalStatus::Paused => {
-                                "goal: paused; resume with `:goal resume`".to_owned()
-                            }
-                            GoalStatus::Blocked => {
-                                "goal: blocked; reply with what it needs, then `:goal resume`"
-                                    .to_owned()
-                            }
-                            status => format!("goal: {status}"),
-                        };
-                        self.settled = Some(text);
-                    }
-                }
-
-                self.goal = goal;
-                vec![Output::Status]
-            }
-
             Incoming::Mcp(session, servers) if session == self.id => {
                 let mut outputs = Vec::new();
                 for server in &servers {
@@ -381,12 +341,7 @@ impl Session {
 
             Incoming::Exited(text) => vec![Output::Failure(text)],
 
-            Incoming::Done(stop) => {
-                let mut outputs = vec![Output::Done(stop)];
-                let settled = self.settled.take().map(Output::Info);
-                outputs.extend(settled);
-                outputs
-            }
+            Incoming::Done(stop) => vec![Output::Done(stop)],
 
             _ => Vec::new(),
         }
@@ -611,18 +566,10 @@ mod tests {
         let stamped = info("s1", stamped);
         session.receive(stamped);
         assert!(session.saved);
-        let goal = Goal {
-            objective: "fix the café parser".to_owned(),
-            status: GoalStatus::Active,
-            updates: Vec::new(),
-        };
-        let goal = Incoming::Goal("s1".to_owned(), Some(goal));
-        session.receive(goal);
-        assert!(session.goal.is_some());
 
         session.open(None).expect("open");
         assert_eq!((session.id.as_str(), session.mcp.len()), ("s2", 0));
-        assert_eq!((session.title.as_str(), &session.goal), ("", &None));
+        assert_eq!(session.title, "");
         assert!(!session.saved);
         session.open(Some("s1")).expect("resume");
         assert!(session.saved);
@@ -633,42 +580,6 @@ mod tests {
         let missing = session.open(Some("nope"));
         assert!(missing.is_err());
         assert_eq!(session.id, "s1");
-    }
-
-    #[test]
-    fn goal_reported() {
-        let agent = fake();
-        let mut session = Session::start(&agent, None, None).expect("start");
-        let mut report = |objective: &str, status: GoalStatus| {
-            let objective = objective.to_owned();
-            let goal = Goal {
-                objective,
-                status,
-                updates: Vec::new(),
-            };
-            let message = Incoming::Goal("s1".to_owned(), Some(goal));
-            let held = session.receive(message);
-            assert!(shown(held).is_empty());
-
-            let done = Incoming::Done(Ok(StopReason::EndTurn));
-            let done = session.receive(done);
-            assert!(matches!(done[0], Output::Done(..)));
-            shown(done)
-        };
-
-        assert!(report("fix the parser", GoalStatus::Paused).is_empty());
-        assert!(report("migrate the database", GoalStatus::Active).is_empty());
-        assert!(report("fix the parser", GoalStatus::Paused).is_empty());
-        assert!(report("fix the parser", GoalStatus::Active).is_empty());
-        let blocked = "goal: blocked; reply with what it needs, then `:goal resume`";
-        assert_eq!(report("fix the parser", GoalStatus::Blocked), [blocked]);
-        assert!(report("fix the parser", GoalStatus::Blocked).is_empty());
-        let paused = "goal: paused; resume with `:goal resume`";
-        assert_eq!(report("fix the parser", GoalStatus::Paused), [paused]);
-        assert_eq!(
-            report("fix the parser", GoalStatus::Complete),
-            ["goal: complete"]
-        );
     }
 
     #[test]
@@ -716,7 +627,7 @@ mod tests {
     fn dropped_ask_answered() {
         let agent = fake();
         let mut session = Session::start(&agent, None, None).expect("start");
-        session.prompt("queue", false);
+        session.prompt("queue");
 
         let mut stops = Vec::new();
         for _ in 0..500 {

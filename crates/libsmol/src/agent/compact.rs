@@ -1,7 +1,6 @@
 use crate::agent::{retry, text_reply, Event, Turn};
 use crate::memory::{
-    bytes, estimate, text_bytes, MemoryStep, StepError, SummaryStep, Usage, Verdict,
-    MAX_OBSERVATION_CHARS,
+    bytes, estimate, text_bytes, MemoryStep, StepError, SummaryStep, Usage, MAX_OBSERVATION_CHARS,
 };
 use crate::model::{ChatMessage, Purpose};
 use crate::prompt::{self, SUMMARIZER};
@@ -14,7 +13,7 @@ const RESERVE_SHARE: f64 = 0.15;
 const MAX_RESERVE_TOKENS: u64 = 16_384;
 const MAX_RECENT_SHARE: f64 = 0.15;
 /// The rest is left for the summary
-pub(crate) const MAX_TRANSCRIPT_SHARE: f64 = 0.7;
+const MAX_TRANSCRIPT_SHARE: f64 = 0.7;
 const MIN_OBSERVATION_CHARS: usize = 1024;
 
 impl Turn<'_> {
@@ -64,13 +63,9 @@ impl Turn<'_> {
                     | MemoryStep::Shell(_)
                     | MemoryStep::Restarted
             );
-            // The model wrote the reply but hasn't seen its call replies, errors or verdict
+            // The model wrote the reply but hasn't seen its call replies or errors
             let reported = match step {
-                MemoryStep::Action(action) => {
-                    let verdict = action.check.as_ref().map(|check| check.verdict);
-                    let told = matches!(verdict, Some(Verdict::Unmet | Verdict::Blocked));
-                    !action.calls.is_empty() || action.error.is_some() || told
-                }
+                MemoryStep::Action(action) => !action.calls.is_empty() || action.error.is_some(),
                 _ => false,
             };
             if !unread && !reported {
@@ -185,7 +180,7 @@ impl Turn<'_> {
 }
 
 /// Always returns a transcript however long, cutting observations first and then the middle
-pub(crate) fn squeezed(steps: &[&MemoryStep], window: u64) -> String {
+fn squeezed(steps: &[&MemoryStep], window: u64) -> String {
     let budget = (window as f64 * MAX_TRANSCRIPT_SHARE) as u64;
     // Stored observations are already cut and a second cut would lose their count,
     // so try them as they are
@@ -216,7 +211,7 @@ mod tests {
     use crate::agent::compact::*;
     use crate::agent::tests::{called, recorded, reply, Run, Script};
     use crate::memory::tests::{asked, coded, metered, replied};
-    use crate::memory::{AgentMemory, AgentStep, Attachment, Check, Exit, ShellStep, TaskStep};
+    use crate::memory::{AgentMemory, AgentStep, Attachment, Exit, ShellStep, TaskStep};
     use crate::model::{Finish, ModelError, TokenUsage};
     use crate::tests::content;
     use std::sync::{Arc, Mutex};
@@ -311,7 +306,6 @@ mod tests {
                 MemoryStep::Action(_) => "action",
                 MemoryStep::Summary(_) => "summary",
                 MemoryStep::Shell(_) => "shell",
-                MemoryStep::Cleared => "cleared",
                 MemoryStep::Restarted => "restarted",
             };
             kinds.push(kind);
@@ -335,7 +329,7 @@ mod tests {
     fn reserve_capped() {
         let window = 1 << 20;
         let filled = |tokens: u64| {
-            let task = asked("Tidy the logs", false);
+            let task = asked("Tidy the logs");
             let printed = "log ".repeat(150_000);
             let read = coded("print(log)", Some(printed));
             let counted = AgentStep {
@@ -372,7 +366,7 @@ mod tests {
         };
         let task = TaskStep {
             files: vec![data],
-            ..asked("Print data", false)
+            ..asked("Print data")
         };
         let printed = "naïve ".repeat(1500);
         let ran = coded("print(data)", Some(printed));
@@ -554,7 +548,7 @@ mod tests {
         };
         let mut memory = AgentMemory {
             steps: vec![
-                MemoryStep::Task(asked("Read the log", false)),
+                MemoryStep::Task(asked("Read the log")),
                 MemoryStep::Action(Box::new(first)),
                 MemoryStep::Action(Box::new(latest)),
             ],
@@ -571,46 +565,6 @@ mod tests {
     }
 
     #[test]
-    fn verdict_kept() {
-        let reason = "the report has no conclusion";
-        let cases = [
-            (Verdict::Unmet, prompt::unmet(reason)),
-            (Verdict::Blocked, prompt::blocked(reason)),
-        ];
-        for (verdict, told) in cases {
-            let mut run = agent(Some(1000), vec![Ok(reply("Did the first one"))]);
-            let ran = AgentStep {
-                usage: metered(500, 10),
-                ..coded("print('first')", Some("first".to_owned()))
-            };
-            let check = Check {
-                verdict,
-                reason: reason.to_owned(),
-                usage: Usage::default(),
-            };
-            let answered = AgentStep {
-                usage: metered(950, 10),
-                check: Some(check),
-                ..replied(&"report".repeat(200))
-            };
-            let mut memory = AgentMemory {
-                steps: vec![
-                    MemoryStep::Task(asked("First one", false)),
-                    MemoryStep::Action(Box::new(ran)),
-                    MemoryStep::Task(asked("Write the report", true)),
-                    MemoryStep::Action(Box::new(answered)),
-                ],
-            };
-            run.agent.compact(&mut memory).expect("compact");
-
-            assert!(summarized(&memory));
-            let conversation = memory.conversation("", None);
-            let texts = contents(&conversation);
-            assert_eq!(texts.last(), Some(&told), "{texts:?}");
-        }
-    }
-
-    #[test]
     fn early_interrupt_uncompacted() {
         let (mut run, events) = watched(Some(1000), vec![Ok(reply("Summary"))]);
         let ran = AgentStep {
@@ -619,7 +573,7 @@ mod tests {
         };
         let mut memory = AgentMemory {
             steps: vec![
-                MemoryStep::Task(asked("First one", false)),
+                MemoryStep::Task(asked("First one")),
                 MemoryStep::Action(Box::new(ran)),
             ],
         };
@@ -650,7 +604,7 @@ mod tests {
             usage: metered(3900, 10),
             ..replied("Read them all")
         };
-        let task = asked("Tidy up", false);
+        let task = asked("Tidy up");
         let mut memory = AgentMemory {
             steps: vec![
                 MemoryStep::Task(task),
@@ -699,9 +653,9 @@ mod tests {
         };
         let update = TaskStep {
             files: vec![data],
-            ..asked("See the attached file", false)
+            ..asked("See the attached file")
         };
-        let first = asked("First one", false);
+        let first = asked("First one");
         let mut memory = AgentMemory {
             steps: vec![
                 MemoryStep::Task(first),
@@ -727,7 +681,7 @@ mod tests {
         let printed = "data ".repeat(150);
         let ran = coded("print(data)", Some(printed));
         let answered = replied(&"done ".repeat(150));
-        let task = |text: &str| MemoryStep::Task(asked(text, false));
+        let task = |text: &str| MemoryStep::Task(asked(text));
         let earlier = SummaryStep {
             summary: "brief ".repeat(165),
             kept: 2,
