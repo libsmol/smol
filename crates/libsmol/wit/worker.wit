@@ -5,13 +5,12 @@ interface control {
     interrupted: func() -> bool;
 }
 
-/// Relative paths resolve against `cwd`, and paths outside the mounts are not found
+/// Relative paths resolve against `cwd`, and paths outside the mounts fail as in the guest's `open()`
 /// Results and errors show paths the way the code wrote them, never resolved against `cwd`
 interface tools {
     record os-error {
-        /// A POSIX name such as ENOENT, since the guest numbers errors differently
+        /// A POSIX name such as ENOENT, which the guest turns into its own number and message
         errno: string,
-        message: string,
         path: string,
     }
 

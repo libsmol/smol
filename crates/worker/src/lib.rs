@@ -21,9 +21,9 @@ wit_bindgen::generate!({ world: "worker", path: "../libsmol/wit" });
 
 /// They must share one file name, which `_run` uses to drop them from tracebacks
 const BOOTSTRAP: [&str; 3] = [
-    include_str!("../../libsmol/src/worker/bootstrap/builtins.py"),
-    include_str!("../../libsmol/src/worker/bootstrap/mcp.py"),
-    include_str!("../../libsmol/src/worker/bootstrap/run.py"),
+    include_str!("bootstrap/builtins.py"),
+    include_str!("bootstrap/mcp.py"),
+    include_str!("bootstrap/run.py"),
 ];
 
 thread_local! {

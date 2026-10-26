@@ -6,7 +6,8 @@ use crate::memory::{
 };
 use crate::model::{Media, Part};
 use crate::utils::truncated;
-use crate::worker::Function;
+use crate::worker::sandbox::guest_path;
+use crate::worker::{Function, Lost};
 use chrono::Utc;
 use std::env::consts::OS;
 use std::path::Path;
@@ -63,7 +64,7 @@ pub(crate) fn system(
     for skill in skills {
         let name = &skill.name;
         let description = &skill.description;
-        let path = skill.path.display();
+        let path = guest_path(&skill.path);
         let entry = format!("## Skill `{name}`\n\n{description}\n\n- {path}");
         entries.push(entry);
     }
@@ -89,7 +90,7 @@ pub(crate) fn system(
         }
     };
 
-    let cwd = cwd.display();
+    let cwd = guest_path(cwd);
     let date = Utc::now().format("%Y-%m-%d");
     format!(
         "You do tasks by running Python code with the {TOOL} tool. Each reply does one of two things:
@@ -339,16 +340,22 @@ pub(crate) fn python(reason: &str) -> String {
     format!("Python {reason}")
 }
 
-pub(crate) fn exited(end: Option<&Exit>) -> String {
-    match end {
-        Some(Exit::Exited(code)) => {
-            let code = exit_code(*code);
-            format!("exited with code {code}")
-        }
-        Some(Exit::Signaled(signal)) => format!("was ended by signal {signal}"),
-        _ => "exited".to_owned(),
+pub(crate) fn lost(lost: &Lost) -> String {
+    match lost {
+        Lost::Exited(code) => format!("exited with code {code}"),
+        Lost::Crashed(reason) => crashed(reason),
+        Lost::Stopped => "was stopped".to_owned(),
     }
 }
+
+pub(crate) fn crashed(reason: &str) -> String {
+    format!("crashed: {reason}")
+}
+
+/// Reasons a crashed Python gives after `Python crashed: `
+pub(crate) const OUT_OF_STACK: &str = "out of stack";
+pub(crate) const OUT_OF_MEMORY: &str = "out of memory";
+pub(crate) const ABORTED: &str = "aborted";
 
 /// `said` is the output or error from before the worker came up
 pub(crate) fn unstarted(said: &str) -> String {
@@ -384,10 +391,6 @@ pub(crate) fn too_large(size: u64) -> String {
 
 pub(crate) fn undecoded(size: u64) -> String {
     format!("{size} bytes, not UTF-8 text; if it is text in another encoding, decode it in code")
-}
-
-pub(crate) fn unserializable(key: &str, kind: &str) -> String {
-    format!("{key}: {kind} is not JSON-serializable")
 }
 
 pub(crate) fn failure(label: &str, object: &str, reason: &str) -> String {

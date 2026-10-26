@@ -1,4 +1,4 @@
-use libsmol::{SETUP_ARG, WORKER_ARG};
+use libsmol::SETUP_ARG;
 use std::env;
 use std::process::ExitCode;
 
@@ -12,7 +12,6 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         [SETUP_ARG] => libsmol::setup(),
-        [WORKER_ARG] => libsmol::worker(),
         _ => {
             eprintln!("libsmol: usage: libsmol [setup | --version]");
             return ExitCode::from(2);

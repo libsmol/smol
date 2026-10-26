@@ -11,7 +11,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The guest is the same file on every system, so it is built once
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./build.sh worker
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - run: cargo about generate --manifest-path crates/worker/Cargo.toml -c about.toml about-python.hbs -o THIRD-PARTY-LICENSES-PYTHON.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worker
+          path: |
+            target/worker/wasm32-wasip2/release/libsmol_worker.wasm
+            THIRD-PARTY-LICENSES-PYTHON.html
+          if-no-files-found: error
+
   build:
+    needs: worker
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +58,12 @@ jobs:
             exit 1
           fi
 
+      # Unpacks into the paths the worker job uploaded from
+      - uses: actions/download-artifact@v4
+        with:
+          name: worker
+          path: .
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -59,7 +84,7 @@ jobs:
           for program in smol libsmol; do
             cp "target/${{ matrix.target }}/release/$program$suffix" "dist/$name/"
           done
-          cp README.md LICENSE CHANGELOG.md THIRD-PARTY-LICENSES.html "dist/$name/"
+          cp README.md LICENSE CHANGELOG.md THIRD-PARTY-LICENSES.html THIRD-PARTY-LICENSES-PYTHON.html "dist/$name/"
           cd dist
           case "${{ matrix.target }}" in
             *windows*) 7z a "$name.zip" "$name" ;;

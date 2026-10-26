@@ -1,42 +1,25 @@
+use crate::config::Skill;
 use crate::memory::{CallError, MAX_OBSERVATION_CHARS};
 use crate::model::Media;
 use crate::prompt::{self, NO_SERVER};
-use crate::spawn::{drain, relay, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
+use crate::spawn::SHOWN_EVERY;
 use crate::tools::mcp::{Called, Calling, Server};
-use crate::utils::{new_id, Clip, Interrupt, Reply};
-#[cfg(not(test))]
-use crate::worker::WORKER_ARG;
-use crate::worker::{
-    FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall, WorkerNote,
-    CONTROL_ENV, COPIES_ENV,
-};
+use crate::utils::Interrupt;
+use crate::worker::sandbox::Sandbox;
+use crate::worker::{Function, Guest, Installed, ToolCall};
 use crate::{Error, Result};
-use reaper::{cause, terminal_view};
-use serde::Deserialize;
-use std::collections::HashMap;
-#[cfg(not(target_os = "linux"))]
-use std::env;
+use reaper::terminal_view;
 use std::future;
-use std::io;
 use std::mem;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::path::Path;
+use std::pin::pin;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::TcpListener;
-use tokio::process::Command;
 use tokio::select;
-use tokio::sync::mpsc::{self, Receiver, UnboundedSender};
-use tokio::task::{self, AbortHandle, JoinSet};
+use tokio::task::JoinSet;
 use tokio::time::{self, Instant};
 
 const STOP_WAIT: Duration = Duration::from_secs(3);
-/// Code that swallows exceptions may have caught the previous interrupt
-const CANCEL_EVERY: Duration = Duration::from_millis(500);
-/// Code that closes stdout never lets the END marker through
-const OUTPUT_WAIT: Duration = Duration::from_secs(2);
-const START_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
 pub(crate) struct Evaluated {
@@ -58,57 +41,18 @@ pub(crate) struct Added {
 
 /// Callers keep track of the installed MCP servers and pass them in on every call
 pub(crate) struct Worker {
-    cwd: PathBuf,
-    copies: PathBuf,
+    sandbox: Arc<Sandbox>,
     interrupt: Interrupt,
     functions: Vec<Function>,
     restarted: bool,
     live: Option<Live>,
 }
 
-/// Dropping it kills the worker
+/// Dropping it stops the Python
 struct Live {
-    group: Group,
-    lines: Lines<BufReader<OwnedReadHalf>>,
-    control: UnboundedSender<String>,
-    pieces: Receiver<Piece>,
-    next_id: u64,
-    calls: JoinSet<(u64, Called)>,
-    running: HashMap<u64, AbortHandle>,
-    output: Clip,
-    media: Vec<(String, Media)>,
-}
-
-enum Event {
-    Call(u64, WorkerCall),
-    Answer(u64, Reply),
-    Ready(Vec<Function>),
-    End,
-    Gone(String),
-}
-
-enum Outcome {
-    Replied(Result<Ran, String>),
-    Gone(String),
-    Stuck,
-}
-
-/// Fields match the dict returned by `_run`
-#[derive(Deserialize)]
-struct Ran {
-    error: Option<String>,
-    code: Option<String>,
-}
-
-/// Fields match the dict returned by `_server`
-#[derive(Deserialize)]
-struct Installed {
-    name: String,
-    /// Another server that already holds this name
-    server: Option<String>,
-    /// Missing when the name is taken
-    #[serde(default)]
-    headers: Vec<String>,
+    guest: Guest,
+    /// MCP calls the code is waiting on
+    calls: JoinSet<()>,
 }
 
 impl Worker {
@@ -117,11 +61,18 @@ impl Worker {
         interrupt: &Interrupt,
         cwd: &Path,
         copies: &Path,
+        skills: &[Skill],
         restarted: bool,
     ) -> Result<Self> {
+        let sandbox = match Sandbox::new(cwd, copies, skills) {
+            Ok(sandbox) => sandbox,
+            Err(reason) => {
+                let message = prompt::unstarted(&reason);
+                return Err(Error::Python(message));
+            }
+        };
         let mut worker = Self {
-            cwd: cwd.to_owned(),
-            copies: copies.to_owned(),
+            sandbox: Arc::new(sandbox),
             interrupt: interrupt.clone(),
             functions: Vec::new(),
             restarted,
@@ -137,17 +88,7 @@ impl Worker {
 
     /// Takes the flag, which turns true again only when the worker is replaced
     pub(crate) fn restarted(&mut self) -> bool {
-        self.reap();
         mem::take(&mut self.restarted)
-    }
-
-    /// Checks only between steps because a worker lost while running code is reported by that step
-    fn reap(&mut self) {
-        let gone = self.live.as_ref().is_some_and(|live| live.group.ended());
-        if gone {
-            self.live = None;
-            self.restarted = true;
-        }
     }
 
     /// A newly started worker gets `servers` installed first
@@ -156,116 +97,12 @@ impl Worker {
             return Ok(());
         }
 
-        let failed = |e: io::Error| {
-            let reason = cause(&e);
-            prompt::unstarted(&reason)
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(failed)?;
-        let address = listener.local_addr().map_err(failed)?;
-        let token = new_id();
-        let (output, writer) = io::pipe().map_err(failed)?;
-        let copied = writer.try_clone().map_err(failed)?;
-
-        // On Linux this still starts the original binary after it is replaced
-        #[cfg(target_os = "linux")]
-        let program = PathBuf::from("/proc/self/exe");
-        #[cfg(not(target_os = "linux"))]
-        let program = env::current_exe().map_err(failed)?;
-        let mut command = Command::new(program);
-        #[cfg(not(test))]
-        command.arg(WORKER_ARG);
-        // Tests rerun the test binary itself with only the test that serves as the worker
-        #[cfg(test)]
-        command.args(["code::tests::serving", "--exact", "--nocapture"]);
-        let control = format!("{address}/{token}");
-        command
-            .current_dir(&self.cwd)
-            .env(CONTROL_ENV, control)
-            .env(COPIES_ENV, &self.copies)
-            .stdin(Stdio::null())
-            .stdout(copied)
-            .stderr(writer);
-        let std = command.as_std_mut();
-        let mark = reaper::prepare(std);
-        let child = command.spawn().map_err(failed)?;
-        // Holding the write end here would keep the pipe open after the worker exits
-        drop(command);
-        let mut group = Group::new(child, mark).map_err(failed)?;
-        let pieces = relay(output);
-
-        let accepting = async {
-            let (stream, _) = listener.accept().await?;
-            let (reader, writer) = stream.into_split();
-            let mut lines = BufReader::new(reader).lines();
-            let greeting = lines.next_line().await?;
-            io::Result::Ok((lines, writer, greeting))
-        };
-        let timed = time::timeout(START_WAIT, accepting);
-        // A worker that exits before connecting back doesn't make us wait out `START_WAIT`
-        let accepted = select! {
-            biased;
-            accepted = timed => accepted.ok(),
-            _ = group.exited() => None,
-        };
-        let (lines, mut writer) = match accepted {
-            Some(Ok((lines, writer, Some(greeting)))) if greeting == token => (lines, writer),
-            _ => {
-                let output = Clip::new(KEPT_BYTES);
-                let reason = start_error(group, pieces, output).await;
-                return Err(reason);
-            }
-        };
-
-        let (control, mut sending) = mpsc::unbounded_channel::<String>();
-        task::spawn(async move {
-            while let Some(line) = sending.recv().await {
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    return;
-                }
-            }
-        });
-
-        let mut live = Live {
-            group,
-            lines,
-            control,
-            pieces,
-            next_id: 0,
+        let started = Guest::start(&self.sandbox, &self.interrupt).await;
+        let (guest, functions) = started.map_err(|reason| prompt::unstarted(&reason))?;
+        let live = Live {
+            guest,
             calls: JoinSet::new(),
-            running: HashMap::new(),
-            output: Clip::new(KEPT_BYTES),
-            media: Vec::new(),
         };
-
-        // Startup output runs up to the END marker and doesn't belong to the first snippet
-        let deadline = Instant::now() + START_WAIT;
-        let mut ready = None;
-        let mut ended = false;
-        let functions = loop {
-            let next = live.next();
-            let event = time::timeout_at(deadline, next).await;
-            match event {
-                Ok(Event::Ready(functions)) => ready = Some(functions),
-                Ok(Event::End) => ended = true,
-                Ok(Event::Gone(_)) | Err(_) => {
-                    let Live {
-                        group,
-                        pieces,
-                        output,
-                        ..
-                    } = live;
-                    let reason = start_error(group, pieces, output).await;
-                    return Err(reason);
-                }
-                Ok(_) => {}
-            }
-            if ended {
-                if let Some(functions) = ready.take() {
-                    break functions;
-                }
-            }
-        };
-
         for added in servers {
             live.install(&added.server).await?;
         }
@@ -276,7 +113,6 @@ impl Worker {
 
     /// `servers` are already installed, and a replacement for a lost worker gets them back first
     pub(crate) async fn add_server(&mut self, server: Server, servers: &[&Added]) -> Result<Added> {
-        self.reap();
         self.connect(servers).await.map_err(Error::Python)?;
         let live = self.live.as_mut().expect("connected");
         let installed = live.install(&server).await.map_err(Error::Python)?;
@@ -297,9 +133,7 @@ impl Worker {
     /// Doesn't restart a lost worker just for this
     pub(crate) fn remove_server(&self, name: &str) {
         if let Some(live) = &self.live {
-            let name = name.to_owned();
-            let note = HostNote::RemoveServer { name };
-            live.note(note);
+            live.guest.remove_server(name);
         }
     }
 
@@ -326,111 +160,68 @@ impl Worker {
         let live = self.live.as_mut().expect("connected");
         // Calls still running from the previous snippet don't belong to this one
         live.calls.abort_all();
-        live.running.clear();
-        live.media.clear();
-        live.output = Clip::new(KEPT_BYTES);
-        let run = HostCall::Run {
-            code: code.to_owned(),
-        };
-        let id = live.send(run);
+        live.guest.clear();
+        let running = live.guest.run(code);
+        let mut running = pin!(running);
 
-        let mut stopping = None;
-        let mut cancel_at = Instant::now();
+        let mut stop_at = None;
+        let mut killed = false;
         let mut show_at = Instant::now() + SHOWN_EVERY;
-        let mut ran = None;
-        let mut ended = false;
-        let mut draining = None;
-        let outcome = loop {
-            let stop_at = stopping.unwrap_or_else(Instant::now);
-            let drain_at = draining.unwrap_or_else(Instant::now);
-            let event = select! {
+        let replied = loop {
+            let stopping = stop_at.unwrap_or_else(Instant::now);
+            select! {
                 biased;
-                event = live.next() => event,
-                () = interrupt.wait(), if stopping.is_none() => {
-                    live.note(HostNote::Cancel { id });
-                    stopping = Some(Instant::now() + STOP_WAIT);
-                    cancel_at = Instant::now() + CANCEL_EVERY;
-                    continue;
+                replied = &mut running => break replied,
+                Some(call) = live.guest.calls.recv() => {
+                    let ToolCall {
+                        server,
+                        tool,
+                        args,
+                        called,
+                        mut reply,
+                    } = call;
+                    let found = servers.iter().find(|added| added.name == server);
+                    let calling: Calling = match found {
+                        Some(added) => (added.server.call)(tool, args, called),
+                        None => {
+                            let reply = Err(NO_SERVER.to_owned());
+                            let called = Called::from(reply);
+                            let ready = future::ready(called);
+                            Box::pin(ready)
+                        }
+                    };
+                    let shared = Arc::clone(&live.guest.shared);
+                    // The guest gives up on the reply when interrupted, which stops the call
+                    let answering = async move {
+                        let called = select! {
+                            called = calling => called,
+                            () = reply.closed() => return,
+                        };
+                        let mut shared = shared.lock().expect("shared lock");
+                        shared.media.extend(called.media);
+                        reply.send(called.result).ok();
+                    };
+                    live.calls.spawn(answering);
                 }
-                () = time::sleep_until(cancel_at), if stopping.is_some() => {
-                    live.note(HostNote::Cancel { id });
-                    cancel_at += CANCEL_EVERY;
-                    continue;
+                Some(_) = live.calls.join_next() => {}
+                () = interrupt.wait(), if stop_at.is_none() => {
+                    stop_at = Some(Instant::now() + STOP_WAIT);
                 }
-                () = time::sleep_until(stop_at), if stopping.is_some() => break Outcome::Stuck,
-                () = time::sleep_until(drain_at), if draining.is_some() => {
-                    let ran = ran.take().expect("replied");
-                    break Outcome::Replied(ran);
+                () = time::sleep_until(stopping), if stop_at.is_some() && !killed => {
+                    live.guest.kill();
+                    killed = true;
                 }
                 () = time::sleep_until(show_at) => {
                     show_at = Instant::now() + SHOWN_EVERY;
-                    if let Some(text) = live.output.fresh(MAX_OBSERVATION_CHARS) {
+                    if let Some(text) = live.guest.fresh(MAX_OBSERVATION_CHARS) {
                         shown(&text);
                     }
-                    continue;
                 }
-            };
-
-            let (number, call) = match event {
-                Event::Answer(number, reply) if number == id => {
-                    let replied = match reply {
-                        Ok(finished) => serde_json::from_value(finished).map_err(|e| e.to_string()),
-                        Err(reason) => Err(reason),
-                    };
-                    if ended {
-                        break Outcome::Replied(replied);
-                    }
-                    ran = Some(replied);
-                    draining = Some(Instant::now() + OUTPUT_WAIT);
-                    continue;
-                }
-                Event::End => {
-                    ended = true;
-                    match ran.take() {
-                        Some(replied) => break Outcome::Replied(replied),
-                        None => continue,
-                    }
-                }
-                Event::Gone(reason) => break Outcome::Gone(reason),
-                Event::Answer(..) | Event::Ready(_) => continue,
-                Event::Call(number, call) => (number, call),
-            };
-
-            let WorkerCall::Tool {
-                server,
-                tool,
-                args,
-                called,
-            } = call;
-            let found = servers.iter().find(|added| added.name == server);
-            let calling: Calling = match found {
-                Some(added) => (added.server.call)(tool, args, called),
-                None => {
-                    let reply = Err(NO_SERVER.to_owned());
-                    let called = Called::from(reply);
-                    let ready = future::ready(called);
-                    Box::pin(ready)
-                }
-            };
-            let task = live.calls.spawn(async move { (number, calling.await) });
-            live.running.insert(number, task);
-        };
-
-        let outcome = match outcome {
-            Outcome::Gone(_) => {
-                drain(&mut live.pieces, &mut live.output).await;
-                let exiting = live.group.exited();
-                let end = time::timeout(DRAIN_WAIT, exiting).await;
-                let end = end.ok().flatten();
-                let exited = prompt::exited(end.as_ref());
-                Outcome::Gone(exited)
             }
-            outcome => outcome,
         };
 
-        let (logs, cut) = live.output.text();
+        let (logs, cut, media) = live.guest.taken();
         let logs = terminal_view(&logs);
-        let media = mem::take(&mut live.media);
         let mut output = Evaluated {
             logs,
             cut,
@@ -438,8 +229,8 @@ impl Worker {
             ..Evaluated::default()
         };
 
-        match outcome {
-            Outcome::Replied(Ok(ran)) => {
+        match replied {
+            Ok(ran) if !killed => {
                 let judged = |error: String| match interrupt.triggered() {
                     true => CallError::Interrupted,
                     false => CallError::Execution(error),
@@ -447,15 +238,20 @@ impl Worker {
                 output.error = ran.error.map(judged);
                 output.code = ran.code;
             }
-            Outcome::Replied(Err(reason)) | Outcome::Gone(reason) if !interrupt.triggered() => {
-                self.live = None;
-                self.restarted = true;
-                output.error = Some(failed(reason));
-            }
-            _ => {
+            // A kill as the code finished still leaves this Python unusable
+            Ok(_) => {
                 self.live = None;
                 self.restarted = true;
                 output.error = Some(CallError::Interrupted);
+            }
+            Err(lost) => {
+                self.live = None;
+                self.restarted = true;
+                let error = match interrupt.triggered() {
+                    true => CallError::Interrupted,
+                    false => failed(prompt::lost(&lost)),
+                };
+                output.error = Some(error);
             }
         }
         Ok(output)
@@ -463,96 +259,15 @@ impl Worker {
 }
 
 impl Live {
-    fn send(&mut self, call: HostCall) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.deliver(&Message::Request { id, call });
-        id
-    }
-
-    fn note(&self, note: HostNote) {
-        self.deliver(&Message::Note(note));
-    }
-
-    fn deliver(&self, message: &ToWorker) {
-        let mut line = serde_json::to_string(message).expect("serialize");
-        line.push('\n');
-        self.control.send(line).ok();
-    }
-
-    /// Takes in output and finished calls here and returns only on some other event
-    async fn next(&mut self) -> Event {
-        loop {
-            select! {
-                Some(piece) = self.pieces.recv() => match piece {
-                    Piece::Output(bytes) => self.output.push(&bytes),
-                    Piece::End => return Event::End,
-                },
-                // Cancelling halfway through a line doesn't lose what was already read
-                line = self.lines.next_line() => {
-                    let Ok(Some(line)) = line else {
-                        return Event::Gone(prompt::exited(None));
-                    };
-                    let Ok(message) = serde_json::from_str::<FromWorker>(&line) else {
-                        return Event::Gone(prompt::exited(None));
-                    };
-                    match message {
-                        Message::Request { id, call } => return Event::Call(id, call),
-                        Message::Answer { id, result } => return Event::Answer(id, Ok(result)),
-                        Message::Error { id, error } => return Event::Answer(id, Err(error)),
-                        Message::Note(WorkerNote::Ready { functions }) => {
-                            return Event::Ready(functions);
-                        }
-                        Message::Note(WorkerNote::Cancel { id }) => {
-                            if let Some(call) = self.running.remove(&id) {
-                                call.abort();
-                            }
-                        }
-                        Message::Note(WorkerNote::Viewed { label, media }) => {
-                            self.media.push((label, media));
-                        }
-                    }
-                }
-                Some(joined) = self.calls.join_next() => {
-                    let Ok((id, called)) = joined else {
-                        continue;
-                    };
-                    self.running.remove(&id);
-                    self.media.extend(called.media);
-                    let reply = Message::reply(id, called.result);
-                    self.deliver(&reply);
-                }
-            }
+    async fn install(&self, server: &Server) -> Result<Installed, String> {
+        let installing = self
+            .guest
+            .add_server(&server.name, &server.description, &server.tools);
+        match installing.await {
+            Ok(installed) => installed,
+            Err(lost) => Err(prompt::lost(&lost)),
         }
     }
-
-    async fn install(&mut self, server: &Server) -> Result<Installed, String> {
-        let call = HostCall::AddServer {
-            source: server.name.clone(),
-            description: server.description.clone(),
-            tools: server.tools.clone(),
-        };
-        let id = self.send(call);
-
-        // No code is running, so the worker makes no host calls now
-        let installed = loop {
-            match self.next().await {
-                Event::Answer(number, reply) if number == id => break reply?,
-                Event::Gone(reason) => return Err(reason),
-                Event::Answer(..) | Event::Call(..) | Event::Ready(_) | Event::End => {}
-            }
-        };
-        serde_json::from_value(installed).map_err(|e| e.to_string())
-    }
-}
-
-async fn start_error(group: Group, mut pieces: Receiver<Piece>, mut output: Clip) -> String {
-    // Kill it first or the pipe stays open and the output never ends
-    drop(group);
-    drain(&mut pieces, &mut output).await;
-
-    let (said, _) = output.text();
-    prompt::unstarted(said.trim())
 }
 
 #[cfg(test)]
@@ -564,9 +279,7 @@ mod tests {
     use crate::tools::mcp::tests::{fake, started};
     use crate::tools::mcp::{Called, Calling, Server};
     use crate::utils::{block_on, Interrupt};
-    use crate::worker::{serve, CONTROL_ENV};
     use serde_json::{json, Map, Value};
-    use std::env;
     #[cfg(unix)]
     use std::fs::Permissions;
     use std::fs::{self, File};
@@ -576,6 +289,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::thread;
     use std::time::{Duration, Instant};
     use tokio::time;
 
@@ -633,7 +347,7 @@ mod tests {
     fn build(interrupt: Interrupt, cwd: PathBuf) -> Temp<Tried> {
         let dir = temp_dir("session");
         let copies = dir.join("copies");
-        let building = Worker::new(&interrupt, &cwd, &copies, false);
+        let building = Worker::new(&interrupt, &cwd, &copies, &[], false);
         let worker = block_on(building).expect("worker");
         let value = Tried {
             worker,
@@ -690,14 +404,6 @@ mod tests {
         error.to_string()
     }
 
-    /// The only test a worker runs, and a no-op otherwise
-    #[test]
-    fn serving() {
-        if env::var_os(CONTROL_ENV).is_some() {
-            serve().expect("serve");
-        }
-    }
-
     #[test]
     fn interrupt_escapes_except() {
         let (mut worker, interrupt) = interruptible();
@@ -733,11 +439,7 @@ mod tests {
         // Running code doesn't take the flag
         let crashed = worker.eval("import os\nos.abort()");
         let crashed = error(crashed);
-        #[cfg(unix)]
-        assert_eq!(crashed, "Python was ended by signal 6");
-        // On Windows the exit code of abort depends on the C runtime
-        #[cfg(windows)]
-        assert!(crashed.starts_with("Python exited with code "), "{crashed}");
+        assert_eq!(crashed, "Python crashed: aborted");
         let output = worker.eval("1 + 1");
         assert_eq!(output.logs, "2\n");
         assert!(worker.restarted());
@@ -756,32 +458,6 @@ mod tests {
         interrupt.begin(1);
         let output = worker.eval("print('ran')");
         assert_eq!(output.logs, "ran\n");
-    }
-
-    /// A worker that exits between steps is also replaced before an MCP install
-    #[test]
-    fn idle_exit_replaced() {
-        let mut worker = fresh();
-        let exiting =
-            "import os, threading\nmarker = 'set'\nthreading.Timer(0.2, os._exit, [7]).start()";
-        let quitting = |worker: &mut Tried| {
-            let output = worker.eval(exiting);
-            assert_eq!(output.error, None);
-            let waiting = async { time::sleep(Duration::from_secs(1)).await };
-            block_on(waiting);
-        };
-
-        quitting(&mut worker);
-        assert!(worker.restarted());
-        let output = worker.eval("'marker' in globals()");
-        assert_eq!((output.logs.as_str(), output.error), ("False\n", None));
-
-        quitting(&mut worker);
-        let notes = server("notes", |_, _| json!("noted"));
-        worker.add(&notes).expect("add server");
-        assert!(worker.restarted());
-        let output = worker.eval("notes.echo_text('x')");
-        assert_eq!(output.logs, "noted\n");
     }
 
     /// With a small thread stack, deep recursion crashes once the limit is raised
@@ -917,6 +593,70 @@ mod tests {
         );
     }
 
+    /// Code busy inside a builtin never checks for an interrupt and is stopped after `STOP_WAIT`
+    #[test]
+    fn builtin_stopped() {
+        let (mut worker, interrupt) = interruptible();
+        worker.eval("x = 1");
+        cancel_soon(&interrupt, 0);
+        let started = Instant::now();
+        let output = worker.eval("import itertools\nsum(itertools.count())");
+        let waited = started.elapsed();
+        assert_eq!(output.error, Some(CallError::Interrupted));
+        assert!(waited < STOP_WAIT + Duration::from_secs(1), "{waited:?}");
+
+        interrupt.begin(1);
+        let output = worker.eval("'x' in globals()");
+        assert_eq!(output.logs, "False\n");
+        assert!(worker.restarted());
+    }
+
+    /// Dropping the worker stops code still running, and the temporary folder goes with it
+    #[test]
+    fn session_dropped() {
+        let mut worker = fresh();
+        let temp = worker
+            .eval("import tempfile\nprint(tempfile.gettempdir())")
+            .logs;
+        let temp = PathBuf::from(temp.trim());
+        assert!(temp.is_dir(), "{temp:?}");
+
+        let mut ignore = |_: &str| {};
+        let looping = worker.evaluate("while True:\n    pass", &[], &mut ignore);
+        let abandoned = async { time::timeout(Duration::from_millis(300), looping).await };
+        assert!(block_on(abandoned).is_err());
+        drop(worker);
+
+        let started = Instant::now();
+        while temp.exists() {
+            assert!(started.elapsed() < Duration::from_secs(5), "{temp:?}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Files in the temporary folder outlive a restart within the session
+    #[test]
+    fn temp_kept() {
+        let mut worker = fresh();
+        let code = "import os, tempfile\npath = os.path.join(tempfile.gettempdir(), 'café.txt')\n\
+            with open(path, 'w') as f:\n    f.write('kept')\nprint(path)";
+        let path = worker.eval(code).logs;
+        worker.eval("import os\nos._exit(0)");
+        assert!(worker.restarted());
+
+        let code = format!("print(open({:?}).read())", path.trim());
+        let output = worker.eval(&code);
+        assert_eq!(output.logs, "kept\n");
+    }
+
+    #[test]
+    fn environment_limited() {
+        let code = "import os\nallowed = {'HOME', 'USER', 'LOGNAME', 'PATH', 'LANG', 'TZ', 'TZDIR', 'PYTHONTZPATH', 'TMPDIR', 'SSL_CERT_FILE'}\n\
+            [sorted(set(os.environ) - allowed), os.environ['LANG']]";
+        let output = run(code);
+        assert_eq!(output.logs, "[[], 'C.UTF-8']\n");
+    }
+
     /// A worker stuck after an interrupt and one that exits on its own are both replaced
     #[test]
     fn cancel_replaced() {
@@ -943,8 +683,6 @@ mod tests {
         }
     }
 
-    /// A flush blocked in `time.sleep` can't be interrupted on Windows
-    #[cfg(unix)]
     #[test]
     fn flush_stop_kept() {
         let (mut worker, interrupt) = interruptible();
@@ -1024,8 +762,8 @@ mod tests {
         let mut worker = fresh();
         let output = worker.eval("x = (");
         let message = error(output);
-        assert!(message.starts_with("syntax error on line 1: "), "{message}");
-        assert!(message.ends_with("\nx = (\n     ^"), "{message}");
+        let expected = "syntax error on line 1: '(' was never closed\nx = (\n    ^";
+        assert_eq!(message, expected);
 
         // Wide characters take two columns in a terminal
         let output = worker.eval("café = '🐍' +");
@@ -1079,7 +817,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("dir");
         let copies = dir.join("copies");
         let interrupt = Interrupt::default();
-        let building = Worker::new(&interrupt, &dir, &copies, false);
+        let building = Worker::new(&interrupt, &dir, &copies, &[], false);
         let worker = block_on(building).expect("worker");
         let mut worker = Tried {
             worker,
@@ -1302,14 +1040,13 @@ mod tests {
         assert_eq!(output.logs, "[]\n");
     }
 
-    /// Only a stop in place replies and keeps variables set by the interrupted snippet,
-    /// and blocking calls never wake on Windows
-    #[cfg(unix)]
+    /// Only a stop in place replies and keeps variables set by the interrupted snippet
     #[test]
     fn stops_in_place() {
         let blocking = [
             "import time\ntime.sleep(30)",
-            "import socket\na, b = socket.socketpair()\na.recv(1)",
+            "import socket\nserver = socket.create_server(('127.0.0.1', 0))\n\
+             quiet = socket.create_connection(server.getsockname())\nquiet.recv(1)",
             "import asyncio\nasyncio.run(asyncio.sleep(30))",
             "while True:\n    print('a line')",
         ];
@@ -1339,14 +1076,11 @@ mod tests {
         let output = worker.eval(caught);
         assert_eq!(output.logs, "True /nope/café\n");
 
+        // The guest numbers errors and words them its own way, the same on every system
         let output = worker.eval("ls('/nope/café')");
         let message = error(output);
-        // The reason is the system's own text, which differs on Windows
-        assert!(
-            message.starts_with("FileNotFoundError: [Errno 2] "),
-            "{message}"
-        );
-        assert!(message.contains(": '/nope/café'"), "{message}");
+        let expected = "FileNotFoundError: [Errno 44] No such file or directory: '/nope/café'";
+        assert_eq!(message.lines().next(), Some(expected));
     }
 
     #[test]
@@ -1912,7 +1646,8 @@ mod tests {
         fs::set_permissions(&closed, open).expect("chmod");
         fs::remove_dir_all(&dir).ok();
 
-        let denied = "PermissionError: [Errno 13] Permission denied";
+        // EACCES is 2 in the guest
+        let denied = "PermissionError: [Errno 2] Permission denied";
         assert_eq!(
             file.lines().next(),
             Some(format!("{denied}: 'locked.txt'").as_str())
@@ -1922,6 +1657,30 @@ mod tests {
             Some(format!("{denied}: 'closed'").as_str())
         );
         assert_eq!(skipped, "[]\n");
+    }
+
+    /// Builtins fail like `open()` on paths outside the mounts and on links that lead out of them,
+    /// including links the code made itself
+    #[cfg(unix)]
+    #[test]
+    fn outside_mounts() {
+        let (mut worker, dir) = workspace("mounts");
+        let code = "import os\nup = '../' * os.getcwd().count('/')\n\
+            os.symlink(up + 'etc', 'out')\nos.symlink(up + 'etc/hosts', 'hosts.png')\n\
+            def tried(attempt):\n    try:\n        attempt()\n    except OSError as e:\n        return f'{type(e).__name__} {e.errno}'\n\
+            attempts = [lambda: open('/etc/hosts'), lambda: ls('/etc'), lambda: open('out/hosts'),\n    \
+                lambda: ls('out'), lambda: grep('localhost', 'out'), lambda: view('hosts.png')]\n\
+            print([tried(attempt) for attempt in attempts])\nprint(ls())";
+        let output = worker.eval(code);
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(output.error, None);
+        let missing = "'FileNotFoundError 44'";
+        let escaped = "'PermissionError 63'";
+        let tried = format!("[{missing}, {missing}, {escaped}, {escaped}, {escaped}, {escaped}]");
+        // A link out of the mounts isn't followed to tell whether it is a folder
+        let expected = format!("{tried}\n['hosts.png', 'out']\n");
+        assert_eq!(output.logs, expected);
     }
 
     #[test]
@@ -1961,6 +1720,7 @@ mod tests {
     /// Output that programs started by the code write to stdout counts too
     #[cfg(unix)]
     #[test]
+    #[ignore = "the sandbox starts no programs until the process interface lands"]
     fn programs_run() {
         let code = "import os, subprocess\n\
             print(subprocess.run(['echo', 'café'], capture_output=True, text=True).stdout, end='')\n\

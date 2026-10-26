@@ -190,9 +190,7 @@ def view(path: str | _os.PathLike) -> None:
 
     Attaches a PNG, JPEG, GIF or WebP image, or an MP4, WebM or MOV video, to this call's result."""
     path = _path("view", "path", path)
-    # The code may have changed directory but the label is relative to the session directory
-    absolute = _os.path.abspath(path)
-    _view(path, absolute)
+    _view(path)
 
 @_builtin
 def help(request: object) -> None:

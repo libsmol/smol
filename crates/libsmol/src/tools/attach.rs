@@ -89,11 +89,8 @@ pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment
                 shown.push('/');
             }
             let going = AtomicBool::new(false);
-            match ls(path, false, &going) {
-                Ok(names) => {
-                    let names: Vec<_> = names.iter().map(|name| name.to_string_lossy()).collect();
-                    names.join("\n")
-                }
+            match ls(cwd, path, false, &|_| true, &going) {
+                Ok(names) => names.join("\n"),
                 Err(e) => e.to_string(),
             }
         }
@@ -147,34 +144,34 @@ fn lines_of(text: &str, (first, last): (u32, u32)) -> String {
     picked.join("\n")
 }
 
-pub(crate) fn viewed(path: &Path, copies: &Path) -> Result<Media, ToolError> {
-    let shown = slashed(path);
+/// `shown` is the path as the code wrote it
+pub(crate) fn viewed(path: &Path, shown: &str, copies: &Path) -> Result<Media, ToolError> {
     let Some(kind) = kind_of(path) else {
-        let refused = unviewable(&shown);
+        let refused = unviewable(shown);
         return Err(ToolError::Failed(refused));
     };
 
-    let unreadable = |e| ToolError::os("read", &shown, e);
+    let unreadable = |e| ToolError::os("read", shown, e);
     let meta = fs::metadata(path).map_err(unreadable)?;
     // Reading a pipe or a device would block forever
     if !meta.is_file() {
-        let irregular = prompt::failure("read", &shown, prompt::IRREGULAR);
+        let irregular = prompt::failure("read", shown, prompt::IRREGULAR);
         return Err(ToolError::Failed(irregular));
     }
     if meta.len() > media_limit(kind) {
         let refused = oversized(kind, meta.len());
-        let refused = prompt::failure("view", &shown, &refused);
+        let refused = prompt::failure("view", shown, &refused);
         return Err(ToolError::Failed(refused));
     }
 
     let data = fs::read(path).map_err(unreadable)?;
     let Some(found) = sniffed(&data) else {
-        let refused = unviewable(&shown);
+        let refused = unviewable(shown);
         return Err(ToolError::Failed(refused));
     };
     // Copying now keeps later writes to the file from changing what this step viewed
     let copy = copied(copies, &data, found, false);
-    copy.map_err(|e| ToolError::os("copy", &shown, e))
+    copy.map_err(|e| ToolError::os("copy", shown, e))
 }
 
 /// For media in MCP results, an unknown format gives None and the reason names no file

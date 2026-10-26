@@ -207,7 +207,7 @@ async fn start(opening: Opening) -> Result<Session> {
 
     // No restart notice again when no code has run since the last restart
     let ran = memory.ran_code();
-    let worker = Worker::new(&interrupt, &cwd, &copies, ran).await?;
+    let worker = Worker::new(&interrupt, &cwd, &copies, &skills, ran).await?;
 
     let response = match loading {
         true => {

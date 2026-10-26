@@ -8,6 +8,7 @@ repository.workspace = true
 readme = "../../README.md"
 keywords = ["agent", "llm", "acp", "tui", "terminal"]
 categories = ["command-line-utilities"]
+publish = false
 
 [dependencies]
 agent-client-protocol-schema = { version = "1", default-features = false }

@@ -1,10 +1,8 @@
 use crate::memory::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
 use crate::utils::{Clip, Interrupt};
-use crate::worker::END;
 use reaper::{cause, Mark};
 use std::env;
 use std::io::{self, PipeReader, Read};
-use std::mem;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
@@ -28,7 +26,7 @@ const CHUNK_BYTES: usize = 64 * 1024;
 /// instead of piling output up in memory
 const MAX_QUEUED_PIECES: usize = 4;
 /// Gives up when a program left in the background keeps the pipe open
-pub(crate) const DRAIN_WAIT: Duration = Duration::from_secs(2);
+const DRAIN_WAIT: Duration = Duration::from_secs(2);
 pub(crate) const SHOWN_EVERY: Duration = Duration::from_millis(100);
 
 /// Dropping it kills the whole group
@@ -76,11 +74,6 @@ impl Group {
         ended.ok().and_then(|end| end.clone()).flatten()
     }
 
-    /// The spawned program has been reaped
-    pub(crate) fn ended(&self) -> bool {
-        self.ended.borrow().is_some()
-    }
-
     pub(crate) fn kill(&self) {
         self.group.kill();
     }
@@ -91,53 +84,18 @@ impl Group {
     }
 }
 
-pub(crate) enum Piece {
-    Output(Vec<u8>),
-    /// The END marker the worker writes after each snippet
-    End,
-}
-
 /// Waits while the receiver falls behind, but once the receiver is gone it keeps reading
 /// until the pipe closes, because a full pipe blocks the program
-pub(crate) fn relay(mut output: PipeReader) -> Receiver<Piece> {
+fn relay(mut output: PipeReader) -> Receiver<Vec<u8>> {
     let (pieces, received) = mpsc::channel(MAX_QUEUED_PIECES);
     thread::spawn(move || {
         let mut buffer = vec![0; CHUNK_BYTES];
-        let mut held = Vec::new();
         while let Ok(count @ 1..) = output.read(&mut buffer) {
-            held.extend_from_slice(&buffer[..count]);
-            while let Some(at) = held.windows(END.len()).position(|window| window == END) {
-                let rest = held.split_off(at + END.len());
-                held.truncate(at);
-                let before = mem::replace(&mut held, rest);
-                pieces.blocking_send(Piece::Output(before)).ok();
-                pieces.blocking_send(Piece::End).ok();
-            }
-
-            // The marker can span two reads, so a tail matching its start waits for the next one
-            let partial = (1..END.len())
-                .rev()
-                .find(|size| held.ends_with(&END[..*size]));
-            let at = held.len() - partial.unwrap_or(0);
-            let rest = held.split_off(at);
-            let before = mem::replace(&mut held, rest);
-            pieces.blocking_send(Piece::Output(before)).ok();
+            let piece = buffer[..count].to_vec();
+            pieces.blocking_send(piece).ok();
         }
-        pieces.blocking_send(Piece::Output(held)).ok();
     });
     received
-}
-
-/// Collects what is left in the pipe without waiting forever on background programs holding it open
-pub(crate) async fn drain(pieces: &mut Receiver<Piece>, output: &mut Clip) {
-    let draining = async {
-        while let Some(piece) = pieces.recv().await {
-            if let Piece::Output(bytes) = piece {
-                output.push(&bytes);
-            }
-        }
-    };
-    time::timeout(DRAIN_WAIT, draining).await.ok();
 }
 
 /// Runs a command the user typed after !, giving `shown` clipped output now and then
@@ -218,15 +176,17 @@ pub(crate) async fn spawn_shell(
                     shown(&text);
                 }
             }
-            Some(piece) = pieces.recv() => {
-                if let Piece::Output(bytes) = piece {
-                    kept.push(&bytes);
-                }
-            }
+            Some(piece) = pieces.recv() => kept.push(&piece),
         }
     };
 
-    drain(&mut pieces, &mut kept).await;
+    // Collects what is left without waiting forever on background programs holding the pipe open
+    let draining = async {
+        while let Some(piece) = pieces.recv().await {
+            kept.push(&piece);
+        }
+    };
+    time::timeout(DRAIN_WAIT, draining).await.ok();
     step.output = kept.shown(MAX_OBSERVATION_CHARS);
     step.end = end;
 

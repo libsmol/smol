@@ -6,7 +6,6 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch}
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use regex_syntax::Parser;
-use std::ffi::OsString;
 use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -15,32 +14,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_GREP_BYTES: usize = 32 * 1024 * 1024;
 
-/// Once `stop` is set it returns early with a result nobody reads
+/// Lists `path`, resolved against `cwd`, and follows a link to tell whether it is a folder
+/// only where `follows` allows. Once `stop` is set it returns early with a result nobody reads
 pub(crate) fn ls(
-    root: &Path,
+    cwd: &Path,
+    path: &Path,
     recursive: bool,
+    follows: &dyn Fn(&Path) -> bool,
     stop: &AtomicBool,
-) -> Result<Vec<OsString>, ToolError> {
-    let shown = root.to_string_lossy();
+) -> Result<Vec<String>, ToolError> {
+    let root = cwd.join(path);
+    let shown = path.to_string_lossy();
     let failed = |e| ToolError::os("list", &shown, e);
     // Read it even when recursing to report a missing path or a non-directory
-    let entries = fs::read_dir(root).map_err(failed)?;
+    let entries = fs::read_dir(&root).map_err(failed)?;
     let named = |relative: &Path, full: &Path| {
-        let mut name = raw(relative);
-        if full.is_dir() {
-            name.push("/");
+        let mut name = slashed(relative);
+        let followed = !full.is_symlink() || follows(full);
+        if followed && full.is_dir() {
+            name.push('/');
         }
         name
     };
 
     let mut names = Vec::new();
     if recursive {
-        for entry in walker(root).build().flatten() {
+        for entry in walker(&root).build().flatten() {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
             let full = entry.path();
-            let relative = full.strip_prefix(root).unwrap_or(full);
+            let relative = full.strip_prefix(&root).unwrap_or(full);
             if relative.as_os_str().is_empty() {
                 continue;
             }
@@ -62,13 +66,15 @@ pub(crate) fn ls(
     Ok(names)
 }
 
+/// Searches `path`, resolved against `cwd`, and names files the way `path` is written.
 /// Once `stop` is set it returns early with a result nobody reads
 pub(crate) fn grep(
     pattern: &str,
-    root: &Path,
+    cwd: &Path,
+    path: &Path,
     glob: Option<&str>,
     stop: &AtomicBool,
-) -> Result<Vec<(OsString, u64, String)>, ToolError> {
+) -> Result<Vec<(String, u64, String)>, ToolError> {
     let invalid = |argument: &str, e: &dyn Display| {
         let reason = e.to_string();
         let message = prompt::failure("grep", argument, &reason);
@@ -88,16 +94,17 @@ pub(crate) fn grep(
         }
     };
 
-    let shown = root.to_string_lossy();
+    let root = cwd.join(path);
+    let shown = path.to_string_lossy();
     let failed = |e| ToolError::os("search", &shown, e);
-    let meta = fs::metadata(root).map_err(failed)?;
+    let meta = fs::metadata(&root).map_err(failed)?;
     // The walk skips unreadable directories but an unreadable root is an error
     if meta.is_dir() {
-        fs::read_dir(root).map_err(failed)?;
+        fs::read_dir(&root).map_err(failed)?;
     }
 
     // As a walker override the glob would let matching files past `.gitignore`
-    let mut globs = OverrideBuilder::new(root);
+    let mut globs = OverrideBuilder::new(&root);
     if let Some(glob) = glob {
         globs.add(glob).map_err(|e| invalid("glob", &e))?;
     }
@@ -110,7 +117,7 @@ pub(crate) fn grep(
     let mut found = Vec::new();
     let mut bytes = 0;
 
-    for entry in walker(root).build().flatten() {
+    for entry in walker(&root).build().flatten() {
         if stop.load(Ordering::Relaxed) {
             break;
         }
@@ -118,19 +125,25 @@ pub(crate) fn grep(
             continue;
         }
 
-        let path = entry.path();
-        if path != root && globs.matched(path, false).is_ignore() {
+        let full = entry.path();
+        if full != root && globs.matched(full, false).is_ignore() {
             continue;
         }
-        let relative = path.strip_prefix(".").unwrap_or(path);
+        let below = full.strip_prefix(&root).unwrap_or(full);
+        // Joining an empty path would add a trailing slash to a file searched by itself
+        let named = match below.as_os_str().is_empty() {
+            true => path.to_owned(),
+            false => path.join(below),
+        };
+        let named = named.strip_prefix(".").unwrap_or(&named);
         let mut matches = Matches {
-            name: raw(relative),
+            name: slashed(named),
             lines: Vec::new(),
             bytes,
             binary: false,
         };
 
-        let searched = match File::open(path) {
+        let searched = match File::open(full) {
             Ok(inner) => {
                 let reader = Stopping { inner, stop };
                 searcher.search_reader(&matcher, reader, &mut matches)
@@ -138,7 +151,7 @@ pub(crate) fn grep(
             Err(e) => Err(e),
         };
         // Unreadable files in a directory are skipped but an unreadable root file is an error
-        if path == root {
+        if full == root {
             searched.map_err(failed)?;
         }
         if matches.binary {
@@ -161,7 +174,7 @@ pub(crate) fn grep(
 
 /// Matching lines of one file, all dropped when a later NUL shows the file is binary
 struct Matches {
-    name: OsString,
+    name: String,
     lines: Vec<(u64, String)>,
     /// Bytes collected so far, earlier files included
     bytes: usize,
@@ -201,14 +214,6 @@ impl<R: Read> Read for Stopping<'_, R> {
     }
 }
 
-/// Names for Python keep non-UTF-8 bytes as they are for Python to decode with surrogateescape
-fn raw(path: &Path) -> OsString {
-    match cfg!(windows) {
-        true => slashed(path).into(),
-        false => path.as_os_str().to_owned(),
-    }
-}
-
 /// Uses `/` on Windows too to match the trailing `/` on directories, and Python still opens it
 pub(crate) fn slashed(path: &Path) -> String {
     let text = path.to_string_lossy();
@@ -242,9 +247,9 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    fn listed(root: &Path, recursive: bool) -> Vec<OsString> {
+    fn listed(root: &Path, recursive: bool) -> Vec<String> {
         let going = AtomicBool::new(false);
-        ls(root, recursive, &going).expect("ls")
+        ls(root, Path::new("."), recursive, &|_| true, &going).expect("ls")
     }
 
     #[test]
@@ -264,8 +269,8 @@ mod tests {
         assert_eq!(listed(&dir, true), expected);
 
         let top = listed(&dir, false);
-        assert!(top.contains(&OsString::from("build/")), "{top:?}");
-        assert!(top.contains(&OsString::from(".git/")), "{top:?}");
+        assert!(top.contains(&"build/".to_owned()), "{top:?}");
+        assert!(top.contains(&".git/".to_owned()), "{top:?}");
 
         let build = dir.join("build");
         assert_eq!(listed(&build, true), ["out.o"]);
@@ -287,13 +292,16 @@ mod tests {
             assert_eq!(made, 0);
         }
         let stopped = AtomicBool::new(true);
-        assert!(ls(&dir, true, &stopped).expect("ls").is_empty());
+        let here = Path::new(".");
+        assert!(ls(&dir, here, true, &|_| true, &stopped)
+            .expect("ls")
+            .is_empty());
 
         let (sender, receiver) = mpsc::channel();
         let root = dir.clone();
         thread::spawn(move || {
             let stopped = AtomicBool::new(true);
-            let found = grep("one", &root, None, &stopped);
+            let found = grep("one", &root, Path::new("."), None, &stopped);
             let empty = found.is_ok_and(|rows| rows.is_empty());
             sender.send(empty).ok();
         });
@@ -324,7 +332,7 @@ mod tests {
         write("deep/crlf.txt", "déjà vu \r\nthe end:\r\n".as_bytes());
         let going = AtomicBool::new(false);
         let found = |pattern: &str, root: &Path, glob: Option<&str>| {
-            let rows = grep(pattern, root, glob, &going).expect("grep");
+            let rows = grep(pattern, &dir, root, glob, &going).expect("grep");
             let mut shown = Vec::new();
             for (name, number, line) in rows {
                 let path = Path::new(&name);
@@ -346,8 +354,14 @@ mod tests {
         assert_eq!(found(":$", &crlf, None), ["deep/crlf.txt:2:the end:"]);
         assert_eq!(found(r"\s+$", &crlf, None), ["deep/crlf.txt:1:déjà vu "]);
 
+        // Relative paths name files from where the path starts, without a leading `./`
+        assert_eq!(found("const [A-Z]", Path::new("."), None), constant);
+        assert_eq!(found("const [A-Z]", Path::new("./deep"), None), constant);
+        let single = found("main", Path::new("deep/code.rs"), None);
+        assert_eq!(single, main);
+
         // Points at the parenthesis as written, not the one grep-regex adds
-        let unclosed = grep("café(", &dir, None, &going).expect_err("invalid");
+        let unclosed = grep("café(", &dir, &dir, None, &going).expect_err("invalid");
         let message = unclosed.to_string();
         let expected =
             "grep: pattern: regex parse error:\n    café(\n        ^\nerror: unclosed group";
@@ -365,6 +379,11 @@ mod tests {
 
         let expected = ["deep/", "deep/file.txt", "loop/"];
         assert_eq!(listed(&dir, true), expected);
+
+        // Links that may not be followed aren't shown as folders
+        let going = AtomicBool::new(false);
+        let unfollowed = ls(&dir, Path::new("."), false, &|_| false, &going).expect("ls");
+        assert_eq!(unfollowed, ["deep/", "loop"]);
         fs::remove_dir_all(&dir).ok();
     }
 }

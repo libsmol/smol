@@ -20,7 +20,7 @@ pub(crate) enum ToolError {
 }
 
 impl ToolError {
-    fn os(action: &'static str, path: &str, source: io::Error) -> Self {
+    pub(crate) fn os(action: &'static str, path: &str, source: io::Error) -> Self {
         let path = path.to_owned();
         Self::Os {
             action,

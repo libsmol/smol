@@ -17,7 +17,6 @@ mod worker;
 
 pub use crate::acp::run;
 pub use crate::setup::{run as setup, SETUP_ARG};
-pub use crate::worker::{serve as worker, WORKER_ARG};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

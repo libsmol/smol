@@ -21,3 +21,18 @@ lto = true
 codegen-units = 1
 strip = true
 opt-level = "z"
+
+# These compile the guest on first start, which takes twice as long when they are built for size
+[profile.release.package]
+cranelift-assembler-x64 = { opt-level = 3 }
+cranelift-bforest = { opt-level = 3 }
+cranelift-bitset = { opt-level = 3 }
+cranelift-codegen = { opt-level = 3 }
+cranelift-control = { opt-level = 3 }
+cranelift-entity = { opt-level = 3 }
+cranelift-frontend = { opt-level = 3 }
+regalloc2 = { opt-level = 3 }
+wasmparser = { opt-level = 3 }
+wasmtime = { opt-level = 3 }
+wasmtime-environ = { opt-level = 3 }
+wasmtime-internal-cranelift = { opt-level = 3 }

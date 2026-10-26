@@ -73,8 +73,7 @@ pub(crate) fn builtins(vm: &VirtualMachine) -> [(&'static str, PyObjectRef); 5] 
             py_serde::deserialize(vm, result).map_err(invalid)
         };
 
-    // builtins.py also passes the absolute path, which only the native worker uses
-    let view = |path: PyStrRef, _absolute: PyStrRef, vm: &VirtualMachine| {
+    let view = |path: PyStrRef, vm: &VirtualMachine| {
         let cwd = current_dir(vm)?;
         let path = path.to_string_lossy();
         let viewed = tools::view(&cwd, &path);
@@ -117,8 +116,11 @@ fn finish<T>(vm: &VirtualMachine, result: Result<T, ToolError>) -> PyResult<T> {
                 Ok(errno) => errno,
                 Err(_) => codes.get_attr("EIO", vm)?,
             };
+            let os = vm.import("os", 0)?;
+            let strerror = os.get_attr("strerror", vm)?;
+            let message = strerror.call((errno.clone(),), vm)?;
             let class = vm.ctx.exceptions.os_error.as_object();
-            let args = (errno, error.message, error.path);
+            let args = (errno, message, error.path);
             let raised = class.call(args, vm)?;
             let exception = raised.downcast().expect("exception");
             Err(exception)

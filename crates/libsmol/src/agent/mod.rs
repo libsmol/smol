@@ -733,7 +733,7 @@ pub(crate) mod tests {
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let dir = temp_dir("session");
         let copies = dir.join("copies");
-        let starting = Worker::new(&interrupt, &cwd, &copies, false);
+        let starting = Worker::new(&interrupt, &cwd, &copies, &[], false);
         let worker = block_on(starting).expect("worker");
 
         let agent = Agent {
@@ -919,7 +919,7 @@ pub(crate) mod tests {
         let replies = vec![Ok(called("print('reading the orders again')"))];
         let mut run = recorded(replies, None, "", Box::new(|_| {}));
         let agent = &run.agent.agent;
-        let restarting = Worker::new(&agent.interrupt, &agent.cwd, &agent.copies, true);
+        let restarting = Worker::new(&agent.interrupt, &agent.cwd, &agent.copies, &[], true);
         run.agent.worker = block_on(restarting).expect("worker");
 
         let mut memory = AgentMemory::default();

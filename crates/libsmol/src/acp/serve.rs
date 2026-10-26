@@ -5,6 +5,7 @@ use crate::config;
 use crate::history::HistoryStore;
 use crate::setup::SETUP_ARG;
 use crate::utils::{block_on, new_id, Interrupt};
+use crate::worker;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodTerminal, CancelNotification, CloseSessionRequest,
@@ -88,6 +89,7 @@ pub fn run() -> Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let pid = process::id();
     info!("agent: started [version={version}, os={OS}, pid={pid}]");
+    worker::prepare();
 
     let app = App {
         peer: Peer::new(Out::Stdout),

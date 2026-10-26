@@ -66,15 +66,6 @@ somewhere else. Running the script again upgrades.
 Releases are built for Linux (x86_64, arm64), macOS (Apple silicon, Intel)
 and Windows (x86_64).
 
-With a recent stable Rust you can also install from crates.io, where the
-agent is `libsmol` and the terminal UI is `libsmol-tui` (its program is still
-`smol`). Keep `--locked`, which builds with the dependency versions the release
-was tested with:
-
-```sh
-cargo install --locked libsmol libsmol-tui
-```
-
 To build from a checkout, run `./build.sh` (`build.ps1` on Windows). It also
 needs clang and llvm-ar with the WebAssembly target: Homebrew's `llvm` on macOS,
 the `clang` and `llvm` packages on Linux, and LLVM on Windows.
@@ -309,4 +300,5 @@ embedded Python. It is an independent project, not affiliated with Hugging Face.
 ## License
 
 [MIT](LICENSE). Release archives also include `THIRD-PARTY-LICENSES.html` with
-the licenses of the libraries built into the programs.
+the licenses of the libraries built into the programs, and
+`THIRD-PARTY-LICENSES-PYTHON.html` with those of the Python inside libsmol.
