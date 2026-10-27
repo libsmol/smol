@@ -18,7 +18,7 @@ but their files stay in `~/.smol/history` untouched.
 - smol groups those agents under the call that started them. One at work shows
   the last lines of what it writes or prints and what it is doing, in a color of
   its own; one that ended takes a single line, and ctrl+o shows the start of its
-  answer. What the call's code printed stays folded until ctrl+o.
+  answer.
 
 ## 0.3.1 - 2026-10-27
 

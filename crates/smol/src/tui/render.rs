@@ -281,15 +281,11 @@ impl Render {
                         let line = vec![kind, gap, name];
                         self.push_lines(mark, &[line]);
                     }
-                    let head = match call.helpers.is_empty() {
-                        true => OUTPUT_HEAD,
-                        false => 0,
-                    };
                     for output in parts.outputs {
                         let mark = branch();
                         let output = output.trim_matches('\n');
                         let lines = highlight::plain(output, Style::new());
-                        self.fold(mark, lines, head, 0);
+                        self.fold(mark, lines, OUTPUT_HEAD, 0);
                     }
                     if let Some(error) = parts.error {
                         let error = error.trim_matches('\n');
@@ -330,7 +326,7 @@ impl Render {
         }
 
         let line = parts.join(" · ");
-        self.wrap(BODY, &line, DIM);
+        self.push_status(BODY, vec![(line, DIM)]);
     }
 
     /// Each agent the call's code started as its title, then what it is doing while it works,
@@ -486,7 +482,8 @@ impl Render {
                 if let (Some(input), Some(output)) = (usage.input, usage.output) {
                     stats.push(in_out(input, output));
                 }
-                self.wrap(body, &stats.join(" · "), DIM);
+                let stats = stats.join(" · ");
+                self.push_status(body, vec![(stats, DIM)]);
 
                 if index + 1 < helpers.len() {
                     self.push_lines(body, &[Vec::new()]);
@@ -530,14 +527,11 @@ impl Render {
         self.rows.truncate(start + head);
         let hidden = rows - head - tail;
         let more = format!("… +{hidden} lines (ctrl+o to expand)");
-        let lead = match head {
-            0 => mark,
-            _ => Mark {
-                first: mark.rest,
-                ..mark
-            },
+        let rest = Mark {
+            first: mark.rest,
+            ..mark
         };
-        self.wrap(lead, &more, DIM);
+        self.push_status(rest, vec![(more, DIM)]);
 
         // The row before is now the hint, so copying must not join onto it
         if let Some(first) = ending.first_mut() {
@@ -961,7 +955,7 @@ fn last_sentence(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use crate::tui::render::*;
-    use crate::tui::transcript::{Attachment, Call, Helper, Shell, StepStats};
+    use crate::tui::transcript::{Attachment, Call, Helper, HelperUsage, Shell, StepStats};
     use agent_client_protocol_schema::v1::ToolCallStatus;
 
     fn call(content: &[&str], status: ToolCallStatus) -> Call {
@@ -1031,8 +1025,9 @@ mod tests {
         assert_eq!(expanded[1].joint.as_deref(), Some(" "));
     }
 
+    /// What the code printed shows after its agents like any call's output
     #[test]
-    fn agent_output_folded() {
+    fn agent_output_shown() {
         let code = "```python\nagent(tasks)\n```";
         let printed = "café: 3\nnaïve: 1\nrésumé: 2";
         let mut started = call(&[code, printed], ToolCallStatus::Completed);
@@ -1048,18 +1043,27 @@ mod tests {
             "  │ agent(tasks)",
             "  ├ agents · 1 done",
             "  │   ◆ Count the menu",
-            "  ╰ … +3 lines (ctrl+o to expand)",
+            "  ╰ café: 3",
+            "    naïve: 1",
+            "    résumé: 2",
         ];
         assert_eq!(rendered(&step, 40, false), expected);
-        let expanded = rendered(&step, 40, true);
-        let shown = ["  ╰ café: 3", "    naïve: 1", "    résumé: 2"];
-        assert_eq!(expanded[expanded.len() - 3..], shown);
     }
 
     #[test]
     fn helper_answer_cut() {
         let answer = "- café 1\n- café 2\n- café 3\n- café 4\n- naïve 5\n- résumé 6";
-        let step = helped(helper("Spell the menu", ToolCallStatus::Completed, answer));
+        let usage = HelperUsage {
+            input: Some(3510),
+            output: Some(211),
+            steps: 2,
+            duration: 10.0,
+        };
+        let spelled = Helper {
+            usage: Some(usage),
+            ..helper("Spell the menu", ToolCallStatus::Completed, answer)
+        };
+        let step = helped(spelled);
         let folded = rendered(&step, 40, false);
         assert_eq!(folded[3..], ["      ◆ Spell the menu"]);
 
@@ -1072,9 +1076,11 @@ mod tests {
             "        • café 3",
             "        • café 4",
             "        … +2 lines",
+            "        2 steps · 10.0s · ⇡3.51k ⇣211",
         ];
         assert_eq!(text(rows), expected);
         assert_eq!(rows[4].mark_width, usize::MAX);
+        assert_eq!(rows[5].mark_width, usize::MAX);
     }
 
     fn rendered(step: &Step, width: u16, expanded: bool) -> Vec<String> {
@@ -1131,11 +1137,17 @@ mod tests {
             ..Step::default()
         };
 
-        let folded = rendered(&step, 40, false);
+        let mut render = Render::new(40, false);
+        render.step(&step);
+        let folded = text(&render.rows);
         let passes = folded.iter().filter(|line| *line == "  │ pass").count();
         assert_eq!(folded[1], "  ✻ last idea");
         assert_eq!(passes, CODE_HEAD);
-        assert!(folded.contains(&"  │ … +4 lines (ctrl+o to expand)".to_owned()));
+        let hint = folded
+            .iter()
+            .position(|line| line == "  │ … +4 lines (ctrl+o to expand)");
+        let hint = hint.expect("hint");
+        assert_eq!(render.rows[hint].mark_width, usize::MAX);
         assert_eq!(folded.last().map(String::as_str), Some("  ╰ ok"));
 
         let expanded = rendered(&step, 40, true);
@@ -1288,6 +1300,10 @@ mod tests {
 
         let expected = ["  1.2s · ⇡1.23k ⇣56", "  · 70 t/s"];
         assert_eq!(rendered(&step, 20, false)[2..], expected);
+        let mut render = Render::new(20, false);
+        render.step(&step);
+        let marks: Vec<usize> = render.rows[2..].iter().map(|row| row.mark_width).collect();
+        assert_eq!(marks, [usize::MAX, usize::MAX]);
         let empty = Step::default();
         assert_eq!(rendered(&empty, 40, false), [""]);
     }

@@ -314,6 +314,17 @@ mod tests {
     }
 
     #[test]
+    fn fold_hint_skipped() {
+        let lines: Vec<String> = (1..=10).map(|n| format!("café {n}")).collect();
+        let mut transcript = Transcript::default();
+        transcript.push(Entry::Task(lines.join("\n")));
+
+        let rows = transcript.rows(40, false);
+        let all = select((0, 0), (rows.len(), 40)).text(rows);
+        assert_eq!(all, "\ncafé 1\ncafé 2\ncafé 3\ncafé 4\ncafé 9\ncafé 10");
+    }
+
+    #[test]
     fn agent_status_skipped() {
         let helper = |title: &str, status: ToolCallStatus, text: &str| Helper {
             id: "call_1.1".to_owned(),
