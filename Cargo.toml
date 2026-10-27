@@ -6,10 +6,10 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/libsmol/smol"
-version = "0.3.0"
+version = "0.3.1"
 
 [workspace.dependencies]
-reaper = { package = "libsmol-reaper", version = "0.3.0", path = "crates/reaper" }
+reaper = { package = "libsmol-reaper", version = "0.3.1", path = "crates/reaper" }
 
 # Test workers run the RustPython built here, which is far too slow unoptimized
 [profile.dev.package."*"]

@@ -7,6 +7,14 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## 0.3.1 - 2026-10-27
+
+- Packages a skill's scripts need now go in a venv in the session's temporary
+  folder. The system prompt used to say to make it in the skill's folder, which the
+  sandbox keeps read-only outside the working directory, so creating it failed.
+- The system prompt is shorter: the rules about fixing failed calls and assuming
+  UTF-8 and the list repeating what the built-in functions do are gone.
+
 ## 0.3.0 - 2026-10-26
 
 Sessions are saved in format 7, so sessions from 0.2.0 and earlier are no longer
