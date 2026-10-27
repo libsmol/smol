@@ -18,9 +18,7 @@ pub(crate) const TOOL_DOC: &str = "Runs Python code.";
 const UPDATE: &str = "Task update";
 
 const RULES: &str = "- Never make up data or functions; check unfamiliar ones with help() first.
-- If a call fails, fix it; if an approach keeps failing, try another.
-- Do the task instead of describing it. Report only results you got, and say what failed or is uncertain.
-- Assume UTF-8 unless data is known to use another encoding.";
+- Do the task instead of describing it. Report only results you got, and say what failed or is uncertain.";
 
 pub(crate) fn system(
     functions: &[&Function],
@@ -68,11 +66,16 @@ pub(crate) fn system(
         let entry = format!("## Skill `{name}`\n\n{description}\n\n- {path}");
         entries.push(entry);
     }
+    // The sandbox gives Windows code TEMP instead of TMPDIR
+    let temp = match cfg!(windows) {
+        true => "%TEMP%",
+        false => "$TMPDIR",
+    };
     let skills = match entries.is_empty() {
         true => String::new(),
         false => {
             let entries = entries.join("\n\n");
-            format!("\n\n# Skills\n\nWhen a task matches a skill below, read its SKILL.md first and follow it; paths in it are relative to its folder. Run its Python scripts with a `.venv` in that folder, creating it with `python3 -m venv .venv` if missing.\n\n{entries}")
+            format!("\n\n# Skills\n\nWhen a task matches a skill below, read and follow its SKILL.md; paths in it are relative to its folder. Install packages its scripts need in a venv in {temp}.\n\n{entries}")
         }
     };
 
@@ -117,7 +120,7 @@ Answer in Markdown, which the user sees rendered, as soon as you have the result
 
 # Functions
 
-These need no import. Prefer them to your own code: ls lists directories, grep searches files, edit changes files, fetch reads web pages. Create new files with open().
+These need no import. Prefer them to your own code. Create new files with open().
 
 ## Built-in
 
@@ -577,10 +580,16 @@ mod tests {
         let place =
             ") in /home/zoë/work; the files and programs a task mentions are there.\n- Today";
         assert!(text.contains(place), "{text}");
-        let skill = "\n\n# Skills\n\n\
-                     When a task matches a skill below, read its SKILL.md first and follow it; paths in it are relative to its folder. Run its Python scripts with a `.venv` in that folder, creating it with `python3 -m venv .venv` if missing.\n\n\
-                     ## Skill `weekly`\n\nWrite the weekly report\n\n- /home/zoë/.smol/skills/weekly/SKILL.md\n\n# Rules\n\n";
-        assert!(text.contains(skill), "{text}");
+        let temp = match cfg!(windows) {
+            true => "%TEMP%",
+            false => "$TMPDIR",
+        };
+        let skill = format!(
+            "\n\n# Skills\n\n\
+             When a task matches a skill below, read and follow its SKILL.md; paths in it are relative to its folder. Install packages its scripts need in a venv in {temp}.\n\n\
+             ## Skill `weekly`\n\nWrite the weekly report\n\n- /home/zoë/.smol/skills/weekly/SKILL.md\n\n# Rules\n\n"
+        );
+        assert!(text.contains(&skill), "{text}");
         let files = " (UTC).\n\n# Instructions\n\n\
                      Follow these instructions:\n\n\
                      <instructions>\nReply in French\n</instructions>\n\n\
