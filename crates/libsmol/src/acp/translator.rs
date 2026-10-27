@@ -1,23 +1,28 @@
 use crate::acp::rpc::{Notice, Peer};
-use crate::acp::{SHELL, UPDATE};
-use crate::agent::Event;
+use crate::acp::{AGENT, SHELL, UPDATE};
+use crate::agent::{Asking, Event, HelperView, Helpers, Sink, Unseen};
 use crate::memory::{
-    estimate, text_bytes, AgentMemory, AgentStep, Call, CallError, Exit, MemoryStep, ShellStep,
-    StepError, SummaryStep, TaskStep, Usage,
+    estimate, text_bytes, AgentMemory, AgentStep, Call, CallError, Ending, Exit, Helper,
+    MemoryStep, ShellStep, StepError, SummaryStep, TaskStep, Usage,
 };
-use crate::prompt::TOOL;
+use crate::prompt::{STOPPED, TOOL, UNFINISHED};
+use crate::spawn::SHOWN_EVERY;
 use agent_client_protocol_schema::v1::{
     ContentBlock, ContentChunk, MessageId, Meta, ResourceLink, SessionUpdate, ToolCall,
     ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use reqwest::Url;
 use serde_json::json;
+use std::env;
 use std::mem;
-use std::path::{self, Path, PathBuf};
+use std::path::{self, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const ESTIMATE_EVERY: Duration = Duration::from_secs(1);
+const MAX_TITLE_CHARS: usize = 80;
+const MAX_PREVIEW_LINES: usize = 4;
+const MAX_PREVIEW_CHARS: usize = 800;
 const COMPACTING: &str = "Compact context";
 const RESTARTED: &str = "python: restarted, earlier variables are gone";
 const SKIPPED: &str = "skipped: an earlier call failed";
@@ -37,6 +42,7 @@ pub(crate) struct Translator {
     /// The call for the user command that is running
     shell: Option<String>,
     progress: Progress,
+    cwd: PathBuf,
     copies: PathBuf,
 }
 
@@ -63,6 +69,7 @@ impl Translator {
         session: String,
         peer: Arc<Peer>,
         window: Option<u64>,
+        cwd: PathBuf,
         copies: PathBuf,
     ) -> Self {
         Self {
@@ -77,6 +84,7 @@ impl Translator {
             thinking: None,
             shell: None,
             progress: Progress::default(),
+            cwd,
             copies,
         }
     }
@@ -253,6 +261,13 @@ impl Translator {
             } else if call.arguments.is_some() {
                 self.unread(index, call);
             }
+            let result = call.result.as_ref();
+            let helpers = result.map(|result| result.agents.as_slice());
+            let views = self.helpers(index);
+            for (offset, helper) in helpers.unwrap_or_default().iter().enumerate() {
+                let mut view = views.open(offset + 1, &helper.task);
+                view.close(helper);
+            }
             if call.result.is_some() || call.error.is_some() {
                 self.ran(index, call);
             }
@@ -360,6 +375,20 @@ impl Translator {
 
     fn opened(&self, index: usize) -> Option<&Opened> {
         self.calls.iter().find(|call| call.index == index)
+    }
+
+    /// The agents that the call at `index` starts take ids after the call's own,
+    /// and a call with no readable code was never opened and starts none
+    pub(crate) fn helpers(&self, index: usize) -> Box<dyn Helpers> {
+        let Some(opened) = self.opened(index) else {
+            return Box::new(Unseen);
+        };
+        Box::new(AgentCalls {
+            peer: Arc::clone(&self.peer),
+            session: self.session.clone(),
+            parent: opened.id.clone(),
+            cwd: self.cwd.clone(),
+        })
     }
 
     fn ran(&mut self, index: usize, ran: &Call) {
@@ -542,6 +571,274 @@ impl Translator {
     }
 }
 
+pub(crate) struct AgentCalls {
+    peer: Arc<Peer>,
+    session: String,
+    parent: String,
+    cwd: PathBuf,
+}
+
+/// An agent started by `agent()`, shown as one tool call with what it is doing now
+/// and the end of what it is writing or printing for that
+pub(crate) struct AgentCall {
+    peer: Arc<Peer>,
+    session: String,
+    id: String,
+    started: bool,
+    /// The reasoning, text and code of each call in its current step
+    thought: String,
+    text: String,
+    codes: Vec<String>,
+    doing: String,
+    /// The status and preview last sent
+    shown: (String, String),
+    shown_at: Instant,
+    /// Agents still running when their snippet ends are aborted before they close
+    closed: bool,
+}
+
+impl Helpers for AgentCalls {
+    fn open(&self, number: usize, task: &str) -> Box<dyn HelperView> {
+        let id = format!("{}.{number}", self.parent);
+        let title = agent_title(task, &self.cwd);
+        let marked = (AGENT.to_owned(), json!(true));
+        let parent = ("parent".to_owned(), json!(self.parent));
+        let meta = Meta::from_iter([marked, parent]);
+        let opened = ToolCall::new(id.clone(), title)
+            .kind(ToolKind::Other)
+            .status(ToolCallStatus::Pending)
+            .meta(meta);
+        let update = SessionUpdate::ToolCall(opened);
+        self.peer.update(&self.session, update);
+
+        let call = AgentCall {
+            peer: Arc::clone(&self.peer),
+            session: self.session.clone(),
+            id,
+            started: false,
+            thought: String::new(),
+            text: String::new(),
+            codes: Vec::new(),
+            doing: String::new(),
+            shown: (String::new(), String::new()),
+            shown_at: Instant::now(),
+            closed: false,
+        };
+        Box::new(call)
+    }
+}
+
+impl AgentCall {
+    fn send(&self, fields: ToolCallUpdateFields, meta: Option<Meta>) {
+        let mut update = ToolCallUpdate::new(self.id.clone(), fields);
+        if let Some(meta) = meta {
+            update = update.meta(meta);
+        }
+        self.peer
+            .update(&self.session, SessionUpdate::ToolCallUpdate(update));
+    }
+}
+
+impl Sink for AgentCall {
+    fn event(&mut self, event: Event) {
+        let streamed = matches!(
+            event,
+            Event::Thought(_) | Event::Text(_) | Event::Code(..) | Event::Output(_)
+        );
+        let preview = match event {
+            Event::Thought(text) => {
+                self.doing = "thinking".to_owned();
+                self.thought.push_str(text);
+                tail(&self.thought)
+            }
+            Event::Text(text) => {
+                self.doing = "writing".to_owned();
+                self.text.push_str(text);
+                tail(&self.text)
+            }
+            Event::Code(index, text) => {
+                if self.codes.len() <= index {
+                    self.codes.resize(index + 1, String::new());
+                }
+                self.codes[index].push_str(text);
+                let code = &self.codes[index];
+                let line = first_line(code);
+                self.doing = format!("writing {line}");
+                tail(code)
+            }
+            Event::Execute(index) => {
+                let code = self.codes.get(index).map(String::as_str);
+                let code = code.unwrap_or_default();
+                let line = first_line(code);
+                self.doing = format!("running {line}");
+                tail(code)
+            }
+            Event::Output(output) => tail(output),
+            Event::Restarted => {
+                self.doing = RESTARTED.to_owned();
+                String::new()
+            }
+            // The retried reply starts over
+            Event::Retry { reason, .. } => {
+                self.thought.clear();
+                self.text.clear();
+                self.codes.clear();
+                self.doing = format!("retrying: {reason}");
+                String::new()
+            }
+            Event::Compact => {
+                self.doing = "compacting".to_owned();
+                String::new()
+            }
+            Event::StepEnd(_) => {
+                self.thought.clear();
+                self.text.clear();
+                self.codes.clear();
+                return;
+            }
+            Event::Unread(..) | Event::Ran(..) | Event::CompactEnd(_) => return,
+        };
+        let shown = (self.doing.clone(), preview);
+
+        // Only streams are throttled, as an update such as starting to run may be the last for a while
+        let due = self.shown_at.elapsed() >= SHOWN_EVERY;
+        if self.started && ((streamed && !due) || shown == self.shown) {
+            return;
+        }
+
+        let (doing, preview) = &shown;
+        let mut content = vec![ToolCallContent::from(doing.clone())];
+        if !preview.is_empty() {
+            content.push(ToolCallContent::from(preview.clone()));
+        }
+        let mut fields = ToolCallUpdateFields::new().content(content);
+        if !self.started {
+            fields = fields.status(ToolCallStatus::InProgress);
+        }
+        self.started = true;
+        self.shown = shown;
+        self.shown_at = Instant::now();
+        self.send(fields, None);
+    }
+
+    fn saved(&mut self, _: &AgentMemory) {}
+
+    fn queued(&mut self) -> Asking<'_> {
+        Box::pin(async { Vec::new() })
+    }
+}
+
+impl HelperView for AgentCall {
+    /// Replay closes it right after opening it, and both send the same last update
+    fn close(&mut self, helper: &Helper) {
+        let (status, text) = match &helper.end {
+            Ending::Answer(answer) => (ToolCallStatus::Completed, answer.as_str()),
+            Ending::Error(error) => (ToolCallStatus::Failed, error.as_str()),
+            Ending::Interrupted {} => (ToolCallStatus::Failed, STOPPED),
+        };
+        let (usage, steps) = helper.memory.spent();
+        let mut meta = Meta::new();
+        meta.insert(AGENT.to_owned(), true.into());
+        if let Some(tokens) = usage.tokens {
+            meta.insert("inputTokens".to_owned(), tokens.input_tokens.into());
+            meta.insert("outputTokens".to_owned(), tokens.output_tokens.into());
+        }
+        meta.insert("steps".to_owned(), steps.into());
+        meta.insert("duration".to_owned(), usage.duration.into());
+        // The client recognizes interrupts by this key, which matches the one on usage updates
+        if helper.end == (Ending::Interrupted {}) {
+            meta.insert("interrupted".to_owned(), true.into());
+        }
+
+        let content = vec![ToolCallContent::from(text)];
+        let fields = ToolCallUpdateFields::new().status(status).content(content);
+        self.send(fields, Some(meta));
+        self.closed = true;
+    }
+}
+
+impl Drop for AgentCall {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let content = vec![ToolCallContent::from(UNFINISHED)];
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Failed)
+            .content(content);
+        let marked = (AGENT.to_owned(), json!(true));
+        let meta = Meta::from_iter([marked]);
+        self.send(fields, Some(meta));
+    }
+}
+
+/// The start of a task on one line, with the session's directory as `.` and paths in it relative,
+/// and the home directory as `~`
+fn agent_title(task: &str, cwd: &Path) -> String {
+    let cwd = cwd.display().to_string();
+    let mut task = shortened(task, &cwd, ".", "");
+    if let Some(home) = env::home_dir() {
+        let home = home.display().to_string();
+        let inside = format!("~{MAIN_SEPARATOR}");
+        task = shortened(&task, &home, "~", &inside);
+    }
+
+    let words: Vec<&str> = task.split_whitespace().collect();
+    let line = words.join(" ");
+    let mut title: String = line.chars().take(MAX_TITLE_CHARS).collect();
+    if title.len() < line.len() {
+        title.push('…');
+    }
+    format!("agent: {title}")
+}
+
+/// Writes `root` as `name` and paths in it starting with `inside`,
+/// except where `root` only begins or ends a longer path or word
+fn shortened(text: &str, root: &str, name: &str, inside: &str) -> String {
+    // An empty root would match at every position and never advance
+    if root.is_empty() {
+        return text.to_owned();
+    }
+
+    let pathy = |c: char| c.is_alphanumeric() || matches!(c, '/' | '\\' | '.' | '-' | '_' | '~');
+    let mut kept = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(root) {
+        let (before, after) = (&rest[..at], &rest[at + root.len()..]);
+        kept.push_str(before);
+        let joined = before.chars().next_back().is_some_and(pathy);
+        rest = after;
+        match after.chars().next() {
+            _ if joined => kept.push_str(root),
+            Some(MAIN_SEPARATOR) => {
+                kept.push_str(inside);
+                rest = &after[MAIN_SEPARATOR.len_utf8()..];
+            }
+            Some(next) if pathy(next) => kept.push_str(root),
+            _ => kept.push_str(name),
+        }
+    }
+    kept.push_str(rest);
+    kept
+}
+
+fn first_line(code: &str) -> &str {
+    let mut lines = code.lines().map(str::trim);
+    lines.find(|line| !line.is_empty()).unwrap_or_default()
+}
+
+/// The last lines of `text` that aren't blank, read from its end since a stream can grow long
+fn tail(text: &str) -> String {
+    let mut chars = text.char_indices().rev();
+    let cut = chars.nth(MAX_PREVIEW_CHARS - 1).map_or(0, |(at, _)| at);
+    let kept = &text[cut..];
+
+    let lines = kept.lines().rev().filter(|line| !line.trim().is_empty());
+    let mut lines: Vec<&str> = lines.take(MAX_PREVIEW_LINES).collect();
+    lines.reverse();
+    lines.join("\n")
+}
+
 fn fenced(code: &str) -> ToolCallContent {
     let code = code.trim_matches('\n');
     let text = format!("```python\n{code}\n```");
@@ -574,7 +871,7 @@ mod tests {
     use crate::acp::translator::*;
     use crate::agent::tests::{called, reply, scripted, Script, ScriptedModel};
     use crate::memory::tests::{asked, coded, metered, replied};
-    use crate::memory::CodeResult;
+    use crate::memory::{CodeResult, Helper};
     use crate::model::tests::png;
     use crate::model::{Finish, ModelError};
     use serde_json::Value;
@@ -584,8 +881,10 @@ mod tests {
     fn translator(window: u64) -> (Translator, Lines) {
         let (lines, sent) = mpsc::unbounded_channel();
         let peer = Peer::new(Out::Lines(lines));
-        let copies = env::temp_dir().join("copies");
-        let translator = Translator::new("session-1".to_owned(), peer, Some(window), copies);
+        let cwd = env::temp_dir();
+        let copies = cwd.join("copies");
+        let session = "session-1".to_owned();
+        let translator = Translator::new(session, peer, Some(window), cwd, copies);
         (translator, sent)
     }
 
@@ -1140,6 +1439,156 @@ mod tests {
             .collect();
         assert_eq!(updates[1]["status"], "failed");
         assert_eq!(updates[1]["content"], json!([]));
+    }
+
+    /// Each agent the code starts is a tool call of its own, the same live and on replay
+    #[test]
+    fn helpers_shown() {
+        let (mut live, mut sent) = translator(1000);
+        live.translate(Event::Code(0, "print(agent('Count the cafés'))\n"));
+        live.translate(Event::Execute(0));
+        let started = live.helpers(0);
+        let mut call = started.open(1, "Count the cafés\nin menu.txt");
+        call.event(Event::Thought("Reading the menu"));
+        call.event(Event::Code(0, "\nprint(len(cafés))\n"));
+        call.event(Event::Execute(0));
+        call.event(Event::Output("3\n"));
+        let counted = AgentStep {
+            usage: metered(100, 20),
+            ..replied("3 cafés")
+        };
+        let memory = AgentMemory {
+            steps: vec![
+                MemoryStep::Task(asked("Count the cafés\nin menu.txt")),
+                MemoryStep::Action(Box::new(counted)),
+            ],
+        };
+        let helper = Helper {
+            task: "Count the cafés\nin menu.txt".to_owned(),
+            end: Ending::Answer("3 cafés".to_owned()),
+            memory,
+        };
+        call.close(&helper);
+        let result = CodeResult {
+            printed: Some("3 cafés".to_owned()),
+            agents: vec![helper],
+            ..CodeResult::default()
+        };
+        let ran = Call {
+            code: "print(agent('Count the cafés'))".to_owned(),
+            result: Some(result),
+            ..Call::default()
+        };
+        live.translate(Event::Ran(0, &ran));
+        let step = AgentStep {
+            calls: vec![ran],
+            ..AgentStep::default()
+        };
+        live.translate(Event::StepEnd(&step));
+        let told = drained(&mut sent);
+
+        let memory = AgentMemory {
+            steps: vec![MemoryStep::Action(Box::new(step))],
+        };
+        let (mut replaying, mut sent) = translator(1000);
+        replaying.replay(&memory);
+        let again = drained(&mut sent);
+        assert_eq!(shown(&again), shown(&told));
+
+        let updates: Vec<&Value> = told
+            .iter()
+            .map(|message| &message["params"]["update"])
+            .collect();
+        let opened = updates[2];
+        assert_eq!(opened["toolCallId"], "call_1.1");
+        assert_eq!(opened["title"], "agent: Count the cafés in menu.txt");
+        let marked = json!({ "_smol/agent": true, "parent": "call_1" });
+        assert_eq!(opened["_meta"], marked);
+        let working = updates[3];
+        assert_eq!(working["status"], "in_progress");
+        assert_eq!(working["content"][0]["content"]["text"], "thinking");
+        assert_eq!(working["content"][1]["content"]["text"], "Reading the menu");
+        // Code that streams too soon after is held back, but not the start of its run
+        let running = updates[4];
+        let content = &running["content"];
+        assert_eq!(content[0]["content"]["text"], "running print(len(cafés))");
+        assert_eq!(content[1]["content"]["text"], "print(len(cafés))");
+        let closed = updates[5];
+        assert_eq!(closed["status"], "completed");
+        assert_eq!(closed["content"][0]["content"]["text"], "3 cafés");
+        let meta = json!({
+            "_smol/agent": true,
+            "inputTokens": 100,
+            "outputTokens": 20,
+            "steps": 1,
+            "duration": 0.0,
+        });
+        assert_eq!(closed["_meta"], meta);
+
+        // An interrupted agent is marked like an interrupted command
+        let stopped = Helper {
+            task: "Count the cafés".to_owned(),
+            end: Ending::Interrupted {},
+            memory: AgentMemory::default(),
+        };
+        let (mut stopping, mut sent) = translator(1000);
+        stopping.translate(Event::Code(0, "agent('Count the cafés')\n"));
+        let started = stopping.helpers(0);
+        let mut call = started.open(1, &stopped.task);
+        call.close(&stopped);
+        // One aborted before it closes still ends
+        let dropped = started.open(2, "Spell naïve");
+        drop(dropped);
+
+        let messages = drained(&mut sent);
+        let closed = &messages[2]["params"]["update"];
+        assert_eq!(closed["status"], "failed");
+        assert_eq!(closed["_meta"]["interrupted"], true);
+        let aborted = &messages[4]["params"]["update"];
+        assert_eq!(aborted["toolCallId"], "call_1.2");
+        assert_eq!(aborted["status"], "failed");
+        let reason = &aborted["content"][0]["content"]["text"];
+        assert_eq!(reason, "stopped before it answered");
+        assert_eq!(messages.len(), 5, "{messages:?}");
+    }
+
+    #[test]
+    fn agent_titles() {
+        let home = env::home_dir().expect("home");
+        let cwd = home.join("menus");
+        let (inside, under, sep) = (cwd.display(), home.display(), MAIN_SEPARATOR);
+        let task =
+            format!("Work in {inside}: read {inside}{sep}café.txt\nand  {under}{sep}naïve.md");
+        let expected = format!("agent: Work in .: read café.txt and ~{sep}naïve.md");
+        assert_eq!(agent_title(&task, &cwd), expected);
+
+        let long = "résumé ".repeat(20);
+        let cut = agent_title(&long, Path::new("/"));
+        assert_eq!(cut.chars().count(), "agent: ".len() + MAX_TITLE_CHARS + 1);
+        assert!(cut.ends_with('…'), "{cut}");
+    }
+
+    #[test]
+    fn paths_shortened() {
+        let sep = MAIN_SEPARATOR;
+        let root = format!("{sep}work{sep}menus");
+        let text = format!("In {root}, read {root}{sep}café.txt ({root}) but not {root}2, {root}.bak or {sep}var{root}{sep}naïve");
+        let expected = format!(
+            "In ., read café.txt (.) but not {root}2, {root}.bak or {sep}var{root}{sep}naïve"
+        );
+        assert_eq!(shortened(&text, &root, ".", ""), expected);
+        assert_eq!(shortened("résumé", "", ".", ""), "résumé");
+    }
+
+    #[test]
+    fn preview_tail() {
+        assert_eq!(tail("\nprint('café')\n"), "print('café')");
+        assert_eq!(tail("a\nb\n\nc\nd\n  \nnaïve\n\n"), "b\nc\nd\nnaïve");
+
+        let long = "résumé ".repeat(200);
+        let kept = tail(&long);
+        assert_eq!(kept.chars().count(), MAX_PREVIEW_CHARS);
+        assert!(long.ends_with(&kept), "{kept}");
     }
 
     #[test]

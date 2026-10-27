@@ -9,6 +9,8 @@ use ratatui::style::{Modifier, Style};
 use std::env;
 use std::io::stdout;
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 mod app;
 mod browser;
@@ -25,6 +27,8 @@ mod ui;
 const POLL_EVERY: Duration = Duration::from_millis(30);
 /// Keys buffered after this long without reading events may have been typed during a stall
 const STALL_WAIT: Duration = Duration::from_millis(200);
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPIN_EVERY: Duration = Duration::from_millis(80);
 
 /// Terminals draw DIM differently and some ignore it entirely
 pub(crate) const DIM: Style = Style::new().fg(theme::COMMENT);
@@ -36,6 +40,40 @@ pub(crate) const RED: Style = Style::new().fg(theme::RED);
 pub(crate) const BORDER: Style = Style::new().fg(theme::LINE);
 
 pub(crate) type Spans = Vec<(String, Style)>;
+
+pub(crate) fn spinner(since: Instant) -> char {
+    let frames = since.elapsed().as_millis() / SPIN_EVERY.as_millis();
+    SPINNER[frames as usize % SPINNER.len()]
+}
+
+/// Cuts with … or pads with spaces to exactly `width` columns
+pub(crate) fn fitted(text: &str, width: usize) -> String {
+    let long = text.width() > width;
+    let room = match long {
+        true => width.saturating_sub(1),
+        false => width,
+    };
+
+    let mut kept = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        let w = grapheme.width();
+        if used + w > room {
+            break;
+        }
+        kept.push_str(grapheme);
+        used += w;
+    }
+
+    if long && width > 0 {
+        kept.push('…');
+        used += 1;
+    }
+
+    let gap = width.saturating_sub(used);
+    let padding = " ".repeat(gap);
+    kept + &padding
+}
 
 pub(crate) fn joined(spans: &[(String, Style)]) -> String {
     spans.iter().map(|(text, _)| text.as_str()).collect()
@@ -188,5 +226,16 @@ mod tests {
             "0", "999", "1k", "1.25k", "1.3k", "10k", "45.4k", "123k", "1M", "1.05M",
         ];
         assert_eq!(shown, expected, "{cases:?}");
+    }
+
+    #[test]
+    fn fitted_width() {
+        assert_eq!(fitted("ab", 4), "ab  ");
+        assert_eq!(fitted("abcdef", 4), "abc…");
+        assert_eq!(fitted("🍕🚀🎉", 5), "🍕🚀…");
+        assert_eq!(fitted("🍕🚀🎉", 4), "🍕… ");
+        assert_eq!(fitted("abc", 0), "");
+        assert_eq!(fitted("⚠️🍕🚀🎉🐍", 5), "⚠️🍕…");
+        assert_eq!(fitted("⚠️🍕", 5), "⚠️🍕 ");
     }
 }

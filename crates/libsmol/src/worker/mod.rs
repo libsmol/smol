@@ -123,6 +123,8 @@ pub(crate) enum WorkerCall {
         args: Map<String, Value>,
         called: String,
     },
+    /// Answered with one `{"answer"}` or `{"error"}` object per task, in order
+    Agent { tasks: Vec<String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

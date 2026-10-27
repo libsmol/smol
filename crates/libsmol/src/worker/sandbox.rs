@@ -405,6 +405,7 @@ pub(crate) mod tests {
     use crate::config::Access;
     use crate::tests::{temp_dir, write_file};
     use crate::utils::{block_on, new_id, Interrupt};
+    use crate::worker::host::tests::no_agents;
     use crate::worker::host::Worker;
     #[cfg(target_os = "linux")]
     use crate::worker::sandbox::spread;
@@ -414,6 +415,7 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     /// The config folder is the parent of `copies`
     pub(crate) fn opened(cwd: &Path, copies: &Path) -> Sandbox {
@@ -482,10 +484,11 @@ pub(crate) mod tests {
 
     fn evaluated(sandbox: Sandbox, code: &str) -> String {
         let interrupt = Interrupt::default();
-        let starting = Worker::new(&interrupt, sandbox, false);
+        let starting = Worker::new(&interrupt, Arc::new(sandbox), false);
         let mut worker = block_on(starting).expect("worker");
         let mut ignore = |_: &str| {};
-        let evaluating = worker.evaluate(code, &[], &mut ignore);
+        let mut none = no_agents;
+        let evaluating = worker.evaluate(code, &[], &mut ignore, &mut none);
         let output = block_on(evaluating).expect("evaluate");
         assert_eq!(output.error, None, "{}", output.logs);
         output.logs

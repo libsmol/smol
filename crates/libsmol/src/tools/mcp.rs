@@ -1,9 +1,9 @@
 use crate::config::{McpConfig, McpKind};
-use crate::model::Media;
 use crate::prompt;
 use crate::spawn::Group;
 use crate::tools::attach::kept;
-use crate::utils::{http_cause, http_client, Reply};
+use crate::utils::{http_cause, http_client};
+use crate::worker::host::{Called, Calling};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use reaper::cause;
@@ -26,10 +26,8 @@ use rmcp::RoleClient;
 use serde_json::{Map, Value};
 use std::collections::{HashSet, VecDeque};
 use std::error;
-use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,20 +47,6 @@ const CLOSED_EARLY: &str = "connection closed during the handshake";
 
 /// The third argument is the `server.function` from the code and labels images but not errors
 type CallFn = dyn Fn(String, Map<String, Value>, String) -> Calling + Send + Sync;
-pub(crate) type Calling = Pin<Box<dyn Future<Output = Called> + Send>>;
-
-/// The result of work done for the worker, with the images and videos it received
-pub(crate) struct Called {
-    pub(crate) result: Reply,
-    pub(crate) media: Vec<(String, Media)>,
-}
-
-impl From<Reply> for Called {
-    fn from(result: Reply) -> Self {
-        let media = Vec::new();
-        Self { result, media }
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct Server {
@@ -374,7 +358,11 @@ pub(crate) async fn connect(
             };
 
             let result = calling.await;
-            Called { result, media }
+            Called {
+                result,
+                media,
+                agents: Vec::new(),
+            }
         })
     };
 

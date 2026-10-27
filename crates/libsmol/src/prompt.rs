@@ -20,6 +20,15 @@ const UPDATE: &str = "Task update";
 const RULES: &str = "- Never make up data or functions; check unfamiliar ones with help() first.
 - Do the task instead of describing it. Report only results you got, and say what failed or is uncertain.";
 
+const UPDATES: &str =
+    "\n\nThe user may send a \"Task update:\" while you work; it changes the current task.";
+const ANSWER: &str =
+    "Answer in Markdown, which the user sees rendered, as soon as you have the result.";
+const HANDED_BACK: &str = "Only your answer goes back to the agent that gave you this task, so include everything the task asks for.";
+pub(crate) const NESTED: &str = "agent: not available to agents started by agent()";
+/// Also what the user sees for an agent that is aborted before it ends
+pub(crate) const UNFINISHED: &str = "stopped before it answered";
+
 pub(crate) fn system(
     functions: &[&Function],
     servers: &[&Added],
@@ -27,6 +36,7 @@ pub(crate) fn system(
     cwd: &Path,
     sandboxed: bool,
     instructions: &[String],
+    delegated: bool,
 ) -> String {
     let mut lines = Vec::new();
     for function in functions {
@@ -98,6 +108,10 @@ pub(crate) fn system(
         true => format!("\n- Your code runs in a sandbox: writing outside {cwd} and $TMPDIR, or reading some private files, fails with PermissionError. $TMPDIR is removed when the session ends. When a tool fails because it can't write its cache, rerun it with the cache in $TMPDIR."),
         false => String::new(),
     };
+    let (updates, answer) = match delegated {
+        true => ("", HANDED_BACK),
+        false => (UPDATES, ANSWER),
+    };
     let date = Utc::now().format("%Y-%m-%d");
     format!(
         "You do tasks by running Python code with the {TOOL} tool. Each reply does one of two things:
@@ -110,17 +124,15 @@ All code runs in one Python session: variables, functions and imports persist ac
 
 A call returns what its code printed, up to {MAX_OBSERVATION_CHARS} characters; longer output is cut in the middle. The value of a top-level expression is printed too unless it is None (strings as is, other values as repr). If the code fails, \"Error:\" follows with the exception and the line that raised it.
 
-Make each call a whole program: use loops, conditions, the standard library and the functions below to do as much as you can at once. Print only what you need to see. Reuse the data, functions and imports the session already holds; reload data only if its source changed. Put code you will run again in a function; help(name) shows the code of functions and classes you defined.
-
-The user may send a \"Task update:\" while you work; it changes the current task.
+Make each call a whole program: use loops, conditions, the standard library and the functions below to do as much as you can at once. Print only what you need to see. Reuse the data, functions and imports the session already holds; reload data only if its source changed. Put code you will run again in a function; help(name) shows the code of functions and classes you defined.{updates}
 
 # Answer
 
-Answer in Markdown, which the user sees rendered, as soon as you have the result. If no code is needed, answer right away.
+{answer} If no code is needed, answer right away.
 
 # Functions
 
-These need no import. Prefer them to your own code. Create new files with open().
+Call these in your code; they need no import. Prefer them to your own code. Create new files with open().
 
 ## Built-in
 
@@ -208,7 +220,7 @@ pub(crate) fn cut(count: usize) -> String {
 /// Cut-off replies are never sent back, so the model cannot see the last reply this mentions
 const CUT: &str = "Your last reply was discarded: it hit the output length limit, so nothing ran. Write less per reply and split long work across several replies.";
 const NO_CODE: &str = "not run: no Python code in the code argument";
-const STOPPED: &str = "interrupted by the user";
+pub(crate) const STOPPED: &str = "interrupted by the user";
 const UNRUN: &str = "interrupted by the user before the code ran";
 const SKIPPED: &str = "not run: an earlier call failed";
 const UNREPLIED: &str = "The user interrupted you before you replied.";
@@ -576,7 +588,7 @@ mod tests {
         }];
         let cwd = Path::new("/home/zoë/work");
 
-        let text = system(&[], &[], &skills, cwd, false, &instructions);
+        let text = system(&[], &[], &skills, cwd, false, &instructions, false);
         let place =
             ") in /home/zoë/work; the files and programs a task mentions are there.\n- Today";
         assert!(text.contains(place), "{text}");
@@ -596,7 +608,7 @@ mod tests {
                      <instructions>\nIndent with tabs\n</instructions>";
         assert!(text.ends_with(files), "{text}");
 
-        let plain = system(&[], &[], &[], cwd, true, &[]);
+        let plain = system(&[], &[], &[], cwd, true, &[], false);
         assert!(!plain.contains("<instructions"), "{plain}");
         assert!(!plain.contains("# Skills"), "{plain}");
         let sandbox = "are there.\n- Your code runs in a sandbox: writing outside /home/zoë/work and $TMPDIR, ";
@@ -700,6 +712,7 @@ mod tests {
         let result = CodeResult {
             printed: Some("Captured".to_owned()),
             media: vec![("screen.grab".to_owned(), called)],
+            ..CodeResult::default()
         };
         let call = Call {
             code: "screen.grab()".to_owned(),

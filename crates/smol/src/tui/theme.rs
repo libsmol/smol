@@ -17,6 +17,12 @@ pub(crate) const GREEN: Color = Color::Rgb(0x50, 0xFA, 0x7B);
 pub(crate) const ORANGE: Color = Color::Rgb(0xFF, 0xB8, 0x6C);
 pub(crate) const RED: Color = Color::Rgb(0xFF, 0x55, 0x55);
 pub(crate) const YELLOW: Color = Color::Rgb(0xF1, 0xFA, 0x8C);
+const BLUE: Color = Color::Rgb(0x6C, 0xB6, 0xFF);
+const LIME: Color = Color::Rgb(0xB5, 0xF3, 0x6B);
+const TEAL: Color = Color::Rgb(0x3F, 0xE0, 0xC5);
+
+/// One for each agent at work, none of them the main agent's purple
+pub(crate) const HELPERS: [Color; 8] = [CYAN, ORANGE, GREEN, PINK, YELLOW, BLUE, LIME, TEAL];
 
 /// Intensity of each level of the 6×6×6 cube in the 256-color palette
 const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
@@ -30,7 +36,7 @@ pub(crate) fn wave(column: usize) -> Color {
     mix(PURPLE, PINK, t)
 }
 
-pub(crate) fn shimmer(text: &str, base: Style, started: Instant) -> Spans {
+pub(crate) fn shimmer(text: &str, base: Style, glow: Color, started: Instant) -> Spans {
     let count = text.chars().count();
     let at = (started.elapsed().as_millis() / 70) as usize % (count + 8);
 
@@ -38,7 +44,7 @@ pub(crate) fn shimmer(text: &str, base: Style, started: Instant) -> Spans {
     for (index, c) in text.chars().enumerate() {
         let style = match index.abs_diff(at) {
             0 => base.fg(FG),
-            1 => base.fg(PURPLE),
+            1 => base.fg(glow),
             _ => base,
         };
         spans.push((c.to_string(), style));
@@ -116,5 +122,10 @@ mod tests {
             assert_eq!(indexed(color), Color::Indexed(index), "{color}");
         }
         assert_eq!(indexed(Color::Reset), Color::Reset);
+
+        let downgraded = HELPERS.map(indexed);
+        for (index, color) in downgraded.iter().enumerate() {
+            assert!(!downgraded[..index].contains(color), "{downgraded:?}");
+        }
     }
 }

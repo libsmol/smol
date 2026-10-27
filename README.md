@@ -19,7 +19,9 @@ A real run with DeepSeek on smol's own source:
   passing through the context, so long tasks take far fewer turns and tokens.
 - **Orchestration in code.** MCP servers show up as Python objects, so the
   model chains, batches, loops over and retries their tools with ordinary
-  code, and keeps the results around for the next step.
+  code, and keeps the results around for the next step. `agent()` hands tasks
+  to fresh agents the same way, several at once, and returns only their
+  answers.
 - **One tool.** The model sees a single `eval(code)` tool. There is no menu of
   tools to choose from or route between; its attention goes to the task.
 - **Python.** The language models write most fluently, with a standard library
@@ -175,10 +177,18 @@ Besides the Python standard library, every session has these functions:
 | `edit(path, old, new)` | Replace text that appears exactly once in a file. |
 | `fetch(url)` | Get a web page as Markdown. |
 | `view(path)` | Show an image or video to the model (offered only when the model takes media). |
+| `agent(task)` | Give a task to a new agent and return its answer; a list of tasks runs up to 8 agents at a time. |
 | `help(name)` | Print a function's signature and docs, including code defined in earlier steps. |
 
 MCP tools appear as Python objects named after their server, for example
 `github.search_issues(query="...")`.
+
+An agent started by `agent()` gets its own Python session and the same files,
+functions, skills, instructions and MCP servers, but not the variables or the
+conversation of the agent that started it, and it can't start agents itself.
+Only its answer goes back; everything it did is saved with the session and
+shown as its own call, and its tokens are counted apart from the session's.
+A task that fails gives a `RuntimeError` in its place in the list.
 
 ## MCP servers
 

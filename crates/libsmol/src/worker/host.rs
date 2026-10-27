@@ -1,8 +1,8 @@
-use crate::memory::{CallError, MAX_OBSERVATION_CHARS};
+use crate::memory::{CallError, Helper, MAX_OBSERVATION_CHARS};
 use crate::model::Media;
 use crate::prompt::{self, NO_SERVER};
 use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
-use crate::tools::mcp::{Called, Calling, Server};
+use crate::tools::mcp::Server;
 use crate::utils::{new_id, Interrupt, Reply};
 use crate::worker::sandbox::Sandbox;
 #[cfg(not(test))]
@@ -17,12 +17,14 @@ use serde::Deserialize;
 use std::collections::HashMap;
 #[cfg(not(target_os = "linux"))]
 use std::env;
-use std::future;
+use std::future::{self, Future};
 use std::io;
 use std::mem;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::tcp::OwnedReadHalf;
@@ -38,6 +40,29 @@ const CANCEL_EVERY: Duration = Duration::from_millis(500);
 /// Code that closes stdout never lets the END marker through
 const OUTPUT_WAIT: Duration = Duration::from_secs(2);
 const START_WAIT: Duration = Duration::from_secs(30);
+/// Agents the code started stop on an interrupt too, and a worker of theirs may take `STOP_WAIT`
+const HELPERS_WAIT: Duration = Duration::from_secs(5);
+
+pub(crate) type Calling = Pin<Box<dyn Future<Output = Called> + Send>>;
+/// Runs the tasks of one `agent()` call
+pub(crate) type Delegating = dyn FnMut(Vec<String>) -> Calling + Send;
+
+/// The result of work done for the worker, with the images, videos and agents it produced
+pub(crate) struct Called {
+    pub(crate) result: Reply,
+    pub(crate) media: Vec<(String, Media)>,
+    pub(crate) agents: Vec<Helper>,
+}
+
+impl From<Reply> for Called {
+    fn from(result: Reply) -> Self {
+        Self {
+            result,
+            media: Vec::new(),
+            agents: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct Evaluated {
@@ -46,10 +71,12 @@ pub(crate) struct Evaluated {
     pub(crate) cut: usize,
     pub(crate) error: Option<CallError>,
     pub(crate) media: Vec<(String, Media)>,
+    pub(crate) agents: Vec<Helper>,
     /// The code actually run after stray tags were stripped
     pub(crate) code: Option<String>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Added {
     /// The name used in code
     pub(crate) name: String,
@@ -59,7 +86,8 @@ pub(crate) struct Added {
 
 /// Callers keep track of the installed MCP servers and pass them in on every call
 pub(crate) struct Worker {
-    sandbox: Sandbox,
+    /// Shared with the workers of agents the code starts
+    sandbox: Arc<Sandbox>,
     interrupt: Interrupt,
     functions: Vec<Function>,
     restarted: bool,
@@ -74,9 +102,12 @@ struct Live {
     pieces: Receiver<Piece>,
     next_id: u64,
     calls: JoinSet<(u64, Called)>,
+    /// Calls a cancel stops, which leaves out agents because their records would be lost
     running: HashMap<u64, AbortHandle>,
     output: Clip,
     media: Vec<(String, Media)>,
+    /// A slot per `agent()` call in the order they arrived, which is how their agents are numbered
+    agents: Vec<(u64, Vec<Helper>)>,
 }
 
 enum Event {
@@ -115,7 +146,7 @@ impl Worker {
     /// `restarted` means earlier code in the session defined names this new worker lacks
     pub(crate) async fn new(
         interrupt: &Interrupt,
-        sandbox: Sandbox,
+        sandbox: Arc<Sandbox>,
         restarted: bool,
     ) -> Result<Self> {
         let mut worker = Self {
@@ -226,6 +257,7 @@ impl Worker {
             running: HashMap::new(),
             output: Clip::new(KEPT_BYTES),
             media: Vec::new(),
+            agents: Vec::new(),
         };
 
         // Startup output runs up to the END marker and doesn't belong to the first snippet
@@ -301,6 +333,7 @@ impl Worker {
         code: &str,
         servers: &[&Added],
         shown: &mut (dyn FnMut(&str) + Send),
+        delegate: &mut Delegating,
     ) -> Result<Evaluated, CallError> {
         let interrupt = self.interrupt.clone();
         let failed = |reason: String| {
@@ -319,6 +352,7 @@ impl Worker {
         live.calls.abort_all();
         live.running.clear();
         live.media.clear();
+        live.agents.clear();
         live.output = Clip::new(KEPT_BYTES);
         let run = HostCall::Run {
             code: code.to_owned(),
@@ -387,12 +421,20 @@ impl Worker {
                 Event::Call(number, call) => (number, call),
             };
 
-            let WorkerCall::Tool {
-                server,
-                tool,
-                args,
-                called,
-            } = call;
+            let (server, tool, args, called) = match call {
+                WorkerCall::Tool {
+                    server,
+                    tool,
+                    args,
+                    called,
+                } => (server, tool, args, called),
+                WorkerCall::Agent { tasks } => {
+                    live.agents.push((number, Vec::new()));
+                    let calling = delegate(tasks);
+                    live.calls.spawn(async move { (number, calling.await) });
+                    continue;
+                }
+            };
             let found = servers.iter().find(|added| added.name == server);
             let calling: Calling = match found {
                 Some(added) => (added.server.call)(tool, args, called),
@@ -406,6 +448,34 @@ impl Worker {
             let task = live.calls.spawn(async move { (number, calling.await) });
             live.running.insert(number, task);
         };
+
+        // Calls the snippet left behind get no reply, and agents among them close their views here
+        for (_, task) in live.running.drain() {
+            task.abort();
+        }
+        // On an interrupt agents get time to stop by themselves and keep their records
+        let wait = match interrupt.triggered() {
+            true => HELPERS_WAIT,
+            false => Duration::ZERO,
+        };
+        let give_up = Instant::now() + wait;
+        let mut aborted = false;
+        loop {
+            let joined = select! {
+                joined = live.calls.join_next() => joined,
+                () = time::sleep_until(give_up), if !aborted => {
+                    live.calls.abort_all();
+                    aborted = true;
+                    continue;
+                }
+            };
+            let Some(joined) = joined else {
+                break;
+            };
+            if let Ok((number, called)) = joined {
+                live.keep(number, called.agents);
+            }
+        }
 
         let outcome = match outcome {
             Outcome::Gone(_) => {
@@ -422,10 +492,13 @@ impl Worker {
         let (logs, cut) = live.output.text();
         let logs = terminal_view(&logs);
         let media = mem::take(&mut live.media);
+        let calls = mem::take(&mut live.agents);
+        let agents = calls.into_iter().flat_map(|(_, agents)| agents).collect();
         let mut output = Evaluated {
             logs,
             cut,
             media,
+            agents,
             ..Evaluated::default()
         };
 
@@ -454,6 +527,14 @@ impl Worker {
 }
 
 impl Live {
+    /// Fills the slot of the `agent()` call answered with `id`
+    fn keep(&mut self, id: u64, agents: Vec<Helper>) {
+        let slot = self.agents.iter_mut().find(|(asked, _)| *asked == id);
+        if let Some((_, kept)) = slot {
+            *kept = agents;
+        }
+    }
+
     fn send(&mut self, call: HostCall) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -510,6 +591,7 @@ impl Live {
                     };
                     self.running.remove(&id);
                     self.media.extend(called.media);
+                    self.keep(id, called.agents);
                     let reply = Message::reply(id, called.result);
                     self.deliver(&reply);
                 }
@@ -547,14 +629,14 @@ async fn start_error(group: Group, mut pieces: Receiver<Piece>, mut output: Clip
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::memory::CallError;
-    use crate::prompt::system;
+pub(crate) mod tests {
+    use crate::memory::{AgentMemory, CallError, Ending, Helper};
+    use crate::prompt::{self, system};
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
     use crate::tools::mcp::tests::{fake, started};
-    use crate::tools::mcp::{Called, Calling, Server};
+    use crate::tools::mcp::Server;
     use crate::utils::{block_on, Interrupt};
-    use crate::worker::host::{Added, Evaluated, Worker, STOP_WAIT};
+    use crate::worker::host::{Added, Called, Calling, Delegating, Evaluated, Worker, STOP_WAIT};
     use crate::worker::sandbox::tests::opened;
     use crate::worker::{serve, CONTROL_ENV};
     use serde_json::{json, Map, Value};
@@ -575,6 +657,12 @@ mod tests {
     struct Tried {
         worker: Worker,
         servers: Vec<Added>,
+        delegate: Box<Delegating>,
+    }
+
+    /// For code that never calls `agent()`
+    pub(crate) fn no_agents(tasks: Vec<String>) -> Calling {
+        panic!("{tasks:?}");
     }
 
     impl Deref for Tried {
@@ -595,7 +683,8 @@ mod tests {
         fn eval(&mut self, code: &str) -> Evaluated {
             let mut ignore = |_: &str| {};
             let servers: Vec<&Added> = self.servers.iter().collect();
-            let evaluating = self.worker.evaluate(code, &servers, &mut ignore);
+            let delegate = &mut *self.delegate;
+            let evaluating = self.worker.evaluate(code, &servers, &mut ignore, delegate);
             block_on(evaluating).expect("evaluate")
         }
 
@@ -626,11 +715,12 @@ mod tests {
         let dir = temp_dir("session");
         let copies = dir.join("copies");
         let sandbox = opened(&cwd, &copies);
-        let building = Worker::new(&interrupt, sandbox, false);
+        let building = Worker::new(&interrupt, Arc::new(sandbox), false);
         let worker = block_on(building).expect("worker");
         let value = Tried {
             worker,
             servers: Vec::new(),
+            delegate: Box::new(no_agents),
         };
         Temp { value, dir }
     }
@@ -742,7 +832,8 @@ mod tests {
         worker.live = None;
         interrupt.cancel(0);
         let mut ignore = |_: &str| {};
-        let evaluating = worker.evaluate("print('skipped')", &[], &mut ignore);
+        let mut none = no_agents;
+        let evaluating = worker.evaluate("print('skipped')", &[], &mut ignore, &mut none);
         let stopped = block_on(evaluating);
         assert_eq!(stopped.err(), Some(CallError::Interrupted));
 
@@ -990,7 +1081,8 @@ mod tests {
         let mut seen = Vec::new();
         let mut shown = |text: &str| seen.push(text.to_owned());
         let code = "import time\nprint('\\x1b[1mfirst line\\x1b[0m', flush=True)\ntime.sleep(0.5)\nprint('second line')";
-        let evaluating = worker.evaluate(code, &[], &mut shown);
+        let mut none = no_agents;
+        let evaluating = worker.evaluate(code, &[], &mut shown, &mut none);
         let output = block_on(evaluating).expect("evaluate");
 
         assert_eq!(output.logs, "first line\nsecond line\n");
@@ -1504,15 +1596,159 @@ mod tests {
         assert_eq!(kept, [("fake.mixed", image)]);
     }
 
+    /// Answers each task with its text, and fails a task that is "fail"
+    fn answering(tasks: Vec<String>) -> Calling {
+        let mut results = Vec::new();
+        for task in &tasks {
+            let result = match task.as_str() {
+                "fail" => json!({ "error": "model: http 503: busy" }),
+                task => json!({ "answer": format!("done: {task}") }),
+            };
+            results.push(result);
+        }
+        let called = Called::from(Ok(Value::Array(results)));
+        Box::pin(async move { called })
+    }
+
+    #[test]
+    fn agents_answered() {
+        let mut worker = fresh();
+        worker.delegate = Box::new(answering);
+
+        let code = "answers = agent(['café', 'fail', 'naïve'])\n\
+            print(answers[0], type(answers[1]).__name__, answers[1], answers[2])\n\
+            print(agent('résumé'))";
+        let output = worker.eval(code);
+        assert_eq!(output.error, None, "{}", output.logs);
+        let printed = "done: café RuntimeError agent: model: http 503: busy done: naïve\n\
+            done: résumé\n";
+        assert_eq!(output.logs, printed);
+
+        let mut refused = Vec::new();
+        for code in [
+            "agent('fail')",
+            "agent(1)",
+            "agent(['a', 2])",
+            "agent('  ')",
+            "agent([])",
+        ] {
+            let output = worker.eval(code);
+            let message = error(output);
+            let first = message.lines().next().unwrap_or_default().to_owned();
+            refused.push(first);
+        }
+        let expected = [
+            "RuntimeError: agent: model: http 503: busy",
+            "TypeError: agent: task must be str or a list of str, not int",
+            "TypeError: agent: task must be str or a list of str, not a list holding int",
+            "ValueError: agent: task is empty",
+            "ValueError: agent: task is empty",
+        ];
+        assert_eq!(refused, expected);
+    }
+
+    struct Dropped(Arc<AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Records keep the order the `agent()` calls arrived in, which numbers their agents
+    #[test]
+    fn agents_in_order() {
+        let mut worker = fresh();
+        let finishing = |tasks: Vec<String>| -> Calling {
+            Box::pin(async move {
+                let wait = match tasks[0].as_str() {
+                    "Count the cafés" => Duration::from_secs(1),
+                    _ => Duration::ZERO,
+                };
+                time::sleep(wait).await;
+                let helper = Helper {
+                    task: tasks[0].clone(),
+                    end: Ending::Answer("done".to_owned()),
+                    memory: AgentMemory::default(),
+                };
+                Called {
+                    result: Ok(json!([{ "answer": "done" }])),
+                    media: Vec::new(),
+                    agents: vec![helper],
+                }
+            })
+        };
+        worker.delegate = Box::new(finishing);
+
+        let code = "import threading, time\n\
+            first = threading.Thread(target=agent, args=('Count the cafés',))\n\
+            first.start()\n\
+            time.sleep(0.2)\n\
+            agent('Spell naïve')\n\
+            first.join()";
+        let output = worker.eval(code);
+        assert_eq!(output.error, None, "{}", output.logs);
+        let tasks: Vec<&str> = output.agents.iter().map(|helper| &*helper.task).collect();
+        assert_eq!(tasks, ["Count the cafés", "Spell naïve"]);
+    }
+
+    /// An agent the code leaves running is stopped before its snippet's result comes back
+    #[test]
+    fn leftover_agents_stopped() {
+        let mut worker = fresh();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&dropped);
+        let endless = move |_: Vec<String>| -> Calling {
+            let guard = Dropped(Arc::clone(&flag));
+            Box::pin(async move {
+                let _guard = guard;
+                time::sleep(Duration::from_secs(60)).await;
+                Called::from(Ok(Value::Null))
+            })
+        };
+        worker.delegate = Box::new(endless);
+
+        let code = "import threading, time\n\
+            threading.Thread(target=agent, args=('Count the cafés',), daemon=True).start()\n\
+            time.sleep(0.5)";
+        let output = worker.eval(code);
+        assert_eq!(output.error, None, "{}", output.logs);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// An interrupt doesn't drop the records of agents that are still stopping
+    #[test]
+    fn helpers_kept() {
+        let (mut worker, interrupt) = interruptible();
+        let waiting = interrupt.clone();
+        let stopping = move |tasks: Vec<String>| -> Calling {
+            let interrupt = waiting.clone();
+            Box::pin(async move {
+                interrupt.wait().await;
+                let helper = Helper {
+                    task: tasks[0].clone(),
+                    end: Ending::Interrupted {},
+                    memory: AgentMemory::default(),
+                };
+                let result = json!([{ "error": prompt::STOPPED }]);
+                Called {
+                    result: Ok(result),
+                    media: Vec::new(),
+                    agents: vec![helper],
+                }
+            })
+        };
+        worker.delegate = Box::new(stopping);
+
+        cancel_soon(&interrupt, 0);
+        let output = worker.eval("agent('Read the café menu')");
+        assert_eq!(output.error, Some(CallError::Interrupted));
+        let tasks: Vec<&str> = output.agents.iter().map(|helper| &*helper.task).collect();
+        assert_eq!(tasks, ["Read the café menu"]);
+    }
+
     #[test]
     fn stopped_call_cancelled() {
-        struct Dropped(Arc<AtomicBool>);
-        impl Drop for Dropped {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
         let dropped = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&dropped);
         let call = move |_: String, _: Map<String, Value>, _: String| -> Calling {
@@ -1588,7 +1824,7 @@ mod tests {
 
         let servers: Vec<&Added> = worker.servers.iter().collect();
         let cwd = Path::new("/work");
-        let text = system(&[], &servers, &[], cwd, false, &[]);
+        let text = system(&[], &servers, &[], cwd, false, &[], false);
         let listed = "\n\n## MCP `news_web`\n\nSearches the web and the news\n\nRead-only\n\n\
                       - news_web.echo_text(the_text: str = None) -> str\n\n\
                       ## MCP `notes`\n\n\

@@ -2,10 +2,10 @@ use crate::acp::rpc::{Notice, Peer};
 use crate::acp::servers::McpPool;
 use crate::acp::translator::Translator;
 use crate::acp::{rfc3339, task_of, to_value, App, QUEUED};
-use crate::agent::{title_of, Agent, Asking, Event, Sink, Task};
+use crate::agent::{title_of, Agent, Asking, Event, Helpers, Sink, Task, MAX_PARALLEL_AGENTS};
 use crate::config::{self, Access, McpConfig, Models};
 use crate::history::{Lock, SessionMeta, Settings};
-use crate::memory::{AgentMemory, Exit, MemoryStep, StepError};
+use crate::memory::{AgentMemory, Exit, MemoryStep};
 use crate::spawn::{spawn_shell, Group};
 use crate::utils::Interrupt;
 use crate::worker::host::Worker;
@@ -27,6 +27,7 @@ use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot::{self, error::TryRecvError};
+use tokio::sync::Semaphore;
 use tokio::task::{self, AbortHandle, JoinHandle};
 use tokio::time;
 use tracing::{error, info, warn};
@@ -199,14 +200,21 @@ async fn start(opening: Opening) -> Result<Session> {
 
     let copies = app.store.copies(&meta.id)?;
     let window = built.context_window();
-    let mut translator = Translator::new(meta.id.clone(), Arc::clone(peer), window, copies.clone());
+    let mut translator = Translator::new(
+        meta.id.clone(),
+        Arc::clone(peer),
+        window,
+        cwd.clone(),
+        copies.clone(),
+    );
     translator.replay(&memory);
 
     let sandbox = Sandbox::new(&cwd, &copies, &app.config, &skills, &access);
     let sandbox = sandbox.map_err(Error::Python)?;
+    let sandbox = Arc::new(sandbox);
     // No restart notice again when no code has run since the last restart
     let ran = memory.ran_code();
-    let worker = Worker::new(&interrupt, sandbox, ran).await?;
+    let worker = Worker::new(&interrupt, Arc::clone(&sandbox), ran).await?;
 
     let response = match loading {
         true => {
@@ -245,6 +253,9 @@ async fn start(opening: Opening) -> Result<Session> {
         cwd,
         copies,
         interrupt: interrupt.clone(),
+        sandbox,
+        slots: Arc::new(Semaphore::new(MAX_PARALLEL_AGENTS)),
+        delegated: false,
     };
     let keeper = Keeper {
         meta,
@@ -509,43 +520,15 @@ impl Keeper {
 
 impl Sink for Keeper {
     fn event(&mut self, event: Event) {
-        // Code errors contain task content and are not logged
-        // A model error fails the turn and is logged only by the turn failure line
-        match event {
-            Event::Retry { reason, wait } => {
-                let wait = wait.as_secs_f64();
-                warn!("model: retrying in {wait:.1}s, {reason}");
-            }
-            Event::StepEnd(step) => {
-                let calls = step.calls.len();
-                let seconds = step.usage.duration;
-                let tokens = match step.usage.tokens {
-                    Some(tokens) => format!("{}/{}", tokens.input_tokens, tokens.output_tokens),
-                    None => "-".to_owned(),
-                };
-                let counted = format!("[calls={calls}, tokens={tokens}, elapsed={seconds:.1}s]");
-                match &step.error {
-                    None => info!("step: done {counted}"),
-                    Some(StepError::Interrupted) => info!("step: interrupted {counted}"),
-                    Some(StepError::Model(_)) => warn!("step: failed {counted}"),
-                    Some(error) => warn!("step: failed, {error} {counted}"),
-                }
-            }
-            Event::CompactEnd(Ok(summary)) => {
-                let kept = summary.kept;
-                let seconds = summary.usage.duration;
-                info!("compact: done [kept={kept}, elapsed={seconds:.1}s]");
-            }
-            Event::CompactEnd(Err(StepError::Interrupted)) => info!("compact: interrupted"),
-            Event::CompactEnd(Err(_)) => warn!("compact: failed"),
-            Event::Restarted => warn!("python: restarted"),
-            _ => {}
-        }
         self.translator.translate(event);
     }
 
     fn saved(&mut self, memory: &AgentMemory) {
         self.save(memory);
+    }
+
+    fn helpers(&mut self, index: usize) -> Box<dyn Helpers> {
+        self.translator.helpers(index)
     }
 
     fn queued(&mut self) -> Asking<'_> {

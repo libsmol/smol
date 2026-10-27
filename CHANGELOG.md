@@ -7,6 +7,19 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- `agent(task)` gives a task to a new agent, with its own Python session and the
+  same files, functions, skills, instructions and MCP servers, and returns its
+  answer. A list of tasks runs up to 8 agents at a time and returns the answers in
+  order, with a `RuntimeError` in place of a task that failed. Each agent shows as
+  its own call, its tokens are counted apart from the session's, and everything it
+  did is saved with the session. Agents it starts can't start agents themselves.
+- smol groups those agents under the call that started them. One at work shows
+  the last lines of what it writes or prints and what it is doing, in a color of
+  its own; one that ended takes a single line, and ctrl+o shows the start of its
+  answer. What the call's code printed stays folded until ctrl+o.
+
 ## 0.3.1 - 2026-10-27
 
 - Packages a skill's scripts need now go in a venv in the session's temporary

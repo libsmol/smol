@@ -25,7 +25,7 @@ use tokio::time;
 
 const CHECK_EVERY: Duration = Duration::from_millis(50);
 
-pub(crate) fn builtins(vm: &VirtualMachine, copies: PathBuf) -> [(&'static str, PyObjectRef); 5] {
+pub(crate) fn builtins(vm: &VirtualMachine, copies: PathBuf) -> [(&'static str, PyObjectRef); 6] {
     // Paths use the filesystem encoding, matching `os.listdir` and `open()` on non-UTF-8 names
     let list = |path: PyStrRef, recursive: bool, vm: &VirtualMachine| -> PyResult<PyListRef> {
         let path = vm.fsencode(&path)?;
@@ -90,11 +90,10 @@ pub(crate) fn builtins(vm: &VirtualMachine, copies: PathBuf) -> [(&'static str, 
                 args: arguments,
                 called,
             };
-            let calling = request(call);
-            let result = wait(vm, calling)?;
-            let result = finish(vm, result)?;
-            py_serde::deserialize(vm, result).map_err(|e| value_error(vm, e))
+            asked(vm, call)
         };
+
+    let delegate = |tasks: Vec<String>, vm: &VirtualMachine| asked(vm, WorkerCall::Agent { tasks });
 
     // No code has run yet at startup and this is still the session directory
     let cwd = env::current_dir().unwrap_or_default();
@@ -117,6 +116,7 @@ pub(crate) fn builtins(vm: &VirtualMachine, copies: PathBuf) -> [(&'static str, 
     let search = vm.new_function("_grep", search);
     let get = vm.new_function("_fetch", get);
     let call_tool = vm.new_function("_call", call_tool);
+    let delegate = vm.new_function("_agent", delegate);
     let view = vm.new_function("_view", view);
 
     [
@@ -124,8 +124,17 @@ pub(crate) fn builtins(vm: &VirtualMachine, copies: PathBuf) -> [(&'static str, 
         ("_grep", search.into()),
         ("_fetch", get.into()),
         ("_call", call_tool.into()),
+        ("_agent", delegate.into()),
         ("_view", view.into()),
     ]
+}
+
+/// Sends the call to the agent and turns the JSON it answers with into Python values
+fn asked(vm: &VirtualMachine, call: WorkerCall) -> PyResult {
+    let calling = request(call);
+    let result = wait(vm, calling)?;
+    let result = finish(vm, result)?;
+    py_serde::deserialize(vm, result).map_err(|e| value_error(vm, e))
 }
 
 /// Runs the work on another thread while this one checks for interrupts and sets `stop` on one

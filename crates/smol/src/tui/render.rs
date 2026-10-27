@@ -1,11 +1,15 @@
 use crate::tui::highlight;
 use crate::tui::markdown::{self, Block, Text, LINK};
-use crate::tui::transcript::{Entry, Item, Retry, Step};
-use crate::tui::{in_out, joined, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG};
+use crate::tui::transcript::{Entry, Helper, Item, Retry, Step};
+use crate::tui::{
+    fitted, in_out, joined, spinner, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG,
+};
+use agent_client_protocol_schema::v1::ToolCallStatus;
 use pulldown_cmark::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::ops::Range;
+use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
 const CODE_HEAD: usize = 8;
@@ -13,6 +17,9 @@ const OUTPUT_HEAD: usize = 6;
 const TASK_HEAD: usize = 4;
 const TASK_TAIL: usize = 2;
 const MAX_THOUGHT_ROWS: usize = 3;
+const MAX_PREVIEW_ROWS: usize = 4;
+const MAX_TITLE_ROWS: usize = 2;
+const MAX_TITLE_COLUMNS: usize = 80;
 const MIN_COLUMN: usize = 6;
 
 const THINKING: Style = DIM.add_modifier(Modifier::ITALIC);
@@ -88,10 +95,32 @@ const RETRY: Mark = Mark {
     rest: "    ",
     style: Style::new().fg(theme::ORANGE),
 };
+/// Agents sit under a branch, and their wrapped rows line up after the status symbol
+const HELPER: Mark = Mark {
+    first: "  │   ",
+    rest: "  │     ",
+    style: DIM,
+};
+const LAST_HELPER: Mark = Mark {
+    first: "      ",
+    rest: "        ",
+    style: DIM,
+};
+const HELPER_BODY: Mark = Mark {
+    first: "  │     ",
+    rest: "  │     ",
+    style: DIM,
+};
+const LAST_HELPER_BODY: Mark = Mark {
+    first: "        ",
+    rest: "        ",
+    style: DIM,
+};
 
 #[derive(Debug, Default)]
 pub(crate) struct Row {
     pub(crate) line: Line<'static>,
+    /// Selecting and copying skip the columns before this, and `usize::MAX` skips the row
     pub(crate) mark_width: usize,
     /// Whitespace a soft wrap folded away, or None at a newline in the source
     pub(crate) joint: Option<String>,
@@ -231,6 +260,10 @@ impl Render {
 
                     // Continuation rows with a bar look like code, so multi-line outputs go last
                     let count = parts.attachments.len() + parts.outputs.len();
+                    if !call.helpers.is_empty() {
+                        let more = count > 0 || parts.error.is_some();
+                        self.helpers(&call.helpers, more);
+                    }
                     let mut drawn = 0;
                     let mut branch = || {
                         drawn += 1;
@@ -248,11 +281,15 @@ impl Render {
                         let line = vec![kind, gap, name];
                         self.push_lines(mark, &[line]);
                     }
+                    let head = match call.helpers.is_empty() {
+                        true => OUTPUT_HEAD,
+                        false => 0,
+                    };
                     for output in parts.outputs {
                         let mark = branch();
                         let output = output.trim_matches('\n');
                         let lines = highlight::plain(output, Style::new());
-                        self.fold(mark, lines, OUTPUT_HEAD, 0);
+                        self.fold(mark, lines, head, 0);
                     }
                     if let Some(error) = parts.error {
                         let error = error.trim_matches('\n');
@@ -296,6 +333,168 @@ impl Render {
         self.wrap(BODY, &line, DIM);
     }
 
+    /// Each agent the call's code started as its title, then what it is doing while it works,
+    /// why it failed, or when expanded the start of its answer
+    fn helpers(&mut self, helpers: &[Helper], more: bool) {
+        let (head, row, body) = match more {
+            true => (BRANCH, HELPER, HELPER_BODY),
+            false => (LAST_BRANCH, LAST_HELPER, LAST_HELPER_BODY),
+        };
+
+        let names = ["running", "queued", "done", "failed", "interrupted"];
+        let mut counts = [0; 5];
+        let (mut input, mut output) = (0, 0);
+        for helper in helpers {
+            let slot = match (helper.status, helper.interrupted) {
+                (ToolCallStatus::InProgress, _) => 0,
+                (ToolCallStatus::Pending, _) => 1,
+                (ToolCallStatus::Completed, _) => 2,
+                (_, false) => 3,
+                (_, true) => 4,
+            };
+            counts[slot] += 1;
+            if let Some(usage) = helper.usage {
+                input += usage.input.unwrap_or(0);
+                output += usage.output.unwrap_or(0);
+            }
+        }
+        let mut summary = vec!["agents".to_owned()];
+        for (count, name) in counts.iter().zip(names) {
+            if *count > 0 {
+                summary.push(format!("{count} {name}"));
+            }
+        }
+        if input + output > 0 {
+            summary.push(in_out(input, output));
+        }
+        let summary = summary.join(" · ");
+        self.push_status(head, vec![(summary, DIM)]);
+
+        // Titles and status rows both start after the symbol
+        let room = self.width.saturating_sub(body.first.width());
+        let limit = room.min(MAX_TITLE_COLUMNS);
+
+        for (index, helper) in helpers.iter().enumerate() {
+            let since = helper.started.unwrap_or_else(Instant::now);
+            let color = theme::HELPERS[helper.color];
+            let (symbol, tint, status, status_style) = match (helper.status, helper.interrupted) {
+                (ToolCallStatus::Pending, _) => ('◌', DIM, "queued".to_owned(), DIM),
+                (ToolCallStatus::InProgress, _) => {
+                    let seconds = since.elapsed().as_secs();
+                    let doing = match helper.text.trim() {
+                        "" => "starting",
+                        doing => doing,
+                    };
+                    let status = format!("{doing} · {seconds}s");
+                    let tint = Style::new().fg(color);
+                    (spinner(since), tint, status, THINKING)
+                }
+                (ToolCallStatus::Completed, _) => ('◆', ANSWER.style, String::new(), Style::new()),
+                (_, true) => ('✗', DIM, String::new(), DIM),
+                (_, false) => {
+                    let mut lines = helper.text.lines().map(str::trim);
+                    let error = lines.find(|line| !line.is_empty()).unwrap_or_default();
+                    ('✗', RED, error.to_owned(), RED)
+                }
+            };
+            let status = fitted(&status, room);
+            let status = status.trim_end();
+            let status = match helper.status {
+                ToolCallStatus::InProgress => theme::shimmer(status, status_style, color, since),
+                _ => vec![(status.to_owned(), status_style)],
+            };
+
+            let symbol = format!("{symbol} ");
+            let first = [
+                Span::styled(row.first, row.style),
+                Span::styled(symbol, tint),
+            ];
+            let rest = [Span::styled(row.rest, row.style)];
+            let width = first.iter().map(Span::width).sum();
+
+            let most = match (self.expanded, helper.waiting()) {
+                (true, _) => usize::MAX,
+                (false, true) => MAX_TITLE_ROWS,
+                (false, false) => 1,
+            };
+            let mut ranges = wrap_ranges(&helper.title, limit);
+            let cut = ranges.len() > most;
+            if cut {
+                ranges.truncate(most);
+            }
+            let last = ranges.len().saturating_sub(1);
+            for (at, (range, joint)) in ranges.into_iter().enumerate() {
+                let mut title = helper.title[range].to_owned();
+                if cut && at == last {
+                    let marked = format!("{title}…");
+                    title = fitted(&marked, limit).trim_end().to_owned();
+                }
+                let lead = match at {
+                    0 => &first[..],
+                    _ => &rest[..],
+                };
+                let line = [(title, Style::new())];
+                self.push_rows(lead, &rest, width, &line, &[]);
+                // Rows wrapped here copy back to the text they came from
+                if let Some(row) = self.rows.last_mut() {
+                    row.joint = joint;
+                }
+            }
+
+            if !helper.preview.is_empty() {
+                let bar = [
+                    Span::styled(body.rest, body.style),
+                    Span::styled("│ ", tint),
+                ];
+                let width = bar.iter().map(Span::width).sum();
+                let lines = highlight::plain(&helper.preview, DIM);
+                let start = self.rows.len();
+                for line in &lines {
+                    self.push_rows(&bar, &bar, width, line, &[]);
+                }
+
+                let excess = (self.rows.len() - start).saturating_sub(MAX_PREVIEW_ROWS);
+                self.rows.drain(start..start + excess);
+                // Copying must not join the first kept row onto the title above
+                if let Some(first) = self.rows.get_mut(start) {
+                    first.joint = None;
+                }
+            }
+
+            match (self.expanded, helper.status, helper.interrupted) {
+                (true, ToolCallStatus::Completed, _) => {
+                    let start = self.rows.len();
+                    self.markdown(body, helper.text.trim());
+                    let hidden = (self.rows.len() - start).saturating_sub(MAX_PREVIEW_ROWS);
+                    if hidden > 0 {
+                        self.rows.truncate(start + MAX_PREVIEW_ROWS);
+                        let more = format!("… +{hidden} lines");
+                        self.push_status(body, vec![(more, DIM)]);
+                    }
+                }
+                (true, ToolCallStatus::Failed, false) => self.wrap(body, helper.text.trim(), RED),
+                (false, ToolCallStatus::Failed, false) => self.push_lines(body, &[status]),
+                (_, ToolCallStatus::Completed, _) | (_, ToolCallStatus::Failed, true) => {}
+                _ => self.push_status(body, status),
+            }
+
+            if let Some(usage) = helper.usage.filter(|_| self.expanded) {
+                let mut stats = vec![
+                    format!("{} steps", usage.steps),
+                    format!("{:.1}s", usage.duration),
+                ];
+                if let (Some(input), Some(output)) = (usage.input, usage.output) {
+                    stats.push(in_out(input, output));
+                }
+                self.wrap(body, &stats.join(" · "), DIM);
+
+                if index + 1 < helpers.len() {
+                    self.push_lines(body, &[Vec::new()]);
+                }
+            }
+        }
+    }
+
     fn paragraph(&mut self, mark: Mark, text: &str, style: Style) {
         self.rows.push(Row::default());
         self.wrap(mark, text, style);
@@ -331,11 +530,14 @@ impl Render {
         self.rows.truncate(start + head);
         let hidden = rows - head - tail;
         let more = format!("… +{hidden} lines (ctrl+o to expand)");
-        let rest = Mark {
-            first: mark.rest,
-            ..mark
+        let lead = match head {
+            0 => mark,
+            _ => Mark {
+                first: mark.rest,
+                ..mark
+            },
         };
-        self.wrap(rest, &more, DIM);
+        self.wrap(lead, &more, DIM);
 
         // The row before is now the hint, so copying must not join onto it
         if let Some(first) = ending.first_mut() {
@@ -347,6 +549,15 @@ impl Render {
     fn wrap(&mut self, mark: Mark, text: &str, style: Style) {
         let lines = highlight::plain(text, style);
         self.push_lines(mark, &lines);
+    }
+
+    /// Status rather than content, which selecting and copying skip whole
+    fn push_status(&mut self, mark: Mark, spans: Spans) {
+        let start = self.rows.len();
+        self.push_lines(mark, &[spans]);
+        for row in &mut self.rows[start..] {
+            row.mark_width = usize::MAX;
+        }
     }
 
     fn push_lines(&mut self, mark: Mark, lines: &[Spans]) {
@@ -750,7 +961,7 @@ fn last_sentence(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use crate::tui::render::*;
-    use crate::tui::transcript::{Attachment, Call, Shell, StepStats};
+    use crate::tui::transcript::{Attachment, Call, Helper, Shell, StepStats};
     use agent_client_protocol_schema::v1::ToolCallStatus;
 
     fn call(content: &[&str], status: ToolCallStatus) -> Call {
@@ -761,11 +972,109 @@ mod tests {
             content: content.iter().map(|text| text.to_string()).collect(),
             attachments: Vec::new(),
             retries: Vec::new(),
+            helpers: Vec::new(),
         }
     }
 
     fn text(rows: &[Row]) -> Vec<String> {
         rows.iter().map(|row| row.line.to_string()).collect()
+    }
+
+    fn helper(title: &str, status: ToolCallStatus, text: &str) -> Helper {
+        Helper {
+            id: "call_1.1".to_owned(),
+            title: title.to_owned(),
+            status,
+            text: text.to_owned(),
+            preview: String::new(),
+            interrupted: false,
+            started: None,
+            color: 0,
+            usage: None,
+        }
+    }
+
+    /// A step whose only call started this agent
+    fn helped(helper: Helper) -> Step {
+        let mut started = call(&["```python\nagent(task)\n```"], ToolCallStatus::Completed);
+        started.helpers.push(helper);
+        Step {
+            items: vec![Item::Call(started)],
+            ..Step::default()
+        }
+    }
+
+    #[test]
+    fn helper_title_rows() {
+        let title = "Review the café menu parser in menu.py, the naïve rounding of its prices and the résumé export 🐍 that reuses both, then report every bug with the line it is on and a fix that keeps the output for valid input";
+        let step = helped(helper(title, ToolCallStatus::Pending, ""));
+
+        let titled = |expanded: bool| {
+            let mut render = Render::new(100, expanded);
+            render.step(&step);
+            let start = 3;
+            let end = render.rows.len() - 1;
+            render.rows.drain(start..end).collect::<Vec<Row>>()
+        };
+        let folded = text(&titled(false));
+        assert_eq!(folded.len(), MAX_TITLE_ROWS, "{folded:#?}");
+        assert!(folded[1].ends_with('…'), "{folded:#?}");
+        let expanded = titled(true);
+        let rows = text(&expanded);
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        for row in &rows {
+            assert!(row.width() <= 8 + MAX_TITLE_COLUMNS, "{rows:#?}");
+        }
+        let parts = rows.iter().map(|row| row.trim_start_matches([' ', '◌']));
+        let joined: Vec<&str> = parts.map(str::trim_end).collect();
+        assert_eq!(joined.join(" "), title);
+        assert_eq!(expanded[1].joint.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn agent_output_folded() {
+        let code = "```python\nagent(tasks)\n```";
+        let printed = "café: 3\nnaïve: 1\nrésumé: 2";
+        let mut started = call(&[code, printed], ToolCallStatus::Completed);
+        let counted = helper("Count the menu", ToolCallStatus::Completed, "3 cafés");
+        started.helpers.push(counted);
+        let step = Step {
+            items: vec![Item::Call(started)],
+            ..Step::default()
+        };
+
+        let expected = [
+            "",
+            "  │ agent(tasks)",
+            "  ├ agents · 1 done",
+            "  │   ◆ Count the menu",
+            "  ╰ … +3 lines (ctrl+o to expand)",
+        ];
+        assert_eq!(rendered(&step, 40, false), expected);
+        let expanded = rendered(&step, 40, true);
+        let shown = ["  ╰ café: 3", "    naïve: 1", "    résumé: 2"];
+        assert_eq!(expanded[expanded.len() - 3..], shown);
+    }
+
+    #[test]
+    fn helper_answer_cut() {
+        let answer = "- café 1\n- café 2\n- café 3\n- café 4\n- naïve 5\n- résumé 6";
+        let step = helped(helper("Spell the menu", ToolCallStatus::Completed, answer));
+        let folded = rendered(&step, 40, false);
+        assert_eq!(folded[3..], ["      ◆ Spell the menu"]);
+
+        let mut render = Render::new(40, true);
+        render.step(&step);
+        let rows = &render.rows[4..];
+        let expected = [
+            "        • café 1",
+            "        • café 2",
+            "        • café 3",
+            "        • café 4",
+            "        … +2 lines",
+        ];
+        assert_eq!(text(rows), expected);
+        assert_eq!(rows[4].mark_width, usize::MAX);
     }
 
     fn rendered(step: &Step, width: u16, expanded: bool) -> Vec<String> {

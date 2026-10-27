@@ -253,7 +253,7 @@ pub(crate) fn instructions(dir: &Path, project: &Path) -> (Vec<String>, Vec<Erro
     (found, skipped)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Skill {
     pub(crate) name: String,
     pub(crate) description: String,

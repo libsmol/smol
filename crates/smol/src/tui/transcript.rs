@@ -1,7 +1,8 @@
-use crate::client::{Notice, Refused, SHELL, UPDATE};
+use crate::client::{Notice, Refused, AGENT, SHELL, UPDATE};
 use crate::tui::render::{Render, Row};
+use crate::tui::theme::HELPERS;
 use agent_client_protocol_schema::v1::{
-    ContentBlock, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
+    ContentBlock, Meta, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
 };
 use anyhow::Result;
 use serde_json::Value;
@@ -38,6 +39,9 @@ pub(crate) struct Stats {
     pub(crate) steps: usize,
     pub(crate) input: u64,
     pub(crate) output: u64,
+    /// Tokens of the agents the code started, which count apart from the session's
+    pub(crate) agent_input: u64,
+    pub(crate) agent_output: u64,
     pub(crate) context: Option<u64>,
     pub(crate) window: Option<u64>,
     /// Output estimated while the step is still generating, which makes the context an estimate too
@@ -164,6 +168,25 @@ impl Transcript {
         self.live.is_some()
     }
 
+    /// Agents the running code started that are still queued or running
+    pub(crate) fn helping(&self) -> usize {
+        let Some(step) = &self.live else {
+            return 0;
+        };
+
+        let mut count = 0;
+        for item in &step.items {
+            if let Item::Call(call) = item {
+                count += call
+                    .helpers
+                    .iter()
+                    .filter(|helper| helper.waiting())
+                    .count();
+            }
+        }
+        count
+    }
+
     pub(crate) fn writing(&self) -> bool {
         let Some(step) = &self.live else {
             return false;
@@ -243,6 +266,11 @@ impl Transcript {
             }
 
             SessionUpdate::ToolCallUpdate(call) => {
+                if let Some(usage) = helper_usage(call.meta.as_ref()) {
+                    self.stats.agent_input += usage.input.unwrap_or(0);
+                    self.stats.agent_output += usage.output.unwrap_or(0);
+                }
+
                 let mut running = None;
                 for entry in self.held.iter_mut().rev() {
                     if let Entry::Shell(shell) = entry {
@@ -465,7 +493,9 @@ impl Transcript {
         }
         self.rows.append(&mut render.rows);
 
-        if mem::take(&mut self.changed) {
+        // Running agents show a spinner and their time, which change on every frame
+        let animated = self.helping() > 0;
+        if mem::take(&mut self.changed) || animated {
             for entry in &self.held {
                 render.entry(entry);
             }
@@ -526,6 +556,34 @@ pub(crate) struct Call {
     pub(crate) attachments: Vec<Attachment>,
     /// Retries of the request that compaction makes
     pub(crate) retries: Vec<Retry>,
+    /// Agents its code started, in the order it started them
+    pub(crate) helpers: Vec<Helper>,
+}
+
+#[derive(Debug)]
+pub(crate) struct Helper {
+    pub(crate) id: String,
+    /// The start of its task
+    pub(crate) title: String,
+    pub(crate) status: ToolCallStatus,
+    /// What it is doing while it runs, then its answer or why it failed
+    pub(crate) text: String,
+    /// The end of what it is writing or printing while it runs
+    pub(crate) preview: String,
+    pub(crate) interrupted: bool,
+    /// Unknown on replay, which reports the duration instead
+    pub(crate) started: Option<Instant>,
+    /// Taken when it starts and held by no other agent running at the same time
+    pub(crate) color: usize,
+    pub(crate) usage: Option<HelperUsage>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HelperUsage {
+    pub(crate) input: Option<u64>,
+    pub(crate) output: Option<u64>,
+    pub(crate) steps: u64,
+    pub(crate) duration: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,6 +599,16 @@ pub(crate) struct Parts<'a> {
     pub(crate) outputs: &'a [String],
     pub(crate) attachments: &'a [Attachment],
     pub(crate) error: Option<&'a str>,
+}
+
+impl Helper {
+    /// Queued or running
+    pub(crate) fn waiting(&self) -> bool {
+        matches!(
+            self.status,
+            ToolCallStatus::Pending | ToolCallStatus::InProgress
+        )
+    }
 }
 
 impl Call {
@@ -590,43 +658,132 @@ impl Step {
             }
 
             SessionUpdate::ToolCall(call) => {
+                let id = call.tool_call_id.0.to_string();
+                // An agent the code started belongs under the call running that code
+                let meta = call.meta.as_ref();
+                let marked = meta.is_some_and(|meta| meta.contains_key(AGENT));
+                let parent = meta.and_then(|meta| meta.get("parent"));
+                let parent = parent.and_then(Value::as_str).filter(|_| marked);
+                if let Some(owner) = parent.and_then(|parent| self.call_mut(parent)) {
+                    let title = call.title.strip_prefix("agent: ").unwrap_or(&call.title);
+                    owner.helpers.push(Helper {
+                        id,
+                        title: title.to_owned(),
+                        status: call.status,
+                        text: String::new(),
+                        preview: String::new(),
+                        interrupted: false,
+                        started: None,
+                        color: 0,
+                        usage: None,
+                    });
+                    return;
+                }
+
                 let (content, attachments) = contents(&call.content);
                 let call = Call {
-                    id: call.tool_call_id.0.to_string(),
+                    id,
                     title: call.title.clone(),
                     status: call.status,
                     content,
                     attachments,
                     retries: Vec::new(),
+                    helpers: Vec::new(),
                 };
                 self.items.push(Item::Call(call));
             }
 
             SessionUpdate::ToolCallUpdate(update) => {
-                let mut found = None;
-                for item in self.items.iter_mut().rev() {
-                    if let Item::Call(call) = item {
-                        if call.id == *update.tool_call_id.0 {
-                            found = Some(call);
-                            break;
+                let id = &*update.tool_call_id.0;
+                if let Some(call) = self.call_mut(id) {
+                    let fields = &update.fields;
+                    if let Some(status) = fields.status {
+                        call.status = status;
+                    }
+                    if let Some(content) = &fields.content {
+                        (call.content, call.attachments) = contents(content);
+                    }
+                    return;
+                }
+
+                // An agent that starts takes the color at its place in its call,
+                // or the lowest free one when a running agent holds that
+                let mut place = None;
+                let mut taken = Vec::new();
+                for item in &self.items {
+                    let Item::Call(call) = item else {
+                        continue;
+                    };
+                    for (index, helper) in call.helpers.iter().enumerate() {
+                        if helper.id == id {
+                            place = Some(index % HELPERS.len());
+                        }
+                        if helper.status == ToolCallStatus::InProgress {
+                            taken.push(helper.color);
                         }
                     }
                 }
-                let Some(call) = found else {
+                let Some(place) = place else {
+                    return;
+                };
+                let mut free = (0..HELPERS.len()).filter(|color| !taken.contains(color));
+                let color = match taken.contains(&place) {
+                    true => free.next().unwrap_or(place),
+                    false => place,
+                };
+
+                let mut found = None;
+                for item in self.items.iter_mut().rev() {
+                    let Item::Call(call) = item else {
+                        continue;
+                    };
+                    found = call.helpers.iter_mut().find(|helper| helper.id == id);
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                let Some(helper) = found else {
                     return;
                 };
 
                 let fields = &update.fields;
                 if let Some(status) = fields.status {
-                    call.status = status;
+                    if status == ToolCallStatus::InProgress && helper.started.is_none() {
+                        helper.started = Some(Instant::now());
+                        helper.color = color;
+                    }
+                    helper.status = status;
                 }
+                // A preview follows the status, and the last update holds only the answer or error
                 if let Some(content) = &fields.content {
-                    (call.content, call.attachments) = contents(content);
+                    let (texts, _) = contents(content);
+                    let mut texts = texts.into_iter();
+                    helper.text = texts.next().unwrap_or_default();
+                    helper.preview = texts.collect();
+                }
+                let meta = update.meta.as_ref();
+                let interrupted = meta.and_then(|meta| meta.get("interrupted"));
+                if interrupted.and_then(Value::as_bool) == Some(true) {
+                    helper.interrupted = true;
+                }
+                if let Some(usage) = helper_usage(meta) {
+                    helper.usage = Some(usage);
                 }
             }
 
             _ => {}
         }
+    }
+
+    fn call_mut(&mut self, id: &str) -> Option<&mut Call> {
+        for item in self.items.iter_mut().rev() {
+            if let Item::Call(call) = item {
+                if call.id == id {
+                    return Some(call);
+                }
+            }
+        }
+        None
     }
 
     /// Notices such as a restart didn't come from the request stream and are kept
@@ -678,6 +835,20 @@ fn text_of(content: &ContentBlock) -> String {
         ContentBlock::Text(text) => text.text.clone(),
         _ => String::new(),
     }
+}
+
+/// Only the last update of an agent's call carries its usage
+fn helper_usage(meta: Option<&Meta>) -> Option<HelperUsage> {
+    let get = |key: &str| meta.and_then(|meta| meta.get(key));
+    get(AGENT)?;
+    let steps = get("steps").and_then(Value::as_u64)?;
+    let duration = get("duration").and_then(Value::as_f64);
+    Some(HelperUsage {
+        input: get("inputTokens").and_then(Value::as_u64),
+        output: get("outputTokens").and_then(Value::as_u64),
+        steps,
+        duration: duration.unwrap_or_default(),
+    })
 }
 
 fn contents(content: &[ToolCallContent]) -> (Vec<String>, Vec<Attachment>) {
@@ -1306,6 +1477,40 @@ mod tests {
 
         step.items.push(Item::Notice("Retrying".to_owned()));
         assert_eq!(replied(&step), "");
+    }
+
+    #[test]
+    fn helper_colors() {
+        let mut step = Step::default();
+        let code = ToolCall::new("call_1", "eval").status(ToolCallStatus::InProgress);
+        step.update(&SessionUpdate::ToolCall(code));
+        let marked = json!({ "_smol/agent": true, "parent": "call_1" });
+        for n in 1..=10 {
+            let id = format!("call_1.{n}");
+            let opened = ToolCall::new(id, format!("agent: Count the cafés in menu {n}"))
+                .meta(marked.as_object().cloned());
+            step.update(&SessionUpdate::ToolCall(opened));
+        }
+
+        let moved = |step: &mut Step, n: usize, status: ToolCallStatus| {
+            let fields = ToolCallUpdateFields::new().status(status);
+            let update = ToolCallUpdate::new(format!("call_1.{n}"), fields);
+            step.update(&SessionUpdate::ToolCallUpdate(update));
+        };
+        for n in (1..=8).rev() {
+            moved(&mut step, n, ToolCallStatus::InProgress);
+        }
+        moved(&mut step, 3, ToolCallStatus::Completed);
+        moved(&mut step, 9, ToolCallStatus::InProgress);
+        moved(&mut step, 1, ToolCallStatus::Completed);
+        moved(&mut step, 10, ToolCallStatus::InProgress);
+        moved(&mut step, 9, ToolCallStatus::InProgress);
+
+        let [Item::Call(call)] = &step.items[..] else {
+            panic!("{:?}", step.items);
+        };
+        let colors: Vec<usize> = call.helpers.iter().map(|helper| helper.color).collect();
+        assert_eq!(colors, [0, 1, 2, 3, 4, 5, 6, 7, 2, 0]);
     }
 
     #[test]

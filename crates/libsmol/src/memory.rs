@@ -70,7 +70,7 @@ impl Usage {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AgentStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<String>,
@@ -114,6 +114,28 @@ pub(crate) struct CodeResult {
     pub(crate) printed: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) media: Vec<(String, Media)>,
+    /// Agents the code started with `agent()`, shown on replay but never sent to the model
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) agents: Vec<Helper>,
+}
+
+/// An agent started by `agent()`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Helper {
+    pub(crate) task: String,
+    /// Saved as an `answer` or `error` key beside the others
+    #[serde(flatten)]
+    pub(crate) end: Ending,
+    pub(crate) memory: AgentMemory,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Ending {
+    Answer(String),
+    Error(String),
+    /// Braces let it flatten into an `interrupted` key
+    Interrupted {},
 }
 
 impl AgentStep {
@@ -135,14 +157,14 @@ impl Call {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TaskStep {
     pub(crate) text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) files: Vec<Attachment>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Attachment {
     /// Directories end in /, and a resource is named by its URI
     pub(crate) path: String,
@@ -198,7 +220,7 @@ pub(crate) fn exit_code(code: i32) -> String {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SummaryStep {
     pub(crate) summary: String,
     /// How many steps before the summary are kept verbatim
@@ -208,7 +230,7 @@ pub(crate) struct SummaryStep {
     pub(crate) used: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum MemoryStep {
     Task(TaskStep),
@@ -295,7 +317,7 @@ impl MemoryStep {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AgentMemory {
     pub(crate) steps: Vec<MemoryStep>,
 }
@@ -398,6 +420,23 @@ impl AgentMemory {
         let conversation = self.conversation(system, window);
         let sent = bytes(&conversation, takes);
         estimate(sent)
+    }
+
+    /// What every request so far cost, compaction included, and how many steps were taken
+    pub(crate) fn spent(&self) -> (Usage, usize) {
+        let mut total = Usage::default();
+        let mut steps = 0;
+        for step in &self.steps {
+            match step {
+                MemoryStep::Action(action) => {
+                    total.add(&action.usage);
+                    steps += 1;
+                }
+                MemoryStep::Summary(summary) => total.add(&summary.usage),
+                _ => {}
+            }
+        }
+        (total, steps)
     }
 
     /// Only looks at steps since the last restart
@@ -708,6 +747,25 @@ pub(crate) mod tests {
         assert_eq!(transcript, skipped);
     }
 
+    /// The agents a call started keep the saved format, with their answer or error beside the task
+    #[test]
+    fn agents_saved() {
+        let saved = r#"{"printed": "3 cafés", "agents": [
+            {"task": "Count the cafés", "answer": "3 cafés", "memory": {"steps": []}},
+            {"task": "Spell naïve", "error": "model: http 503: busy", "memory": {"steps": []}},
+            {"task": "Read the résumé", "interrupted": {}, "memory": {"steps": []}}
+        ]}"#;
+        let result: CodeResult = serde_json::from_str(saved).expect("deserialize");
+        let ends: Vec<&Ending> = result.agents.iter().map(|helper| &helper.end).collect();
+        let answered = Ending::Answer("3 cafés".to_owned());
+        let failed = Ending::Error("model: http 503: busy".to_owned());
+        assert_eq!(ends, [&answered, &failed, &Ending::Interrupted {}]);
+
+        let again = serde_json::to_value(&result).expect("serialize");
+        let saved: serde_json::Value = serde_json::from_str(saved).expect("parse");
+        assert_eq!(again, saved);
+    }
+
     #[test]
     fn context_estimate() {
         let printed = "x".repeat(300);
@@ -859,6 +917,7 @@ pub(crate) mod tests {
             let result = CodeResult {
                 printed: printed.map(str::to_owned),
                 media: vec![("screenshot.png".to_owned(), media.clone())],
+                ..CodeResult::default()
             };
             let mut step = coded("view('screenshot.png')", None);
             step.calls[0].result = Some(result);

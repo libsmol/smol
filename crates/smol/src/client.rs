@@ -39,6 +39,8 @@ const MCP: &str = "_smol/mcp";
 pub(crate) const UPDATE: &str = "_smol/update";
 /// Also set in the `_meta` of the tool calls it produces
 pub(crate) const SHELL: &str = "_smol/shell";
+/// Marks the tool calls of agents the code starts
+pub(crate) const AGENT: &str = "_smol/agent";
 const MAX_STDERR_LINES: usize = 20;
 const STDERR_WAIT: Duration = Duration::from_millis(200);
 /// The agent needs time to finish saving the cancelled turn

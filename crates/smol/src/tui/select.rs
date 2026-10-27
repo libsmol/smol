@@ -128,17 +128,20 @@ impl Selection {
     pub(crate) fn text(&self, rows: Rows) -> String {
         let (start, end) = self.ordered();
         let mut text = String::new();
+        let mut copied = false;
 
         for index in start.row..=end.row {
             let Some(row) = rows.get(index) else {
                 break;
             };
-            if index > start.row {
-                text += row.joint.as_deref().unwrap_or("\n");
-            }
+            // A row left out whole adds no line break either
             let Some(columns) = self.columns(index, row.mark_width) else {
                 continue;
             };
+            if copied {
+                text += row.joint.as_deref().unwrap_or("\n");
+            }
+            copied = true;
 
             for (col, grapheme) in graphemes(row) {
                 if columns.contains(&col) {
@@ -217,7 +220,8 @@ pub(crate) fn copy(text: &str) {
 #[cfg(test)]
 mod tests {
     use crate::tui::select::*;
-    use crate::tui::transcript::{Entry, Item, Step, Transcript};
+    use crate::tui::transcript::{Call, Entry, Helper, Item, Step, Transcript};
+    use agent_client_protocol_schema::v1::ToolCallStatus;
 
     fn rows(transcript: &mut Transcript) -> Rows<'_> {
         transcript.rows(12, false)
@@ -307,5 +311,54 @@ mod tests {
         let rows = rows(&mut transcript);
         assert_eq!(rows.len(), 3);
         assert_eq!(select((1, 0), (2, 40)).text(rows), "• 🍕🍕 🚀🚀 🎉🎉");
+    }
+
+    #[test]
+    fn agent_status_skipped() {
+        let helper = |title: &str, status: ToolCallStatus, text: &str| Helper {
+            id: "call_1.1".to_owned(),
+            title: title.to_owned(),
+            status,
+            text: text.to_owned(),
+            preview: String::new(),
+            interrupted: false,
+            started: None,
+            color: 0,
+            usage: None,
+        };
+        let counting = Helper {
+            preview: "print(len(cafés))".to_owned(),
+            ..helper("Count the cafés", ToolCallStatus::InProgress, "thinking")
+        };
+        let call = Call {
+            id: "call_1".to_owned(),
+            title: "eval".to_owned(),
+            status: ToolCallStatus::Completed,
+            content: vec!["```python\nagent(tasks)\n```".to_owned()],
+            attachments: Vec::new(),
+            retries: Vec::new(),
+            helpers: vec![
+                counting,
+                helper(
+                    "Spell naïve",
+                    ToolCallStatus::Completed,
+                    "It has a diaeresis.",
+                ),
+            ],
+        };
+        let step = Step {
+            items: vec![Item::Call(call)],
+            ..Step::default()
+        };
+        let mut transcript = Transcript::default();
+        transcript.push(Entry::Step(step));
+
+        let rows = transcript.rows(40, false);
+        let all = select((0, 0), (rows.len(), 40)).text(rows);
+        let expected = "\nagent(tasks)\nCount the cafés\nprint(len(cafés))\nSpell naïve";
+        assert_eq!(all, expected);
+        for (row, to) in [(2, 40), (5, 40), (6, 7)] {
+            assert_eq!(select((row, 0), (row, to)).text(rows), "", "{row}");
+        }
     }
 }

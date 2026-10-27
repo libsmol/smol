@@ -25,6 +25,8 @@ const QUEUED: &str = "_smol/queued";
 const UPDATE: &str = "_smol/update";
 /// Replied to like a prompt, and the tool calls it opens carry the same marker in `_meta`
 const SHELL: &str = "_smol/shell";
+/// Marks the tool calls of agents the code starts, whose usage counts apart from the session's
+const AGENT: &str = "_smol/agent";
 
 pub(crate) struct App {
     pub(crate) peer: Arc<Peer>,

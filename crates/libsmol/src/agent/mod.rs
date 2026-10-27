@@ -1,8 +1,8 @@
 use crate::config::Skill;
 use crate::history::MAX_TITLE_CHARS;
 use crate::memory::{
-    bytes, estimate, AgentMemory, AgentStep, Call, MemoryStep, StepError, SummaryStep, TaskStep,
-    Usage,
+    bytes, estimate, AgentMemory, AgentStep, Call, Helper, MemoryStep, StepError, SummaryStep,
+    TaskStep, Usage,
 };
 use crate::model::{
     ChatMessage, Finish, Finished, MediaKind, Model, ModelError, Purpose, StreamDelta,
@@ -11,6 +11,7 @@ use crate::prompt;
 use crate::tools::attach::{attach, Mention};
 use crate::utils::Interrupt;
 use crate::worker::host::{Added, Worker};
+use crate::worker::sandbox::Sandbox;
 use crate::{Error, Result};
 use std::fs;
 use std::future::Future;
@@ -19,13 +20,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::select;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio::{task, time};
+use tracing::{info, warn};
 
 mod compact;
+mod delegate;
 mod step;
 
+pub(crate) use crate::agent::delegate::MAX_PARALLEL_AGENTS;
+
 const VIEW: &str = "view";
+const AGENT: &str = "agent";
 const MAX_NAMING_CHARS: usize = 2000;
 const MAX_RETRIES: u32 = 3;
 const RETRY_WAIT: Duration = match cfg!(test) {
@@ -66,6 +72,101 @@ pub(crate) trait Sink: Send {
 
     /// The returned messages are already taken off the client's queue
     fn queued(&mut self) -> Asking<'_>;
+
+    /// Shows the agents that the code of the call at `index` starts
+    fn helpers(&mut self, _index: usize) -> Box<dyn Helpers> {
+        Box::new(Unseen)
+    }
+}
+
+/// Helpers are numbered from 1 within the call that starts them
+pub(crate) trait Helpers: Send + Sync {
+    fn open(&self, number: usize, task: &str) -> Box<dyn HelperView>;
+}
+
+/// A helper is saved with the call that started it, so its view saves nothing
+pub(crate) trait HelperView: Sink {
+    fn close(&mut self, helper: &Helper);
+}
+
+pub(crate) struct Unseen;
+
+impl Helpers for Unseen {
+    fn open(&self, _: usize, _: &str) -> Box<dyn HelperView> {
+        Box::new(Unseen)
+    }
+}
+
+impl Sink for Unseen {
+    fn event(&mut self, _: Event) {}
+
+    fn saved(&mut self, _: &AgentMemory) {}
+
+    fn queued(&mut self) -> Asking<'_> {
+        Box::pin(async { Vec::new() })
+    }
+}
+
+impl HelperView for Unseen {
+    fn close(&mut self, _: &Helper) {}
+}
+
+/// Logs how steps and compaction end before passing events on
+struct Logged<'a>(&'a mut dyn Sink);
+
+impl Sink for Logged<'_> {
+    fn event(&mut self, event: Event) {
+        // Code errors contain task content and are not logged
+        // A model error fails the turn and is logged only by the turn failure line
+        match event {
+            Event::Retry { reason, wait } => {
+                let wait = wait.as_secs_f64();
+                warn!("model: retrying in {wait:.1}s, {reason}");
+            }
+            Event::StepEnd(step) => {
+                let calls = step.calls.len();
+                let seconds = step.usage.duration;
+                let tokens = logged_tokens(&step.usage);
+                let counted = format!("[calls={calls}, tokens={tokens}, elapsed={seconds:.1}s]");
+                match &step.error {
+                    None => info!("step: done {counted}"),
+                    Some(StepError::Interrupted) => info!("step: interrupted {counted}"),
+                    Some(StepError::Model(_)) => warn!("step: failed {counted}"),
+                    Some(error) => warn!("step: failed, {error} {counted}"),
+                }
+            }
+            Event::CompactEnd(Ok(summary)) => {
+                let kept = summary.kept;
+                let seconds = summary.usage.duration;
+                info!("compact: done [kept={kept}, elapsed={seconds:.1}s]");
+            }
+            Event::CompactEnd(Err(StepError::Interrupted)) => info!("compact: interrupted"),
+            Event::CompactEnd(Err(_)) => warn!("compact: failed"),
+            Event::Restarted => warn!("python: restarted"),
+            _ => {}
+        }
+        self.0.event(event);
+    }
+
+    fn saved(&mut self, memory: &AgentMemory) {
+        self.0.saved(memory);
+    }
+
+    fn queued(&mut self) -> Asking<'_> {
+        self.0.queued()
+    }
+
+    fn helpers(&mut self, index: usize) -> Box<dyn Helpers> {
+        self.0.helpers(index)
+    }
+}
+
+/// Input and output tokens as log lines show them, or - when the provider gave none
+fn logged_tokens(usage: &Usage) -> String {
+    match usage.tokens {
+        Some(tokens) => format!("{}/{}", tokens.input_tokens, tokens.output_tokens),
+        None => "-".to_owned(),
+    }
 }
 
 pub(crate) struct Task {
@@ -73,6 +174,7 @@ pub(crate) struct Task {
     pub(crate) mentions: Vec<Mention>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Agent {
     pub(crate) model: Arc<dyn Model>,
     pub(crate) instructions: Vec<String>,
@@ -80,6 +182,12 @@ pub(crate) struct Agent {
     pub(crate) cwd: PathBuf,
     pub(crate) copies: PathBuf,
     pub(crate) interrupt: Interrupt,
+    /// Every worker of the session uses it
+    pub(crate) sandbox: Arc<Sandbox>,
+    /// Shared by all agents the session's code starts
+    pub(crate) slots: Arc<Semaphore>,
+    /// Started by `agent()`, which it can't call itself
+    pub(crate) delegated: bool,
 }
 
 struct Turn<'a> {
@@ -104,7 +212,9 @@ impl Agent {
         let seeing = self.model.takes(MediaKind::Image) || self.model.takes(MediaKind::Video);
         let mut functions = Vec::new();
         for function in worker.functions() {
-            if seeing || function.name != VIEW {
+            let unseen = !seeing && function.name == VIEW;
+            let nested = self.delegated && function.name == AGENT;
+            if !unseen && !nested {
                 functions.push(function);
             }
         }
@@ -115,15 +225,17 @@ impl Agent {
             &self.cwd,
             worker.sandboxed(),
             &self.instructions,
+            self.delegated,
         );
 
+        let mut logged = Logged(sink);
         let mut turn = Turn {
             agent: self,
             worker,
             servers,
             memory,
             system,
-            sink,
+            sink: &mut logged,
         };
         turn.run(task).await
     }
@@ -417,7 +529,9 @@ pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<Stri
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::agent::{title_of, Agent, Asking, Event, Sink, Task, Turn, RETRY_WAIT};
+    use crate::agent::{
+        title_of, Agent, Asking, Event, Sink, Task, Turn, MAX_PARALLEL_AGENTS, RETRY_WAIT,
+    };
     use crate::history::MAX_TITLE_CHARS;
     use crate::memory::{AgentMemory, MemoryStep};
     use crate::model::{
@@ -428,6 +542,7 @@ pub(crate) mod tests {
     use crate::tests::{content, temp_dir, write_file, Temp};
     use crate::tools::attach::tests::mentioned;
     use crate::utils::{block_on, Interrupt};
+    use crate::worker::host::tests::no_agents;
     use crate::worker::host::Worker;
     use crate::worker::sandbox::tests::opened;
     use crate::Result;
@@ -436,6 +551,7 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::Semaphore;
     use tokio::task;
 
     /// Tool name and raw arguments of a call with no readable code
@@ -641,8 +757,8 @@ pub(crate) mod tests {
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let dir = temp_dir("session");
         let copies = dir.join("copies");
-        let sandbox = opened(&cwd, &copies);
-        let starting = Worker::new(&interrupt, sandbox, false);
+        let sandbox = Arc::new(opened(&cwd, &copies));
+        let starting = Worker::new(&interrupt, Arc::clone(&sandbox), false);
         let worker = block_on(starting).expect("worker");
 
         let agent = Agent {
@@ -652,6 +768,9 @@ pub(crate) mod tests {
             cwd,
             copies,
             interrupt,
+            sandbox,
+            slots: Arc::new(Semaphore::new(MAX_PARALLEL_AGENTS)),
+            delegated: false,
         };
         let probe = Probe {
             events,
@@ -829,8 +948,9 @@ pub(crate) mod tests {
         let replies = vec![Ok(called("print('reading the orders again')"))];
         let mut run = recorded(replies, None, "", Box::new(|_| {}));
         let mut ignore = |_: &str| {};
+        let mut none = no_agents;
         let code = "import os\nos._exit(1)";
-        let exiting = run.agent.worker.evaluate(code, &[], &mut ignore);
+        let exiting = run.agent.worker.evaluate(code, &[], &mut ignore, &mut none);
         block_on(exiting).expect("evaluate");
 
         let mut memory = AgentMemory::default();

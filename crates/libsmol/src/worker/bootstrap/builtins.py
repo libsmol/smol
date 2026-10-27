@@ -195,6 +195,34 @@ def view(path: str | _os.PathLike) -> None:
     _view(path, absolute)
 
 @_builtin
+def agent(task: str | list[str]) -> str | list[str | RuntimeError]:
+    """a new agent does the task with the same files and functions and returns its answer; a list runs in parallel
+
+    Gives the task to a new agent and returns its final answer. The agent has its own Python session and the same files, functions, skills and instructions as you, but not your variables or this conversation, so the task must say everything it needs. A list of tasks runs up to 8 agents at a time and returns their answers in the same order, with the exception in place of any task that failed. Agents started this way can't call agent()."""
+    single = isinstance(task, str)
+    tasks = [task] if single else task
+    if not isinstance(tasks, list):
+        kind = type(task).__name__
+        raise TypeError(f"agent: task must be str or a list of str, not {kind}")
+    for item in tasks:
+        if not isinstance(item, str):
+            kind = type(item).__name__
+            raise TypeError(f"agent: task must be str or a list of str, not a list holding {kind}")
+    if not tasks or not all(item.strip() for item in tasks):
+        raise ValueError("agent: task is empty")
+
+    answers = []
+    for result in _agent(tasks):
+        error = result.get("error")
+        answer = result.get("answer") if error is None else RuntimeError(f"agent: {error}")
+        answers.append(answer)
+    if not single:
+        return answers
+    if isinstance(answers[0], RuntimeError):
+        raise answers[0]
+    return answers[0]
+
+@_builtin
 def help(request: object) -> None:
     """prints the signature and docs of a function or module
 
@@ -260,7 +288,7 @@ def help(request: object) -> None:
     text = "\n".join(parts)
     print(text, limit=None)
 
-_BUILTINS = [edit, ls, grep, fetch, view, help]
+_BUILTINS = [edit, ls, grep, fetch, view, agent, help]
 _FUNCTIONS = []
 for _function in _BUILTINS:
     _name = _function.__name__

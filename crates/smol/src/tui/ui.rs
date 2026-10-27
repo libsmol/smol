@@ -1,7 +1,9 @@
 use crate::client::{McpState, McpStatus};
 use crate::tui::app::App;
 use crate::tui::render::wrap_ranges;
-use crate::tui::{in_out, kilo, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG};
+use crate::tui::{
+    fitted, in_out, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG,
+};
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -9,7 +11,6 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Padding, Paragr
 use ratatui::Frame;
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use reaper::tilde;
-use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -17,8 +18,6 @@ const SIDEBAR_WIDTH: u16 = 32;
 const MIN_WIDE_SCREEN: u16 = 100;
 const MAX_INPUT_ROWS: usize = 10;
 const MAX_CHOICE_ROWS: usize = 10;
-const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const SPIN_EVERY: Duration = Duration::from_millis(80);
 const PINK: Style = Style::new().fg(theme::PINK);
 const GREEN: Style = Style::new().fg(theme::GREEN);
 const QUEUED: &str = " · queued";
@@ -77,6 +76,19 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                 None => "?%".to_owned(),
             };
             usage += &format!(" · context {share}");
+        }
+        let working = app.transcript.helping();
+        let mut agents = Vec::new();
+        if working > 0 {
+            agents.push(format!("{working} working"));
+        }
+        if stats.agent_input + stats.agent_output > 0 {
+            let tokens = in_out(stats.agent_input, stats.agent_output);
+            agents.push(tokens);
+        }
+        if !agents.is_empty() {
+            let agents = agents.join(" · ");
+            usage += &format!(" · agents {agents}");
         }
 
         // Startup failures are not reported in the conversation,
@@ -148,6 +160,18 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             context,
             bar,
         ];
+        // The progress line already counts the agents at work, and both don't fit here
+        let helped = stats.agent_input + stats.agent_output > 0;
+        let working = app.transcript.helping();
+        let agents = match (helped, working) {
+            (true, _) => Some(in_out(stats.agent_input, stats.agent_output)),
+            (false, 0) => None,
+            (false, working) => Some(format!("{working} working")),
+        };
+        if let Some(agents) = agents {
+            let agents = labeled("agents", agents, width);
+            lines.push(agents);
+        }
 
         if !app.session.mcp.is_empty() {
             let section = heading("mcp");
@@ -192,8 +216,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(run) = &app.run {
         let started = run.step_started;
         let elapsed = started.elapsed();
-        let frames = elapsed.as_millis() / SPIN_EVERY.as_millis();
-        let tick = SPINNER[frames as usize % SPINNER.len()];
+        let tick = spinner(started);
         let spinner = format!("  {tick} ");
 
         let transcript = &app.transcript;
@@ -213,6 +236,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let connecting = app.session.mcp.iter().filter(connecting);
         let connecting: Vec<&str> = connecting.map(|server| server.name.as_str()).collect();
         let waiting = transcript.unstarted() && !connecting.is_empty();
+        let helping = transcript.helping();
         let label = match (run.interrupting, left, writing) {
             (true, _, _) => "interrupting…".to_owned(),
             (false, Some(left), _) => {
@@ -224,6 +248,13 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                 let names = connecting.join(", ");
                 format!("waiting for mcp {names} · {seconds}s")
             }
+            (false, None, _) if helping > 0 => {
+                let agents = match helping {
+                    1 => "agent",
+                    _ => "agents",
+                };
+                format!("waiting for {helping} {agents} · {seconds}s")
+            }
             (false, None, false) => format!("thinking · {seconds}s{estimated}"),
             (false, None, true) => format!("working · {seconds}s{estimated}"),
         };
@@ -234,7 +265,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         }
         let italic = DIM.add_modifier(Modifier::ITALIC);
         let mut line = vec![Span::styled(spinner, ACCENT)];
-        for (text, style) in theme::shimmer(&label, italic, started) {
+        for (text, style) in theme::shimmer(&label, italic, theme::PURPLE, started) {
             line.push(Span::styled(text, style));
         }
         progress.push(Line::from(line));
@@ -595,34 +626,6 @@ fn tail(text: &str, width: usize) -> String {
     format!("…{kept}")
 }
 
-fn fitted(text: &str, width: usize) -> String {
-    let long = text.width() > width;
-    let room = match long {
-        true => width.saturating_sub(1),
-        false => width,
-    };
-
-    let mut kept = String::new();
-    let mut used = 0;
-    for grapheme in text.graphemes(true) {
-        let w = grapheme.width();
-        if used + w > room {
-            break;
-        }
-        kept.push_str(grapheme);
-        used += w;
-    }
-
-    if long && width > 0 {
-        kept.push('…');
-        used += 1;
-    }
-
-    let gap = width.saturating_sub(used);
-    let padding = " ".repeat(gap);
-    kept + &padding
-}
-
 fn panel() -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
@@ -699,11 +702,12 @@ mod tests {
     use crate::tui::tests::{app, draw, fill};
     use crate::tui::ui::*;
     use agent_client_protocol_schema::v1::{
-        ContentBlock, ContentChunk, SessionUpdate, UsageUpdate,
+        ContentBlock, ContentChunk, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
+        ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
     };
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let terminal = draw(app, width, height);
@@ -757,17 +761,6 @@ mod tests {
         assert_eq!(widths(28, 40, 30), (15, 15));
         assert_eq!(widths(10, 8, 30), (10, 8));
         assert_eq!(widths(10, 8, 0), (0, 0));
-    }
-
-    #[test]
-    fn fitted_width() {
-        assert_eq!(fitted("ab", 4), "ab  ");
-        assert_eq!(fitted("abcdef", 4), "abc…");
-        assert_eq!(fitted("🍕🚀🎉", 5), "🍕🚀…");
-        assert_eq!(fitted("🍕🚀🎉", 4), "🍕… ");
-        assert_eq!(fitted("abc", 0), "");
-        assert_eq!(fitted("⚠️🍕🚀🎉🐍", 5), "⚠️🍕…");
-        assert_eq!(fitted("⚠️🍕", 5), "⚠️🍕 ");
     }
 
     #[test]
@@ -983,5 +976,155 @@ mod tests {
         let screen = screen(&mut app, 120, 20).join("\n");
         assert!(screen.contains("s · ≈⇣1.23k"), "{screen}");
         assert!(screen.contains("≈5k / 100k · 5%"), "{screen}");
+    }
+
+    fn helper_update(app: &mut App, id: &str, status: ToolCallStatus, texts: &[&str], meta: Value) {
+        let content: Vec<ToolCallContent> = texts
+            .iter()
+            .map(|text| ToolCallContent::from(*text))
+            .collect();
+        let fields = ToolCallUpdateFields::new().status(status).content(content);
+        let update = ToolCallUpdate::new(id.to_owned(), fields).meta(meta.as_object().cloned());
+        app.transcript
+            .update(&SessionUpdate::ToolCallUpdate(update));
+    }
+
+    /// Agents sit under the call whose code started them, and their tokens count apart
+    #[test]
+    fn helpers_grouped() {
+        let mut app = app();
+        app.submit_text("wait");
+        let code = ToolCallContent::from("```python\nagent(tasks)\n```");
+        let running = ToolCall::new("call_1", "agent(tasks)")
+            .status(ToolCallStatus::InProgress)
+            .content(vec![code]);
+        app.transcript.update(&SessionUpdate::ToolCall(running));
+        let tasks = [
+            "Review prices.py",
+            "Review names.py",
+            "Review dates.py",
+            "Review café.py",
+            "Review menu.py",
+        ];
+        for (offset, task) in tasks.iter().enumerate() {
+            let id = format!("call_1.{}", offset + 1);
+            let meta = json!({ "_smol/agent": true, "parent": "call_1" });
+            let opened =
+                ToolCall::new(id, format!("agent: {task}")).meta(meta.as_object().cloned());
+            app.transcript.update(&SessionUpdate::ToolCall(opened));
+        }
+        let marked = json!({ "_smol/agent": true });
+        let preview = "prices = load('prices.csv')\nprint(prices[:3])\nprint(total(prices))\nprint(sum(prices))\nprint('café', len(prices))";
+        helper_update(
+            &mut app,
+            "call_1.1",
+            ToolCallStatus::InProgress,
+            &["writing prices = load('prices.csv')", preview],
+            marked.clone(),
+        );
+        let usage = json!({ "_smol/agent": true, "inputTokens": 1200, "outputTokens": 340, "steps": 3, "duration": 12.5 });
+        let answer = "**Bug:** `prices[1:]` skips the first price\n\nUse `sum(prices)`.";
+        helper_update(
+            &mut app,
+            "call_1.2",
+            ToolCallStatus::Completed,
+            &[answer],
+            usage,
+        );
+        helper_update(
+            &mut app,
+            "call_1.3",
+            ToolCallStatus::Failed,
+            &["model: http 503: busy"],
+            marked.clone(),
+        );
+        let stopped = json!({ "_smol/agent": true, "interrupted": true });
+        helper_update(
+            &mut app,
+            "call_1.4",
+            ToolCallStatus::Failed,
+            &["interrupted by the user"],
+            stopped,
+        );
+
+        let stats = app.transcript.stats();
+        assert_eq!((stats.input, stats.output, stats.steps), (0, 0, 0));
+        assert_eq!(app.transcript.helping(), 2);
+        let rows = screen(&mut app, 120, 30);
+        let wide = rows.join("\n");
+        let header =
+            "╰ agents · 1 running · 1 queued · 1 done · 1 failed · 1 interrupted · ⇡1.2k ⇣340";
+        assert!(wide.contains(header), "{wide}");
+        assert!(!wide.contains('✓'), "{wide}");
+        // Only the conversation panel, without its borders or the sidebar
+        let mut panel = Vec::new();
+        for row in &rows {
+            let inside = row.split("││").next().unwrap_or_default();
+            let inside = inside.strip_prefix('│').unwrap_or(inside);
+            panel.push(inside.trim_end().to_owned());
+        }
+        // Ended agents keep a row, or two when they failed,
+        // and a running one shows the end of its work above its status
+        let group = [
+            "Review prices.py",
+            "│ print(prices[:3])",
+            "│ print(total(prices))",
+            "│ print(sum(prices))",
+            "│ print('café', len(prices))",
+            "writing prices = load('prices.csv') · 0s",
+            "◆ Review names.py",
+            "✗ Review dates.py",
+            "model: http 503: busy",
+            "✗ Review café.py",
+            "◌ Review menu.py",
+            "queued",
+        ];
+        let header = panel.iter().position(|row| row.contains("╰ agents"));
+        let header = header.expect("header");
+        let shown = &panel[header + 1..header + 1 + group.len()];
+        for (row, expected) in shown.iter().zip(group) {
+            assert!(row.ends_with(expected), "{panel:#?}");
+        }
+        let start = |row: &str, text: &str| row.find(text).map(|at| row[..at].width());
+        let menu = header + group.len() - 1;
+        let column = start(&panel[menu], "Review");
+        assert_eq!(start(&panel[menu + 1], "queued"), column, "{panel:#?}");
+        assert!(wide.contains("waiting for 2 agents · "), "{wide}");
+        let sidebar = |row: &&str| row.contains("││ agents ") && row.ends_with(" ⇡1.2k ⇣340 │");
+        assert!(wide.lines().any(|row| sidebar(&row)), "{wide}");
+
+        app.expanded = true;
+        let expanded = screen(&mut app, 120, 40);
+        let title = expanded
+            .iter()
+            .position(|row| row.contains(" Review prices.py"));
+        let title = title.expect("title");
+        assert!(
+            expanded[title + 5].contains("writing prices = load('prices.csv') · 0s"),
+            "{expanded:#?}"
+        );
+        assert!(
+            expanded[title + 6].contains("◆ Review names.py"),
+            "{expanded:#?}"
+        );
+        let stats = expanded
+            .iter()
+            .position(|row| row.contains("3 steps · 12.5s · ⇡1.2k ⇣340"))
+            .expect("stats");
+        assert!(
+            expanded[stats - 1].contains("Use sum(prices)."),
+            "{expanded:#?}"
+        );
+        let gap = expanded[stats + 1].split("││").next().unwrap_or_default();
+        assert_eq!(gap.trim_matches([' ', '│']), "", "{expanded:#?}");
+        assert!(
+            expanded[stats + 2].contains("✗ Review dates.py"),
+            "{expanded:#?}"
+        );
+        let narrow = screen(&mut app, 80, 20);
+        assert!(
+            narrow[0].contains(" · agents 2 working · ⇡1.2k ⇣340 "),
+            "{narrow:?}"
+        );
     }
 }
