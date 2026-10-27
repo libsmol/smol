@@ -1,10 +1,10 @@
 use crate::acp::rpc::Peer;
 use crate::acp::MCP;
-use crate::code::{Added, Worker};
 use crate::config::McpConfig;
 use crate::history::Settings;
 use crate::prompt;
 use crate::tools::mcp::{connect, Server};
+use crate::worker::host::{Added, Worker};
 use serde_json::json;
 use std::mem;
 use std::path::{Path, PathBuf};

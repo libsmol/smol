@@ -230,7 +230,7 @@ fn default_name(api: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::setup::{check_name, default_name, parse_context};
+    use crate::config::setup::{check_name, default_name, parse_context};
 
     #[test]
     fn default_names() {

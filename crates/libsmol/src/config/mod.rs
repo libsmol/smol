@@ -15,6 +15,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{self, Path, PathBuf};
 use toml::Value;
 
+pub(crate) mod setup;
+
 /// Testing compaction shrinks the window a lot, so this only catches 0 and obvious typos
 pub(crate) const MIN_CONTEXT: u64 = 1024;
 /// Only the first one found in each directory is used

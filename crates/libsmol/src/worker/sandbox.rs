@@ -402,13 +402,13 @@ pub(crate) fn sweep() {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::code::Worker;
     use crate::config::Access;
-    #[cfg(target_os = "linux")]
-    use crate::sandbox::spread;
-    use crate::sandbox::{profile, sweep, Sandbox, LOCK, PASSED_ENV, TEMP_PREFIX};
     use crate::tests::{temp_dir, write_file};
     use crate::utils::{block_on, new_id, Interrupt};
+    use crate::worker::host::Worker;
+    #[cfg(target_os = "linux")]
+    use crate::worker::sandbox::spread;
+    use crate::worker::sandbox::{profile, sweep, Sandbox, LOCK, PASSED_ENV, TEMP_PREFIX};
     use std::env;
     use std::fs;
     #[cfg(target_os = "linux")]

@@ -1,4 +1,3 @@
-use crate::code::Added;
 use crate::config::Skill;
 use crate::memory::{
     exit_code, AgentStep, Call, CallError, Exit, MemoryStep, ShellStep, StepError, TaskStep,
@@ -6,6 +5,7 @@ use crate::memory::{
 };
 use crate::model::{Media, Part};
 use crate::utils::truncated;
+use crate::worker::host::Added;
 use crate::worker::Function;
 use chrono::Utc;
 use std::env::consts::OS;

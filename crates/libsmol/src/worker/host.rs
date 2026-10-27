@@ -1,10 +1,10 @@
 use crate::memory::{CallError, MAX_OBSERVATION_CHARS};
 use crate::model::Media;
 use crate::prompt::{self, NO_SERVER};
-use crate::sandbox::Sandbox;
-use crate::spawn::{drain, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
+use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
 use crate::tools::mcp::{Called, Calling, Server};
-use crate::utils::{new_id, Clip, Interrupt, Reply};
+use crate::utils::{new_id, Interrupt, Reply};
+use crate::worker::sandbox::Sandbox;
 #[cfg(not(test))]
 use crate::worker::WORKER_ARG;
 use crate::worker::{
@@ -176,7 +176,7 @@ impl Worker {
         command.arg(WORKER_ARG);
         // Tests rerun the test binary itself with only the test that serves as the worker
         #[cfg(test)]
-        command.args(["code::tests::serving", "--exact", "--nocapture"]);
+        command.args(["worker::host::tests::serving", "--exact", "--nocapture"]);
         let control = format!("{address}/{token}");
         command
             .env(CONTROL_ENV, control)
@@ -548,14 +548,14 @@ async fn start_error(group: Group, mut pieces: Receiver<Piece>, mut output: Clip
 
 #[cfg(test)]
 mod tests {
-    use crate::code::{Added, Evaluated, Worker, STOP_WAIT};
     use crate::memory::CallError;
     use crate::prompt::system;
-    use crate::sandbox::tests::opened;
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
     use crate::tools::mcp::tests::{fake, started};
     use crate::tools::mcp::{Called, Calling, Server};
     use crate::utils::{block_on, Interrupt};
+    use crate::worker::host::{Added, Evaluated, Worker, STOP_WAIT};
+    use crate::worker::sandbox::tests::opened;
     use crate::worker::{serve, CONTROL_ENV};
     use serde_json::{json, Map, Value};
     use std::env;

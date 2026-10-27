@@ -1,7 +1,10 @@
 use crate::memory::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
-use crate::utils::{Clip, Interrupt};
+use crate::utils::{truncated_with, Interrupt};
 use crate::worker::END;
-use reaper::{cause, Mark};
+#[cfg(windows)]
+use encoding_rs::Encoding;
+use reaper::{cause, terminal_view, Mark};
+use std::collections::VecDeque;
 use std::env;
 use std::io::{self, Read};
 use std::mem;
@@ -11,6 +14,8 @@ use std::os::unix::process::ExitStatusExt;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
+#[cfg(windows)]
+use std::str;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -20,6 +25,8 @@ use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::watch;
 use tokio::task;
 use tokio::time::{self, Instant};
+#[cfg(windows)]
+use windows_sys::Win32::Globalization::GetACP;
 
 /// Must hold `MAX_OBSERVATION_CHARS` characters at up to 4 bytes each
 pub(crate) const KEPT_BYTES: usize = 256 * 1024;
@@ -141,6 +148,123 @@ pub(crate) enum Piece {
     End,
 }
 
+/// Keeps about `half` bytes at each end without splitting a UTF-8 character
+pub(crate) struct Clip {
+    half: usize,
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    /// Bytes dropped from the middle
+    dropped: usize,
+    /// Characters dropped from the middle
+    cut: usize,
+    /// Bytes received as of the last `fresh`
+    reported: usize,
+}
+
+impl Clip {
+    pub(crate) fn new(half: usize) -> Self {
+        Self {
+            half,
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            dropped: 0,
+            cut: 0,
+            reported: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, mut bytes: &[u8]) {
+        let continues = |byte: &u8| byte & 0xC0 == 0x80;
+        // The head runs to the end of a character,
+        // and the next chunk completes one split across chunks
+        if self.tail.is_empty() {
+            let room = self.half.saturating_sub(self.head.len());
+            let mut room = room.min(bytes.len());
+            while room < bytes.len() && continues(&bytes[room]) {
+                room += 1;
+            }
+            let (now, later) = bytes.split_at(room);
+            self.head.extend_from_slice(now);
+            bytes = later;
+        }
+        self.tail.extend(bytes);
+
+        // The tail starts at the beginning of a character
+        let mut over = self.tail.len().saturating_sub(self.half);
+        while over > 0 && over < self.tail.len() && continues(&self.tail[over]) {
+            over += 1;
+        }
+        let dropped = self.tail.drain(..over);
+        self.cut += dropped.filter(|byte| !continues(byte)).count();
+        self.dropped += over;
+    }
+
+    /// The kept text and the number of characters dropped from the middle
+    pub(crate) fn text(&self) -> (String, usize) {
+        let mut bytes = self.head.clone();
+        bytes.extend(&self.tail);
+        let text = decoded(&bytes);
+        (text, self.cut)
+    }
+
+    pub(crate) fn shown(&self, max: usize) -> String {
+        let (text, cut) = self.text();
+        let text = terminal_view(&text);
+        truncated_with(&text, max, cut)
+    }
+
+    /// Returns text only when more output arrived since the last call
+    pub(crate) fn fresh(&mut self, max: usize) -> Option<String> {
+        let pushed = self.head.len() + self.tail.len() + self.dropped;
+        if pushed == self.reported {
+            return None;
+        }
+        self.reported = pushed;
+        let text = self.shown(max);
+        Some(text)
+    }
+}
+
+#[cfg(not(windows))]
+fn decoded(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Some programs write in the system code page with \r\n line ends,
+/// so lines that aren't UTF-8 are decoded with that code page
+#[cfg(windows)]
+fn decoded(bytes: &[u8]) -> String {
+    // SAFETY: Only reads a system setting
+    let page = unsafe { GetACP() };
+    let label = match page {
+        932 => "shift_jis".to_owned(),
+        936 => "gbk".to_owned(),
+        949 => "euc-kr".to_owned(),
+        950 => "big5".to_owned(),
+        866 => "ibm866".to_owned(),
+        874 | 1250..=1258 => format!("windows-{page}"),
+        _ => "utf-8".to_owned(),
+    };
+    let encoding = Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+
+    let mut text = String::new();
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        match str::from_utf8(line) {
+            Ok(line) => text.push_str(line),
+            // A character split at the end of a read is still UTF-8 waiting for its last bytes
+            Err(error) if error.error_len().is_none() => {
+                let line = String::from_utf8_lossy(line);
+                text.push_str(&line);
+            }
+            Err(_) => {
+                let (line, _) = encoding.decode_without_bom_handling(line);
+                text.push_str(&line);
+            }
+        }
+    }
+    text.replace("\r\n", "\n")
+}
+
 /// Collects what is left in the pipe without waiting forever on background programs holding it open
 pub(crate) async fn drain(pieces: &mut Receiver<Piece>, output: &mut Clip) {
     let draining = async {
@@ -240,13 +364,57 @@ fn end_of(status: ExitStatus) -> Exit {
 
 #[cfg(test)]
 mod tests {
-    use crate::memory::{Exit, ShellStep};
-    use crate::spawn::spawn_shell;
+    use crate::memory::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
+    use crate::spawn::{spawn_shell, Clip};
     use crate::tests::temp_dir;
-    use crate::utils::{block_on, Interrupt};
+    use crate::utils::{block_on, truncated, truncated_with, Interrupt};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn clip_matches_truncated() {
+        let sizes = [
+            0,
+            10,
+            MAX_OBSERVATION_CHARS,
+            MAX_OBSERVATION_CHARS + 1,
+            MAX_OBSERVATION_CHARS * 3 + 7,
+        ];
+        for size in sizes {
+            let text: String = "café 🐍\n".chars().cycle().take(size).collect();
+            let mut clip = Clip::new(MAX_OBSERVATION_CHARS * 2);
+            // Chunk boundaries fall inside characters
+            for chunk in text.as_bytes().chunks(4097) {
+                clip.push(chunk);
+            }
+            let (kept, cut) = clip.text();
+            let clipped = truncated_with(&kept, MAX_OBSERVATION_CHARS, cut);
+            let expected = truncated(&text, MAX_OBSERVATION_CHARS);
+            assert_eq!(clipped, expected, "{size}");
+        }
+    }
+
+    /// A character split across two chunks is completed by the next one
+    #[test]
+    fn clip_shown_fresh() {
+        let bytes = "é🍕".as_bytes();
+        let mut clip = Clip::new(4);
+        clip.push(&bytes[..4]);
+        assert_eq!(clip.fresh(100).as_deref(), Some("é\u{fffd}"));
+        assert_eq!(clip.fresh(100), None);
+
+        clip.push(&bytes[4..]);
+        assert_eq!(clip.fresh(100).as_deref(), Some("é🍕"));
+    }
+
+    #[test]
+    fn clip_head_whole() {
+        // The head limit of 3 bytes falls inside ï
+        let mut clip = Clip::new(3);
+        clip.push("naïve café".as_bytes());
+        assert_eq!(clip.text(), ("naïfé".to_owned(), 5));
+    }
 
     /// The second item says whether programs were left in the background
     fn shelled(dir: &Path, line: &str, interrupt: &Interrupt) -> (ShellStep, bool) {

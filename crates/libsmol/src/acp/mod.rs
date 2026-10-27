@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 pub use crate::acp::serve::run;
 
-mod mcp;
 mod rpc;
 mod serve;
+mod servers;
 mod session;
 mod translator;
 

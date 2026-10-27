@@ -29,6 +29,8 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread;
 
 mod builtins;
+pub(crate) mod host;
+pub(crate) mod sandbox;
 
 pub const WORKER_ARG: &str = "--worker";
 /// Holds the `address/token` the agent listens on

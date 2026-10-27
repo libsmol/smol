@@ -2,10 +2,10 @@ use crate::acp::rpc::{Lines, Out, Peer};
 use crate::acp::session::{self, Message, Opening, Prompt, Shell};
 use crate::acp::{rfc3339, task_of, to_value, App, QUEUED, SHELL};
 use crate::config;
+use crate::config::setup::SETUP_ARG;
 use crate::history::HistoryStore;
-use crate::sandbox;
-use crate::setup::SETUP_ARG;
 use crate::utils::{block_on, new_id, Interrupt};
+use crate::worker::sandbox;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodTerminal, CancelNotification, CloseSessionRequest,

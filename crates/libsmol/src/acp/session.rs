@@ -1,15 +1,15 @@
-use crate::acp::mcp::McpPool;
 use crate::acp::rpc::{Notice, Peer};
+use crate::acp::servers::McpPool;
 use crate::acp::translator::Translator;
 use crate::acp::{rfc3339, task_of, to_value, App, QUEUED};
 use crate::agent::{title_of, Agent, Asking, Event, Sink, Task};
-use crate::code::Worker;
 use crate::config::{self, Access, McpConfig, Models};
 use crate::history::{Lock, SessionMeta, Settings};
 use crate::memory::{AgentMemory, Exit, MemoryStep, StepError};
-use crate::sandbox::Sandbox;
 use crate::spawn::{spawn_shell, Group};
 use crate::utils::Interrupt;
+use crate::worker::host::Worker;
+use crate::worker::sandbox::Sandbox;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     ContentBlock, LoadSessionResponse, NewSessionResponse, PromptResponse, SessionConfigOption,

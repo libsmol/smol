@@ -1,4 +1,3 @@
-use crate::code::{Added, Worker};
 use crate::config::Skill;
 use crate::history::MAX_TITLE_CHARS;
 use crate::memory::{
@@ -11,6 +10,7 @@ use crate::model::{
 use crate::prompt;
 use crate::tools::attach::{attach, Mention};
 use crate::utils::Interrupt;
+use crate::worker::host::{Added, Worker};
 use crate::{Error, Result};
 use std::fs;
 use std::future::Future;
@@ -418,7 +418,6 @@ pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::agent::{title_of, Agent, Asking, Event, Sink, Task, Turn, RETRY_WAIT};
-    use crate::code::Worker;
     use crate::history::MAX_TITLE_CHARS;
     use crate::memory::{AgentMemory, MemoryStep};
     use crate::model::{
@@ -426,10 +425,11 @@ pub(crate) mod tests {
         StreamDelta, TokenUsage, Unread,
     };
     use crate::prompt::RESTARTED;
-    use crate::sandbox::tests::opened;
     use crate::tests::{content, temp_dir, write_file, Temp};
     use crate::tools::attach::tests::mentioned;
     use crate::utils::{block_on, Interrupt};
+    use crate::worker::host::Worker;
+    use crate::worker::sandbox::tests::opened;
     use crate::Result;
     use std::collections::VecDeque;
     use std::fs;
