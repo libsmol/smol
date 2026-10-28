@@ -37,8 +37,18 @@ pub(crate) fn unknown_role(name: &str, roles: &[Role]) -> String {
     format!("agent: role: {name}: unknown (roles: {names})")
 }
 
+/// None leaves view() out of the prompt
+pub(crate) fn view_summary(image: bool, video: bool) -> Option<&'static str> {
+    match (image, video) {
+        (true, true) => Some("attaches an image or video file to this call's result"),
+        (true, false) => Some("attaches an image file to this call's result"),
+        (false, true) => Some("attaches a video file to this call's result"),
+        (false, false) => None,
+    }
+}
+
 pub(crate) fn system(
-    functions: &[&Function],
+    functions: &[Function],
     servers: &[&Added],
     skills: &[Skill],
     cwd: &Path,
@@ -606,7 +616,9 @@ mod tests {
     };
     use crate::model::tests::png;
     use crate::model::Media;
-    use crate::prompt::{call_error, error, media_tag, shell, system, transcript, unseen};
+    use crate::prompt::{
+        call_error, error, media_tag, shell, system, transcript, unseen, view_summary,
+    };
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -676,6 +688,17 @@ mod tests {
         assert!(!helper.contains("# Agents"), "{helper}");
         let plain = system(&[], &[], &[], cwd, false, &[], &Place::Delegated(None));
         assert!(!plain.contains("# Role"), "{plain}");
+    }
+
+    #[test]
+    fn view_summaries() {
+        let both = Some("attaches an image or video file to this call's result");
+        assert_eq!(view_summary(true, true), both);
+        let images = Some("attaches an image file to this call's result");
+        assert_eq!(view_summary(true, false), images);
+        let videos = Some("attaches a video file to this call's result");
+        assert_eq!(view_summary(false, true), videos);
+        assert_eq!(view_summary(false, false), None);
     }
 
     /// The model cannot tell from the record how far it got before the interrupt

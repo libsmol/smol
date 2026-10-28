@@ -226,15 +226,22 @@ impl Agent {
         task: Task,
         sink: &mut dyn Sink,
     ) -> Result<Option<String>> {
-        let seeing = self.model.takes(MediaKind::Image) || self.model.takes(MediaKind::Video);
+        let image = self.model.takes(MediaKind::Image);
+        let video = self.model.takes(MediaKind::Video);
         let delegated = matches!(self.place, Place::Delegated(_));
         let mut functions = Vec::new();
         for function in worker.functions() {
-            let unseen = !seeing && function.name == VIEW;
-            let nested = delegated && function.name == AGENT;
-            if !unseen && !nested {
-                functions.push(function);
+            if delegated && function.name == AGENT {
+                continue;
             }
+            let mut function = function.clone();
+            if function.name == VIEW {
+                let Some(summary) = prompt::view_summary(image, video) else {
+                    continue;
+                };
+                function.summary = summary.to_owned();
+            }
+            functions.push(function);
         }
         let system = prompt::system(
             &functions,
