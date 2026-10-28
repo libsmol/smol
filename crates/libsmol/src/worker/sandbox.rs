@@ -484,7 +484,9 @@ pub(crate) mod tests {
 
     fn evaluated(sandbox: Sandbox, code: &str) -> String {
         let interrupt = Interrupt::default();
-        let starting = Worker::new(&interrupt, Arc::new(sandbox), false);
+        let has_roles = false;
+        let restarted = false;
+        let starting = Worker::new(&interrupt, Arc::new(sandbox), has_roles, restarted);
         let mut worker = block_on(starting).expect("worker");
         let mut ignore = |_: &str| {};
         let mut none = no_agents;

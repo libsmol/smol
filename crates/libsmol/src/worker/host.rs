@@ -9,7 +9,7 @@ use crate::worker::sandbox::Sandbox;
 use crate::worker::WORKER_ARG;
 use crate::worker::{
     FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall, WorkerNote,
-    CONTROL_ENV, COPIES_ENV,
+    CONTROL_ENV, COPIES_ENV, ROLES_ENV,
 };
 use crate::{Error, Result};
 use reaper::{cause, terminal_view};
@@ -44,8 +44,8 @@ const START_WAIT: Duration = Duration::from_secs(30);
 const HELPERS_WAIT: Duration = Duration::from_secs(5);
 
 pub(crate) type Calling = Pin<Box<dyn Future<Output = Called> + Send>>;
-/// Runs the tasks of one `agent()` call
-pub(crate) type Delegating = dyn FnMut(Vec<String>) -> Calling + Send;
+/// Runs the tasks of one `agent()` call, each with the role at the same place in the roles
+pub(crate) type Delegating = dyn FnMut(Vec<String>, Vec<Option<String>>) -> Calling + Send;
 
 /// The result of work done for the worker, with the images, videos and agents it produced
 pub(crate) struct Called {
@@ -89,6 +89,8 @@ pub(crate) struct Worker {
     /// Shared with the workers of agents the code starts
     sandbox: Arc<Sandbox>,
     interrupt: Interrupt,
+    /// `agent()` takes a role
+    roles: bool,
     functions: Vec<Function>,
     restarted: bool,
     live: Option<Live>,
@@ -147,11 +149,13 @@ impl Worker {
     pub(crate) async fn new(
         interrupt: &Interrupt,
         sandbox: Arc<Sandbox>,
+        roles: bool,
         restarted: bool,
     ) -> Result<Self> {
         let mut worker = Self {
             sandbox,
             interrupt: interrupt.clone(),
+            roles,
             functions: Vec::new(),
             restarted,
             live: None,
@@ -213,6 +217,9 @@ impl Worker {
             .env(CONTROL_ENV, control)
             .env(COPIES_ENV, &self.sandbox.copies)
             .stdin(Stdio::null());
+        if self.roles {
+            command.env(ROLES_ENV, "1");
+        }
         let (mut group, pieces) = Group::start(command).map_err(failed)?;
 
         let accepting = async {
@@ -428,9 +435,9 @@ impl Worker {
                     args,
                     called,
                 } => (server, tool, args, called),
-                WorkerCall::Agent { tasks } => {
+                WorkerCall::Agent { tasks, roles } => {
                     live.agents.push((number, Vec::new()));
-                    let calling = delegate(tasks);
+                    let calling = delegate(tasks, roles);
                     live.calls.spawn(async move { (number, calling.await) });
                     continue;
                 }
@@ -630,6 +637,7 @@ async fn start_error(group: Group, mut pieces: Receiver<Piece>, mut output: Clip
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::agent::Place;
     use crate::memory::{AgentMemory, CallError, Ending, Helper};
     use crate::prompt::{self, system};
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
@@ -661,7 +669,7 @@ pub(crate) mod tests {
     }
 
     /// For code that never calls `agent()`
-    pub(crate) fn no_agents(tasks: Vec<String>) -> Calling {
+    pub(crate) fn no_agents(tasks: Vec<String>, _: Vec<Option<String>>) -> Calling {
         panic!("{tasks:?}");
     }
 
@@ -711,11 +719,12 @@ pub(crate) mod tests {
         }
     }
 
-    fn build(interrupt: Interrupt, cwd: PathBuf) -> Temp<Tried> {
+    fn build(interrupt: Interrupt, cwd: PathBuf, has_roles: bool) -> Temp<Tried> {
         let dir = temp_dir("session");
         let copies = dir.join("copies");
         let sandbox = opened(&cwd, &copies);
-        let building = Worker::new(&interrupt, Arc::new(sandbox), false);
+        let restarted = false;
+        let building = Worker::new(&interrupt, Arc::new(sandbox), has_roles, restarted);
         let worker = block_on(building).expect("worker");
         let value = Tried {
             worker,
@@ -733,7 +742,7 @@ pub(crate) mod tests {
     fn workspace(name: &str) -> (Temp<Tried>, PathBuf) {
         let dir = temp_dir(name);
         fs::create_dir_all(&dir).expect("dir");
-        let worker = build(Interrupt::default(), dir.clone());
+        let worker = build(Interrupt::default(), dir.clone(), false);
         (worker, dir)
     }
 
@@ -744,7 +753,7 @@ pub(crate) mod tests {
     fn interruptible() -> (Temp<Tried>, Interrupt) {
         let interrupt = Interrupt::default();
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let worker = build(interrupt.clone(), cwd);
+        let worker = build(interrupt.clone(), cwd, false);
         (worker, interrupt)
     }
 
@@ -1194,7 +1203,7 @@ pub(crate) mod tests {
         let module = dir.join("smol_local.py");
         fs::write(&module, "value = 42\n").expect("write");
 
-        let mut worker = build(Interrupt::default(), dir.clone());
+        let mut worker = build(Interrupt::default(), dir.clone(), false);
         let code = "import argparse, pathlib, runpy, smol_local\n\
              print(smol_local.value)\n\
              _ = pathlib.Path('script.py').write_text('import sys\\nprint(sys.argv[0])')\n\
@@ -1596,13 +1605,14 @@ pub(crate) mod tests {
         assert_eq!(kept, [("fake.mixed", image)]);
     }
 
-    /// Answers each task with its text, and fails a task that is "fail"
-    fn answering(tasks: Vec<String>) -> Calling {
+    /// Answers each task with its text and role, and fails a task that is "fail"
+    fn answering(tasks: Vec<String>, roles: Vec<Option<String>>) -> Calling {
         let mut results = Vec::new();
-        for task in &tasks {
+        for (task, role) in tasks.iter().zip(roles) {
+            let role = role.map(|role| format!(" as {role}")).unwrap_or_default();
             let result = match task.as_str() {
                 "fail" => json!({ "error": "model: http 503: busy" }),
-                task => json!({ "answer": format!("done: {task}") }),
+                task => json!({ "answer": format!("done: {task}{role}") }),
             };
             results.push(result);
         }
@@ -1647,6 +1657,55 @@ pub(crate) mod tests {
         assert_eq!(refused, expected);
     }
 
+    /// Only a session with roles lists the parameter, and without it passing one fails
+    #[test]
+    fn role_listed() {
+        let header = |worker: &Worker| {
+            let mut functions = worker.functions().iter();
+            let found = functions.find(|function| function.name == "agent");
+            found.expect("agent").header.clone()
+        };
+        let plain = "agent(task: str | list[str]) -> str | list[str | RuntimeError]";
+        let mut worker = fresh();
+        assert_eq!(header(&worker), plain);
+        worker.delegate = Box::new(answering);
+        let output = worker.eval("agent('café', role='critic')");
+        let refused = format!("TypeError: {plain}: got an unexpected keyword argument 'role'");
+        assert_eq!(error(output).lines().next(), Some(refused.as_str()));
+
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut worker = build(Interrupt::default(), cwd, true);
+        let roled = "agent(task: str | list[str], role: str | list[str] | None = None) -> str | list[str | RuntimeError]";
+        assert_eq!(header(&worker), roled);
+        worker.delegate = Box::new(answering);
+        let code = "print(agent('café', role='critic'))\n\
+            print(agent(['naïve', 'résumé'], role=['critic', 'editor']))\n\
+            print(agent(['naïve', 'résumé'], role='critic'), agent(['naïve']))";
+        let output = worker.eval(code);
+        let printed = "done: café as critic\n\
+            ['done: naïve as critic', 'done: résumé as editor']\n\
+            ['done: naïve as critic', 'done: résumé as critic'] ['done: naïve']\n";
+        assert_eq!(output.logs, printed);
+
+        let mut refused = Vec::new();
+        for code in [
+            "agent('café', role=1)",
+            "agent(['café'], role=['critic', 2])",
+            "agent(['café', 'naïve'], role=['critic'])",
+        ] {
+            let output = worker.eval(code);
+            let message = error(output);
+            let first = message.lines().next().unwrap_or_default().to_owned();
+            refused.push(first);
+        }
+        let expected = [
+            "TypeError: agent: role must be str or a list of str, not int",
+            "TypeError: agent: role must be str or a list of str, not a list holding int",
+            "ValueError: agent: role: needs one role per task (2), not 1",
+        ];
+        assert_eq!(refused, expected);
+    }
+
     struct Dropped(Arc<AtomicBool>);
 
     impl Drop for Dropped {
@@ -1659,7 +1718,7 @@ pub(crate) mod tests {
     #[test]
     fn agents_in_order() {
         let mut worker = fresh();
-        let finishing = |tasks: Vec<String>| -> Calling {
+        let finishing = |tasks: Vec<String>, _: Vec<Option<String>>| -> Calling {
             Box::pin(async move {
                 let wait = match tasks[0].as_str() {
                     "Count the cafés" => Duration::from_secs(1),
@@ -1668,6 +1727,7 @@ pub(crate) mod tests {
                 time::sleep(wait).await;
                 let helper = Helper {
                     task: tasks[0].clone(),
+                    role: None,
                     end: Ending::Answer("done".to_owned()),
                     memory: AgentMemory::default(),
                 };
@@ -1698,7 +1758,7 @@ pub(crate) mod tests {
         let mut worker = fresh();
         let dropped = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&dropped);
-        let endless = move |_: Vec<String>| -> Calling {
+        let endless = move |_: Vec<String>, _: Vec<Option<String>>| -> Calling {
             let guard = Dropped(Arc::clone(&flag));
             Box::pin(async move {
                 let _guard = guard;
@@ -1721,12 +1781,13 @@ pub(crate) mod tests {
     fn helpers_kept() {
         let (mut worker, interrupt) = interruptible();
         let waiting = interrupt.clone();
-        let stopping = move |tasks: Vec<String>| -> Calling {
+        let stopping = move |tasks: Vec<String>, _: Vec<Option<String>>| -> Calling {
             let interrupt = waiting.clone();
             Box::pin(async move {
                 interrupt.wait().await;
                 let helper = Helper {
                     task: tasks[0].clone(),
+                    role: None,
                     end: Ending::Interrupted {},
                     memory: AgentMemory::default(),
                 };
@@ -1824,7 +1885,8 @@ pub(crate) mod tests {
 
         let servers: Vec<&Added> = worker.servers.iter().collect();
         let cwd = Path::new("/work");
-        let text = system(&[], &servers, &[], cwd, false, &[], false);
+        let main = Place::Main(Vec::new());
+        let text = system(&[], &servers, &[], cwd, false, &[], &main);
         let listed = "\n\n## MCP `news_web`\n\nSearches the web and the news\n\nRead-only\n\n\
                       - news_web.echo_text(the_text: str = None) -> str\n\n\
                       ## MCP `notes`\n\n\
@@ -2090,7 +2152,7 @@ pub(crate) mod tests {
         }
         write_file(&dir.join("random.txt"), text.as_bytes());
         let interrupt = Interrupt::default();
-        let mut worker = build(interrupt.clone(), dir.clone());
+        let mut worker = build(interrupt.clone(), dir.clone(), false);
 
         worker.eval("noted = 1");
         cancel_soon(&interrupt, 0);

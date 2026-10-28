@@ -401,9 +401,16 @@ impl Render {
             };
 
             let symbol = format!("{symbol} ");
+            let tag = match &helper.role {
+                Some(role) => format!("{role} "),
+                None => String::new(),
+            };
+            // Titles wrap before the tag goes in front, so its width comes off every row
+            let limit = limit.saturating_sub(tag.width()).max(1);
             let first = [
                 Span::styled(row.first, row.style),
                 Span::styled(symbol, tint),
+                Span::styled(tag, DIM),
             ];
             let rest = [Span::styled(row.rest, row.style)];
             let width = first.iter().map(Span::width).sum();
@@ -978,6 +985,7 @@ mod tests {
         Helper {
             id: "call_1.1".to_owned(),
             title: title.to_owned(),
+            role: None,
             status,
             text: text.to_owned(),
             preview: String::new(),
@@ -1023,6 +1031,29 @@ mod tests {
         let joined: Vec<&str> = parts.map(str::trim_end).collect();
         assert_eq!(joined.join(" "), title);
         assert_eq!(expanded[1].joint.as_deref(), Some(" "));
+    }
+
+    /// The role goes in front of the title, which still wraps within the width
+    #[test]
+    fn helper_role_tagged() {
+        let title = "Review the café menu parser in menu.py and the naïve rounding of its prices";
+        let tagged = Helper {
+            role: Some("reviewer".to_owned()),
+            ..helper(title, ToolCallStatus::Pending, "")
+        };
+        let step = helped(tagged);
+        let mut render = Render::new(50, true);
+        render.step(&step);
+        let end = render.rows.len() - 1;
+        let rows = text(&render.rows[3..end]);
+
+        assert!(rows[0].starts_with("      ◌ reviewer Review"), "{rows:#?}");
+        for row in &rows {
+            assert!(row.width() <= 50, "{rows:#?}");
+        }
+        let parts = rows.iter().map(|row| row.trim_start_matches([' ', '◌']));
+        let joined: Vec<&str> = parts.map(str::trim_end).collect();
+        assert_eq!(joined.join(" "), format!("reviewer {title}"));
     }
 
     /// What the code printed shows after its agents like any call's output

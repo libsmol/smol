@@ -565,6 +565,7 @@ pub(crate) struct Helper {
     pub(crate) id: String,
     /// The start of its task
     pub(crate) title: String,
+    pub(crate) role: Option<String>,
     pub(crate) status: ToolCallStatus,
     /// What it is doing while it runs, then its answer or why it failed
     pub(crate) text: String,
@@ -666,9 +667,12 @@ impl Step {
                 let parent = parent.and_then(Value::as_str).filter(|_| marked);
                 if let Some(owner) = parent.and_then(|parent| self.call_mut(parent)) {
                     let title = call.title.strip_prefix("agent: ").unwrap_or(&call.title);
+                    let role = meta.and_then(|meta| meta.get("role"));
+                    let role = role.and_then(Value::as_str).map(str::to_owned);
                     owner.helpers.push(Helper {
                         id,
                         title: title.to_owned(),
+                        role,
                         status: call.status,
                         text: String::new(),
                         preview: String::new(),

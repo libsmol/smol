@@ -177,7 +177,7 @@ Besides the Python standard library, every session has these functions:
 | `edit(path, old, new)` | Replace text that appears exactly once in a file. |
 | `fetch(url)` | Get a web page as Markdown. |
 | `view(path)` | Show an image or video to the model (offered only when the model takes media). |
-| `agent(task)` | Give a task to a new agent and return its answer; a list of tasks runs up to 8 agents at a time. |
+| `agent(task)` | Give a task to a new agent and return its answer; a list of tasks runs up to 8 agents at a time, and `role=` picks one of your [roles](#roles). |
 | `help(name)` | Print a function's signature and docs, including code defined in earlier steps. |
 
 MCP tools appear as Python objects named after their server, for example
@@ -281,6 +281,26 @@ They are read from `~/.smol/skills/<skill>/SKILL.md` and from
 directory; a deeper one wins over one with the same name. Only the name,
 description and path go into the prompt; the model reads the file when it
 needs it.
+
+## Roles
+
+A role is an agent that `agent(task, role="reviewer")` can give a task to; a
+list of tasks takes one role for all of them or a list with one per task, as in
+`agent([review, tests], role=["reviewer", "tester"])`. Each table in
+`~/.smol/roles.toml` is one role:
+
+```toml
+[reviewer]
+description = "Reviews code changes and lists real bugs with the lines they are on"
+# Optional, a model from model.toml; without it the role uses the session's model
+model = "deepseek/deepseek-chat"
+```
+
+The system prompt lists each role's name and description, and an agent started
+with a role is told its own. Roles are also read from `.smol/roles.toml` in
+each directory down to the working directory; a deeper one wins over one with
+the same name. A file or role that can't be used is skipped with a notice.
+Without roles, `agent()` takes no `role`.
 
 ## Zed and other ACP clients
 

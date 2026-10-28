@@ -13,6 +13,7 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{self, Path, PathBuf};
+use std::sync::Arc;
 use toml::Value;
 
 pub(crate) mod setup;
@@ -22,6 +23,7 @@ pub(crate) const MIN_CONTEXT: u64 = 1024;
 /// Only the first one found in each directory is used
 const INSTRUCTION_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 const SKILL_FILE: &str = "SKILL.md";
+const ROLE_FILE: &str = "roles.toml";
 pub(crate) const MODEL_FILE: &str = "model.toml";
 const MODEL_EXAMPLE: &str = r#"[model.deepseek]
 type = "openai-completions"
@@ -261,19 +263,25 @@ pub(crate) struct Skill {
     pub(crate) path: PathBuf,
 }
 
-/// Global skills live under the config directory's skills
-/// and project ones under each level's .smol/skills, and the deepest wins on a name clash
-pub(crate) fn skills(dir: &Path, project: &Path) -> (Vec<Skill>, Vec<Error>) {
-    let mut roots = vec![dir.join("skills")];
+/// `name` in the config directory, then in each level's .smol from the root down to `project`
+fn layered(dir: &Path, project: &Path, name: &str) -> Vec<PathBuf> {
+    let mut paths = vec![dir.join(name)];
     let mut above: Vec<&Path> = project.ancestors().collect();
     above.reverse();
     for layer in above {
-        let root = layer.join(".smol").join("skills");
+        let path = layer.join(".smol").join(name);
         // The config directory may itself be the .smol of one of the levels
-        if !roots.contains(&root) {
-            roots.push(root);
+        if !paths.contains(&path) {
+            paths.push(path);
         }
     }
+    paths
+}
+
+/// Global skills live under the config directory's skills
+/// and project ones under each level's .smol/skills, and the deepest wins on a name clash
+pub(crate) fn skills(dir: &Path, project: &Path) -> (Vec<Skill>, Vec<Error>) {
+    let roots = layered(dir, project, "skills");
 
     let mut found = BTreeMap::new();
     let mut skipped = Vec::new();
@@ -330,6 +338,87 @@ pub(crate) fn skills(dir: &Path, project: &Path) -> (Vec<Skill>, Vec<Error>) {
                 path,
             };
             found.insert(name, skill);
+        }
+    }
+
+    let found = found.into_values().collect();
+    (found, skipped)
+}
+
+#[derive(Clone)]
+pub(crate) struct Role {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    /// The session's model when unset
+    pub(crate) model: Option<Arc<dyn Model>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleSpec {
+    description: String,
+    model: Option<String>,
+}
+
+/// Global roles live in the config directory's roles.toml
+/// and project ones in each level's .smol/roles.toml, and the deepest wins on a name clash
+pub(crate) fn roles(dir: &Path, project: &Path, models: &Models) -> (Vec<Role>, Vec<Error>) {
+    let paths = layered(dir, project, ROLE_FILE);
+
+    let mut found = BTreeMap::new();
+    let mut skipped = Vec::new();
+    for path in paths {
+        let invalid = invalid(&path);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                let reason = unreadable(&e);
+                skipped.push(invalid(reason));
+                continue;
+            }
+        };
+        let table: toml::Table = match parsed(&text) {
+            Ok(table) => table,
+            Err(problem) => {
+                let problem = format!("{problem}, skipped");
+                skipped.push(invalid(problem));
+                continue;
+            }
+        };
+
+        for (name, value) in table {
+            let spec = match value.try_into::<RoleSpec>() {
+                Ok(spec) => spec,
+                Err(e) => {
+                    let message = e.message();
+                    let problem = format!("[{name}]: {message}, skipped");
+                    skipped.push(invalid(problem));
+                    continue;
+                }
+            };
+            let description = spec.description.trim();
+            if description.is_empty() {
+                let problem = format!("[{name}]: description is empty, skipped");
+                skipped.push(invalid(problem));
+                continue;
+            }
+
+            let model = match spec.model.as_deref().map(|model| models.make(model)) {
+                None => None,
+                Some(Ok(built)) => Some(Arc::from(built)),
+                Some(Err(e)) => {
+                    let problem = format!("[{name}]: {e}, skipped");
+                    skipped.push(invalid(problem));
+                    continue;
+                }
+            };
+            let role = Role {
+                name: name.clone(),
+                description: description.to_owned(),
+                model,
+            };
+            found.insert(name, role);
         }
     }
 
@@ -645,7 +734,7 @@ fn parsed<T: DeserializeOwned>(text: &str) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        agent, instructions, models, save_model, skills, Access, McpConfig, McpKind, Skill,
+        agent, instructions, models, roles, save_model, skills, Access, McpConfig, McpKind, Skill,
         MODEL_EXAMPLE,
     };
     use crate::model::{MediaKind, ModelSpec};
@@ -916,6 +1005,56 @@ models = [{ id = "m3" }]
         let skipped: Vec<String> = skipped.iter().map(ToString::to_string).collect();
         assert_eq!(skipped, [problem]);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn roles_found() {
+        let text = "[model.mock]\ntype = \"openai-completions\"\napi = \"http://127.0.0.1:1/v1\"\nmodels = [{ id = \"m1\", context = 8000 }]\n";
+        let (global, _) = written(text);
+        let read = models(&global).expect("load");
+        let outer = global.join("outer");
+        let project = outer.join("résumé");
+        let write = |dir: PathBuf, text: &str| {
+            fs::create_dir_all(&dir).expect("create");
+            let path = dir.join("roles.toml");
+            fs::write(&path, text).expect("write");
+            tilde(&path)
+        };
+        write(
+            global.clone(),
+            "[reviewer]\ndescription = \"Reviews the café's code\"\n\n[tester]\ndescription = \"Writes tests\"\nmodel = \"mock/m1\"\n",
+        );
+        let middle = write(
+            outer.join(".smol"),
+            "[reviewer]\ndescription = \"  Reviews naïve code \"\n\n[writer]\ndescription = \"\"\n\n[guesser]\ndescription = \"Guesses\"\nmodel = \"mock/m9\"\n\n[typo]\ndescripton = \"x\"\n",
+        );
+        let broken = write(project.join(".smol"), "[résumé\n");
+
+        let (found, skipped) = roles(&global, &project, &read);
+        let mut listed = Vec::new();
+        for role in &found {
+            let window = role.model.as_ref().and_then(|model| model.context_window());
+            listed.push((role.name.as_str(), role.description.as_str(), window));
+        }
+        let expected = [
+            ("reviewer", "Reviews naïve code", None),
+            ("tester", "Writes tests", Some(8000)),
+        ];
+        assert_eq!(listed, expected);
+        let skipped: Vec<String> = skipped.iter().map(ToString::to_string).collect();
+        let expected = [
+            format!("config: {middle}: [writer]: description is empty, skipped"),
+            format!("config: {middle}: [guesser]: model: mock/m9: not in model.toml (models: mock/m1), skipped"),
+            format!("config: {middle}: [typo]: unknown field `descripton`, expected `description` or `model`, skipped"),
+            format!("config: {broken}: line 1: unclosed table, expected `]`, skipped"),
+        ];
+        assert_eq!(skipped, expected);
+
+        // When the config directory is the project's .smol it is read only once
+        let (found, skipped) = roles(&outer.join(".smol"), &outer, &read);
+        assert_eq!(found.len(), 1);
+        assert_eq!(skipped.len(), 3, "{skipped:?}");
+        fs::remove_dir_all(&global).ok();
     }
 
     #[test]

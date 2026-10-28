@@ -93,7 +93,9 @@ pub(crate) fn builtins(vm: &VirtualMachine, copies: PathBuf) -> [(&'static str, 
             asked(vm, call)
         };
 
-    let delegate = |tasks: Vec<String>, vm: &VirtualMachine| asked(vm, WorkerCall::Agent { tasks });
+    let delegate = |tasks: Vec<String>, roles: Vec<Option<String>>, vm: &VirtualMachine| {
+        asked(vm, WorkerCall::Agent { tasks, roles })
+    };
 
     // No code has run yet at startup and this is still the session directory
     let cwd = env::current_dir().unwrap_or_default();

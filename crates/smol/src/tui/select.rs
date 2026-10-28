@@ -329,6 +329,7 @@ mod tests {
         let helper = |title: &str, status: ToolCallStatus, text: &str| Helper {
             id: "call_1.1".to_owned(),
             title: title.to_owned(),
+            role: None,
             status,
             text: text.to_owned(),
             preview: String::new(),
@@ -338,6 +339,7 @@ mod tests {
             usage: None,
         };
         let counting = Helper {
+            role: Some("counter".to_owned()),
             preview: "print(len(cafés))".to_owned(),
             ..helper("Count the cafés", ToolCallStatus::InProgress, "thinking")
         };

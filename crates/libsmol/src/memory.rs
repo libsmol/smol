@@ -123,6 +123,8 @@ pub(crate) struct CodeResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Helper {
     pub(crate) task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) role: Option<String>,
     /// Saved as an `answer` or `error` key beside the others
     #[serde(flatten)]
     pub(crate) end: Ending,
@@ -752,7 +754,7 @@ pub(crate) mod tests {
     fn agents_saved() {
         let saved = r#"{"printed": "3 cafés", "agents": [
             {"task": "Count the cafés", "answer": "3 cafés", "memory": {"steps": []}},
-            {"task": "Spell naïve", "error": "model: http 503: busy", "memory": {"steps": []}},
+            {"task": "Spell naïve", "role": "speller", "error": "model: http 503: busy", "memory": {"steps": []}},
             {"task": "Read the résumé", "interrupted": {}, "memory": {"steps": []}}
         ]}"#;
         let result: CodeResult = serde_json::from_str(saved).expect("deserialize");
@@ -760,6 +762,12 @@ pub(crate) mod tests {
         let answered = Ending::Answer("3 cafés".to_owned());
         let failed = Ending::Error("model: http 503: busy".to_owned());
         assert_eq!(ends, [&answered, &failed, &Ending::Interrupted {}]);
+        let roles: Vec<Option<&str>> = result
+            .agents
+            .iter()
+            .map(|helper| helper.role.as_deref())
+            .collect();
+        assert_eq!(roles, [None, Some("speller"), None]);
 
         let again = serde_json::to_value(&result).expect("serialize");
         let saved: serde_json::Value = serde_json::from_str(saved).expect("parse");

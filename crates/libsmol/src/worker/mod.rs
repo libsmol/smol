@@ -36,6 +36,8 @@ pub const WORKER_ARG: &str = "--worker";
 /// Holds the `address/token` the agent listens on
 pub(crate) const CONTROL_ENV: &str = "SMOL_CONTROL";
 pub(crate) const COPIES_ENV: &str = "SMOL_COPIES";
+/// Set when the session has roles for `agent()`
+pub(crate) const ROLES_ENV: &str = "SMOL_ROLES";
 pub(crate) const END: &[u8] = b"\x02smol\x03end\n";
 
 /// They must share one file name, which `_run` uses to drop them from tracebacks
@@ -124,7 +126,11 @@ pub(crate) enum WorkerCall {
         called: String,
     },
     /// Answered with one `{"answer"}` or `{"error"}` object per task, in order
-    Agent { tasks: Vec<String> },
+    Agent {
+        tasks: Vec<String>,
+        /// One for each task
+        roles: Vec<Option<String>>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -147,9 +153,11 @@ pub fn serve() -> Result<()> {
     let control = env::var(CONTROL_ENV).unwrap_or_default();
     let copies = env::var_os(COPIES_ENV).unwrap_or_default();
     let copies = PathBuf::from(copies);
+    let roles = env::var_os(ROLES_ENV).is_some();
     // Programs the code starts would inherit these, and they must go before any thread starts
     env::remove_var(CONTROL_ENV);
     env::remove_var(COPIES_ENV);
+    env::remove_var(ROLES_ENV);
 
     let Some((address, token)) = control.split_once('/') else {
         let message = format!("worker: {CONTROL_ENV}: not set by the agent");
@@ -170,7 +178,7 @@ pub fn serve() -> Result<()> {
     // RustPython calls are stack-hungry and the default stack overflows a few thousand levels deep
     let builder = thread::Builder::new().stack_size(PYTHON_STACK_BYTES);
     let running = builder.spawn(move || -> Result<()> {
-        let python = Python::start(copies);
+        let python = Python::start(copies, roles);
         // SAFETY: Only reads the current thread's id
         #[cfg(unix)]
         let main = unsafe { libc::pthread_self() };
@@ -324,7 +332,7 @@ struct Python {
 }
 
 impl Python {
-    fn start(copies: PathBuf) -> Self {
+    fn start(copies: PathBuf, roles: bool) -> Self {
         let crypto = CryptoExt {
             all_cipher_suites: Some(aws_lc_rs::ALL_CIPHER_SUITES),
             default_cipher_suites: Some(aws_lc_rs::DEFAULT_CIPHER_SUITES),
@@ -356,6 +364,9 @@ impl Python {
                 let set = scope.globals.set_item(name, value, vm);
                 set.expect("set global");
             }
+            let roles = vm.ctx.new_bool(roles);
+            let set = scope.globals.set_item("_ROLES", roles.into(), vm);
+            set.expect("set global");
 
             for source in BOOTSTRAP {
                 let ran = vm.run_string(scope.clone(), source, "<libsmol_bootstrap>");

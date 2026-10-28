@@ -194,8 +194,7 @@ def view(path: str | _os.PathLike) -> None:
     absolute = _os.path.abspath(path)
     _view(path, absolute)
 
-@_builtin
-def agent(task: str | list[str]) -> str | list[str | RuntimeError]:
+def agent(task: str | list[str], role: str | list[str] | None = None) -> str | list[str | RuntimeError]:
     """a new agent does the task with the same files and functions and returns its answer; a list runs in parallel
 
     Gives the task to a new agent and returns its final answer. The agent has its own Python session and the same files, functions, skills and instructions as you, but not your variables or this conversation, so the task must say everything it needs. A list of tasks runs up to 8 agents at a time and returns their answers in the same order, with the exception in place of any task that failed. Agents started this way can't call agent()."""
@@ -210,9 +209,22 @@ def agent(task: str | list[str]) -> str | list[str | RuntimeError]:
             raise TypeError(f"agent: task must be str or a list of str, not a list holding {kind}")
     if not tasks or not all(item.strip() for item in tasks):
         raise ValueError("agent: task is empty")
+    if role is None or isinstance(role, str):
+        roles = [role] * len(tasks)
+    elif isinstance(role, list):
+        roles = role
+        for item in roles:
+            if not isinstance(item, str):
+                kind = type(item).__name__
+                raise TypeError(f"agent: role must be str or a list of str, not a list holding {kind}")
+        if len(roles) != len(tasks):
+            raise ValueError(f"agent: role: needs one role per task ({len(tasks)}), not {len(roles)}")
+    else:
+        kind = type(role).__name__
+        raise TypeError(f"agent: role must be str or a list of str, not {kind}")
 
     answers = []
-    for result in _agent(tasks):
+    for result in _agent(tasks, roles):
         error = result.get("error")
         answer = result.get("answer") if error is None else RuntimeError(f"agent: {error}")
         answers.append(answer)
@@ -221,6 +233,13 @@ def agent(task: str | list[str]) -> str | list[str | RuntimeError]:
     if isinstance(answers[0], RuntimeError):
         raise answers[0]
     return answers[0]
+
+# Without roles the parameter is left out, so passing one fails like any unknown argument
+if not _ROLES:
+    _signature = _inspect.signature(agent)
+    _task = _signature.parameters["task"]
+    agent.__signature__ = _signature.replace(parameters=[_task])
+agent = _builtin(agent)
 
 @_builtin
 def help(request: object) -> None:

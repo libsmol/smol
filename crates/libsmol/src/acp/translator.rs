@@ -265,7 +265,8 @@ impl Translator {
             let helpers = result.map(|result| result.agents.as_slice());
             let views = self.helpers(index);
             for (offset, helper) in helpers.unwrap_or_default().iter().enumerate() {
-                let mut view = views.open(offset + 1, &helper.task);
+                let role = helper.role.as_deref();
+                let mut view = views.open(offset + 1, &helper.task, role);
                 view.close(helper);
             }
             if call.result.is_some() || call.error.is_some() {
@@ -598,12 +599,15 @@ pub(crate) struct AgentCall {
 }
 
 impl Helpers for AgentCalls {
-    fn open(&self, number: usize, task: &str) -> Box<dyn HelperView> {
+    fn open(&self, number: usize, task: &str, role: Option<&str>) -> Box<dyn HelperView> {
         let id = format!("{}.{number}", self.parent);
         let title = agent_title(task, &self.cwd);
         let marked = (AGENT.to_owned(), json!(true));
         let parent = ("parent".to_owned(), json!(self.parent));
-        let meta = Meta::from_iter([marked, parent]);
+        let mut meta = Meta::from_iter([marked, parent]);
+        if let Some(role) = role {
+            meta.insert("role".to_owned(), role.into());
+        }
         let opened = ToolCall::new(id.clone(), title)
             .kind(ToolKind::Other)
             .status(ToolCallStatus::Pending)
@@ -1448,7 +1452,7 @@ mod tests {
         live.translate(Event::Code(0, "print(agent('Count the cafés'))\n"));
         live.translate(Event::Execute(0));
         let started = live.helpers(0);
-        let mut call = started.open(1, "Count the cafés\nin menu.txt");
+        let mut call = started.open(1, "Count the cafés\nin menu.txt", Some("counter"));
         call.event(Event::Thought("Reading the menu"));
         call.event(Event::Code(0, "\nprint(len(cafés))\n"));
         call.event(Event::Execute(0));
@@ -1465,6 +1469,7 @@ mod tests {
         };
         let helper = Helper {
             task: "Count the cafés\nin menu.txt".to_owned(),
+            role: Some("counter".to_owned()),
             end: Ending::Answer("3 cafés".to_owned()),
             memory,
         };
@@ -1502,7 +1507,7 @@ mod tests {
         let opened = updates[2];
         assert_eq!(opened["toolCallId"], "call_1.1");
         assert_eq!(opened["title"], "agent: Count the cafés in menu.txt");
-        let marked = json!({ "_smol/agent": true, "parent": "call_1" });
+        let marked = json!({ "_smol/agent": true, "parent": "call_1", "role": "counter" });
         assert_eq!(opened["_meta"], marked);
         let working = updates[3];
         assert_eq!(working["status"], "in_progress");
@@ -1528,16 +1533,17 @@ mod tests {
         // An interrupted agent is marked like an interrupted command
         let stopped = Helper {
             task: "Count the cafés".to_owned(),
+            role: None,
             end: Ending::Interrupted {},
             memory: AgentMemory::default(),
         };
         let (mut stopping, mut sent) = translator(1000);
         stopping.translate(Event::Code(0, "agent('Count the cafés')\n"));
         let started = stopping.helpers(0);
-        let mut call = started.open(1, &stopped.task);
+        let mut call = started.open(1, &stopped.task, None);
         call.close(&stopped);
         // One aborted before it closes still ends
-        let dropped = started.open(2, "Spell naïve");
+        let dropped = started.open(2, "Spell naïve", None);
         drop(dropped);
 
         let messages = drained(&mut sent);

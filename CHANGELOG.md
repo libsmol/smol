@@ -19,6 +19,11 @@ but their files stay in `~/.smol/history` untouched.
   the last lines of what it writes or prints and what it is doing, in a color of
   its own; one that ended takes a single line, and ctrl+o shows the start of its
   answer.
+- Roles in `~/.smol/roles.toml`, and in `.smol/roles.toml` down to the working
+  directory, each give `agent(task, role="name")` an agent with a description
+  and optionally a model of its own; a list of tasks takes one role or a list
+  with one per task. The system prompt lists them, and smol shows an agent's
+  role in front of its task.
 
 ## 0.3.1 - 2026-10-27
 

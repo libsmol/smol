@@ -1,4 +1,5 @@
-use crate::config::Skill;
+use crate::agent::Place;
+use crate::config::{Role, Skill};
 use crate::memory::{
     exit_code, AgentStep, Call, CallError, Exit, MemoryStep, ShellStep, StepError, TaskStep,
     MAX_OBSERVATION_CHARS,
@@ -29,6 +30,12 @@ pub(crate) const NESTED: &str = "agent: not available to agents started by agent
 /// Also what the user sees for an agent that is aborted before it ends
 pub(crate) const UNFINISHED: &str = "stopped before it answered";
 
+pub(crate) fn unknown_role(name: &str, roles: &[Role]) -> String {
+    let names: Vec<&str> = roles.iter().map(|role| role.name.as_str()).collect();
+    let names = names.join(", ");
+    format!("agent: role: {name}: unknown (roles: {names})")
+}
+
 pub(crate) fn system(
     functions: &[&Function],
     servers: &[&Added],
@@ -36,7 +43,7 @@ pub(crate) fn system(
     cwd: &Path,
     sandboxed: bool,
     instructions: &[String],
-    delegated: bool,
+    place: &Place,
 ) -> String {
     let mut lines = Vec::new();
     for function in functions {
@@ -89,6 +96,30 @@ pub(crate) fn system(
         }
     };
 
+    let (updates, answer, roles) = match place {
+        Place::Main(roles) => (UPDATES, ANSWER, roles.as_slice()),
+        Place::Delegated(_) => ("", HANDED_BACK, &[][..]),
+    };
+    let mut entries = Vec::new();
+    for role in roles {
+        let entry = format!("- `{}`: {}", role.name, role.description);
+        entries.push(entry);
+    }
+    let agents = match entries.is_empty() {
+        true => String::new(),
+        false => {
+            let entries = entries.join("\n");
+            format!("\n\n# Agents\n\nTo give a task to an agent in one of these roles, call agent(task, role=name); a list of tasks takes one name for all or a list with one per task:\n\n{entries}")
+        }
+    };
+    let role = match place.role() {
+        Some(role) => format!(
+            "\n\n# Role\n\nYour role is `{}`: {}",
+            role.name, role.description
+        ),
+        None => String::new(),
+    };
+
     let mut files = Vec::new();
     for text in instructions {
         let file = format!("<instructions>\n{text}\n</instructions>");
@@ -108,10 +139,6 @@ pub(crate) fn system(
         true => format!("\n- Your code runs in a sandbox: writing outside {cwd} and $TMPDIR, or reading some private files, fails with PermissionError. $TMPDIR is removed when the session ends. When a tool fails because it can't write its cache, rerun it with the cache in $TMPDIR."),
         false => String::new(),
     };
-    let (updates, answer) = match delegated {
-        true => ("", HANDED_BACK),
-        false => (UPDATES, ANSWER),
-    };
     let date = Utc::now().format("%Y-%m-%d");
     format!(
         "You do tasks by running Python code with the {TOOL} tool. Each reply does one of two things:
@@ -128,7 +155,7 @@ Make each call a whole program: use loops, conditions, the standard library and 
 
 # Answer
 
-{answer} If no code is needed, answer right away.
+{answer} If no code is needed, answer right away.{role}
 
 # Functions
 
@@ -136,7 +163,7 @@ Call these in your code; they need no import. Prefer them to your own code. Crea
 
 ## Built-in
 
-{functions}{listed}{skills}
+{functions}{listed}{skills}{agents}
 
 # Rules
 
@@ -569,7 +596,8 @@ pub(crate) fn summary(transcript: &str, previous: Option<&str>, trailing: bool) 
 
 #[cfg(test)]
 mod tests {
-    use crate::config::Skill;
+    use crate::agent::Place;
+    use crate::config::{Role, Skill};
     use crate::memory::{
         AgentStep, Call, CallError, CodeResult, Exit, MemoryStep, ShellStep, StepError,
     };
@@ -588,7 +616,8 @@ mod tests {
         }];
         let cwd = Path::new("/home/zoë/work");
 
-        let text = system(&[], &[], &skills, cwd, false, &instructions, false);
+        let main = Place::Main(Vec::new());
+        let text = system(&[], &[], &skills, cwd, false, &instructions, &main);
         let place =
             ") in /home/zoë/work; the files and programs a task mentions are there.\n- Today";
         assert!(text.contains(place), "{text}");
@@ -608,11 +637,42 @@ mod tests {
                      <instructions>\nIndent with tabs\n</instructions>";
         assert!(text.ends_with(files), "{text}");
 
-        let plain = system(&[], &[], &[], cwd, true, &[], false);
+        let plain = system(&[], &[], &[], cwd, true, &[], &main);
         assert!(!plain.contains("<instructions"), "{plain}");
         assert!(!plain.contains("# Skills"), "{plain}");
+        assert!(!plain.contains("# Agents"), "{plain}");
         let sandbox = "are there.\n- Your code runs in a sandbox: writing outside /home/zoë/work and $TMPDIR, ";
         assert!(plain.contains(sandbox), "{plain}");
+    }
+
+    #[test]
+    fn roles_described() {
+        let role = |name: &str, description: &str| Role {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            model: None,
+        };
+        let reviewer = role("reviewer", "Reviews the café's code");
+        let roles = vec![reviewer.clone(), role("tester", "Writes naïve tests")];
+        let cwd = Path::new("/home/zoë/work");
+
+        let main = system(&[], &[], &[], cwd, false, &[], &Place::Main(roles));
+        let listed = "\n\n# Agents\n\n\
+                      To give a task to an agent in one of these roles, call agent(task, role=name); \
+                      a list of tasks takes one name for all or a list with one per task:\n\n\
+                      - `reviewer`: Reviews the café's code\n\
+                      - `tester`: Writes naïve tests\n\n# Rules\n\n";
+        assert!(main.contains(listed), "{main}");
+        assert!(!main.contains("# Role\n"), "{main}");
+
+        let played = Place::Delegated(Some(reviewer));
+        let helper = system(&[], &[], &[], cwd, false, &[], &played);
+        let own = "If no code is needed, answer right away.\n\n# Role\n\n\
+                   Your role is `reviewer`: Reviews the café's code\n\n# Functions";
+        assert!(helper.contains(own), "{helper}");
+        assert!(!helper.contains("# Agents"), "{helper}");
+        let plain = system(&[], &[], &[], cwd, false, &[], &Place::Delegated(None));
+        assert!(!plain.contains("# Role"), "{plain}");
     }
 
     /// The model cannot tell from the record how far it got before the interrupt

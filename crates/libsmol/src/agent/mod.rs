@@ -1,4 +1,4 @@
-use crate::config::Skill;
+use crate::config::{Role, Skill};
 use crate::history::MAX_TITLE_CHARS;
 use crate::memory::{
     bytes, estimate, AgentMemory, AgentStep, Call, Helper, MemoryStep, StepError, SummaryStep,
@@ -81,7 +81,7 @@ pub(crate) trait Sink: Send {
 
 /// Helpers are numbered from 1 within the call that starts them
 pub(crate) trait Helpers: Send + Sync {
-    fn open(&self, number: usize, task: &str) -> Box<dyn HelperView>;
+    fn open(&self, number: usize, task: &str, role: Option<&str>) -> Box<dyn HelperView>;
 }
 
 /// A helper is saved with the call that started it, so its view saves nothing
@@ -92,7 +92,7 @@ pub(crate) trait HelperView: Sink {
 pub(crate) struct Unseen;
 
 impl Helpers for Unseen {
-    fn open(&self, _: usize, _: &str) -> Box<dyn HelperView> {
+    fn open(&self, _: usize, _: &str, _: Option<&str>) -> Box<dyn HelperView> {
         Box::new(Unseen)
     }
 }
@@ -186,8 +186,25 @@ pub(crate) struct Agent {
     pub(crate) sandbox: Arc<Sandbox>,
     /// Shared by all agents the session's code starts
     pub(crate) slots: Arc<Semaphore>,
+    pub(crate) place: Place,
+}
+
+#[derive(Clone)]
+pub(crate) enum Place {
+    /// The session's own agent, with the roles `agent()` can give tasks to
+    Main(Vec<Role>),
     /// Started by `agent()`, which it can't call itself
-    pub(crate) delegated: bool,
+    Delegated(Option<Role>),
+}
+
+impl Place {
+    /// The one it plays, which the session's own agent never has
+    pub(crate) fn role(&self) -> Option<&Role> {
+        match self {
+            Place::Main(_) => None,
+            Place::Delegated(role) => role.as_ref(),
+        }
+    }
 }
 
 struct Turn<'a> {
@@ -210,10 +227,11 @@ impl Agent {
         sink: &mut dyn Sink,
     ) -> Result<Option<String>> {
         let seeing = self.model.takes(MediaKind::Image) || self.model.takes(MediaKind::Video);
+        let delegated = matches!(self.place, Place::Delegated(_));
         let mut functions = Vec::new();
         for function in worker.functions() {
             let unseen = !seeing && function.name == VIEW;
-            let nested = self.delegated && function.name == AGENT;
+            let nested = delegated && function.name == AGENT;
             if !unseen && !nested {
                 functions.push(function);
             }
@@ -225,7 +243,7 @@ impl Agent {
             &self.cwd,
             worker.sandboxed(),
             &self.instructions,
-            self.delegated,
+            &self.place,
         );
 
         let mut logged = Logged(sink);
@@ -530,8 +548,9 @@ pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::agent::{
-        title_of, Agent, Asking, Event, Sink, Task, Turn, MAX_PARALLEL_AGENTS, RETRY_WAIT,
+        title_of, Agent, Asking, Event, Place, Sink, Task, Turn, MAX_PARALLEL_AGENTS, RETRY_WAIT,
     };
+    use crate::config::Role;
     use crate::history::MAX_TITLE_CHARS;
     use crate::memory::{AgentMemory, MemoryStep};
     use crate::model::{
@@ -753,12 +772,22 @@ pub(crate) mod tests {
         model: impl Model + 'static,
         events: Box<dyn FnMut(Event) + Send>,
     ) -> Temp<Tested> {
+        with_roles(model, events, Vec::new())
+    }
+
+    pub(crate) fn with_roles(
+        model: impl Model + 'static,
+        events: Box<dyn FnMut(Event) + Send>,
+        roles: Vec<Role>,
+    ) -> Temp<Tested> {
         let interrupt = Interrupt::default();
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let dir = temp_dir("session");
         let copies = dir.join("copies");
         let sandbox = Arc::new(opened(&cwd, &copies));
-        let starting = Worker::new(&interrupt, Arc::clone(&sandbox), false);
+        let has_roles = !roles.is_empty();
+        let restarted = false;
+        let starting = Worker::new(&interrupt, Arc::clone(&sandbox), has_roles, restarted);
         let worker = block_on(starting).expect("worker");
 
         let agent = Agent {
@@ -770,7 +799,7 @@ pub(crate) mod tests {
             interrupt,
             sandbox,
             slots: Arc::new(Semaphore::new(MAX_PARALLEL_AGENTS)),
-            delegated: false,
+            place: Place::Main(roles),
         };
         let probe = Probe {
             events,

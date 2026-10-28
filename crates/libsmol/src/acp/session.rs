@@ -2,7 +2,9 @@ use crate::acp::rpc::{Notice, Peer};
 use crate::acp::servers::McpPool;
 use crate::acp::translator::Translator;
 use crate::acp::{rfc3339, task_of, to_value, App, QUEUED};
-use crate::agent::{title_of, Agent, Asking, Event, Helpers, Sink, Task, MAX_PARALLEL_AGENTS};
+use crate::agent::{
+    title_of, Agent, Asking, Event, Helpers, Place, Sink, Task, MAX_PARALLEL_AGENTS,
+};
 use crate::config::{self, Access, McpConfig, Models};
 use crate::history::{Lock, SessionMeta, Settings};
 use crate::memory::{AgentMemory, Exit, MemoryStep};
@@ -182,6 +184,11 @@ async fn start(opening: Opening) -> Result<Session> {
         let notice = problem.to_string();
         notices.push(notice);
     }
+    let (roles, skipped) = config::roles(&app.config, &cwd, &models);
+    for problem in skipped {
+        let notice = problem.to_string();
+        notices.push(notice);
+    }
 
     let mut settings = Settings {
         cwd: cwd.clone(),
@@ -214,7 +221,8 @@ async fn start(opening: Opening) -> Result<Session> {
     let sandbox = Arc::new(sandbox);
     // No restart notice again when no code has run since the last restart
     let ran = memory.ran_code();
-    let worker = Worker::new(&interrupt, Arc::clone(&sandbox), ran).await?;
+    let has_roles = !roles.is_empty();
+    let worker = Worker::new(&interrupt, Arc::clone(&sandbox), has_roles, ran).await?;
 
     let response = match loading {
         true => {
@@ -255,7 +263,7 @@ async fn start(opening: Opening) -> Result<Session> {
         interrupt: interrupt.clone(),
         sandbox,
         slots: Arc::new(Semaphore::new(MAX_PARALLEL_AGENTS)),
-        delegated: false,
+        place: Place::Main(roles),
     };
     let keeper = Keeper {
         meta,
@@ -1168,6 +1176,51 @@ mod tests {
             format!("config: {shown}: not UTF-8 text, skipped"),
         ];
         assert_eq!(notices, expected);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Roles reach the prompt and the signature, and one with an unknown model is skipped
+    #[test]
+    fn roles_read() {
+        let dir = temp_dir("roles");
+        fs::create_dir_all(&dir).expect("dir");
+        let roles =
+            "[reviewer]\ndescription = \"Reviews the café's code\"\nmodel = \"mock/m1\"\n\n\
+            [critic]\ndescription = \"Critiques\"\nmodel = \"mock/gone\"\n";
+        fs::write(dir.join("roles.toml"), roles).expect("write");
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&prompts);
+        let api = model_server(move |body| {
+            let system = system_prompt(body);
+            if system != NAMER {
+                seen.lock().expect("prompts").push(system);
+            }
+            Ok("Done.".to_owned())
+        });
+        let running = async {
+            let mut connection = Connection::open(&dir, &api, "");
+            let session = connection.new_session().await;
+            connection.prompt(&session, "Review it").await;
+            connection.close().await
+        };
+        let seen = block_on(running);
+
+        let mut notices = Vec::new();
+        for message in seen {
+            if message["method"] == "_smol/notice" {
+                let text = message["params"]["text"].as_str().unwrap_or_default();
+                notices.push(text.to_owned());
+            }
+        }
+        let shown = tilde(&dir.join("roles.toml"));
+        let skipped = format!("config: {shown}: [critic]: model: mock/gone: not in model.toml (models: mock/m1), skipped");
+        assert_eq!(notices, [skipped]);
+        let prompts = prompts.lock().expect("prompts");
+        let prompt = &prompts[0];
+        let header = "- agent(task: str | list[str], role: str | list[str] | None = None) -> ";
+        assert!(prompt.contains(header), "{prompt}");
+        let listed = "with one per task:\n\n- `reviewer`: Reviews the café's code\n\n";
+        assert!(prompt.contains(listed), "{prompt}");
         fs::remove_dir_all(&dir).ok();
     }
 
