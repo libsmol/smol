@@ -132,13 +132,14 @@ impl Agent {
                     Some(role) => info!("agent: started [role={role}]"),
                     None => info!("agent: started"),
                 }
+                let sandbox = Arc::clone(&self.sandbox);
+                let installed: Vec<&Added> = servers.iter().collect();
                 let has_roles = false;
                 let restarted = false;
-                let sandbox = Arc::clone(&self.sandbox);
-                let worker = Worker::new(&self.interrupt, sandbox, has_roles, restarted).await;
-                match worker {
+                let starting =
+                    Worker::new(&self.interrupt, sandbox, &installed, has_roles, restarted);
+                match starting.await {
                     Ok(mut worker) => {
-                        let installed: Vec<&Added> = servers.iter().collect();
                         let asked = Task {
                             text: task.clone(),
                             mentions: Vec::new(),
@@ -193,6 +194,7 @@ mod tests {
     };
     use crate::prompt;
     use crate::tests::content;
+    use crate::tools::mcp::tests::fake;
     use crate::utils::block_on;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -201,8 +203,8 @@ mod tests {
 
     type Requests = Arc<Mutex<Vec<Vec<ChatMessage>>>>;
 
-    /// The main agent starts four agents, which answer with their task, except one that crashes
-    /// and one that tries to start an agent itself and answers with what happened
+    /// The main agent starts four agents, which answer with their task, except one that crashes,
+    /// and agents that start an agent or add with the MCP server answer with what happened
     struct Teamed(Requests);
 
     impl Model for Teamed {
@@ -221,6 +223,9 @@ mod tests {
             let (text, code) = match (system.contains("goes back to the agent"), first) {
                 (true, true) if task == "Start another agent" => {
                     (String::new(), Some("print(agent('deeper'))"))
+                }
+                (true, true) if task == "Add with the server" => {
+                    (String::new(), Some("print(fake.add(a=2, b=3))"))
                 }
                 (true, true) if task == "Crash" => panic!("{task}"),
                 (true, true) => (format!("Answer: {task}"), None),
@@ -392,6 +397,20 @@ mod tests {
             .map(|helper| helper.role.as_deref())
             .collect();
         assert_eq!(played, [Some("reviewer"), Some("reviewer"), Some("tester")]);
+    }
+
+    /// Agents get the MCP servers of the code that started them
+    #[test]
+    fn servers_shared() {
+        let mut tested = scripted(Teamed(Requests::default()), Box::new(|_| {}));
+        let adding = tested.worker.add_server(fake(), &[]);
+        let added = block_on(adding).expect("add server");
+
+        let mut delegate = tested.agent.delegate(&[&added], Box::new(Unseen));
+        let tasks = vec!["Add with the server".to_owned()];
+        let calling = delegate(tasks, vec![None]);
+        let called = block_on(calling);
+        assert_eq!(called.agents[0].end, Ending::Answer("5".to_owned()));
     }
 
     /// One still waiting for a slot ends on an interrupt without starting a worker

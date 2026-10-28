@@ -787,7 +787,7 @@ pub(crate) mod tests {
         let sandbox = Arc::new(opened(&cwd, &copies));
         let has_roles = !roles.is_empty();
         let restarted = false;
-        let starting = Worker::new(&interrupt, Arc::clone(&sandbox), has_roles, restarted);
+        let starting = Worker::new(&interrupt, Arc::clone(&sandbox), &[], has_roles, restarted);
         let worker = block_on(starting).expect("worker");
 
         let agent = Agent {

@@ -222,7 +222,7 @@ async fn start(opening: Opening) -> Result<Session> {
     // No restart notice again when no code has run since the last restart
     let ran = memory.ran_code();
     let has_roles = !roles.is_empty();
-    let worker = Worker::new(&interrupt, Arc::clone(&sandbox), has_roles, ran).await?;
+    let worker = Worker::new(&interrupt, Arc::clone(&sandbox), &[], has_roles, ran).await?;
 
     let response = match loading {
         true => {

@@ -149,6 +149,7 @@ impl Worker {
     pub(crate) async fn new(
         interrupt: &Interrupt,
         sandbox: Arc<Sandbox>,
+        servers: &[&Added],
         roles: bool,
         restarted: bool,
     ) -> Result<Self> {
@@ -160,7 +161,7 @@ impl Worker {
             restarted,
             live: None,
         };
-        worker.connect(&[]).await.map_err(Error::Python)?;
+        worker.connect(servers).await.map_err(Error::Python)?;
         Ok(worker)
     }
 
@@ -724,7 +725,7 @@ pub(crate) mod tests {
         let copies = dir.join("copies");
         let sandbox = opened(&cwd, &copies);
         let restarted = false;
-        let building = Worker::new(&interrupt, Arc::new(sandbox), has_roles, restarted);
+        let building = Worker::new(&interrupt, Arc::new(sandbox), &[], has_roles, restarted);
         let worker = block_on(building).expect("worker");
         let value = Tried {
             worker,
