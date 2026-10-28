@@ -19,13 +19,14 @@ pub(crate) const TOOL_DOC: &str = "Runs Python code.";
 const UPDATE: &str = "Task update";
 
 const RULES: &str = "- Never make up data or functions; check unfamiliar ones with help() first.
-- Do the task instead of describing it. Report only results you got, and say what failed or is uncertain.";
+- Do the task instead of describing it.
+- Report only results you obtained, and state what failed or is uncertain.";
 
-const UPDATES: &str =
-    "\n\nThe user may send a \"Task update:\" while you work; it changes the current task.";
-const ANSWER: &str =
-    "Answer in Markdown, which the user sees rendered, as soon as you have the result.";
-const HANDED_BACK: &str = "Only your answer goes back to the agent that gave you this task, so include everything the task asks for.";
+const ANSWER_USER: &str = "Answer: reply in Markdown without a tool call. This ends the task. Answer as soon as you have the result; if no code is needed, answer immediately.";
+const UPDATES: &str = "The user may send a \"Task update:\" while you work; it adds to or changes the current task. Text you write in a reply that runs code is shown to the user.";
+const HAND_OFF: &str = "\n- Pass independent parts of a task to agent() as a list to run them in parallel. Also give agent() long side work where only the result matters, so its steps stay out of this conversation.";
+const ANSWER_AGENT: &str = "Answer: reply without a tool call. This ends the task. Answer as soon as you have the result; if no code is needed, answer immediately.";
+const HANDED_BACK: &str = "Only your answer is returned to the agent that assigned this task, so include everything the task asks for.";
 pub(crate) const NESTED: &str = "agent: not available to agents started by agent()";
 /// Also what the user sees for an agent that is aborted before it ends
 pub(crate) const UNFINISHED: &str = "stopped before it answered";
@@ -96,9 +97,9 @@ pub(crate) fn system(
         }
     };
 
-    let (updates, answer, roles) = match place {
-        Place::Main(roles) => (UPDATES, ANSWER, roles.as_slice()),
-        Place::Delegated(_) => ("", HANDED_BACK, &[][..]),
+    let (answer, note, hand_off, roles) = match place {
+        Place::Main(roles) => (ANSWER_USER, UPDATES, HAND_OFF, roles.as_slice()),
+        Place::Delegated(_) => (ANSWER_AGENT, HANDED_BACK, "", &[][..]),
     };
     let mut entries = Vec::new();
     for role in roles {
@@ -109,7 +110,7 @@ pub(crate) fn system(
         true => String::new(),
         false => {
             let entries = entries.join("\n");
-            format!("\n\n# Agents\n\nTo give a task to an agent in one of these roles, call agent(task, role=name); a list of tasks takes one name for all or a list with one per task:\n\n{entries}")
+            format!("\n\n# Agents\n\nTo give a task to an agent in one of these roles, call agent(task, role=name). For a list of tasks, role is one name for all of them or a list with one name per task:\n\n{entries}")
         }
     };
     let role = match place.role() {
@@ -136,30 +137,32 @@ pub(crate) fn system(
 
     let cwd = cwd.display();
     let sandbox = match sandboxed {
-        true => format!("\n- Your code runs in a sandbox: writing outside {cwd} and $TMPDIR, or reading some private files, fails with PermissionError. $TMPDIR is removed when the session ends. When a tool fails because it can't write its cache, rerun it with the cache in $TMPDIR."),
+        true => format!("\n- Your code runs in a sandbox: writing outside {cwd} and $TMPDIR, or reading some private files, fails with PermissionError. $TMPDIR is removed when the session ends.\n- If a tool fails because it cannot write its cache, rerun it with the cache in $TMPDIR."),
         false => String::new(),
     };
     let date = Utc::now().format("%Y-%m-%d");
     format!(
-        "You do tasks by running Python code with the {TOOL} tool. Each reply does one of two things:
-- Run code: call {TOOL}. A reply may make several calls; they run in order, and once one fails, the rest do not run.
-- Answer: reply without a tool call. This ends the task.
+        "You complete tasks by running Python code with the {TOOL} tool. Each reply does one of two things:
+- Run code: call {TOOL}. A reply may contain several calls; they run in order, and once one fails, the rest are skipped.
+- {answer}
 
-# Code
+{note}{role}
 
-All code runs in one Python session: variables, functions and imports persist across calls and tasks.
+# Running code
 
-A call returns what its code printed, up to {MAX_OBSERVATION_CHARS} characters; longer output is cut in the middle. The value of a top-level expression is printed too unless it is None (strings as is, other values as repr). If the code fails, \"Error:\" follows with the exception and the line that raised it.
+All calls share one Python session: variables, functions and imports persist across calls.
 
-Make each call a whole program: use loops, conditions, the standard library and the functions below to do as much as you can at once. Print only what you need to see. Reuse the data, functions and imports the session already holds; reload data only if its source changed. Put code you will run again in a function; help(name) shows the code of functions and classes you defined.{updates}
+A call returns what its code printed, plus the value of every top-level expression that is not None (strings verbatim, other values as repr). Output longer than {MAX_OBSERVATION_CHARS} characters is cut in the middle. If the code fails, the result ends with \"Error:\" followed by the exception and the line that raised it.
 
-# Answer
-
-{answer} If no code is needed, answer right away.{role}
+Write each call as a complete program:
+- Do as much as possible with loops, conditions, the standard library and the functions below.{hand_off}
+- Print only what you need to see.
+- Reuse the data, functions and imports the session already holds; reload data only if its source changed.
+- Put code you will run again in a function.
 
 # Functions
 
-Call these in your code; they need no import. Prefer them to your own code. Create new files with open().
+These functions need no import. Use them instead of writing your own. Create new files with open().
 
 ## Built-in
 
@@ -658,8 +661,8 @@ mod tests {
 
         let main = system(&[], &[], &[], cwd, false, &[], &Place::Main(roles));
         let listed = "\n\n# Agents\n\n\
-                      To give a task to an agent in one of these roles, call agent(task, role=name); \
-                      a list of tasks takes one name for all or a list with one per task:\n\n\
+                      To give a task to an agent in one of these roles, call agent(task, role=name). \
+                      For a list of tasks, role is one name for all of them or a list with one name per task:\n\n\
                       - `reviewer`: Reviews the café's code\n\
                       - `tester`: Writes naïve tests\n\n# Rules\n\n";
         assert!(main.contains(listed), "{main}");
@@ -667,8 +670,8 @@ mod tests {
 
         let played = Place::Delegated(Some(reviewer));
         let helper = system(&[], &[], &[], cwd, false, &[], &played);
-        let own = "If no code is needed, answer right away.\n\n# Role\n\n\
-                   Your role is `reviewer`: Reviews the café's code\n\n# Functions";
+        let own = "include everything the task asks for.\n\n# Role\n\n\
+                   Your role is `reviewer`: Reviews the café's code\n\n# Running code";
         assert!(helper.contains(own), "{helper}");
         assert!(!helper.contains("# Agents"), "{helper}");
         let plain = system(&[], &[], &[], cwd, false, &[], &Place::Delegated(None));

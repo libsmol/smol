@@ -220,7 +220,7 @@ mod tests {
             let task = asked.strip_prefix("New task:\n").unwrap_or_default();
             let last = conversation.last().map(content).unwrap_or_default();
             let first = conversation.len() == 2;
-            let (text, code) = match (system.contains("goes back to the agent"), first) {
+            let (text, code) = match (system.contains("returned to the agent"), first) {
                 (true, true) if task == "Start another agent" => {
                     (String::new(), Some("print(agent('deeper'))"))
                 }
@@ -303,14 +303,10 @@ mod tests {
             .into_iter()
             .find(|text| *text != main)
             .expect("helper");
-        assert!(!helper.contains("- agent("), "{helper}");
+        assert!(!helper.contains("agent("), "{helper}");
         assert!(!helper.contains("Task update"), "{helper}");
-        assert!(
-            helper.contains(
-                "\n\n# Answer\n\nOnly your answer goes back to the agent that gave you this task"
-            ),
-            "{helper}"
-        );
+        let returned = "\n\nOnly your answer is returned to the agent that assigned this task";
+        assert!(helper.contains(returned), "{helper}");
     }
 
     /// The main agent gives tasks to roles, and agents answer with their role and model
@@ -326,7 +322,7 @@ mod tests {
             let system = content(&conversation[0]);
             let own = system.split("# Role\n\n").nth(1);
             let own = own.and_then(|rest| rest.lines().next());
-            let main = !system.contains("goes back to the agent");
+            let main = !system.contains("returned to the agent");
             let first = conversation.len() == 2;
             let (text, code) = match (main, first) {
                 (true, true) => {

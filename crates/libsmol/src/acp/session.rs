@@ -1219,7 +1219,7 @@ mod tests {
         let prompt = &prompts[0];
         let header = "- agent(task: str | list[str], role: str | list[str] | None = None) -> ";
         assert!(prompt.contains(header), "{prompt}");
-        let listed = "with one per task:\n\n- `reviewer`: Reviews the café's code\n\n";
+        let listed = "with one name per task:\n\n- `reviewer`: Reviews the café's code\n\n";
         assert!(prompt.contains(listed), "{prompt}");
         fs::remove_dir_all(&dir).ok();
     }

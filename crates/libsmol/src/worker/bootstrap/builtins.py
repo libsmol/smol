@@ -104,7 +104,7 @@ def _path(function, name, value):
 
 @_builtin
 def edit(path: str | _os.PathLike, old: str, new: str) -> None:
-    """replaces old with new; old must appear exactly once
+    """replaces old with new; raises ValueError and leaves the file unchanged unless old appears exactly once
 
     Replaces old with new in a text file; raises unless old appears exactly once."""
     path = _path("edit", "path", path)
@@ -155,7 +155,7 @@ def edit(path: str | _os.PathLike, old: str, new: str) -> None:
 
 @_builtin
 def ls(path: str | _os.PathLike = ".", recursive: bool = False) -> list[str]:
-    """sorted paths relative to path (src/a.py is listed as 'a.py'), directories end with /; recursive=True skips .gitignore'd paths
+    """sorted paths relative to path (ls('src') returns 'a.py', not 'src/a.py'); directories end with /; recursive=True skips .gitignore'd paths
 
     Lists directory path as sorted paths relative to it, directories ending with /; recursive=True lists everything below it, skipping .git and .gitignore'd paths and not entering symbolic links."""
     path = "." if path is None else _path("ls", "path", path)
@@ -164,7 +164,7 @@ def ls(path: str | _os.PathLike = ".", recursive: bool = False) -> list[str]:
 
 @_builtin
 def grep(pattern: str, path: str | _os.PathLike = ".", glob: str | None = None) -> list[tuple[str, int, str]]:
-    """Rust regex, no lookaround or backreferences; skips .gitignore'd and binary files
+    """(path, line number from 1, line) for each matching line; Rust regex without lookaround or backreferences; skips .gitignore'd and binary files
 
     Searches a file, or every file below a directory except .git, symbolic links, .gitignore'd and binary files, for a Rust regex (Python re without lookaround or backreferences; (?i) ignores case); returns the matching lines, paths usable with open() and lines counted from 1.
 
@@ -195,9 +195,9 @@ def view(path: str | _os.PathLike) -> None:
     _view(path, absolute)
 
 def agent(task: str | list[str], role: str | list[str] | None = None) -> str | list[str | RuntimeError]:
-    """a new agent does the task with the same files and functions and returns its answer; a list runs in parallel
+    """a new agent does the task and returns its answer; it has the same files, built-in functions and MCP servers, but not this Python session or this conversation, so the task must state everything it needs
 
-    Gives the task to a new agent and returns its final answer. The agent has its own Python session and the same files, functions, skills and instructions as you, but not your variables or this conversation, so the task must say everything it needs. A list of tasks runs up to 8 agents at a time and returns their answers in the same order, with the exception in place of any task that failed. Agents started this way can't call agent()."""
+    Gives the task to a new agent and returns its final answer. The agent has its own Python session and the same files, built-in functions, MCP servers, skills and instructions as you, but not your variables or this conversation, so the task must state everything it needs. A list of tasks runs up to 8 agents at a time and returns their answers in the same order, with the exception in place of any task that failed. Agents started this way cannot call agent()."""
     single = isinstance(task, str)
     tasks = [task] if single else task
     if not isinstance(tasks, list):
@@ -243,7 +243,7 @@ agent = _builtin(agent)
 
 @_builtin
 def help(request: object) -> None:
-    """prints the signature and docs of a function or module
+    """prints the signature and docs of a function, class, module or MCP server, and the code of functions and classes you defined
 
     Prints the signature and documentation of an object, or of the function, module or MCP server a dotted name refers to; modules also list their public members, and functions and classes your code defined in an earlier call also show that code."""
     import importlib

@@ -111,7 +111,7 @@ def _server(source, description, tools):
     about = description.strip()
     about = f"\n{about}" if about else ""
     entries = "\n".join(entries)
-    listing = f"MCP server {titled}{about}\n\nFunctions, help({name}.<function>) prints one in full:\n\n{entries}"
+    listing = f"MCP server {titled}{about}\n\nFunctions (help({name}.<function>) prints one in full):\n\n{entries}"
     builtins[name] = _Server(name, source, listing, functions)
     return {"name": name, "headers": headers}
 

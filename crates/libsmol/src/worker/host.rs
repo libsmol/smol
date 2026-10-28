@@ -2019,7 +2019,7 @@ pub(crate) mod tests {
         assert!(ls.starts_with(header), "{ls}");
 
         let own = help("help");
-        let header = "help(request: object) -> None\nprints the signature and docs of a function or module\n\nPrints ";
+        let header = "help(request: object) -> None\nprints the signature and docs of a function, class, module or MCP server, and the code of functions and classes you defined\n\nPrints ";
         assert!(own.starts_with(header), "{own}");
 
         let zipfile = help("'zipfile.ZipFile'");
