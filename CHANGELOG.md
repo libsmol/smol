@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.4.2 - 2026-10-29
 
 - On macOS the Python process applies its Seatbelt profile itself with
   `sandbox_init` when it starts, instead of being started through
