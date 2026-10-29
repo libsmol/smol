@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.4.1 - 2026-10-29
 
 - The system prompt is laid out as How to reply, Running code, Functions,
   Sub-agents, Environment and Rules, with code and literal text in backticks.
