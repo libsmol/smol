@@ -202,6 +202,11 @@ meanwhile reaches it as a task update. smol shows running agents under the
 call that started them, and pins them below the conversation while their rows
 are scrolled out of view.
 
+A real run with DeepSeek: four agents write and test a tool each in the
+background while the main agent answers a question, then it checks their work:
+
+![four background agents writing tools in parallel](https://raw.githubusercontent.com/libsmol/smol/main/docs/agents.gif)
+
 ## MCP servers
 
 Add servers to `~/.smol/agent.toml`:
