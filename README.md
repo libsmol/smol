@@ -26,7 +26,7 @@ A real run with DeepSeek on smol's own source:
   tools to choose from or route between; its attention goes to the task.
 - **Python.** The language models write most fluently, with a standard library
   that covers files, data, text, HTTP and more.
-- **A tiny prompt.** The system prompt is under 1,000 tokens: how the session
+- **A tiny prompt.** The system prompt is under 1,500 tokens: how the session
   works, the built-in functions and a few rules. No persona, no imposed
   workflow, nothing that holds a capable model back.
 - **No permission prompts.** It never stops to ask before running code,
@@ -35,7 +35,8 @@ A real run with DeepSeek on smol's own source:
 - **Standard ACP.** `libsmol` speaks the
   [Agent Client Protocol](https://agentclientprotocol.com), so Zed or any other
   ACP client can drive it; `smol` is just one such client. The few extras that
-  ACP has no message for (`!` commands, queued updates) use `_smol/`
+  ACP has no message for (`!` commands, queued updates, the agents `agent()`
+  starts) use `_smol/`
   extensions, which other clients ignore as the protocol requires.
 
 > [!WARNING]
@@ -177,7 +178,8 @@ Besides the Python standard library, every session has these functions:
 | `edit(path, old, new)` | Replace text that appears exactly once in a file. |
 | `fetch(url)` | Get a web page as Markdown. |
 | `view(path)` | Show an image or video to the model (offered only when the model takes media). |
-| `agent(task)` | Give a task to a new agent and return its answer; a list of tasks runs up to 8 agents at a time, and `role=` picks one of your [roles](#roles). |
+| `agent(task)` | Give a task to a new agent and return its answer; a list of tasks runs up to 8 agents at a time, and `role=` picks one of your [roles](#roles). With `name=` it runs in the background and returns an `Agent` handle at once. |
+| `Agent.get(name)` | The handle of a background agent, whose `wait(timeout=None)`, `status()` and `stop()` return its answer, say what it is doing and stop it. |
 | `help(name)` | Print a function's signature and docs, including code defined in earlier steps. |
 
 MCP tools appear as Python objects named after their server, for example
@@ -189,6 +191,16 @@ conversation of the agent that started it, and it can't start agents itself.
 Only its answer goes back; everything it did is saved with the session and
 shown as its own call, and its tokens are counted apart from the session's.
 A task that fails gives a `RuntimeError` in its place in the list.
+
+An agent started with a name runs in the background, so the model can answer
+while it works. `Agent.get(name)` finds it again, also after Python restarts;
+`wait()` returns its answer, or `None` if it is still running after `timeout`
+seconds, and raises `RuntimeError` if it failed or was stopped. The turn stays
+open until every background agent has ended. When one ends before code took
+its answer, the model gets an "Agent done:" message, and what you type
+meanwhile reaches it as a task update. smol shows running agents under the
+call that started them, and pins them below the conversation while their rows
+are scrolled out of view.
 
 ## MCP servers
 

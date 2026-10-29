@@ -9,6 +9,9 @@ but their files stay in `~/.smol/history` untouched.
 
 ## Unreleased
 
+Sessions are saved in format 8, so sessions from 0.3.1 and earlier are no longer
+listed.
+
 - `agent(task)` gives a task to a new agent, with its own Python session and the
   same files, functions, skills, instructions and MCP servers, and returns its
   answer. A list of tasks runs up to 8 agents at a time and returns the answers in
@@ -24,6 +27,27 @@ but their files stay in `~/.smol/history` untouched.
   and optionally a model of its own; a list of tasks takes one role or a list
   with one per task. The system prompt lists them, and smol shows an agent's
   role in front of its task.
+- `agent(task, name="...")` starts the agent in the background and returns an
+  `Agent` handle at once, so the model can answer while it works; a list of
+  tasks takes one name per task. `Agent.get(name)` finds it again, also after
+  Python restarts, and the handle's `wait(timeout)`, `status()` and `stop()`
+  return its answer, say what it is doing and stop it. The turn stays open until
+  every background agent has ended. When one ends before code took its answer,
+  the model gets an "Agent done:" message, and what you type meanwhile reaches
+  it as a task update. While the rows of a call's running agents are scrolled
+  out of view, smol pins them below the conversation.
+- Only the latest 8 to 15 images and videos go with each request, and older
+  ones are replaced by a note. A session that had viewed 47 images failed with
+  HTTP 413 because the request grew too large.
+- The system prompt is arranged in short sections and lists. A task update now
+  adds to or changes the current task, and the model is told that text in a
+  reply that runs code is shown to you. `view()` is described by the media the
+  current model takes.
+- For ACP clients: agents arrive as tool calls marked `_smol/agent`, with the
+  call that started them in `parent` and their task, role and name in
+  `rawInput`. A client that declared `_smol/queued` sends `_smol/enqueued` when
+  it queues a message during a turn, which reaches a turn waiting on background
+  agents.
 
 ## 0.3.1 - 2026-10-27
 
