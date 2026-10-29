@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 
 #[cfg(unix)]
 mod unix;
@@ -161,9 +161,53 @@ pub fn tilde(path: &Path) -> String {
     }
 }
 
+/// The text on one line, with `cwd` as `.` and paths in it relative, and the home directory as `~`
+pub fn one_line(text: &str, cwd: &Path) -> String {
+    let cwd = cwd.display().to_string();
+    let mut text = shortened(text, &cwd, ".", "");
+    if let Some(home) = env::home_dir() {
+        let home = home.display().to_string();
+        let inside = format!("~{MAIN_SEPARATOR}");
+        text = shortened(&text, &home, "~", &inside);
+    }
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    words.join(" ")
+}
+
+/// Writes `root` as `name` and paths in it starting with `inside`,
+/// except where `root` only begins or ends a longer path or word
+fn shortened(text: &str, root: &str, name: &str, inside: &str) -> String {
+    // An empty root would match at every position and never advance
+    if root.is_empty() {
+        return text.to_owned();
+    }
+
+    let pathy = |c: char| c.is_alphanumeric() || matches!(c, '/' | '\\' | '.' | '-' | '_' | '~');
+    let mut kept = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(root) {
+        let (before, after) = (&rest[..at], &rest[at + root.len()..]);
+        kept.push_str(before);
+        let joined = before.chars().next_back().is_some_and(pathy);
+        rest = after;
+        match after.chars().next() {
+            _ if joined => kept.push_str(root),
+            Some(MAIN_SEPARATOR) => {
+                kept.push_str(inside);
+                rest = &after[MAIN_SEPARATOR.len_utf8()..];
+            }
+            Some(next) if pathy(next) => kept.push_str(root),
+            _ => kept.push_str(name),
+        }
+    }
+    kept.push_str(rest);
+    kept
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{cause, searched, terminal_view};
+    use crate::{cause, one_line, searched, shortened, terminal_view};
     use std::env;
     use std::fs;
     #[cfg(unix)]
@@ -172,6 +216,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::path::MAIN_SEPARATOR;
     use std::process;
 
     #[test]
@@ -257,5 +302,25 @@ mod tests {
         for (text, expected) in cases {
             assert_eq!(terminal_view(text), expected, "{text:?}");
         }
+    }
+
+    #[test]
+    fn paths_shortened() {
+        let sep = MAIN_SEPARATOR;
+        let root = format!("{sep}work{sep}menus");
+        let text = format!("In {root}, read {root}{sep}café.txt ({root}) but not {root}2, {root}.bak or {sep}var{root}{sep}naïve");
+        let expected = format!(
+            "In ., read café.txt (.) but not {root}2, {root}.bak or {sep}var{root}{sep}naïve"
+        );
+        assert_eq!(shortened(&text, &root, ".", ""), expected);
+        assert_eq!(shortened("résumé", "", ".", ""), "résumé");
+
+        let home = env::home_dir().expect("home");
+        let cwd = home.join("menus");
+        let (inside, under) = (cwd.display(), home.display());
+        let task =
+            format!("Work in {inside}: read {inside}{sep}café.txt\nand  {under}{sep}naïve.md");
+        let expected = format!("Work in .: read café.txt and ~{sep}naïve.md");
+        assert_eq!(one_line(&task, &cwd), expected);
     }
 }

@@ -58,7 +58,10 @@ pub(crate) struct App {
     pub(crate) scrolled_back: usize,
     /// The most rows the previous frame could scroll back
     pub(crate) bottom: usize,
+    /// `scrolled_back` as the previous frame left it, which only scrolling changes before the next
+    pub(crate) drawn_back: usize,
     pub(crate) messages_area: Rect,
+    pub(crate) pinned_area: Rect,
     pub(crate) scrollbar: Rect,
     pub(crate) selection: Option<Selection>,
     pressed: Option<Point>,
@@ -220,9 +223,10 @@ const HINTS: [Hint; 5] = [
 
 impl App {
     pub(crate) fn new(session: Session) -> Self {
+        let cwd = session.client.cwd.clone();
         Self {
             session,
-            transcript: Transcript::default(),
+            transcript: Transcript::new(cwd),
             run: None,
             queued: VecDeque::new(),
             input: input_box(""),
@@ -241,7 +245,9 @@ impl App {
             drawn: Instant::now(),
             scrolled_back: 0,
             bottom: 0,
+            drawn_back: 0,
             messages_area: Rect::default(),
+            pinned_area: Rect::default(),
             scrollbar: Rect::default(),
             selection: None,
             pressed: None,
@@ -340,7 +346,8 @@ impl App {
             return self.failure(text);
         }
 
-        self.transcript = Transcript::default();
+        let cwd = self.session.client.cwd.clone();
+        self.transcript = Transcript::new(cwd);
         self.history = History::default();
         // A queued command runs with no key press to clear the selection,
         // which would land on the new transcript by row number
@@ -507,6 +514,7 @@ impl App {
                 let on_choices = self.choices_area.contains(position);
                 let area = self.messages_area;
                 let inside = area.contains(position);
+                let scrolls = inside || self.pinned_area.contains(position);
                 let on_bar = self.scrollbar.contains(position);
 
                 match mouse.kind {
@@ -514,8 +522,8 @@ impl App {
                     MouseEventKind::ScrollDown if on_choices => self.highlight.select_next(),
                     _ if on_choices => {}
 
-                    MouseEventKind::ScrollUp if inside => self.scroll_up(3),
-                    MouseEventKind::ScrollDown if inside => self.scroll_down(3),
+                    MouseEventKind::ScrollUp if scrolls => self.scroll_up(3),
+                    MouseEventKind::ScrollDown if scrolls => self.scroll_down(3),
 
                     MouseEventKind::Down(MouseButton::Left) if on_bar => {
                         self.dragging = true;
@@ -645,9 +653,8 @@ impl App {
 
                     // A command waits for the turn to end, and so does everything queued behind it
                     Output::Queued(asked) => {
-                        let ready = |text: &&String| Command::parse(text).is_none();
                         let count = match self.running() {
-                            true => self.queued.iter().take_while(ready).count(),
+                            true => self.queued.iter().take_while(|text| plain(text)).count(),
                             false => 0,
                         };
 
@@ -1033,10 +1040,13 @@ impl App {
         self.set_input("");
         self.pastes.clear();
 
-        let waits = self.run.is_some();
-        match waits {
-            true => self.queued.push_back(text),
-            false => self.submit_text(&text),
+        if self.run.is_none() {
+            return self.submit_text(&text);
+        }
+        self.queued.push_back(text);
+        // A turn waiting on agents takes it now, unless a command ahead of it waits for the turn to end
+        if self.queued.iter().all(|text| plain(text)) {
+            self.session.enqueued();
         }
     }
 
@@ -1145,6 +1155,11 @@ pub(crate) fn pasted(events: &[Event], stalled: bool) -> Option<String> {
 fn placeholder(number: usize, text: &str) -> String {
     let lines = text.lines().count();
     format!("[paste #{number}: {lines} lines]")
+}
+
+/// Queued text the running turn can take, as commands wait for it to end
+fn plain(text: &str) -> bool {
+    Command::parse(text).is_none()
 }
 
 /// Strips leading whitespace first, as submitting does

@@ -127,7 +127,10 @@ pub(crate) struct Helper {
     pub(crate) task: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) role: Option<String>,
-    /// Saved as an `answer` or `error` key beside the others
+    /// Given to one started in the background
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    /// Saved beside the others as one key named after how it ended
     #[serde(flatten)]
     pub(crate) end: Ending,
     pub(crate) memory: AgentMemory,
@@ -140,6 +143,18 @@ pub(crate) enum Ending {
     Error(String),
     /// Braces let it flatten into an `interrupted` key
     Interrupted {},
+    /// `stop()` ended it
+    Stopped {},
+    /// Aborted or panicked before it ended
+    Unfinished {},
+    /// One started in the background keeps this record until it ends, or for good if libsmol exits first
+    Running {},
+}
+
+impl Helper {
+    pub(crate) fn running(&self) -> bool {
+        self.end == (Ending::Running {})
+    }
 }
 
 impl AgentStep {
@@ -243,6 +258,10 @@ pub(crate) enum MemoryStep {
     Summary(SummaryStep),
     Shell(ShellStep),
     Restarted,
+    /// Agents started in the background that ended before the code took their results
+    Done {
+        agents: Vec<String>,
+    },
 }
 
 impl MemoryStep {
@@ -262,6 +281,10 @@ impl MemoryStep {
                 return vec![ChatMessage::user(text)];
             }
             MemoryStep::Restarted => return vec![ChatMessage::user(prompt::RESTARTED)],
+            MemoryStep::Done { agents } => {
+                let text = prompt::done(agents);
+                return vec![ChatMessage::user(text)];
+            }
             MemoryStep::Action(step) => step,
             MemoryStep::Summary(_) => return Vec::new(),
         };
@@ -352,7 +375,8 @@ impl AgentMemory {
                     MemoryStep::Action(_)
                     | MemoryStep::Summary(_)
                     | MemoryStep::Shell(_)
-                    | MemoryStep::Restarted => {}
+                    | MemoryStep::Restarted
+                    | MemoryStep::Done { .. } => {}
                 }
             }
             visible.summary = Some(summary);
@@ -417,7 +441,8 @@ impl AgentMemory {
                 MemoryStep::Task(_)
                 | MemoryStep::Update(_)
                 | MemoryStep::Shell(_)
-                | MemoryStep::Restarted => None,
+                | MemoryStep::Restarted
+                | MemoryStep::Done { .. } => None,
                 MemoryStep::Action(action) => {
                     let said = !action.text.is_empty() || !action.calls.is_empty();
                     let shown = said && !action.dropped();
@@ -465,6 +490,29 @@ impl AgentMemory {
             }
         }
         (total, steps)
+    }
+
+    /// The earliest record since the last task of an agent started in the background with this name
+    /// that still runs
+    pub(crate) fn running_record(&mut self, name: &str) -> Option<&mut Helper> {
+        let tasked = |step: &MemoryStep| matches!(step, MemoryStep::Task(_));
+        let start = self.steps.iter().rposition(tasked).unwrap_or(0);
+        for step in &mut self.steps[start..] {
+            let MemoryStep::Action(action) = step else {
+                continue;
+            };
+            for call in &mut action.calls {
+                let Some(result) = &mut call.result else {
+                    continue;
+                };
+                for helper in &mut result.agents {
+                    if helper.running() && helper.name.as_deref() == Some(name) {
+                        return Some(helper);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Only looks at steps since the last restart

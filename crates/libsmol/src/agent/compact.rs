@@ -62,6 +62,7 @@ impl Turn<'_> {
                     | MemoryStep::Update(_)
                     | MemoryStep::Shell(_)
                     | MemoryStep::Restarted
+                    | MemoryStep::Done { .. }
             );
             // The model wrote the reply but hasn't seen its call replies or errors
             let reported = match step {
@@ -307,6 +308,7 @@ mod tests {
                 MemoryStep::Summary(_) => "summary",
                 MemoryStep::Shell(_) => "shell",
                 MemoryStep::Restarted => "restarted",
+                MemoryStep::Done { .. } => "done",
             };
             kinds.push(kind);
         }

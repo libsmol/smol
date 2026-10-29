@@ -1,6 +1,6 @@
 use crate::acp::rpc::{Lines, Out, Peer};
 use crate::acp::session::{self, Message, Opening, Prompt, Shell};
-use crate::acp::{rfc3339, task_of, to_value, App, QUEUED, SHELL};
+use crate::acp::{rfc3339, task_of, to_value, App, ENQUEUED, QUEUED, SHELL};
 use crate::config;
 use crate::config::setup::SETUP_ARG;
 use crate::history::HistoryStore;
@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::Notify;
 use tokio::task::{self, JoinHandle};
 use tokio::time;
 use tracing::{error, error_span, info, Event, Instrument, Span, Subscriber};
@@ -188,6 +189,14 @@ pub(crate) async fn serve(mut input: Lines, app: Arc<App>) -> Result<()> {
                     session.interrupt.cancel(session.received);
                 }
             }
+            None if method == ENQUEUED => {
+                let Ok(enqueued) = serde_json::from_value::<EnqueuedParams>(params) else {
+                    continue;
+                };
+                if let Some(session) = router.sessions.get(&enqueued.session_id) {
+                    session.enqueued.notify_one();
+                }
+            }
             None => {}
         }
     };
@@ -219,6 +228,7 @@ struct Router {
 struct Handle {
     sender: UnboundedSender<Message>,
     interrupt: Interrupt,
+    enqueued: Arc<Notify>,
     /// Prompts and commands received so far, and a cancel covers every turn up to this count
     received: u64,
     /// The session task is instrumented with it too, which puts the session id on every log line
@@ -239,6 +249,12 @@ impl Handle {
 struct ShellParams {
     session_id: String,
     command: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnqueuedParams {
+    session_id: String,
 }
 
 impl Router {
@@ -385,6 +401,7 @@ impl Router {
         };
 
         let interrupt = Interrupt::default();
+        let enqueued = Arc::new(Notify::new());
         let (sender, inbox) = mpsc::unbounded_channel();
         let opening = Opening {
             id: id.clone(),
@@ -397,6 +414,7 @@ impl Router {
             access,
             app: Arc::clone(&self.app),
             interrupt: interrupt.clone(),
+            enqueued: Arc::clone(&enqueued),
             inbox,
         };
 
@@ -408,6 +426,7 @@ impl Router {
         let handle = Handle {
             sender,
             interrupt,
+            enqueued,
             received: 0,
             span,
             task,
@@ -574,6 +593,7 @@ mod tests {
             let opened = Handle {
                 sender,
                 interrupt: interrupt.clone(),
+                enqueued: Arc::default(),
                 received: 0,
                 span: Span::none(),
                 task: old,

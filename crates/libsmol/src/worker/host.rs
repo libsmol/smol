@@ -1,4 +1,4 @@
-use crate::memory::{CallError, Helper, MAX_OBSERVATION_CHARS};
+use crate::memory::{CallError, MAX_OBSERVATION_CHARS};
 use crate::model::Media;
 use crate::prompt::{self, NO_SERVER};
 use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
@@ -8,8 +8,8 @@ use crate::worker::sandbox::Sandbox;
 #[cfg(not(test))]
 use crate::worker::WORKER_ARG;
 use crate::worker::{
-    FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall, WorkerNote,
-    CONTROL_ENV, COPIES_ENV, ROLES_ENV,
+    AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
+    WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV,
 };
 use crate::{Error, Result};
 use reaper::{cause, terminal_view};
@@ -40,18 +40,14 @@ const CANCEL_EVERY: Duration = Duration::from_millis(500);
 /// Code that closes stdout never lets the END marker through
 const OUTPUT_WAIT: Duration = Duration::from_secs(2);
 const START_WAIT: Duration = Duration::from_secs(30);
-/// Agents the code started stop on an interrupt too, and a worker of theirs may take `STOP_WAIT`
-const HELPERS_WAIT: Duration = Duration::from_secs(5);
 
 pub(crate) type Calling = Pin<Box<dyn Future<Output = Called> + Send>>;
-/// Runs the tasks of one `agent()` call, each with the role at the same place in the roles
-pub(crate) type Delegating = dyn FnMut(Vec<String>, Vec<Option<String>>) -> Calling + Send;
+pub(crate) type Delegating<'a> = dyn FnMut(AgentCall) -> Calling + Send + 'a;
 
-/// The result of work done for the worker, with the images, videos and agents it produced
+/// The result of work done for the worker, with the images and videos it produced
 pub(crate) struct Called {
     pub(crate) result: Reply,
     pub(crate) media: Vec<(String, Media)>,
-    pub(crate) agents: Vec<Helper>,
 }
 
 impl From<Reply> for Called {
@@ -59,7 +55,6 @@ impl From<Reply> for Called {
         Self {
             result,
             media: Vec::new(),
-            agents: Vec::new(),
         }
     }
 }
@@ -71,7 +66,6 @@ pub(crate) struct Evaluated {
     pub(crate) cut: usize,
     pub(crate) error: Option<CallError>,
     pub(crate) media: Vec<(String, Media)>,
-    pub(crate) agents: Vec<Helper>,
     /// The code actually run after stray tags were stripped
     pub(crate) code: Option<String>,
 }
@@ -89,8 +83,7 @@ pub(crate) struct Worker {
     /// Shared with the workers of agents the code starts
     sandbox: Arc<Sandbox>,
     interrupt: Interrupt,
-    /// `agent()` takes a role
-    roles: bool,
+    delegation: Delegation,
     functions: Vec<Function>,
     restarted: bool,
     live: Option<Live>,
@@ -104,12 +97,10 @@ struct Live {
     pieces: Receiver<Piece>,
     next_id: u64,
     calls: JoinSet<(u64, Called)>,
-    /// Calls a cancel stops, which leaves out agents because their records would be lost
+    /// Calls a cancel stops, which leaves out the agents the code waits for so they keep their records
     running: HashMap<u64, AbortHandle>,
     output: Clip,
     media: Vec<(String, Media)>,
-    /// A slot per `agent()` call in the order they arrived, which is how their agents are numbered
-    agents: Vec<(u64, Vec<Helper>)>,
 }
 
 enum Event {
@@ -150,13 +141,13 @@ impl Worker {
         interrupt: &Interrupt,
         sandbox: Arc<Sandbox>,
         servers: &[&Added],
-        roles: bool,
+        delegation: Delegation,
         restarted: bool,
     ) -> Result<Self> {
         let mut worker = Self {
             sandbox,
             interrupt: interrupt.clone(),
-            roles,
+            delegation,
             functions: Vec::new(),
             restarted,
             live: None,
@@ -218,8 +209,13 @@ impl Worker {
             .env(CONTROL_ENV, control)
             .env(COPIES_ENV, &self.sandbox.copies)
             .stdin(Stdio::null());
-        if self.roles {
-            command.env(ROLES_ENV, "1");
+        let agents = match self.delegation {
+            Delegation::Off => None,
+            Delegation::On => Some("on"),
+            Delegation::Roles => Some("roles"),
+        };
+        if let Some(agents) = agents {
+            command.env(AGENTS_ENV, agents);
         }
         let (mut group, pieces) = Group::start(command).map_err(failed)?;
 
@@ -265,7 +261,6 @@ impl Worker {
             running: HashMap::new(),
             output: Clip::new(KEPT_BYTES),
             media: Vec::new(),
-            agents: Vec::new(),
         };
 
         // Startup output runs up to the END marker and doesn't belong to the first snippet
@@ -341,7 +336,7 @@ impl Worker {
         code: &str,
         servers: &[&Added],
         shown: &mut (dyn FnMut(&str) + Send),
-        delegate: &mut Delegating,
+        delegate: &mut Delegating<'_>,
     ) -> Result<Evaluated, CallError> {
         let interrupt = self.interrupt.clone();
         let failed = |reason: String| {
@@ -360,7 +355,6 @@ impl Worker {
         live.calls.abort_all();
         live.running.clear();
         live.media.clear();
-        live.agents.clear();
         live.output = Clip::new(KEPT_BYTES);
         let run = HostCall::Run {
             code: code.to_owned(),
@@ -429,61 +423,46 @@ impl Worker {
                 Event::Call(number, call) => (number, call),
             };
 
-            let (server, tool, args, called) = match call {
+            let (calling, cancelable) = match call {
                 WorkerCall::Tool {
                     server,
                     tool,
                     args,
                     called,
-                } => (server, tool, args, called),
-                WorkerCall::Agent { tasks, roles } => {
-                    live.agents.push((number, Vec::new()));
-                    let calling = delegate(tasks, roles);
-                    live.calls.spawn(async move { (number, calling.await) });
-                    continue;
+                } => {
+                    let found = servers.iter().find(|added| added.name == server);
+                    let calling: Calling = match found {
+                        Some(added) => (added.server.call)(tool, args, called),
+                        None => {
+                            let reply = Err(NO_SERVER.to_owned());
+                            let called = Called::from(reply);
+                            let ready = future::ready(called);
+                            Box::pin(ready)
+                        }
+                    };
+                    (calling, true)
                 }
-            };
-            let found = servers.iter().find(|added| added.name == server);
-            let calling: Calling = match found {
-                Some(added) => (added.server.call)(tool, args, called),
-                None => {
-                    let reply = Err(NO_SERVER.to_owned());
-                    let called = Called::from(reply);
-                    let ready = future::ready(called);
-                    Box::pin(ready)
+                WorkerCall::Agent(call) => {
+                    let asked = matches!(call, AgentCall::Ask { .. });
+                    let calling = delegate(call);
+                    (calling, !asked)
                 }
             };
             let task = live.calls.spawn(async move { (number, calling.await) });
-            live.running.insert(number, task);
+            if cancelable {
+                live.running.insert(number, task);
+            }
         };
 
         // Calls the snippet left behind get no reply, and agents among them close their views here
         for (_, task) in live.running.drain() {
             task.abort();
         }
-        // On an interrupt agents get time to stop by themselves and keep their records
-        let wait = match interrupt.triggered() {
-            true => HELPERS_WAIT,
-            false => Duration::ZERO,
-        };
-        let give_up = Instant::now() + wait;
-        let mut aborted = false;
-        loop {
-            let joined = select! {
-                joined = live.calls.join_next() => joined,
-                () = time::sleep_until(give_up), if !aborted => {
-                    live.calls.abort_all();
-                    aborted = true;
-                    continue;
-                }
-            };
-            let Some(joined) = joined else {
-                break;
-            };
-            if let Ok((number, called)) = joined {
-                live.keep(number, called.agents);
-            }
+        // On an interrupt the agents the code waits for stop by themselves and keep their records
+        if !interrupt.triggered() {
+            live.calls.abort_all();
         }
+        while live.calls.join_next().await.is_some() {}
 
         let outcome = match outcome {
             Outcome::Gone(_) => {
@@ -500,13 +479,10 @@ impl Worker {
         let (logs, cut) = live.output.text();
         let logs = terminal_view(&logs);
         let media = mem::take(&mut live.media);
-        let calls = mem::take(&mut live.agents);
-        let agents = calls.into_iter().flat_map(|(_, agents)| agents).collect();
         let mut output = Evaluated {
             logs,
             cut,
             media,
-            agents,
             ..Evaluated::default()
         };
 
@@ -535,14 +511,6 @@ impl Worker {
 }
 
 impl Live {
-    /// Fills the slot of the `agent()` call answered with `id`
-    fn keep(&mut self, id: u64, agents: Vec<Helper>) {
-        let slot = self.agents.iter_mut().find(|(asked, _)| *asked == id);
-        if let Some((_, kept)) = slot {
-            *kept = agents;
-        }
-    }
-
     fn send(&mut self, call: HostCall) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -599,7 +567,6 @@ impl Live {
                     };
                     self.running.remove(&id);
                     self.media.extend(called.media);
-                    self.keep(id, called.agents);
                     let reply = Message::reply(id, called.result);
                     self.deliver(&reply);
                 }
@@ -638,8 +605,9 @@ async fn start_error(group: Group, mut pieces: Receiver<Piece>, mut output: Clip
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::agent::Place;
-    use crate::memory::{AgentMemory, CallError, Ending, Helper};
+    use crate::agent::tests::main_place;
+    use crate::agent::MAX_PARALLEL_AGENTS;
+    use crate::memory::CallError;
     use crate::prompt::{self, system};
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
     use crate::tools::mcp::tests::{fake, started};
@@ -647,7 +615,7 @@ pub(crate) mod tests {
     use crate::utils::{block_on, Interrupt};
     use crate::worker::host::{Added, Called, Calling, Delegating, Evaluated, Worker, STOP_WAIT};
     use crate::worker::sandbox::tests::opened;
-    use crate::worker::{serve, CONTROL_ENV};
+    use crate::worker::{serve, AgentCall, Delegation, CONTROL_ENV};
     use serde_json::{json, Map, Value};
     use std::env;
     #[cfg(unix)]
@@ -666,12 +634,12 @@ pub(crate) mod tests {
     struct Tried {
         worker: Worker,
         servers: Vec<Added>,
-        delegate: Box<Delegating>,
+        delegate: Box<Delegating<'static>>,
     }
 
     /// For code that never calls `agent()`
-    pub(crate) fn no_agents(tasks: Vec<String>, _: Vec<Option<String>>) -> Calling {
-        panic!("{tasks:?}");
+    pub(crate) fn no_agents(call: AgentCall) -> Calling {
+        panic!("{call:?}");
     }
 
     impl Deref for Tried {
@@ -720,12 +688,12 @@ pub(crate) mod tests {
         }
     }
 
-    fn build(interrupt: Interrupt, cwd: PathBuf, has_roles: bool) -> Temp<Tried> {
+    fn build(interrupt: Interrupt, cwd: PathBuf, delegation: Delegation) -> Temp<Tried> {
         let dir = temp_dir("session");
         let copies = dir.join("copies");
         let sandbox = opened(&cwd, &copies);
         let restarted = false;
-        let building = Worker::new(&interrupt, Arc::new(sandbox), &[], has_roles, restarted);
+        let building = Worker::new(&interrupt, Arc::new(sandbox), &[], delegation, restarted);
         let worker = block_on(building).expect("worker");
         let value = Tried {
             worker,
@@ -743,7 +711,7 @@ pub(crate) mod tests {
     fn workspace(name: &str) -> (Temp<Tried>, PathBuf) {
         let dir = temp_dir(name);
         fs::create_dir_all(&dir).expect("dir");
-        let worker = build(Interrupt::default(), dir.clone(), false);
+        let worker = build(Interrupt::default(), dir.clone(), Delegation::On);
         (worker, dir)
     }
 
@@ -754,7 +722,7 @@ pub(crate) mod tests {
     fn interruptible() -> (Temp<Tried>, Interrupt) {
         let interrupt = Interrupt::default();
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let worker = build(interrupt.clone(), cwd, false);
+        let worker = build(interrupt.clone(), cwd, Delegation::On);
         (worker, interrupt)
     }
 
@@ -1204,7 +1172,7 @@ pub(crate) mod tests {
         let module = dir.join("smol_local.py");
         fs::write(&module, "value = 42\n").expect("write");
 
-        let mut worker = build(Interrupt::default(), dir.clone(), false);
+        let mut worker = build(Interrupt::default(), dir.clone(), Delegation::On);
         let code = "import argparse, pathlib, runpy, smol_local\n\
              print(smol_local.value)\n\
              _ = pathlib.Path('script.py').write_text('import sys\\nprint(sys.argv[0])')\n\
@@ -1606,18 +1574,39 @@ pub(crate) mod tests {
         assert_eq!(kept, [("fake.mixed", image)]);
     }
 
-    /// Answers each task with its text and role, and fails a task that is "fail"
-    fn answering(tasks: Vec<String>, roles: Vec<Option<String>>) -> Calling {
-        let mut results = Vec::new();
-        for (task, role) in tasks.iter().zip(roles) {
-            let role = role.map(|role| format!(" as {role}")).unwrap_or_default();
-            let result = match task.as_str() {
-                "fail" => json!({ "error": "model: http 503: busy" }),
-                task => json!({ "answer": format!("done: {task}{role}") }),
-            };
-            results.push(result);
-        }
-        let called = Called::from(Ok(Value::Array(results)));
+    /// Answers each task with its text and role and fails a task that is "fail",
+    /// or starts named tasks as agents numbered from 0 that answer with their id
+    fn answering(call: AgentCall) -> Calling {
+        let result = match call {
+            AgentCall::Ask { agents } => {
+                let mut results = Vec::new();
+                for asked in agents {
+                    let role = asked.role.map(|role| format!(" as {role}"));
+                    let role = role.unwrap_or_default();
+                    let result = match asked.task.as_str() {
+                        "fail" => json!({ "error": "model: http 503: busy" }),
+                        task => json!({ "answer": format!("done: {task}{role}") }),
+                    };
+                    results.push(result);
+                }
+                Value::Array(results)
+            }
+            AgentCall::Start { agents } => {
+                let mut handles = Vec::new();
+                for (id, asked) in agents.iter().enumerate() {
+                    let handle = json!({ "id": id, "name": asked.name, "task": asked.task, "role": asked.role });
+                    handles.push(handle);
+                }
+                Value::Array(handles)
+            }
+            AgentCall::Find { name } if name == "cafés" => {
+                json!({ "id": 7, "name": name, "task": "Count the cafés", "role": null })
+            }
+            AgentCall::Wait { id, timeout: None } => json!({ "answer": format!("done: {id}") }),
+            AgentCall::Status { id } => json!(format!("running for 1s, step 1: on {id}")),
+            AgentCall::Find { .. } | AgentCall::Wait { .. } | AgentCall::Stop { .. } => Value::Null,
+        };
+        let called = Called::from(Ok(result));
         Box::pin(async move { called })
     }
 
@@ -1658,6 +1647,75 @@ pub(crate) mod tests {
         assert_eq!(refused, expected);
     }
 
+    /// Named tasks return handles at once, whose methods ask the agent by id
+    #[test]
+    fn handles_returned() {
+        let mut worker = fresh();
+        worker.delegate = Box::new(answering);
+
+        let code =
+            "cafés, naïve = agent(['Count the cafés', 'Spell naïve'], name=['cafés', 'naïve'])\n\
+            print(cafés, naïve.name, naïve.task, naïve.role)\n\
+            print(naïve.wait(), cafés.wait(0.5), naïve.status())\n\
+            print(Agent.get('cafés')._id, Agent.get('menu'), cafés.stop())";
+        let output = worker.eval(code);
+        assert_eq!(output.error, None, "{}", output.logs);
+        let printed = "<Agent cafés> naïve Spell naïve None\n\
+            done: 1 None running for 1s, step 1: on 1\n\
+            7 None None\n";
+        assert_eq!(output.logs, printed);
+
+        let mut refused = Vec::new();
+        for code in [
+            "agent('café', name=1)",
+            "agent(['café', 'naïve'], name='cafés')",
+            "agent('café', name=' ')",
+            "agent(['café', 'naïve'], name=['cafés', 'cafés'])",
+            "agent('café', name='cafés').wait('soon')",
+            "agent('café', name='cafés').wait(-1)",
+            "Agent.get(3)",
+        ] {
+            let output = worker.eval(code);
+            let message = error(output);
+            let first = message.lines().next().unwrap_or_default().to_owned();
+            refused.push(first);
+        }
+        let expected = [
+            "TypeError: agent: name must be str or a list of str, not int",
+            "ValueError: agent: name: needs one name per task (2), not 1",
+            "ValueError: agent: name is empty",
+            "ValueError: agent: name: cafés: given twice",
+            "TypeError: Agent.wait: timeout must be a number or None, not str",
+            "ValueError: Agent.wait: timeout must be 0 or more, not -1",
+            "TypeError: Agent.get: name must be str, not int",
+        ];
+        assert_eq!(refused, expected);
+
+        let methods: Vec<&str> = worker
+            .functions()
+            .iter()
+            .filter(|function| function.name.starts_with("Agent."))
+            .map(|function| function.header.as_str())
+            .collect();
+        let listed = [
+            "Agent.get(name: str) -> Agent | None",
+            "Agent.wait(timeout: float | None = None) -> str | None",
+            "Agent.status() -> str",
+            "Agent.stop() -> None",
+        ];
+        assert_eq!(methods, listed);
+    }
+
+    /// Docs name the limit and the message the agent sets
+    #[test]
+    fn docs_shared() {
+        let output = run("help(agent)\nhelp(Agent.stop)");
+        let limit = format!("runs up to {MAX_PARALLEL_AGENTS} agents at a time");
+        assert!(output.logs.contains(&limit), "{}", output.logs);
+        let done = format!("no \"{}:\" message", prompt::DONE);
+        assert!(output.logs.contains(&done), "{}", output.logs);
+    }
+
     /// Only a session with roles lists the parameter, and without it passing one fails
     #[test]
     fn role_listed() {
@@ -1666,17 +1724,21 @@ pub(crate) mod tests {
             let found = functions.find(|function| function.name == "agent");
             found.expect("agent").header.clone()
         };
-        let plain = "agent(task: str | list[str]) -> str | list[str | RuntimeError]";
+        let plain = "agent(task: str | list[str], *, name: str | list[str] | None = None) -> str | list[str | RuntimeError] | Agent | list[Agent]";
         let mut worker = fresh();
         assert_eq!(header(&worker), plain);
         worker.delegate = Box::new(answering);
         let output = worker.eval("agent('café', role='critic')");
         let refused = format!("TypeError: {plain}: got an unexpected keyword argument 'role'");
         assert_eq!(error(output).lines().next(), Some(refused.as_str()));
+        // Nor does a second positional argument become the name
+        let output = worker.eval("agent('café', 'critic')");
+        let refused = format!("TypeError: {plain}: too many positional arguments");
+        assert_eq!(error(output).lines().next(), Some(refused.as_str()));
 
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let mut worker = build(Interrupt::default(), cwd, true);
-        let roled = "agent(task: str | list[str], role: str | list[str] | None = None) -> str | list[str | RuntimeError]";
+        let mut worker = build(Interrupt::default(), cwd, Delegation::Roles);
+        let roled ="agent(task: str | list[str], role: str | list[str] | None = None, *, name: str | list[str] | None = None) -> str | list[str | RuntimeError] | Agent | list[Agent]";
         assert_eq!(header(&worker), roled);
         worker.delegate = Box::new(answering);
         let code = "print(agent('café', role='critic'))\n\
@@ -1715,51 +1777,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// Records keep the order the `agent()` calls arrived in, which numbers their agents
-    #[test]
-    fn agents_in_order() {
-        let mut worker = fresh();
-        let finishing = |tasks: Vec<String>, _: Vec<Option<String>>| -> Calling {
-            Box::pin(async move {
-                let wait = match tasks[0].as_str() {
-                    "Count the cafés" => Duration::from_secs(1),
-                    _ => Duration::ZERO,
-                };
-                time::sleep(wait).await;
-                let helper = Helper {
-                    task: tasks[0].clone(),
-                    role: None,
-                    end: Ending::Answer("done".to_owned()),
-                    memory: AgentMemory::default(),
-                };
-                Called {
-                    result: Ok(json!([{ "answer": "done" }])),
-                    media: Vec::new(),
-                    agents: vec![helper],
-                }
-            })
-        };
-        worker.delegate = Box::new(finishing);
-
-        let code = "import threading, time\n\
-            first = threading.Thread(target=agent, args=('Count the cafés',))\n\
-            first.start()\n\
-            time.sleep(0.2)\n\
-            agent('Spell naïve')\n\
-            first.join()";
-        let output = worker.eval(code);
-        assert_eq!(output.error, None, "{}", output.logs);
-        let tasks: Vec<&str> = output.agents.iter().map(|helper| &*helper.task).collect();
-        assert_eq!(tasks, ["Count the cafés", "Spell naïve"]);
-    }
-
     /// An agent the code leaves running is stopped before its snippet's result comes back
     #[test]
     fn leftover_agents_stopped() {
         let mut worker = fresh();
         let dropped = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&dropped);
-        let endless = move |_: Vec<String>, _: Vec<Option<String>>| -> Calling {
+        let endless = move |_: AgentCall| -> Calling {
             let guard = Dropped(Arc::clone(&flag));
             Box::pin(async move {
                 let _guard = guard;
@@ -1777,27 +1801,22 @@ pub(crate) mod tests {
         assert!(dropped.load(Ordering::SeqCst));
     }
 
-    /// An interrupt doesn't drop the records of agents that are still stopping
+    /// An interrupt lets the agents the code waits for stop by themselves
     #[test]
-    fn helpers_kept() {
+    fn helpers_waited() {
         let (mut worker, interrupt) = interruptible();
         let waiting = interrupt.clone();
-        let stopping = move |tasks: Vec<String>, _: Vec<Option<String>>| -> Calling {
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&finished);
+        let stopping = move |_: AgentCall| -> Calling {
             let interrupt = waiting.clone();
+            let flag = Arc::clone(&flag);
             Box::pin(async move {
                 interrupt.wait().await;
-                let helper = Helper {
-                    task: tasks[0].clone(),
-                    role: None,
-                    end: Ending::Interrupted {},
-                    memory: AgentMemory::default(),
-                };
+                time::sleep(Duration::from_millis(200)).await;
+                flag.store(true, Ordering::SeqCst);
                 let result = json!([{ "error": prompt::STOPPED }]);
-                Called {
-                    result: Ok(result),
-                    media: Vec::new(),
-                    agents: vec![helper],
-                }
+                Called::from(Ok(result))
             })
         };
         worker.delegate = Box::new(stopping);
@@ -1805,8 +1824,7 @@ pub(crate) mod tests {
         cancel_soon(&interrupt, 0);
         let output = worker.eval("agent('Read the café menu')");
         assert_eq!(output.error, Some(CallError::Interrupted));
-        let tasks: Vec<&str> = output.agents.iter().map(|helper| &*helper.task).collect();
-        assert_eq!(tasks, ["Read the café menu"]);
+        assert!(finished.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1886,7 +1904,7 @@ pub(crate) mod tests {
 
         let servers: Vec<&Added> = worker.servers.iter().collect();
         let cwd = Path::new("/work");
-        let main = Place::Main(Vec::new());
+        let main = main_place(Vec::new());
         let text = system(&[], &servers, &[], cwd, false, &[], &main);
         let listed = "\n\n## MCP `news_web`\n\nSearches the web and the news\n\nRead-only\n\n\
                       - news_web.echo_text(the_text: str = None) -> str\n\n\
@@ -2153,7 +2171,7 @@ pub(crate) mod tests {
         }
         write_file(&dir.join("random.txt"), text.as_bytes());
         let interrupt = Interrupt::default();
-        let mut worker = build(interrupt.clone(), dir.clone(), false);
+        let mut worker = build(interrupt.clone(), dir.clone(), Delegation::On);
 
         worker.eval("noted = 1");
         cancel_soon(&interrupt, 0);

@@ -2,9 +2,7 @@ use crate::acp::rpc::{Notice, Peer};
 use crate::acp::servers::McpPool;
 use crate::acp::translator::Translator;
 use crate::acp::{rfc3339, task_of, to_value, App, QUEUED};
-use crate::agent::{
-    title_of, Agent, Asking, Event, Helpers, Place, Sink, Task, MAX_PARALLEL_AGENTS,
-};
+use crate::agent::{title_of, Agent, Asking, Event, Helpers, Nudging, Place, Sink, Task};
 use crate::config::{self, Access, McpConfig, Models};
 use crate::history::{Lock, SessionMeta, Settings};
 use crate::memory::{AgentMemory, Exit, MemoryStep};
@@ -12,6 +10,7 @@ use crate::spawn::{spawn_shell, Group};
 use crate::utils::Interrupt;
 use crate::worker::host::Worker;
 use crate::worker::sandbox::Sandbox;
+use crate::worker::Delegation;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     ContentBlock, LoadSessionResponse, NewSessionResponse, PromptResponse, SessionConfigOption,
@@ -29,7 +28,7 @@ use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot::{self, error::TryRecvError};
-use tokio::sync::Semaphore;
+use tokio::sync::Notify;
 use tokio::task::{self, AbortHandle, JoinHandle};
 use tokio::time;
 use tracing::{error, info, warn};
@@ -72,6 +71,7 @@ pub(crate) struct Opening {
     pub(crate) access: Access,
     pub(crate) app: Arc<App>,
     pub(crate) interrupt: Interrupt,
+    pub(crate) enqueued: Arc<Notify>,
     /// Only `Router` holds the sender, and dropping it closes the session
     pub(crate) inbox: UnboundedReceiver<Message>,
 }
@@ -104,6 +104,7 @@ struct Keeper {
     titling: Option<(oneshot::Receiver<Option<String>>, AbortHandle)>,
     unsaved: Unsaved,
     translator: Translator,
+    enqueued: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -142,6 +143,7 @@ async fn start(opening: Opening) -> Result<Session> {
         access,
         app,
         interrupt,
+        enqueued,
         inbox,
     } = opening;
     let peer = &app.peer;
@@ -221,8 +223,11 @@ async fn start(opening: Opening) -> Result<Session> {
     let sandbox = Arc::new(sandbox);
     // No restart notice again when no code has run since the last restart
     let ran = memory.ran_code();
-    let has_roles = !roles.is_empty();
-    let worker = Worker::new(&interrupt, Arc::clone(&sandbox), &[], has_roles, ran).await?;
+    let delegation = match roles.is_empty() {
+        true => Delegation::On,
+        false => Delegation::Roles,
+    };
+    let worker = Worker::new(&interrupt, Arc::clone(&sandbox), &[], delegation, ran).await?;
 
     let response = match loading {
         true => {
@@ -262,8 +267,10 @@ async fn start(opening: Opening) -> Result<Session> {
         copies,
         interrupt: interrupt.clone(),
         sandbox,
-        slots: Arc::new(Semaphore::new(MAX_PARALLEL_AGENTS)),
-        place: Place::Main(roles),
+        place: Place::Main {
+            roles,
+            team: Arc::default(),
+        },
     };
     let keeper = Keeper {
         meta,
@@ -271,6 +278,7 @@ async fn start(opening: Opening) -> Result<Session> {
         titling: None,
         unsaved: Unsaved::default(),
         translator,
+        enqueued,
     };
 
     Ok(Session {
@@ -561,6 +569,10 @@ impl Sink for Keeper {
             }
             tasks
         })
+    }
+
+    fn enqueued(&mut self) -> Nudging<'_> {
+        Box::pin(self.enqueued.notified())
     }
 }
 
@@ -1217,9 +1229,10 @@ mod tests {
         assert_eq!(notices, [skipped]);
         let prompts = prompts.lock().expect("prompts");
         let prompt = &prompts[0];
-        let header = "- agent(task: str | list[str], role: str | list[str] | None = None) -> ";
+        let header =
+            "- agent(task: str | list[str], role: str | list[str] | None = None, *, name: ";
         assert!(prompt.contains(header), "{prompt}");
-        let listed = "with one name per task:\n\n- `reviewer`: Reviews the café's code\n\n";
+        let listed = "with one role per task:\n\n- `reviewer`: Reviews the café's code\n\n";
         assert!(prompt.contains(listed), "{prompt}");
         fs::remove_dir_all(&dir).ok();
     }

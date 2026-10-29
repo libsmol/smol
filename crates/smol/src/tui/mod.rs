@@ -28,7 +28,7 @@ const POLL_EVERY: Duration = Duration::from_millis(30);
 /// Keys buffered after this long without reading events may have been typed during a stall
 const STALL_WAIT: Duration = Duration::from_millis(200);
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const SPIN_EVERY: Duration = Duration::from_millis(80);
+pub(crate) const SPIN_EVERY: Duration = Duration::from_millis(80);
 
 /// Terminals draw DIM differently and some ignore it entirely
 pub(crate) const DIM: Style = Style::new().fg(theme::COMMENT);
@@ -46,8 +46,8 @@ pub(crate) fn spinner(since: Instant) -> char {
     SPINNER[frames as usize % SPINNER.len()]
 }
 
-/// Cuts with … or pads with spaces to exactly `width` columns
-pub(crate) fn fitted(text: &str, width: usize) -> String {
+/// Cuts with … to at most `width` columns
+pub(crate) fn clipped(text: &str, width: usize) -> String {
     let long = text.width() > width;
     let room = match long {
         true => width.saturating_sub(1),
@@ -67,10 +67,14 @@ pub(crate) fn fitted(text: &str, width: usize) -> String {
 
     if long && width > 0 {
         kept.push('…');
-        used += 1;
     }
+    kept
+}
 
-    let gap = width.saturating_sub(used);
+/// Cuts with … or pads with spaces to exactly `width` columns
+pub(crate) fn fitted(text: &str, width: usize) -> String {
+    let kept = clipped(text, width);
+    let gap = width.saturating_sub(kept.width());
     let padding = " ".repeat(gap);
     kept + &padding
 }
@@ -191,8 +195,9 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use crate::tests::fake;
-    use crate::tui::transcript::Entry;
+    use crate::tui::transcript::{Entry, Helper};
     use crate::tui::*;
+    use agent_client_protocol_schema::v1::ToolCallStatus;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -213,6 +218,23 @@ mod tests {
         for line in 0..lines {
             let text = format!("line {line}");
             app.transcript.push(Entry::Info(text));
+        }
+    }
+
+    pub(crate) fn helper(title: &str, status: ToolCallStatus, text: &str) -> Helper {
+        Helper {
+            id: "call_1.1".to_owned(),
+            title: title.to_owned(),
+            role: None,
+            name: None,
+            status,
+            text: text.to_owned(),
+            preview: String::new(),
+            interrupted: false,
+            started: None,
+            color: theme::HELPERS[0],
+            tokens: None,
+            totals: None,
         }
     }
 

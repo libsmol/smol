@@ -18,7 +18,7 @@ const META_PREFIX: &[u8; 8] = br#"{"meta":"#;
 pub(crate) const MAX_TITLE_CHARS: usize = 50;
 /// Bump it whenever the saved session format changes,
 /// as sessions in any other format are neither listed nor opened
-const FORMAT: u32 = 7;
+const FORMAT: u32 = 8;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionMeta {

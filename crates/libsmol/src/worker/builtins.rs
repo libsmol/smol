@@ -4,13 +4,13 @@ use crate::tools::files::{grep, ls};
 use crate::tools::web::fetch;
 use crate::tools::ToolError;
 use crate::utils::block_on;
-use crate::worker::{request, send, Message, WorkerCall, WorkerNote};
+use crate::worker::{request, send, AgentCall, Message, WorkerCall, WorkerNote};
 use reaper::described;
 use rustpython_host_env::os::ErrorExt;
 use rustpython_vm::builtins::{PyBaseExceptionRef, PyDictRef, PyListRef, PyStrRef};
 use rustpython_vm::{py_serde, AsObject, PyObjectRef, PyResult, VirtualMachine};
 use serde_json::value::Serializer;
-use serde_json::Map;
+use serde_json::{json, Map};
 use std::env;
 use std::fmt::Display;
 use std::future::Future;
@@ -93,8 +93,12 @@ pub(crate) fn builtins(vm: &VirtualMachine, copies: PathBuf) -> [(&'static str, 
             asked(vm, call)
         };
 
-    let delegate = |tasks: Vec<String>, roles: Vec<Option<String>>, vm: &VirtualMachine| {
-        asked(vm, WorkerCall::Agent { tasks, roles })
+    let delegate = |method: String, params: PyObjectRef, vm: &VirtualMachine| {
+        let invalid = |e| value_error(vm, e);
+        let params = py_serde::serialize(vm, &params, Serializer).map_err(invalid)?;
+        let call = json!({ "method": method, "params": params });
+        let call: AgentCall = serde_json::from_value(call).map_err(invalid)?;
+        asked(vm, WorkerCall::Agent(call))
     };
 
     // No code has run yet at startup and this is still the session directory
@@ -131,7 +135,6 @@ pub(crate) fn builtins(vm: &VirtualMachine, copies: PathBuf) -> [(&'static str, 
     ]
 }
 
-/// Sends the call to the agent and turns the JSON it answers with into Python values
 fn asked(vm: &VirtualMachine, call: WorkerCall) -> PyResult {
     let calling = request(call);
     let result = wait(vm, calling)?;

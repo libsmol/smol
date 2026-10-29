@@ -1,3 +1,4 @@
+use crate::agent::delegate::Records;
 use crate::agent::{generate, retry, Event, Turn, MAX_RETRIES};
 use crate::memory::{
     estimate, text_bytes, AgentStep, Call, CallError, CodeResult, StepError, MAX_OBSERVATION_CHARS,
@@ -141,7 +142,8 @@ impl Turn<'_> {
             self.sink.event(Event::Execute(index));
 
             let views = self.sink.helpers(index);
-            let mut delegate = self.agent.delegate(self.servers, views);
+            let records = Records::default();
+            let mut delegate = self.agent.delegate(self.servers, views, &records);
             let code = &step.calls[index].code;
             let mut shown = |output: &str| self.sink.event(Event::Output(output));
             let evaluating = self
@@ -149,6 +151,8 @@ impl Turn<'_> {
                 .evaluate(code, self.servers, &mut shown, &mut *delegate);
             let evaluated = evaluating.await;
             step.usage.duration += started.elapsed().as_secs_f64();
+            // Every call that could still change them has ended with the code
+            let agents = mem::take(&mut *records.lock().expect("records"));
 
             let call = &mut step.calls[index];
             match evaluated {
@@ -181,7 +185,7 @@ impl Turn<'_> {
                     call.result = Some(CodeResult {
                         printed,
                         media: output.media,
-                        agents: output.agents,
+                        agents,
                     });
                     call.error = error;
 

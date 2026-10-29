@@ -1,4 +1,6 @@
+use crate::agent::MAX_PARALLEL_AGENTS;
 use crate::model::Media;
+use crate::prompt;
 use crate::tools::ToolError;
 use crate::utils::{Reply, Waiting};
 use crate::worker::builtins::{builtins, value_error};
@@ -36,8 +38,8 @@ pub const WORKER_ARG: &str = "--worker";
 /// Holds the `address/token` the agent listens on
 pub(crate) const CONTROL_ENV: &str = "SMOL_CONTROL";
 pub(crate) const COPIES_ENV: &str = "SMOL_COPIES";
-/// Set when the session has roles for `agent()`
-pub(crate) const ROLES_ENV: &str = "SMOL_ROLES";
+/// Holds `on`, or `roles` when `agent()` takes a role, and is unset for workers without `agent()`
+pub(crate) const AGENTS_ENV: &str = "SMOL_AGENTS";
 pub(crate) const END: &[u8] = b"\x02smol\x03end\n";
 
 /// They must share one file name, which `_run` uses to drop them from tracebacks
@@ -125,12 +127,54 @@ pub(crate) enum WorkerCall {
         args: Map<String, Value>,
         called: String,
     },
-    /// Answered with one `{"answer"}` or `{"error"}` object per task, in order
-    Agent {
-        tasks: Vec<String>,
-        /// One for each task
-        roles: Vec<Option<String>>,
+    #[serde(untagged)]
+    Agent(AgentCall),
+}
+
+/// A call to `agent()` or to a handle it returned, where a handle is `{"id", "name", "task", "role"}`
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params", rename_all = "snake_case")]
+pub(crate) enum AgentCall {
+    /// Answered with `{"answer"}` or `{"error"}` for each agent, in order, once all have ended
+    Ask {
+        agents: Vec<Asked>,
     },
+    /// Answered at once with the handle of each agent, which runs in the background
+    Start {
+        agents: Vec<Asked>,
+    },
+    /// Answered with the handle of the agent last started with the name, or null
+    Find {
+        name: String,
+    },
+    /// Answered with `{"answer"}` or `{"error"}` once it ends, or null after `timeout` seconds
+    Wait {
+        id: usize,
+        timeout: Option<f64>,
+    },
+    Status {
+        id: usize,
+    },
+    /// Answered once it has stopped
+    Stop {
+        id: usize,
+    },
+}
+
+/// An agent for `agent()` to start
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Asked {
+    pub(crate) task: String,
+    pub(crate) role: Option<String>,
+    pub(crate) name: Option<String>,
+}
+
+/// Which `agent()` a worker offers
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Delegation {
+    Off,
+    On,
+    Roles,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -153,11 +197,11 @@ pub fn serve() -> Result<()> {
     let control = env::var(CONTROL_ENV).unwrap_or_default();
     let copies = env::var_os(COPIES_ENV).unwrap_or_default();
     let copies = PathBuf::from(copies);
-    let roles = env::var_os(ROLES_ENV).is_some();
+    let agents = env::var(AGENTS_ENV).unwrap_or_default();
     // Programs the code starts would inherit these, and they must go before any thread starts
     env::remove_var(CONTROL_ENV);
     env::remove_var(COPIES_ENV);
-    env::remove_var(ROLES_ENV);
+    env::remove_var(AGENTS_ENV);
 
     let Some((address, token)) = control.split_once('/') else {
         let message = format!("worker: {CONTROL_ENV}: not set by the agent");
@@ -178,7 +222,7 @@ pub fn serve() -> Result<()> {
     // RustPython calls are stack-hungry and the default stack overflows a few thousand levels deep
     let builder = thread::Builder::new().stack_size(PYTHON_STACK_BYTES);
     let running = builder.spawn(move || -> Result<()> {
-        let python = Python::start(copies, roles);
+        let python = Python::start(copies, agents);
         // SAFETY: Only reads the current thread's id
         #[cfg(unix)]
         let main = unsafe { libc::pthread_self() };
@@ -332,7 +376,7 @@ struct Python {
 }
 
 impl Python {
-    fn start(copies: PathBuf, roles: bool) -> Self {
+    fn start(copies: PathBuf, agents: String) -> Self {
         let crypto = CryptoExt {
             all_cipher_suites: Some(aws_lc_rs::ALL_CIPHER_SUITES),
             default_cipher_suites: Some(aws_lc_rs::DEFAULT_CIPHER_SUITES),
@@ -358,15 +402,20 @@ impl Python {
 
         let bootstrap = interpreter.enter(|vm| {
             let tools = builtins(vm, copies);
+            let agents = vm.ctx.new_str(agents);
+            let cap = vm.ctx.new_int(MAX_PARALLEL_AGENTS);
+            let done = vm.ctx.new_str(prompt::DONE);
+            let shared = [
+                ("_AGENTS", agents.into()),
+                ("_MAX_AGENTS", cap.into()),
+                ("_DONE", done.into()),
+            ];
 
             let scope = vm.new_scope_with_builtins();
-            for (name, value) in tools {
+            for (name, value) in tools.into_iter().chain(shared) {
                 let set = scope.globals.set_item(name, value, vm);
                 set.expect("set global");
             }
-            let roles = vm.ctx.new_bool(roles);
-            let set = scope.globals.set_item("_ROLES", roles.into(), vm);
-            set.expect("set global");
 
             for source in BOOTSTRAP {
                 let ran = vm.run_string(scope.clone(), source, "<libsmol_bootstrap>");

@@ -22,10 +22,12 @@ mod translator;
 const NOTICE: &str = "_smol/notice";
 const MCP: &str = "_smol/mcp";
 const QUEUED: &str = "_smol/queued";
+/// Sent by a client that declared `_smol/queued` when it queues a message during a turn
+const ENQUEUED: &str = "_smol/enqueued";
 const UPDATE: &str = "_smol/update";
 /// Replied to like a prompt, and the tool calls it opens carry the same marker in `_meta`
 const SHELL: &str = "_smol/shell";
-/// Marks the tool calls of agents the code starts, whose usage counts apart from the session's
+/// Marks the tool calls that open agents the code starts, whose `rawInput` is what they were given
 const AGENT: &str = "_smol/agent";
 
 pub(crate) struct App {

@@ -1,8 +1,8 @@
-use crate::agent::Place;
+use crate::agent::{Place, Status};
 use crate::config::{Role, Skill};
 use crate::memory::{
-    exit_code, AgentStep, Call, CallError, Exit, MemoryStep, ShellStep, StepError, TaskStep,
-    MAX_OBSERVATION_CHARS,
+    exit_code, AgentStep, Call, CallError, Ending, Exit, MemoryStep, ShellStep, StepError,
+    TaskStep, MAX_OBSERVATION_CHARS,
 };
 use crate::model::{Media, Part};
 use crate::utils::truncated;
@@ -22,19 +22,67 @@ const RULES: &str = "- Never make up data or functions; check unfamiliar ones wi
 - Do the task instead of describing it.
 - Report only results you obtained, and state what failed or is uncertain.";
 
-const ANSWER_USER: &str = "Answer: reply in Markdown without a tool call. This ends the task. Answer as soon as you have the result; if no code is needed, answer immediately.";
+const ANSWER: &str = "without a tool call. This ends the task. Answer as soon as you have the result; if no code is needed, answer immediately.";
 const UPDATES: &str = "The user may send a \"Task update:\" while you work; it adds to or changes the current task. Text you write in a reply that runs code is shown to the user.";
-const HAND_OFF: &str = "\n- Pass independent parts of a task to agent() as a list to run them in parallel. Also give agent() long side work where only the result matters, so its steps stay out of this conversation.";
-const ANSWER_AGENT: &str = "Answer: reply without a tool call. This ends the task. Answer as soon as you have the result; if no code is needed, answer immediately.";
 const HANDED_BACK: &str = "Only your answer is returned to the agent that assigned this task, so include everything the task asks for.";
-pub(crate) const NESTED: &str = "agent: not available to agents started by agent()";
+/// Errors of `agent()` and its handles go unlabeled, as the worker labels them with the function
+/// the code called
+pub(crate) const NESTED: &str = "not available to agents started by agent()";
+pub(crate) const NO_AGENT: &str = "no such agent";
 /// Also what the user sees for an agent that is aborted before it ends
 pub(crate) const UNFINISHED: &str = "stopped before it answered";
+pub(crate) const STOPPED_BY_CODE: &str = "stopped by stop()";
+/// The worker puts it in the docs of `Agent.wait` and `Agent.stop`
+pub(crate) const DONE: &str = "Agent done";
 
 pub(crate) fn unknown_role(name: &str, roles: &[Role]) -> String {
     let names: Vec<&str> = roles.iter().map(|role| role.name.as_str()).collect();
     let names = names.join(", ");
-    format!("agent: role: {name}: unknown (roles: {names})")
+    format!("role: {name}: unknown (roles: {names})")
+}
+
+pub(crate) fn name_running(name: &str) -> String {
+    format!("name: {name}: already running")
+}
+
+/// What `Agent.status()` returns
+pub(crate) fn agent_status(status: &Status, end: &Ending) -> String {
+    match end {
+        Ending::Answer(_) => return "answered".to_owned(),
+        Ending::Error(error) => return format!("failed: {error}"),
+        Ending::Interrupted {} => return STOPPED.to_owned(),
+        Ending::Stopped {} => return STOPPED_BY_CODE.to_owned(),
+        Ending::Unfinished {} => return UNFINISHED.to_owned(),
+        Ending::Running {} => {}
+    }
+
+    let Some(since) = status.since else {
+        return "waiting for a free slot".to_owned();
+    };
+    let seconds = since.elapsed().as_secs();
+    let step = status.steps + 1;
+    let running = format!("running for {seconds}s, step {step}: {}", status.doing);
+    match status.preview.is_empty() {
+        true => running,
+        false => format!("{running}\n{}", status.preview),
+    }
+}
+
+/// What an agent started by `agent()` is doing, which the user sees as well
+pub(crate) const STARTING: &str = "starting";
+pub(crate) const THINKING: &str = "thinking";
+pub(crate) const WRITING: &str = "writing";
+pub(crate) const RUNNING: &str = "running";
+pub(crate) const COMPACTING: &str = "compacting";
+pub(crate) const PYTHON_RESTARTED: &str = "python restarted";
+
+pub(crate) fn retrying(reason: &str) -> String {
+    format!("retrying: {reason}")
+}
+
+pub(crate) fn done(agents: &[String]) -> String {
+    let names = agents.join("\n");
+    format!("{DONE}:\n{names}")
 }
 
 /// None leaves view() out of the prompt
@@ -107,9 +155,15 @@ pub(crate) fn system(
         }
     };
 
-    let (answer, note, hand_off, roles) = match place {
-        Place::Main(roles) => (ANSWER_USER, UPDATES, HAND_OFF, roles.as_slice()),
-        Place::Delegated(_) => (ANSWER_AGENT, HANDED_BACK, "", &[][..]),
+    let (reply, note, hand_off, roles) = match place {
+        Place::Main { roles, .. } => {
+            let hand_off = format!("\n\nagent() gives a task to a new agent:
+- Pass independent parts of a task as a list to run them in parallel.
+- Give it long side work where only the result matters, so its steps stay out of this conversation.
+- With a name, it runs in the background: the task goes on after your answer until it ends, and an \"{DONE}:\" message tells you when.");
+            ("reply in Markdown", UPDATES, hand_off, roles.as_slice())
+        }
+        Place::Delegated(_) => ("reply", HANDED_BACK, String::new(), &[][..]),
     };
     let mut entries = Vec::new();
     for role in roles {
@@ -120,7 +174,7 @@ pub(crate) fn system(
         true => String::new(),
         false => {
             let entries = entries.join("\n");
-            format!("\n\n# Agents\n\nTo give a task to an agent in one of these roles, call agent(task, role=name). For a list of tasks, role is one name for all of them or a list with one name per task:\n\n{entries}")
+            format!("\n\n# Agents\n\nTo give a task to an agent in one of these roles, call agent(task, role=role). For a list of tasks, role is one role for all of them or a list with one role per task:\n\n{entries}")
         }
     };
     let role = match place.role() {
@@ -154,18 +208,18 @@ pub(crate) fn system(
     format!(
         "You complete tasks by running Python code with the {TOOL} tool. Each reply does one of two things:
 - Run code: call {TOOL}. A reply may contain several calls; they run in order, and once one fails, the rest are skipped.
-- {answer}
+- Answer: {reply} {ANSWER}
 
-{note}{role}
+{note}{hand_off}{role}
 
 # Running code
 
 All calls share one Python session: variables, functions and imports persist across calls.
 
-A call returns what its code printed, plus the value of every top-level expression that is not None (strings verbatim, other values as repr). Output longer than {MAX_OBSERVATION_CHARS} characters is cut in the middle. If the code fails, the result ends with \"Error:\" followed by the exception and the line that raised it.
+A call returns what its code printed, plus the value of every top-level expression that is not None (strings verbatim, other values as repr). Output longer than {MAX_OBSERVATION_CHARS} characters is cut in the middle; this cut does not change the values in your variables. If the code fails, the result ends with \"Error:\" followed by the exception and the line that raised it.
 
 Write each call as a complete program:
-- Do as much as possible with loops, conditions, the standard library and the functions below.{hand_off}
+- Do as much as possible with loops, conditions, the standard library and the functions below.
 - Print only what you need to see.
 - Reuse the data, functions and imports the session already holds; reload data only if its source changed.
 - Put code you will run again in a function.
@@ -560,6 +614,12 @@ pub(crate) fn transcript(steps: &[&MemoryStep], max: usize) -> String {
                 entries.push(entry);
                 continue;
             }
+            MemoryStep::Done { agents } => {
+                let names = agents.join(", ");
+                let entry = format!("[{DONE}]: {names}");
+                entries.push(entry);
+                continue;
+            }
             MemoryStep::Summary(_) | MemoryStep::Restarted => continue,
         };
 
@@ -614,6 +674,7 @@ pub(crate) fn summary(transcript: &str, previous: Option<&str>, trailing: bool) 
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::tests::main_place;
     use crate::agent::Place;
     use crate::config::{Role, Skill};
     use crate::memory::{
@@ -636,7 +697,7 @@ mod tests {
         }];
         let cwd = Path::new("/home/zoë/work");
 
-        let main = Place::Main(Vec::new());
+        let main = main_place(Vec::new());
         let text = system(&[], &[], &skills, cwd, false, &instructions, &main);
         let place =
             ") in /home/zoë/work; the files and programs a task mentions are there.\n- Today";
@@ -676,10 +737,11 @@ mod tests {
         let roles = vec![reviewer.clone(), role("tester", "Writes naïve tests")];
         let cwd = Path::new("/home/zoë/work");
 
-        let main = system(&[], &[], &[], cwd, false, &[], &Place::Main(roles));
+        let place = main_place(roles);
+        let main = system(&[], &[], &[], cwd, false, &[], &place);
         let listed = "\n\n# Agents\n\n\
-                      To give a task to an agent in one of these roles, call agent(task, role=name). \
-                      For a list of tasks, role is one name for all of them or a list with one name per task:\n\n\
+                      To give a task to an agent in one of these roles, call agent(task, role=role). \
+                      For a list of tasks, role is one role for all of them or a list with one role per task:\n\n\
                       - `reviewer`: Reviews the café's code\n\
                       - `tester`: Writes naïve tests\n\n# Rules\n\n";
         assert!(main.contains(listed), "{main}");

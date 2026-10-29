@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::select;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 use tokio::{task, time};
 use tracing::{info, warn};
 
@@ -28,10 +28,11 @@ mod compact;
 mod delegate;
 mod step;
 
+use crate::agent::delegate::Team;
+
 pub(crate) use crate::agent::delegate::MAX_PARALLEL_AGENTS;
 
 const VIEW: &str = "view";
-const AGENT: &str = "agent";
 const MAX_NAMING_CHARS: usize = 2000;
 const MAX_RETRIES: u32 = 3;
 const RETRY_WAIT: Duration = match cfg!(test) {
@@ -63,6 +64,7 @@ pub(crate) enum Event<'a> {
 }
 
 pub(crate) type Asking<'a> = Pin<Box<dyn Future<Output = Vec<Task>> + Send + 'a>>;
+pub(crate) type Nudging<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 pub(crate) trait Sink: Send {
     fn event(&mut self, event: Event);
@@ -73,41 +75,50 @@ pub(crate) trait Sink: Send {
     /// The returned messages are already taken off the client's queue
     fn queued(&mut self) -> Asking<'_>;
 
+    /// Resolves once the client has queued a message for `queued` to return
+    fn enqueued(&mut self) -> Nudging<'_>;
+
     /// Shows the agents that the code of the call at `index` starts
-    fn helpers(&mut self, _index: usize) -> Box<dyn Helpers> {
-        Box::new(Unseen)
-    }
+    fn helpers(&mut self, index: usize) -> Box<dyn Helpers>;
 }
 
-/// Helpers are numbered from 1 within the call that starts them
+/// Helpers are numbered from 1 within the call that starts them,
+/// and each opens with the record it keeps until it ends
 pub(crate) trait Helpers: Send + Sync {
-    fn open(&self, number: usize, task: &str, role: Option<&str>) -> Box<dyn HelperView>;
+    fn open(&self, number: usize, helper: &Helper) -> Box<dyn HelperView>;
 }
 
-/// A helper is saved with the call that started it, so its view saves nothing
-pub(crate) trait HelperView: Sink {
+pub(crate) trait HelperView: Send {
+    fn shown(&mut self, status: &Status);
+
     fn close(&mut self, helper: &Helper);
+}
+
+/// What an agent started by `agent()` is doing now,
+/// and the end of what it is writing or printing for that
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Status {
+    pub(crate) doing: String,
+    pub(crate) preview: String,
+    /// Steps it has finished
+    pub(crate) steps: usize,
+    /// What the requests of those steps and of compaction cost
+    pub(crate) usage: Usage,
+    /// When it got a slot to run in
+    pub(crate) since: Option<Instant>,
 }
 
 pub(crate) struct Unseen;
 
 impl Helpers for Unseen {
-    fn open(&self, _: usize, _: &str, _: Option<&str>) -> Box<dyn HelperView> {
+    fn open(&self, _: usize, _: &Helper) -> Box<dyn HelperView> {
         Box::new(Unseen)
     }
 }
 
-impl Sink for Unseen {
-    fn event(&mut self, _: Event) {}
-
-    fn saved(&mut self, _: &AgentMemory) {}
-
-    fn queued(&mut self) -> Asking<'_> {
-        Box::pin(async { Vec::new() })
-    }
-}
-
 impl HelperView for Unseen {
+    fn shown(&mut self, _: &Status) {}
+
     fn close(&mut self, _: &Helper) {}
 }
 
@@ -156,6 +167,10 @@ impl Sink for Logged<'_> {
         self.0.queued()
     }
 
+    fn enqueued(&mut self) -> Nudging<'_> {
+        self.0.enqueued()
+    }
+
     fn helpers(&mut self, index: usize) -> Box<dyn Helpers> {
         self.0.helpers(index)
     }
@@ -184,15 +199,14 @@ pub(crate) struct Agent {
     pub(crate) interrupt: Interrupt,
     /// Every worker of the session uses it
     pub(crate) sandbox: Arc<Sandbox>,
-    /// Shared by all agents the session's code starts
-    pub(crate) slots: Arc<Semaphore>,
     pub(crate) place: Place,
 }
 
 #[derive(Clone)]
 pub(crate) enum Place {
     /// The session's own agent, with the roles `agent()` can give tasks to
-    Main(Vec<Role>),
+    /// and the agents its code started in the background
+    Main { roles: Vec<Role>, team: Arc<Team> },
     /// Started by `agent()`, which it can't call itself
     Delegated(Option<Role>),
 }
@@ -201,8 +215,15 @@ impl Place {
     /// The one it plays, which the session's own agent never has
     pub(crate) fn role(&self) -> Option<&Role> {
         match self {
-            Place::Main(_) => None,
+            Place::Main { .. } => None,
             Place::Delegated(role) => role.as_ref(),
+        }
+    }
+
+    pub(crate) fn team(&self) -> Option<&Arc<Team>> {
+        match self {
+            Place::Main { team, .. } => Some(team),
+            Place::Delegated(_) => None,
         }
     }
 }
@@ -228,12 +249,8 @@ impl Agent {
     ) -> Result<Option<String>> {
         let image = self.model.takes(MediaKind::Image);
         let video = self.model.takes(MediaKind::Video);
-        let delegated = matches!(self.place, Place::Delegated(_));
         let mut functions = Vec::new();
         for function in worker.functions() {
-            if delegated && function.name == AGENT {
-                continue;
-            }
             let mut function = function.clone();
             if function.name == VIEW {
                 let Some(summary) = prompt::view_summary(image, video) else {
@@ -262,7 +279,10 @@ impl Agent {
             system,
             sink: &mut logged,
         };
-        turn.run(task).await
+        let ran = turn.run(task).await;
+        // However the turn ends, no agent its code started in the background keeps running
+        turn.stopped().await;
+        ran
     }
 
     /// Reading files and copying images and videos stays off the async runtime
@@ -360,19 +380,38 @@ impl Turn<'_> {
             self.sink.event(Event::StepEnd(step));
             self.sink.saved(self.memory);
 
-            // An interrupt that arrives after the answer still ends the turn as interrupted
-            if self.agent.interrupt.triggered() {
-                return Ok(None);
-            }
-            if answer.is_some() {
-                return Ok(answer);
-            }
+            // An answer ends the turn only once no agent started in the background runs
+            let (updates, done) = loop {
+                // An interrupt that arrives after the answer still ends the turn as interrupted
+                if self.agent.interrupt.triggered() {
+                    return Ok(None);
+                }
+                // Read before collecting, so an agent that ends in between is still collected
+                let team = self.agent.place.team();
+                let running = team.is_some_and(|team| team.running());
+                let done = self.ended();
+                if answer.is_none() || !done.is_empty() {
+                    let updates = self.queued().await;
+                    break (updates, done);
+                }
+                if !running {
+                    return Ok(answer);
+                }
 
-            let updates = self.queued().await;
-            let received = !updates.is_empty();
+                let updates = self.news().await;
+                if !updates.is_empty() {
+                    break (updates, done);
+                }
+            };
+
+            let received = !updates.is_empty() || !done.is_empty();
             for update in updates {
                 let update = self.agent.attached(update).await;
                 self.memory.steps.push(MemoryStep::Update(update));
+            }
+            if !done.is_empty() {
+                let ended = MemoryStep::Done { agents: done };
+                self.memory.steps.push(ended);
             }
             if received {
                 self.sink.saved(self.memory);
@@ -555,7 +594,8 @@ pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::agent::{
-        title_of, Agent, Asking, Event, Place, Sink, Task, Turn, MAX_PARALLEL_AGENTS, RETRY_WAIT,
+        title_of, Agent, Asking, Event, Helpers, Nudging, Place, Sink, Task, Turn, Unseen,
+        RETRY_WAIT,
     };
     use crate::config::Role;
     use crate::history::MAX_TITLE_CHARS;
@@ -571,14 +611,15 @@ pub(crate) mod tests {
     use crate::worker::host::tests::no_agents;
     use crate::worker::host::Worker;
     use crate::worker::sandbox::tests::opened;
+    use crate::worker::Delegation;
     use crate::Result;
     use std::collections::VecDeque;
     use std::fs;
+    use std::future;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::sync::Semaphore;
-    use tokio::task;
+    use tokio::{task, time};
 
     /// Tool name and raw arguments of a call with no readable code
     pub(crate) type Unreadable = (&'static str, &'static str);
@@ -710,6 +751,8 @@ pub(crate) mod tests {
     pub(crate) struct Probe {
         events: Box<dyn FnMut(Event) + Send>,
         pub(crate) updates: Box<dyn FnMut() -> Vec<Task> + Send>,
+        /// How long until the client says once that it queued a message
+        pub(crate) nudge: Option<Duration>,
         /// Step count at each save
         pub(crate) saves: Vec<usize>,
     }
@@ -726,6 +769,17 @@ pub(crate) mod tests {
         fn queued(&mut self) -> Asking<'_> {
             let updates = (self.updates)();
             Box::pin(async move { updates })
+        }
+
+        fn enqueued(&mut self) -> Nudging<'_> {
+            match self.nudge.take() {
+                Some(wait) => Box::pin(time::sleep(wait)),
+                None => Box::pin(future::pending()),
+            }
+        }
+
+        fn helpers(&mut self, _: usize) -> Box<dyn Helpers> {
+            Box::new(Unseen)
         }
     }
 
@@ -782,6 +836,13 @@ pub(crate) mod tests {
         with_roles(model, events, Vec::new())
     }
 
+    pub(crate) fn main_place(roles: Vec<Role>) -> Place {
+        Place::Main {
+            roles,
+            team: Arc::default(),
+        }
+    }
+
     pub(crate) fn with_roles(
         model: impl Model + 'static,
         events: Box<dyn FnMut(Event) + Send>,
@@ -792,9 +853,12 @@ pub(crate) mod tests {
         let dir = temp_dir("session");
         let copies = dir.join("copies");
         let sandbox = Arc::new(opened(&cwd, &copies));
-        let has_roles = !roles.is_empty();
+        let delegation = match roles.is_empty() {
+            true => Delegation::On,
+            false => Delegation::Roles,
+        };
         let restarted = false;
-        let starting = Worker::new(&interrupt, Arc::clone(&sandbox), &[], has_roles, restarted);
+        let starting = Worker::new(&interrupt, Arc::clone(&sandbox), &[], delegation, restarted);
         let worker = block_on(starting).expect("worker");
 
         let agent = Agent {
@@ -805,12 +869,12 @@ pub(crate) mod tests {
             copies,
             interrupt,
             sandbox,
-            slots: Arc::new(Semaphore::new(MAX_PARALLEL_AGENTS)),
-            place: Place::Main(roles),
+            place: main_place(roles),
         };
         let probe = Probe {
             events,
             updates: Box::new(Vec::new),
+            nudge: None,
             saves: Vec::new(),
         };
         let value = Tested {

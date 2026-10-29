@@ -34,6 +34,7 @@ use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_
 
 const EXITED: &str = "agent: exited";
 const QUEUED: &str = "_smol/queued";
+const ENQUEUED: &str = "_smol/enqueued";
 const NOTICE: &str = "_smol/notice";
 const MCP: &str = "_smol/mcp";
 pub(crate) const UPDATE: &str = "_smol/update";
@@ -188,6 +189,11 @@ impl Connection {
 
     fn post(&self, id: u64, method: &str, params: impl Serialize) {
         let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.send(message);
+    }
+
+    fn notify(&self, method: &str, params: impl Serialize) {
+        let message = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         self.send(message);
     }
 
@@ -593,8 +599,13 @@ impl Client {
         let method = AGENT_METHOD_NAMES.session_cancel;
         let session = session.to_owned();
         let params = CancelNotification::new(session);
-        let message = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        self.connection.send(message);
+        self.connection.notify(method, params);
+    }
+
+    /// Tells the agent that a message is queued for the running turn, which it then asks for
+    pub(crate) fn enqueued(&self, session: &str) {
+        let params = json!({ "sessionId": session });
+        self.connection.notify(ENQUEUED, params);
     }
 }
 

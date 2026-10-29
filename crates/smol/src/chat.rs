@@ -259,6 +259,10 @@ impl Session {
         self.client.prompt(&self.id, blocks);
     }
 
+    pub(crate) fn enqueued(&self) {
+        self.client.enqueued(&self.id);
+    }
+
     pub(crate) fn blocks(&self, text: &str) -> Vec<ContentBlock> {
         let cwd = &self.client.cwd;
         let exists = |path: &str| {

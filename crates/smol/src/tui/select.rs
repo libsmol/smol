@@ -220,6 +220,7 @@ pub(crate) fn copy(text: &str) {
 #[cfg(test)]
 mod tests {
     use crate::tui::select::*;
+    use crate::tui::tests::helper;
     use crate::tui::transcript::{Call, Entry, Helper, Item, Step, Transcript};
     use agent_client_protocol_schema::v1::ToolCallStatus;
 
@@ -326,18 +327,6 @@ mod tests {
 
     #[test]
     fn agent_status_skipped() {
-        let helper = |title: &str, status: ToolCallStatus, text: &str| Helper {
-            id: "call_1.1".to_owned(),
-            title: title.to_owned(),
-            role: None,
-            status,
-            text: text.to_owned(),
-            preview: String::new(),
-            interrupted: false,
-            started: None,
-            color: 0,
-            usage: None,
-        };
         let counting = Helper {
             role: Some("counter".to_owned()),
             preview: "print(len(cafés))".to_owned(),

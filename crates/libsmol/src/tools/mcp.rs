@@ -358,11 +358,7 @@ pub(crate) async fn connect(
             };
 
             let result = calling.await;
-            Called {
-                result,
-                media,
-                agents: Vec::new(),
-            }
+            Called { result, media }
         })
     };
 

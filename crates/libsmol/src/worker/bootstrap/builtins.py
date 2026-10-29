@@ -39,6 +39,7 @@ _STDOUT, _STDERR = _stream(1), _stream(2)
 _SHOWN = None
 
 _MAX_PRINT_CHARS = 8192
+_FIELDS = ".name, .task and .role" if _AGENTS == "roles" else ".name and .task"
 
 def _open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
     opened = _REAL_OPEN(file, mode, buffering, encoding, errors, newline, closefd, opener)
@@ -78,15 +79,23 @@ def _bound(signature, header, args, kwargs):
 
 def _builtin(function, header=None):
     signature = _inspect.signature(function)
-    header = header or f"{function.__name__}{signature}"
+    if header is None:
+        shown = signature
+        # Methods are listed as Class.method without self or cls
+        if "." in function.__qualname__:
+            parameters = list(signature.parameters.values())[1:]
+            shown = signature.replace(parameters=parameters)
+        header = f"{function.__qualname__}{shown}"
 
     def builtin(*args, **kwargs):
         bound = _bound(signature, header, args, kwargs)
         return function(*bound.args, **bound.kwargs)
 
-    builtin.__name__ = builtin.__qualname__ = function.__name__
+    builtin.__name__ = function.__name__
+    builtin.__qualname__ = function.__qualname__
     builtin.__signature__ = signature
-    builtin.__doc__ = function.__doc__
+    # The agent decides these values, so docs name them in braces
+    builtin.__doc__ = function.__doc__.format(agents=_MAX_AGENTS, done=_DONE, fields=_FIELDS)
     builtin._smol_header = header
     return builtin
 
@@ -194,51 +203,129 @@ def view(path: str | _os.PathLike) -> None:
     absolute = _os.path.abspath(path)
     _view(path, absolute)
 
-def agent(task: str | list[str], role: str | list[str] | None = None) -> str | list[str | RuntimeError]:
-    """a new agent does the task and returns its answer; it has the same files, built-in functions and MCP servers, but not this Python session or this conversation, so the task must state everything it needs
+def _delegated(function, method, params):
+    try:
+        return _agent(method, params)
+    except (TypeError, ValueError) as exc:
+        raise type(exc)(f"{function}: {exc}") from None
 
-    Gives the task to a new agent and returns its final answer. The agent has its own Python session and the same files, built-in functions, MCP servers, skills and instructions as you, but not your variables or this conversation, so the task must state everything it needs. A list of tasks runs up to 8 agents at a time and returns their answers in the same order, with the exception in place of any task that failed. Agents started this way cannot call agent()."""
-    single = isinstance(task, str)
-    tasks = [task] if single else task
-    if not isinstance(tasks, list):
-        kind = type(task).__name__
-        raise TypeError(f"agent: task must be str or a list of str, not {kind}")
-    for item in tasks:
+def _handed(function, result):
+    error = result.get("error")
+    if error is None:
+        return result["answer"]
+    return RuntimeError(f"{function}: {error}")
+
+def _texts(function, name, value, count=None):
+    texts = [value] if isinstance(value, str) else value
+    if not isinstance(texts, list):
+        kind = type(value).__name__
+        raise TypeError(f"{function}: {name} must be str or a list of str, not {kind}")
+    for item in texts:
         if not isinstance(item, str):
             kind = type(item).__name__
-            raise TypeError(f"agent: task must be str or a list of str, not a list holding {kind}")
+            raise TypeError(f"{function}: {name} must be str or a list of str, not a list holding {kind}")
+    if count is not None and len(texts) != count:
+        raise ValueError(f"{function}: {name}: needs one {name} per task ({count}), not {len(texts)}")
+    return texts
+
+class Agent:
+    __doc__ = f"the handle of an agent that agent() started in the background; {_FIELDS} hold what it was started with"
+
+    _smol_header = "class Agent"
+
+    def __init__(self, id, name, task, role):
+        self._id = id
+        self.name = name
+        self.task = task
+        self.role = role
+
+    def __repr__(self):
+        return f"<Agent {self.name}>"
+
+    def get(cls, name: str) -> Agent | None:
+        """the handle of the agent last started with this name, also after Python restarts; {fields} hold what it was started with
+
+        Returns the handle of the agent last started with this name in this session, also after Python restarts, or None if there is none."""
+        name = _str("Agent.get", "name", name)
+        found = _delegated("Agent.get", "find", {"name": name})
+        if found is None:
+            return None
+        return cls(**found)
+
+    def wait(self, timeout: float | None = None) -> str | None:
+        """its answer once it ends, or None if it is still running after timeout seconds; raises RuntimeError if it failed or was stopped
+
+        Waits until the agent ends and returns its answer, or returns None if it is still running after timeout seconds; timeout=None waits until it ends. Raises RuntimeError if the agent failed or was stopped. Once the code has its result, no "{done}:" message is sent for it."""
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                kind = type(timeout).__name__
+                raise TypeError(f"Agent.wait: timeout must be a number or None, not {kind}")
+            if not timeout >= 0:
+                raise ValueError(f"Agent.wait: timeout must be 0 or more, not {timeout}")
+            timeout = float(timeout)
+        result = _delegated("Agent.wait", "wait", {"id": self._id, "timeout": timeout})
+        if result is None:
+            return None
+        answer = _handed("Agent.wait", result)
+        if isinstance(answer, RuntimeError):
+            raise answer
+        return answer
+
+    def status(self) -> str:
+        """what it is doing now and the end of what it is writing or printing, or how it ended
+
+        Returns how long it has run and what it is doing now, followed by the last lines it is writing or printing; once it has ended, returns how it ended."""
+        return _delegated("Agent.status", "status", {"id": self._id})
+
+    def stop(self) -> None:
+        """stops it and returns once it has stopped
+
+        Stops the agent and returns once it has stopped; no "{done}:" message is sent for it."""
+        _delegated("Agent.stop", "stop", {"id": self._id})
+
+# Wrapped once the class exists, which their annotations name
+for _method in [Agent.get, Agent.wait, Agent.status, Agent.stop]:
+    setattr(Agent, _method.__name__, _builtin(_method))
+Agent.get = classmethod(Agent.get)
+
+def agent(task: str | list[str], role: str | list[str] | None = None, *, name: str | list[str] | None = None) -> str | list[str | RuntimeError] | Agent | list[Agent]:
+    """a new agent does the task and returns its answer, or its handle at once when given a name; it has the same files, built-in functions and MCP servers, but not this Python session or this conversation, so the task must state everything it needs
+
+    Gives the task to a new agent and returns its final answer, or raises RuntimeError if the agent fails. The agent has its own Python session and the same files, built-in functions, MCP servers, skills and instructions as you, but not your variables or this conversation, so the task must state everything it needs. A list of tasks runs up to {agents} agents at a time and returns their answers in the same order, with the exception in place of any task that failed. Agents started this way cannot call agent().
+
+    With name, the agent runs in the background and agent() returns its Agent handle at once; a list of tasks takes a list of names, one per task, and returns a list of handles. A name cannot be given again while its agent is running."""
+    single = isinstance(task, str)
+    tasks = _texts("agent", "task", task)
     if not tasks or not all(item.strip() for item in tasks):
         raise ValueError("agent: task is empty")
-    if role is None or isinstance(role, str):
-        roles = [role] * len(tasks)
-    elif isinstance(role, list):
-        roles = role
-        for item in roles:
-            if not isinstance(item, str):
-                kind = type(item).__name__
-                raise TypeError(f"agent: role must be str or a list of str, not a list holding {kind}")
-        if len(roles) != len(tasks):
-            raise ValueError(f"agent: role: needs one role per task ({len(tasks)}), not {len(roles)}")
-    else:
-        kind = type(role).__name__
-        raise TypeError(f"agent: role must be str or a list of str, not {kind}")
+    roles = [role] * len(tasks) if role is None or isinstance(role, str) else _texts("agent", "role", role, len(tasks))
 
-    answers = []
-    for result in _agent(tasks, roles):
-        error = result.get("error")
-        answer = result.get("answer") if error is None else RuntimeError(f"agent: {error}")
-        answers.append(answer)
-    if not single:
-        return answers
-    if isinstance(answers[0], RuntimeError):
-        raise answers[0]
-    return answers[0]
+    if name is None:
+        asked = [{"task": task, "role": role, "name": None} for task, role in zip(tasks, roles)]
+        results = _delegated("agent", "ask", {"agents": asked})
+        answers = [_handed("agent", result) for result in results]
+        if not single:
+            return answers
+        if isinstance(answers[0], RuntimeError):
+            raise answers[0]
+        return answers[0]
+
+    names = _texts("agent", "name", name, len(tasks))
+    if not all(item.strip() for item in names):
+        raise ValueError("agent: name is empty")
+    for at, item in enumerate(names):
+        if item in names[:at]:
+            raise ValueError(f"agent: name: {item}: given twice")
+    asked = [{"task": task, "role": role, "name": name} for task, role, name in zip(tasks, roles, names)]
+    handles = _delegated("agent", "start", {"agents": asked})
+    handles = [Agent(**handle) for handle in handles]
+    return handles[0] if single else handles
 
 # Without roles the parameter is left out, so passing one fails like any unknown argument
-if not _ROLES:
+if _AGENTS != "roles":
     _signature = _inspect.signature(agent)
-    _task = _signature.parameters["task"]
-    agent.__signature__ = _signature.replace(parameters=[_task])
+    _parameters = [_signature.parameters["task"], _signature.parameters["name"]]
+    agent.__signature__ = _signature.replace(parameters=_parameters)
 agent = _builtin(agent)
 
 @_builtin
@@ -307,11 +394,17 @@ def help(request: object) -> None:
     text = "\n".join(parts)
     print(text, limit=None)
 
-_BUILTINS = [edit, ls, grep, fetch, view, agent, help]
+_BUILTINS = [edit, ls, grep, fetch, view, help]
+# Workers of agents that agent() started have none of it
+if _AGENTS:
+    _BUILTINS[5:5] = [agent, Agent.get, Agent.wait, Agent.status, Agent.stop]
+    _builtins.Agent = Agent
 _FUNCTIONS = []
 for _function in _BUILTINS:
-    _name = _function.__name__
+    _name = _function.__qualname__
     _header = _function._smol_header
     _summary = _inspect.getdoc(_function).split("\n\n")[0]
     _FUNCTIONS.append((_name, _header, _summary))
-    vars(_builtins)[_name] = _function
+    # Methods come with their class
+    if "." not in _name:
+        vars(_builtins)[_name] = _function

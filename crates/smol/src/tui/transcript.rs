@@ -1,12 +1,18 @@
 use crate::client::{Notice, Refused, AGENT, SHELL, UPDATE};
 use crate::tui::render::{Render, Row};
 use crate::tui::theme::HELPERS;
+use crate::tui::SPIN_EVERY;
 use agent_client_protocol_schema::v1::{
-    ContentBlock, Meta, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
+    ContentBlock, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
 };
 use anyhow::Result;
+use ratatui::style::Color;
+use reaper::one_line;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::mem;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub(crate) enum Entry {
@@ -15,6 +21,41 @@ pub(crate) enum Entry {
     Task(String),
     Step(Step),
     Shell(Shell),
+}
+
+impl Entry {
+    fn step(&self) -> Option<&Step> {
+        match self {
+            Entry::Step(step) => Some(step),
+            _ => None,
+        }
+    }
+
+    fn step_mut(&mut self) -> Option<&mut Step> {
+        match self {
+            Entry::Step(step) => Some(step),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a step is settled or held, at that index, or is the live one
+#[derive(Debug, Clone, Copy)]
+enum Spot {
+    Settled(usize),
+    Held(usize),
+    Live,
+}
+
+/// The rows of the agents of one call with agents at work, counted from the start of its
+/// settled entry or, with no entry, of the held rows
+#[derive(Debug)]
+pub(crate) struct Group {
+    pub(crate) call: String,
+    pub(crate) entry: Option<usize>,
+    pub(crate) rows: Range<usize>,
+    /// One of its agents changed after these rows were drawn
+    pub(crate) stale: bool,
 }
 
 pub(crate) struct Shell {
@@ -118,9 +159,29 @@ pub(crate) struct Transcript {
     layout: (u16, bool),
     task_id: Option<String>,
     retry_at: Option<Instant>,
+    /// Settled entries with agents at work, or whose agents ended after their rows were drawn
+    lively: BTreeSet<usize>,
+    /// When the spinners in `groups` were last drawn moving on
+    spun: Option<Instant>,
+    groups: Vec<Group>,
+    /// The rows on screen
+    view: Option<Range<usize>>,
+    /// Whether scrolling moved `view` since the frame before
+    scrolled: bool,
+    /// The calls whose agents the last frame drew at the bottom, by id
+    pins: Vec<String>,
+    /// The session's directory, which agents' titles write as `.`
+    cwd: PathBuf,
 }
 
 impl Transcript {
+    pub(crate) fn new(cwd: PathBuf) -> Self {
+        Self {
+            cwd,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn stats(&self) -> &Stats {
         &self.stats
     }
@@ -168,23 +229,64 @@ impl Transcript {
         self.live.is_some()
     }
 
-    /// Agents the running code started that are still queued or running
+    /// Agents still queued or running, wherever the call that started them is
     pub(crate) fn helping(&self) -> usize {
-        let Some(step) = &self.live else {
+        let working = self.working();
+        working.iter().map(|(_, step)| step.helping()).sum()
+    }
+
+    /// Agents the turn waits for, which are those the running code waits for
+    /// or, after an answer, every one still at work
+    pub(crate) fn awaited(&self) -> usize {
+        // Agents started in the background don't hold up the code
+        if let Some(step) = &self.live {
+            let blocking = |helper: &&Helper| helper.waiting() && helper.name.is_none();
+            return step.helpers().filter(blocking).count();
+        }
+        // A message the turn took after the answer is what the model works on next
+        let Some((Entry::Step(last), after)) = self.held.split_first() else {
             return 0;
         };
+        if after.iter().any(|entry| matches!(entry, Entry::Task(_))) {
+            return 0;
+        }
 
-        let mut count = 0;
-        for item in &step.items {
-            if let Item::Call(call) = item {
-                count += call
-                    .helpers
-                    .iter()
-                    .filter(|helper| helper.waiting())
-                    .count();
+        let mut said = false;
+        for item in &last.items {
+            match item {
+                Item::Call(_) => return 0,
+                Item::Message { text, .. } => said |= !text.trim().is_empty(),
+                Item::Thought(_) | Item::Notice(_) => {}
             }
         }
-        count
+        match said && !last.interrupted {
+            true => self.helping(),
+            false => 0,
+        }
+    }
+
+    pub(crate) fn view(&mut self, rows: Range<usize>, scrolled: bool) {
+        self.view = Some(rows);
+        self.scrolled = scrolled;
+    }
+
+    /// The steps that may hold agents at work, oldest first
+    fn working(&self) -> Vec<(Spot, &Step)> {
+        let mut steps = Vec::new();
+        for index in &self.lively {
+            if let Some(Entry::Step(step)) = self.entries.get(*index) {
+                steps.push((Spot::Settled(*index), step));
+            }
+        }
+        for (index, entry) in self.held.iter().enumerate() {
+            if let Entry::Step(step) = entry {
+                steps.push((Spot::Held(index), step));
+            }
+        }
+        if let Some(step) = &self.live {
+            steps.push((Spot::Live, step));
+        }
+        steps
     }
 
     pub(crate) fn writing(&self) -> bool {
@@ -214,6 +316,98 @@ impl Transcript {
 
     /// Returns true when a step ended
     pub(crate) fn update(&mut self, update: &SessionUpdate) -> bool {
+        // An agent the code started keeps updating after the step of its call has ended
+        if let SessionUpdate::ToolCallUpdate(call) = update {
+            let id = &*call.tool_call_id.0;
+            let mut place = None;
+            let mut taken = Vec::new();
+            for (spot, step) in self.working() {
+                for (at, item) in step.items.iter().enumerate() {
+                    let Item::Call(started) = item else {
+                        continue;
+                    };
+                    for (index, helper) in started.helpers.iter().enumerate() {
+                        if helper.id == id {
+                            place = Some((spot, at, index));
+                        }
+                        if helper.state() == State::Running {
+                            taken.push(helper.color);
+                        }
+                    }
+                }
+            }
+
+            if let Some((spot, at, index)) = place {
+                let step = match spot {
+                    Spot::Settled(index) => self.entries.get_mut(index).and_then(Entry::step_mut),
+                    Spot::Held(index) => self.held.get_mut(index).and_then(Entry::step_mut),
+                    Spot::Live => self.live.as_mut(),
+                };
+                let item = step.and_then(|step| step.items.get_mut(at));
+                let Some(Item::Call(started)) = item else {
+                    return false;
+                };
+                let parent = started.id.clone();
+                let helper = &mut started.helpers[index];
+
+                let fields = &call.fields;
+                if let Some(status) = fields.status {
+                    // The color at its place in its call, or the lowest free one when a running agent holds that
+                    if status == ToolCallStatus::InProgress && helper.started.is_none() {
+                        let place = HELPERS[index % HELPERS.len()];
+                        let free = HELPERS.iter().find(|color| !taken.contains(color));
+                        helper.color = match taken.contains(&place) {
+                            true => free.copied().unwrap_or(place),
+                            false => place,
+                        };
+                        helper.started = Some(Instant::now());
+                    }
+                    helper.status = status;
+                }
+                // A preview follows the status, and the last update holds only the answer or error
+                if let Some(content) = &fields.content {
+                    let (texts, _) = contents(content);
+                    let mut texts = texts.into_iter();
+                    helper.text = texts.next().unwrap_or_default();
+                    helper.preview = texts.collect();
+                }
+                let meta = call.meta.as_ref();
+                let get = |key: &str| meta.and_then(|meta| meta.get(key));
+                if get("interrupted").and_then(Value::as_bool) == Some(true) {
+                    helper.interrupted = true;
+                }
+                let count = |key: &str| get(key).and_then(Value::as_u64);
+                let tokens = count("inputTokens").zip(count("outputTokens"));
+                if tokens.is_some() {
+                    helper.tokens = tokens;
+                }
+
+                // Every update carries its usage so far, so only the last one counts
+                let ended = matches!(
+                    fields.status,
+                    Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+                );
+                if ended {
+                    if let Some(steps) = count("steps") {
+                        let duration = get("duration").and_then(Value::as_f64);
+                        let duration = duration.unwrap_or_default();
+                        helper.totals = Some(Totals { steps, duration });
+                    }
+                    let (input, output) = tokens.unwrap_or_default();
+                    self.stats.agent_input += input;
+                    self.stats.agent_output += output;
+                }
+
+                // Only the rows of its call change, and ones not drawn yet come with the held rows
+                let group = self.groups.iter_mut().find(|group| group.call == parent);
+                match group {
+                    Some(group) => group.stale = true,
+                    None => self.changed = true,
+                }
+                return false;
+            }
+        }
+
         self.changed = true;
         // A retry notice is followed by a usage update that withdraws the estimate
         if !matches!(update, SessionUpdate::UsageUpdate(_)) {
@@ -262,15 +456,11 @@ impl Transcript {
             SessionUpdate::AgentThoughtChunk(_)
             | SessionUpdate::AgentMessageChunk(_)
             | SessionUpdate::ToolCall(_) => {
-                self.live.get_or_insert_default().update(update);
+                let cwd = &self.cwd;
+                self.live.get_or_insert_default().update(update, cwd);
             }
 
             SessionUpdate::ToolCallUpdate(call) => {
-                if let Some(usage) = helper_usage(call.meta.as_ref()) {
-                    self.stats.agent_input += usage.input.unwrap_or(0);
-                    self.stats.agent_output += usage.output.unwrap_or(0);
-                }
-
                 let mut running = None;
                 for entry in self.held.iter_mut().rev() {
                     if let Entry::Shell(shell) = entry {
@@ -283,7 +473,7 @@ impl Transcript {
                 // Calls from a finished step are no longer updated and don't start a new step
                 let Some(shell) = running else {
                     if let Some(step) = &mut self.live {
-                        step.update(update);
+                        step.update(update, &self.cwd);
                     }
                     return false;
                 };
@@ -348,8 +538,20 @@ impl Transcript {
 
     /// Settles everything before this step, which may still change
     fn hold(&mut self, step: Step) {
-        self.entries.append(&mut self.held);
+        self.settle();
         self.held.push(Entry::Step(step));
+    }
+
+    /// Moves the held entries to the settled ones, which still follow the agents at work in them
+    fn settle(&mut self) {
+        for entry in self.held.drain(..) {
+            if let Entry::Step(step) = &entry {
+                if step.helping() > 0 {
+                    self.lively.insert(self.entries.len());
+                }
+            }
+            self.entries.push(entry);
+        }
     }
 
     pub(crate) fn notice(&mut self, notice: &Notice) {
@@ -401,7 +603,7 @@ impl Transcript {
                 Outcome::Answered | Outcome::Failed => {}
             }
         }
-        self.entries.append(&mut self.held);
+        self.settle();
     }
 
     pub(crate) fn done(&mut self, stop: Result<StopReason>) {
@@ -481,34 +683,167 @@ impl Transcript {
             self.layout = (width, expanded);
             self.rows.clear();
             self.starts.clear();
+            self.groups.clear();
+            // Rows are numbered anew, so the agents at the bottom are found again
+            self.view = None;
+            self.pins.clear();
             self.changed = true;
         }
 
         let mut render = Render::new(width, expanded);
         let rendered = self.starts.len();
-        for entry in &self.entries[rendered..] {
-            let start = self.rows.len() + render.rows.len();
-            self.starts.push(start);
+        for (index, entry) in self.entries.iter().enumerate().skip(rendered) {
+            let start = render.rows.len();
+            self.starts.push(self.rows.len() + start);
             render.entry(entry);
+            for mut group in render.groups.drain(..) {
+                group.entry = Some(index);
+                group.rows = group.rows.start - start..group.rows.end - start;
+                self.groups.push(group);
+            }
         }
         self.rows.append(&mut render.rows);
 
-        // Running agents show a spinner and their time, which change on every frame
-        let animated = self.helping() > 0;
-        if mem::take(&mut self.changed) || animated {
+        let redrawn = mem::take(&mut self.changed);
+        if redrawn {
             for entry in &self.held {
                 render.entry(entry);
             }
             if let Some(step) = &self.live {
                 render.step(step);
             }
+            self.groups.retain(|group| group.entry.is_some());
+            self.groups.append(&mut render.groups);
             self.held_rows = render.rows;
+        }
+
+        // Agents at work show a spinner and their time, so the rows of their calls are drawn again
+        // as these move on and after one of them changed, in settled entries only while on screen
+        let spinning = self.spun.is_none_or(|at| at.elapsed() >= SPIN_EVERY);
+        if spinning {
+            self.spun = Some(Instant::now());
+        }
+        let mut at = 0;
+        while at < self.groups.len() {
+            let group = &self.groups[at];
+            let fresh = match group.entry {
+                Some(index) => index >= rendered,
+                None => redrawn,
+            };
+            let start = match group.entry {
+                Some(index) => self.starts[index],
+                None => self.rows.len(),
+            };
+            let shown = start + group.rows.start..start + group.rows.end;
+            let hidden = group.entry.is_some() && !self.on_screen(shown);
+            if fresh || hidden || !(group.stale || spinning) {
+                at += 1;
+                continue;
+            }
+
+            let steps: Vec<&Step> = match group.entry {
+                Some(index) => self.entries[index].step().into_iter().collect(),
+                None => self
+                    .held
+                    .iter()
+                    .filter_map(Entry::step)
+                    .chain(&self.live)
+                    .collect(),
+            };
+            let mut calls = steps.into_iter().flat_map(Step::calls);
+            let Some(call) = calls.find(|call| call.id == group.call) else {
+                self.groups.remove(at);
+                continue;
+            };
+            let mut drawn = Render::new(width, expanded);
+            drawn.helpers(call);
+
+            // The rows after these move by as many as they grew or shrank
+            let old = group.rows.clone();
+            let entry = group.entry;
+            let height = drawn.rows.len();
+            let moved = |at: usize| at + height - old.len();
+            match entry {
+                Some(index) => {
+                    let start = self.starts[index];
+                    let replaced = start + old.start..start + old.end;
+                    self.rows.splice(replaced, drawn.rows);
+                    for later in &mut self.starts[index + 1..] {
+                        *later = moved(*later);
+                    }
+                }
+                None => {
+                    self.held_rows.splice(old.clone(), drawn.rows);
+                }
+            }
+            for later in &mut self.groups {
+                if later.entry == entry && later.rows.start >= old.end {
+                    later.rows = moved(later.rows.start)..moved(later.rows.end);
+                }
+            }
+
+            // A call keeps its rows apart only while its agents are at work
+            if drawn.groups.is_empty() {
+                self.groups.remove(at);
+                let left = |group: &Group| group.entry.is_some() && group.entry == entry;
+                if let (Some(index), false) = (entry, self.groups.iter().any(left)) {
+                    self.lively.remove(&index);
+                }
+                continue;
+            }
+            let group = &mut self.groups[at];
+            group.rows = old.start..old.start + height;
+            group.stale = false;
+            at += 1;
         }
 
         Rows {
             done: &self.rows,
             held: &self.held_rows,
             starts: &self.starts,
+        }
+    }
+
+    /// The agents at work of each call whose rows went off screen, for the bottom of a conversation
+    /// `height` rows tall
+    pub(crate) fn pinned(&mut self, width: u16, height: usize) -> Vec<Row> {
+        let mut hidden = Vec::new();
+        let mut pins = Vec::new();
+        for (_, step) in self.working() {
+            for call in step.calls() {
+                // Rows not drawn yet count as on screen
+                let found = self.groups.iter().find(|group| group.call == call.id);
+                let Some(group) = found else {
+                    continue;
+                };
+                let start = match group.entry {
+                    Some(index) => self.starts[index],
+                    None => self.rows.len(),
+                };
+                // Hiding the area moves these rows again, so only scrolling takes agents back out of it
+                let kept = self.pins.contains(&call.id) && !self.scrolled;
+                let rows = start + group.rows.start..start + group.rows.end;
+                if !kept && self.on_screen(rows) {
+                    continue;
+                }
+
+                pins.push(call.id.clone());
+                let waiting = call.helpers.iter().filter(|helper| helper.waiting());
+                hidden.extend(waiting);
+            }
+        }
+
+        let mut render = Render::new(width, false);
+        render.pinned(&hidden, height);
+        self.pins = pins;
+        render.rows
+    }
+
+    /// Before the screen is known every row counts as on it
+    fn on_screen(&self, rows: Range<usize>) -> bool {
+        match &self.view {
+            Some(view) => rows.start < view.end && view.start < rows.end,
+            None => true,
         }
     }
 }
@@ -539,6 +874,15 @@ pub(crate) enum Item {
     Notice(String),
 }
 
+impl Item {
+    fn call(&self) -> Option<&Call> {
+        match self {
+            Item::Call(call) => Some(call),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Retry {
     pub(crate) text: String,
@@ -566,6 +910,8 @@ pub(crate) struct Helper {
     /// The start of its task
     pub(crate) title: String,
     pub(crate) role: Option<String>,
+    /// Given to one started in the background
+    pub(crate) name: Option<String>,
     pub(crate) status: ToolCallStatus,
     /// What it is doing while it runs, then its answer or why it failed
     pub(crate) text: String,
@@ -575,16 +921,26 @@ pub(crate) struct Helper {
     /// Unknown on replay, which reports the duration instead
     pub(crate) started: Option<Instant>,
     /// Taken when it starts and held by no other agent running at the same time
-    pub(crate) color: usize,
-    pub(crate) usage: Option<HelperUsage>,
+    pub(crate) color: Color,
+    /// Input and output tokens so far
+    pub(crate) tokens: Option<(u64, u64)>,
+    /// Known once it ends
+    pub(crate) totals: Option<Totals>,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct HelperUsage {
-    pub(crate) input: Option<u64>,
-    pub(crate) output: Option<u64>,
+pub(crate) struct Totals {
     pub(crate) steps: u64,
     pub(crate) duration: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum State {
+    Running,
+    Queued,
+    Done,
+    Failed,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -603,12 +959,18 @@ pub(crate) struct Parts<'a> {
 }
 
 impl Helper {
-    /// Queued or running
+    pub(crate) fn state(&self) -> State {
+        match (self.status, self.interrupted) {
+            (ToolCallStatus::InProgress, _) => State::Running,
+            (ToolCallStatus::Pending, _) => State::Queued,
+            (ToolCallStatus::Completed, _) => State::Done,
+            (_, true) => State::Interrupted,
+            (_, false) => State::Failed,
+        }
+    }
+
     pub(crate) fn waiting(&self) -> bool {
-        matches!(
-            self.status,
-            ToolCallStatus::Pending | ToolCallStatus::InProgress
-        )
+        matches!(self.state(), State::Running | State::Queued)
     }
 }
 
@@ -637,7 +999,7 @@ impl Call {
 }
 
 impl Step {
-    fn update(&mut self, update: &SessionUpdate) {
+    fn update(&mut self, update: &SessionUpdate, cwd: &Path) {
         match update {
             SessionUpdate::AgentThoughtChunk(chunk) => {
                 let text = text_of(&chunk.content);
@@ -666,20 +1028,25 @@ impl Step {
                 let parent = meta.and_then(|meta| meta.get("parent"));
                 let parent = parent.and_then(Value::as_str).filter(|_| marked);
                 if let Some(owner) = parent.and_then(|parent| self.call_mut(parent)) {
-                    let title = call.title.strip_prefix("agent: ").unwrap_or(&call.title);
-                    let role = meta.and_then(|meta| meta.get("role"));
-                    let role = role.and_then(Value::as_str).map(str::to_owned);
+                    let asked = call.raw_input.as_ref();
+                    let given = |key: &str| asked.and_then(|asked| asked.get(key));
+                    let given = |key: &str| given(key).and_then(Value::as_str);
+                    let task = given("task").unwrap_or_default();
+                    let role = given("role").map(str::to_owned);
+                    let name = given("name").map(str::to_owned);
                     owner.helpers.push(Helper {
                         id,
-                        title: title.to_owned(),
+                        title: one_line(task, cwd),
                         role,
+                        name,
                         status: call.status,
                         text: String::new(),
                         preview: String::new(),
                         interrupted: false,
                         started: None,
-                        color: 0,
-                        usage: None,
+                        color: HELPERS[0],
+                        tokens: None,
+                        totals: None,
                     });
                     return;
                 }
@@ -707,76 +1074,25 @@ impl Step {
                     if let Some(content) = &fields.content {
                         (call.content, call.attachments) = contents(content);
                     }
-                    return;
-                }
-
-                // An agent that starts takes the color at its place in its call,
-                // or the lowest free one when a running agent holds that
-                let mut place = None;
-                let mut taken = Vec::new();
-                for item in &self.items {
-                    let Item::Call(call) = item else {
-                        continue;
-                    };
-                    for (index, helper) in call.helpers.iter().enumerate() {
-                        if helper.id == id {
-                            place = Some(index % HELPERS.len());
-                        }
-                        if helper.status == ToolCallStatus::InProgress {
-                            taken.push(helper.color);
-                        }
-                    }
-                }
-                let Some(place) = place else {
-                    return;
-                };
-                let mut free = (0..HELPERS.len()).filter(|color| !taken.contains(color));
-                let color = match taken.contains(&place) {
-                    true => free.next().unwrap_or(place),
-                    false => place,
-                };
-
-                let mut found = None;
-                for item in self.items.iter_mut().rev() {
-                    let Item::Call(call) = item else {
-                        continue;
-                    };
-                    found = call.helpers.iter_mut().find(|helper| helper.id == id);
-                    if found.is_some() {
-                        break;
-                    }
-                }
-                let Some(helper) = found else {
-                    return;
-                };
-
-                let fields = &update.fields;
-                if let Some(status) = fields.status {
-                    if status == ToolCallStatus::InProgress && helper.started.is_none() {
-                        helper.started = Some(Instant::now());
-                        helper.color = color;
-                    }
-                    helper.status = status;
-                }
-                // A preview follows the status, and the last update holds only the answer or error
-                if let Some(content) = &fields.content {
-                    let (texts, _) = contents(content);
-                    let mut texts = texts.into_iter();
-                    helper.text = texts.next().unwrap_or_default();
-                    helper.preview = texts.collect();
-                }
-                let meta = update.meta.as_ref();
-                let interrupted = meta.and_then(|meta| meta.get("interrupted"));
-                if interrupted.and_then(Value::as_bool) == Some(true) {
-                    helper.interrupted = true;
-                }
-                if let Some(usage) = helper_usage(meta) {
-                    helper.usage = Some(usage);
                 }
             }
 
             _ => {}
         }
+    }
+
+    /// Agents its code started that are still queued or running
+    fn helping(&self) -> usize {
+        self.helpers().filter(|helper| helper.waiting()).count()
+    }
+
+    fn calls(&self) -> impl Iterator<Item = &Call> {
+        self.items.iter().filter_map(Item::call)
+    }
+
+    /// The agents its code started
+    fn helpers(&self) -> impl Iterator<Item = &Helper> {
+        self.calls().flat_map(|call| &call.helpers)
     }
 
     fn call_mut(&mut self, id: &str) -> Option<&mut Call> {
@@ -841,20 +1157,6 @@ fn text_of(content: &ContentBlock) -> String {
     }
 }
 
-/// Only the last update of an agent's call carries its usage
-fn helper_usage(meta: Option<&Meta>) -> Option<HelperUsage> {
-    let get = |key: &str| meta.and_then(|meta| meta.get(key));
-    get(AGENT)?;
-    let steps = get("steps").and_then(Value::as_u64)?;
-    let duration = get("duration").and_then(Value::as_f64);
-    Some(HelperUsage {
-        input: get("inputTokens").and_then(Value::as_u64),
-        output: get("outputTokens").and_then(Value::as_u64),
-        steps,
-        duration: duration.unwrap_or_default(),
-    })
-}
-
 fn contents(content: &[ToolCallContent]) -> (Vec<String>, Vec<Attachment>) {
     let mut texts = Vec::new();
     let mut attachments = Vec::new();
@@ -890,6 +1192,7 @@ fn fenced(text: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use crate::tui::transcript::*;
+    use crate::tui::SPINNER;
     use agent_client_protocol_schema::v1::{
         ContentChunk, MessageId, Meta, ResourceLink, ToolCall, ToolCallUpdate,
         ToolCallUpdateFields, ToolKind, UsageUpdate,
@@ -1460,14 +1763,15 @@ mod tests {
             reply
         };
 
+        let cwd = Path::new("");
         let mut step = Step::default();
-        step.update(&message("Let me look."));
+        step.update(&message("Let me look."), cwd);
         let started = ToolCall::new("call_1", "eval").status(ToolCallStatus::Pending);
-        step.update(&SessionUpdate::ToolCall(started));
+        step.update(&SessionUpdate::ToolCall(started), cwd);
         assert_eq!(replied(&step), "");
 
-        step.update(&message("The answer is "));
-        step.update(&message("42."));
+        step.update(&message("The answer is "), cwd);
+        step.update(&message("42."), cwd);
         assert_eq!(replied(&step), "The answer is 42.");
 
         step.mark_answer();
@@ -1483,38 +1787,174 @@ mod tests {
         assert_eq!(replied(&step), "");
     }
 
+    /// Starts a call that starts `count` agents, the first of them named
+    fn started(transcript: &mut Transcript, count: usize) {
+        let code = ToolCall::new("call_1", "eval").status(ToolCallStatus::InProgress);
+        transcript.update(&SessionUpdate::ToolCall(code));
+        for n in 1..=count {
+            let marked = json!({ "_smol/agent": true, "parent": "call_1" });
+            let task = format!("Count the cafés in menu {n}");
+            let name = (n == 1).then_some("cafés");
+            let asked = json!({ "task": task, "role": null, "name": name });
+            let id = format!("call_1.{n}");
+            let opened = ToolCall::new(id, format!("agent: {task}"))
+                .raw_input(asked)
+                .meta(marked.as_object().cloned());
+            transcript.update(&SessionUpdate::ToolCall(opened));
+        }
+    }
+
+    fn moved(transcript: &mut Transcript, n: usize, status: ToolCallStatus) {
+        let fields = ToolCallUpdateFields::new().status(status);
+        let update = ToolCallUpdate::new(format!("call_1.{n}"), fields);
+        transcript.update(&SessionUpdate::ToolCallUpdate(update));
+    }
+
     #[test]
     fn helper_colors() {
-        let mut step = Step::default();
-        let code = ToolCall::new("call_1", "eval").status(ToolCallStatus::InProgress);
-        step.update(&SessionUpdate::ToolCall(code));
-        let marked = json!({ "_smol/agent": true, "parent": "call_1" });
-        for n in 1..=10 {
-            let id = format!("call_1.{n}");
-            let opened = ToolCall::new(id, format!("agent: Count the cafés in menu {n}"))
-                .meta(marked.as_object().cloned());
-            step.update(&SessionUpdate::ToolCall(opened));
-        }
-
-        let moved = |step: &mut Step, n: usize, status: ToolCallStatus| {
-            let fields = ToolCallUpdateFields::new().status(status);
-            let update = ToolCallUpdate::new(format!("call_1.{n}"), fields);
-            step.update(&SessionUpdate::ToolCallUpdate(update));
-        };
+        let mut transcript = Transcript::default();
+        started(&mut transcript, 10);
         for n in (1..=8).rev() {
-            moved(&mut step, n, ToolCallStatus::InProgress);
+            moved(&mut transcript, n, ToolCallStatus::InProgress);
         }
-        moved(&mut step, 3, ToolCallStatus::Completed);
-        moved(&mut step, 9, ToolCallStatus::InProgress);
-        moved(&mut step, 1, ToolCallStatus::Completed);
-        moved(&mut step, 10, ToolCallStatus::InProgress);
-        moved(&mut step, 9, ToolCallStatus::InProgress);
+        moved(&mut transcript, 3, ToolCallStatus::Completed);
+        moved(&mut transcript, 9, ToolCallStatus::InProgress);
+        moved(&mut transcript, 1, ToolCallStatus::Completed);
+        moved(&mut transcript, 10, ToolCallStatus::InProgress);
+        moved(&mut transcript, 9, ToolCallStatus::InProgress);
 
+        let step = transcript.live.as_ref().expect("live");
         let [Item::Call(call)] = &step.items[..] else {
             panic!("{:?}", step.items);
         };
-        let colors: Vec<usize> = call.helpers.iter().map(|helper| helper.color).collect();
-        assert_eq!(colors, [0, 1, 2, 3, 4, 5, 6, 7, 2, 0]);
+        let colors: Vec<Color> = call.helpers.iter().map(|helper| helper.color).collect();
+        let places = [0, 1, 2, 3, 4, 5, 6, 7, 2, 0];
+        assert_eq!(colors, places.map(|place| HELPERS[place]));
+        assert_eq!(call.helpers[0].name.as_deref(), Some("cafés"));
+    }
+
+    /// An agent keeps updating under its call after the step that started it has ended
+    #[test]
+    fn background_followed() {
+        let mut transcript = Transcript::default();
+        transcript.task("Count the cafés");
+        started(&mut transcript, 1);
+        moved(&mut transcript, 1, ToolCallStatus::InProgress);
+        let ended = |transcript: &mut Transcript| {
+            let meta = json!({ "duration": 0.5 });
+            let usage = UsageUpdate::new(0, 1000).meta(meta.as_object().cloned());
+            transcript.update(&SessionUpdate::UsageUpdate(usage));
+        };
+        ended(&mut transcript);
+        assert_eq!(transcript.awaited(), 0);
+
+        let said = ContentChunk::new(ContentBlock::from("Started them."));
+        transcript.update(&SessionUpdate::AgentMessageChunk(said));
+        ended(&mut transcript);
+        assert_eq!((transcript.helping(), transcript.awaited()), (1, 1));
+        transcript.amend("Count the naïve ones too");
+        assert_eq!((transcript.helping(), transcript.awaited()), (1, 0));
+
+        moved(&mut transcript, 1, ToolCallStatus::Completed);
+        assert_eq!((transcript.helping(), transcript.awaited()), (0, 0));
+        let Some(Entry::Step(first)) = transcript.entries.last() else {
+            panic!("{}", transcript.entries.len());
+        };
+        let Item::Call(call) = &first.items[0] else {
+            panic!("{:?}", first.items);
+        };
+        assert_eq!(call.helpers[0].status, ToolCallStatus::Completed);
+    }
+
+    /// Only scrolling or a new layout takes a call's agents back out of the area at the bottom
+    #[test]
+    fn hidden_pinned() {
+        let mut transcript = Transcript::default();
+        started(&mut transcript, 2);
+        moved(&mut transcript, 1, ToolCallStatus::InProgress);
+        moved(&mut transcript, 2, ToolCallStatus::InProgress);
+        let pinned = |transcript: &mut Transcript| {
+            transcript.rows(60, false);
+            let area = transcript.pinned(60, 40);
+            let shown: Vec<String> = area.iter().map(|row| row.line.to_string()).collect();
+            shown.iter().filter(|row| row.contains("menu ")).count()
+        };
+        let rows = transcript.rows(60, false);
+        let second = rows
+            .iter()
+            .position(|row| row.line.to_string().contains("menu 2"));
+        let second = second.expect("second");
+
+        // Only the second agent is on screen at first
+        transcript.view(second..second + 40, false);
+        assert_eq!(pinned(&mut transcript), 0);
+        transcript.view(30..70, false);
+        assert_eq!(pinned(&mut transcript), 2);
+        transcript.view(0..40, false);
+        assert_eq!(pinned(&mut transcript), 2);
+        transcript.view(0..40, true);
+        assert_eq!(pinned(&mut transcript), 0);
+        transcript.view(30..70, true);
+        assert_eq!(pinned(&mut transcript), 2);
+        transcript.rows(70, false);
+        assert!(transcript.pinned(70, 40).is_empty());
+    }
+
+    /// Drawing a call's agents again on their own gives the rows drawing everything anew does
+    #[test]
+    fn groups_redrawn() {
+        let anew = |transcript: &mut Transcript| {
+            // Spinners move on between the two
+            let shown = |row: &Row| row.line.to_string().replace(SPINNER, "*");
+            let rows = transcript.rows(60, false);
+            let drawn: Vec<String> = rows.iter().map(shown).collect();
+            let mut fresh = Render::new(60, false);
+            let mut starts = Vec::new();
+            for entry in &transcript.entries {
+                starts.push(fresh.rows.len());
+                fresh.entry(entry);
+            }
+            for entry in &transcript.held {
+                fresh.entry(entry);
+            }
+            let expected: Vec<String> = fresh.rows.iter().map(shown).collect();
+            assert_eq!(drawn, expected);
+            assert_eq!(transcript.starts, starts);
+        };
+        let previewed = |transcript: &mut Transcript, preview: &str| {
+            let content = vec![content("writing x = 1"), content(preview)];
+            let fields = ToolCallUpdateFields::new().content(content);
+            let update = ToolCallUpdate::new("call_1.1", fields);
+            transcript.update(&SessionUpdate::ToolCallUpdate(update));
+        };
+
+        let mut transcript = Transcript::default();
+        transcript.task("Count the cafés");
+        started(&mut transcript, 2);
+        moved(&mut transcript, 1, ToolCallStatus::InProgress);
+        end_step(&mut transcript, 10, 1);
+        transcript.push(Entry::Info("Counted the naïve ones".to_owned()));
+        anew(&mut transcript);
+        assert!(!transcript.changed);
+        previewed(&mut transcript, "x = 1\nprint(x)");
+        assert!(!transcript.changed);
+        anew(&mut transcript);
+
+        transcript.finish_turn(Outcome::Answered);
+        transcript.push(Entry::Info("Done with the résumé".to_owned()));
+        anew(&mut transcript);
+        previewed(&mut transcript, "x = 1");
+        anew(&mut transcript);
+        moved(&mut transcript, 2, ToolCallStatus::InProgress);
+        previewed(&mut transcript, "x = 1\ny = 2\nprint(x, y)");
+        anew(&mut transcript);
+
+        // A call whose agents all ended keeps its rows settled for good
+        moved(&mut transcript, 1, ToolCallStatus::Completed);
+        moved(&mut transcript, 2, ToolCallStatus::Completed);
+        anew(&mut transcript);
+        assert!(transcript.groups.is_empty(), "{:?}", transcript.groups);
+        assert!(transcript.lively.is_empty(), "{:?}", transcript.lively);
     }
 
     #[test]
@@ -1527,9 +1967,10 @@ mod tests {
 
     #[test]
     fn update_splits_links() {
+        let cwd = Path::new("");
         let mut step = Step::default();
         let started = ToolCall::new("call_1", "eval").status(ToolCallStatus::Pending);
-        step.update(&SessionUpdate::ToolCall(started));
+        step.update(&SessionUpdate::ToolCall(started), cwd);
 
         let image = ResourceLink::new("screenshot.png", "file:///copies/a1.png")
             .mime_type("image/png".to_owned());
@@ -1540,10 +1981,10 @@ mod tests {
             .status(ToolCallStatus::Completed)
             .content(vec![content("hello"), image, file]);
         let finished = ToolCallUpdate::new("call_1", finished);
-        step.update(&SessionUpdate::ToolCallUpdate(finished));
+        step.update(&SessionUpdate::ToolCallUpdate(finished), cwd);
         let unknown = ToolCallUpdateFields::new().status(ToolCallStatus::Failed);
         let unknown = ToolCallUpdate::new("call_9", unknown);
-        step.update(&SessionUpdate::ToolCallUpdate(unknown));
+        step.update(&SessionUpdate::ToolCallUpdate(unknown), cwd);
 
         let [Item::Call(call)] = &step.items[..] else {
             panic!("{:?}", step.items);

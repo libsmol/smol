@@ -2,7 +2,7 @@ use crate::client::{McpState, McpStatus};
 use crate::tui::app::App;
 use crate::tui::render::wrap_ranges;
 use crate::tui::{
-    fitted, in_out, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG,
+    clipped, fitted, in_out, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG,
 };
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -204,13 +204,22 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     // Two corners, a space on each side of the title and at least one cell of border line
     let taken = usage_width + 5;
     let room = usize::from(conversation.width).saturating_sub(taken);
-    let title = fitted(title, room);
+    let title = clipped(title, room);
     let title = format!(" {} ", title.trim_end());
     let title = Span::styled(title, HEADING);
     block = block.title(title);
 
-    let inner = block.inner(conversation);
+    let conversation_inner = block.inner(conversation);
+    // The rows on screen depend on how many these take, so they come from the previous frame's
+    let pinned = app.transcript.pinned(
+        conversation_inner.width,
+        usize::from(conversation_inner.height),
+    );
+    let height = u16::try_from(pinned.len()).unwrap_or(u16::MAX);
+    let heights = [Constraint::Fill(1), Constraint::Length(height)];
+    let [inner, pinned_area] = Layout::vertical(heights).areas(conversation_inner);
     app.messages_area = inner;
+    app.pinned_area = pinned_area;
 
     let mut progress = Vec::new();
     if let Some(run) = &app.run {
@@ -236,7 +245,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let connecting = app.session.mcp.iter().filter(connecting);
         let connecting: Vec<&str> = connecting.map(|server| server.name.as_str()).collect();
         let waiting = transcript.unstarted() && !connecting.is_empty();
-        let helping = transcript.helping();
+        let helping = transcript.awaited();
         let label = match (run.interrupting, left, writing) {
             (true, _, _) => "interrupting…".to_owned(),
             (false, Some(left), _) => {
@@ -276,6 +285,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     // and a scrolled-back view must stay on the same content
     let anchor = app.transcript.anchor(old_top, inner.width, app.expanded);
     let anchor = anchor.filter(|_| app.scrolled_back > 0);
+    let screen = usize::from(inner.height);
+    let scrolled = app.scrolled_back != app.drawn_back;
+    app.transcript.view(old_top..old_top + screen, scrolled);
     let rows = app.transcript.rows(inner.width, app.expanded);
 
     app.scrollbar = Rect::default();
@@ -371,6 +383,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         }
         let paragraph = Paragraph::new(visible).block(block);
         frame.render_widget(paragraph, conversation);
+        let pinned: Vec<Line> = pinned.into_iter().map(|row| row.line).collect();
+        frame.render_widget(Paragraph::new(pinned), pinned_area);
 
         let inside = conversation.inner(Margin::new(1, 0));
         let fills = rows.iter().map(|row| row.fill).skip(top).take(height);
@@ -397,6 +411,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             selection.highlight(rows, top, inner, buffer);
         }
     }
+
+    app.drawn_back = app.scrolled_back;
 
     let placeholder = match app.shell {
         true => "Run a shell command · backspace goes back",
@@ -602,8 +618,7 @@ fn first_row(text: &str, width: usize) -> String {
         return first.to_owned();
     }
     let marked = format!("{first}…");
-    let marked = fitted(&marked, width);
-    marked.trim_end().to_owned()
+    clipped(&marked, width)
 }
 
 fn tail(text: &str, width: usize) -> String {
@@ -1009,11 +1024,13 @@ mod tests {
         for (offset, task) in tasks.iter().enumerate() {
             let id = format!("call_1.{}", offset + 1);
             let meta = json!({ "_smol/agent": true, "parent": "call_1" });
-            let opened =
-                ToolCall::new(id, format!("agent: {task}")).meta(meta.as_object().cloned());
+            let asked = json!({ "task": task, "role": null, "name": null });
+            let opened = ToolCall::new(id, format!("agent: {task}"))
+                .raw_input(asked)
+                .meta(meta.as_object().cloned());
             app.transcript.update(&SessionUpdate::ToolCall(opened));
         }
-        let marked = json!({ "_smol/agent": true });
+        let marked = json!({});
         let preview = "prices = load('prices.csv')\nprint(prices[:3])\nprint(total(prices))\nprint(sum(prices))\nprint('café', len(prices))";
         helper_update(
             &mut app,
@@ -1022,7 +1039,8 @@ mod tests {
             &["writing prices = load('prices.csv')", preview],
             marked.clone(),
         );
-        let usage = json!({ "_smol/agent": true, "inputTokens": 1200, "outputTokens": 340, "steps": 3, "duration": 12.5 });
+        let usage =
+            json!({ "inputTokens": 1200, "outputTokens": 340, "steps": 3, "duration": 12.5 });
         let answer = "**Bug:** `prices[1:]` skips the first price\n\nUse `sum(prices)`.";
         helper_update(
             &mut app,
@@ -1038,7 +1056,7 @@ mod tests {
             &["model: http 503: busy"],
             marked.clone(),
         );
-        let stopped = json!({ "_smol/agent": true, "interrupted": true });
+        let stopped = json!({ "interrupted": true });
         helper_update(
             &mut app,
             "call_1.4",

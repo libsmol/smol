@@ -410,6 +410,7 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     use crate::worker::sandbox::spread;
     use crate::worker::sandbox::{profile, sweep, Sandbox, LOCK, PASSED_ENV, TEMP_PREFIX};
+    use crate::worker::Delegation;
     use std::env;
     use std::fs;
     #[cfg(target_os = "linux")]
@@ -484,9 +485,14 @@ pub(crate) mod tests {
 
     fn evaluated(sandbox: Sandbox, code: &str) -> String {
         let interrupt = Interrupt::default();
-        let has_roles = false;
         let restarted = false;
-        let starting = Worker::new(&interrupt, Arc::new(sandbox), &[], has_roles, restarted);
+        let starting = Worker::new(
+            &interrupt,
+            Arc::new(sandbox),
+            &[],
+            Delegation::Off,
+            restarted,
+        );
         let mut worker = block_on(starting).expect("worker");
         let mut ignore = |_: &str| {};
         let mut none = no_agents;
