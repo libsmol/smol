@@ -7,6 +7,13 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- On macOS the Python process applies its Seatbelt profile itself with
+  `sandbox_init` when it starts, instead of being started through
+  `/usr/bin/sandbox-exec`. The profile is the same. If applying it fails, Python
+  doesn't start and the session says why, rather than running unconfined.
+
 ## 0.4.1 - 2026-10-29
 
 - The system prompt is laid out as How to reply, Running code, Functions,

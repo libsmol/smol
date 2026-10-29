@@ -235,8 +235,9 @@ enabled = false
 
 ## Sandbox
 
-On Linux (with Landlock, kernel 5.13 or later) and macOS (with
-`sandbox-exec`), the Python process and the programs it starts:
+On Linux (with Landlock, kernel 5.13 or later) and macOS (with Seatbelt, which
+the Python process applies to itself before running any code), the Python
+process and the programs it starts:
 
 - can write only in the working directory, in a temporary folder of their own
   (`TMPDIR`) and in the session's copies of viewed images;

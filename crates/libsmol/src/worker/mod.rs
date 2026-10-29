@@ -40,6 +40,9 @@ pub(crate) const CONTROL_ENV: &str = "SMOL_CONTROL";
 pub(crate) const COPIES_ENV: &str = "SMOL_COPIES";
 /// Holds `on`, or `roles` when `agent()` takes a role, and is unset for workers without `agent()`
 pub(crate) const AGENTS_ENV: &str = "SMOL_AGENTS";
+/// Holds the Seatbelt profile the worker confines itself with
+#[cfg(target_os = "macos")]
+pub(crate) const SANDBOX_ENV: &str = "SMOL_SANDBOX";
 pub(crate) const END: &[u8] = b"\x02smol\x03end\n";
 
 /// They must share one file name, which `_run` uses to drop them from tracebacks
@@ -198,10 +201,20 @@ pub fn serve() -> Result<()> {
     let copies = env::var_os(COPIES_ENV).unwrap_or_default();
     let copies = PathBuf::from(copies);
     let agents = env::var(AGENTS_ENV).unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    let profile = env::var(SANDBOX_ENV).ok();
     // Programs the code starts would inherit these, and they must go before any thread starts
     env::remove_var(CONTROL_ENV);
     env::remove_var(COPIES_ENV);
     env::remove_var(AGENTS_ENV);
+    #[cfg(target_os = "macos")]
+    env::remove_var(SANDBOX_ENV);
+
+    // Must come before any other thread starts and before any code runs
+    #[cfg(target_os = "macos")]
+    if let Some(profile) = profile {
+        sandbox::confine(&profile).map_err(Error::Python)?;
+    }
 
     let Some((address, token)) = control.split_once('/') else {
         let message = format!("worker: {CONTROL_ENV}: not set by the agent");

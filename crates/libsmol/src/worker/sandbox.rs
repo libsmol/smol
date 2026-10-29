@@ -1,5 +1,7 @@
 use crate::config::{Access, Skill};
 use crate::utils::new_id;
+#[cfg(target_os = "macos")]
+use crate::worker::SANDBOX_ENV;
 #[cfg(target_os = "linux")]
 use landlock::{
     Access as _, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
@@ -9,11 +11,17 @@ use reaper::{cause, tilde};
 use std::convert::Infallible;
 use std::env;
 use std::ffi::OsString;
+#[cfg(target_os = "macos")]
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs::{self, File};
 use std::io;
+#[cfg(target_os = "macos")]
+use std::mem;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::ptr;
 use tokio::process::Command;
 use tracing::info;
 #[cfg(target_os = "linux")]
@@ -22,8 +30,6 @@ use tracing::warn;
 const TEMP_PREFIX: &str = "smol-";
 /// The sandbox holds a lock on this file in its temporary folder while it lives
 const LOCK: &str = "lock";
-#[cfg(target_os = "macos")]
-const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// Relative to the home folder
 const CREDENTIALS: &[&str] = &[
     ".ssh",
@@ -82,9 +88,14 @@ const TEMP_ENV: &[&str] = &["TEMP", "TMP"];
 /// The Landlock ruleset the worker restricts itself with
 #[cfg(target_os = "linux")]
 type Isolation = OwnedFd;
-/// The Seatbelt profile sandbox-exec applies
+/// The Seatbelt profile the worker confines itself with
 #[cfg(target_os = "macos")]
 type Isolation = String;
+/// `sandbox_init` and `sandbox_free_error` as sandbox.h declares them
+#[cfg(target_os = "macos")]
+type SandboxInit = unsafe extern "C" fn(*const c_char, u64, *mut *mut c_char) -> c_int;
+#[cfg(target_os = "macos")]
+type FreeError = unsafe extern "C" fn(*mut c_char);
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 type Isolation = Infallible;
 
@@ -186,23 +197,17 @@ impl Sandbox {
         self.isolation.is_some()
     }
 
-    /// The worker's command before its arguments, already confined
+    /// The worker's command before its arguments, confined before it runs any code
     pub(crate) fn command(&self, program: &Path) -> Command {
-        #[cfg(target_os = "macos")]
-        let mut command = match &self.isolation {
-            Some(profile) => {
-                let mut command = Command::new(SANDBOX_EXEC);
-                command.arg("-p").arg(profile).arg(program);
-                command
-            }
-            None => Command::new(program),
-        };
-        #[cfg(not(target_os = "macos"))]
         let mut command = Command::new(program);
-
         command.current_dir(&self.cwd).env_clear();
         for (name, value) in &self.env {
             command.env(name, value);
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Some(profile) = &self.isolation {
+            command.env(SANDBOX_ENV, profile);
         }
 
         #[cfg(target_os = "linux")]
@@ -328,14 +333,62 @@ fn spread(path: &Path, write: bool, hidden: &[PathBuf], allowed: &mut Vec<(PathB
 #[cfg(target_os = "macos")]
 fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation> {
     // Apple deprecated it, and the worker runs unconfined once it is gone
-    if !Path::new(SANDBOX_EXEC).exists() {
-        info!("sandbox: not enforced, {SANDBOX_EXEC} not found");
+    if seatbelt().is_none() {
+        info!("sandbox: not enforced, sandbox_init not found");
         return None;
     }
 
     info!("sandbox: enforced (seatbelt)");
     let profile = profile(granted, hidden);
     Some(profile)
+}
+
+/// Looked up at run time because linking to them would keep libsmol from loading without them
+#[cfg(target_os = "macos")]
+fn seatbelt() -> Option<(SandboxInit, FreeError)> {
+    // SAFETY: Only looks the symbols up in the libraries already loaded
+    let (init, free) = unsafe {
+        let init = libc::dlsym(libc::RTLD_DEFAULT, c"sandbox_init".as_ptr());
+        let free = libc::dlsym(libc::RTLD_DEFAULT, c"sandbox_free_error".as_ptr());
+        (init, free)
+    };
+    if init.is_null() || free.is_null() {
+        return None;
+    }
+
+    // SAFETY: Both symbols have the signatures sandbox.h declares
+    let init = unsafe { mem::transmute::<*mut c_void, SandboxInit>(init) };
+    let free = unsafe { mem::transmute::<*mut c_void, FreeError>(free) };
+    Some((init, free))
+}
+
+/// Confines this process and every program it starts from now on, which can't be undone
+#[cfg(target_os = "macos")]
+pub(crate) fn confine(profile: &str) -> Result<(), String> {
+    let Some((init, free)) = seatbelt() else {
+        return Err("sandbox: sandbox_init not found".to_owned());
+    };
+    let profile = CString::new(profile).map_err(|e| format!("sandbox: {e}"))?;
+
+    let mut error: *mut c_char = ptr::null_mut();
+    // SAFETY: Flags 0 make the profile its text, and error is set only when it fails
+    let status = unsafe { init(profile.as_ptr(), 0, &mut error) };
+    if status == 0 {
+        return Ok(());
+    }
+
+    let reason = match error.is_null() {
+        true => format!("sandbox_init returned {status}"),
+        false => {
+            // SAFETY: The text is NUL-terminated and only sandbox_free_error may free it
+            let text = unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { free(error) };
+            text
+        }
+    };
+    Err(format!("sandbox: {reason}"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -517,24 +570,26 @@ pub(crate) mod tests {
         let config = dir.join("config");
         let copies = config.join("copies");
         let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access).expect("sandbox");
+        #[cfg(target_os = "macos")]
+        assert!(sandbox.enforced());
         if !sandbox.enforced() {
             fs::remove_dir_all(&dir).ok();
             return;
         }
 
-        let code = "import subprocess, tempfile\n\
+        let code = "import os, subprocess, tempfile\n\
             def tried(act):\n    try:\n        act()\n        return 'ok'\n    except PermissionError:\n        return 'denied'\n\
             key = '../secret/id_rsa'\n\
             [tried(lambda: open('../notes.md').read()), tried(lambda: open(key).read()),\n\
              tried(lambda: open('résumé.txt', 'w').write('x')), tried(lambda: tempfile.TemporaryFile().write(b'x')),\n\
              tried(lambda: open('../naïve.txt', 'w').write('x')), tried(lambda: open('../config/x', 'w').write('x')),\n\
-             subprocess.run(['cat', key], capture_output=True).returncode]";
+             subprocess.run(['cat', key], capture_output=True).returncode, 'SMOL_SANDBOX' in os.environ]";
         let logs = evaluated(sandbox, code);
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(
             logs,
-            "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 1]\n"
+            "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 1, False]\n"
         );
     }
 
