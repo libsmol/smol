@@ -17,7 +17,8 @@ impl Turn<'_> {
     pub(crate) async fn step(&mut self) -> Box<AgentStep> {
         let model = &*self.agent.model;
         let window = model.context_window();
-        let mut conversation = self.memory.conversation(&self.system, window);
+        let takes = |kind| model.takes(kind);
+        let mut conversation = self.memory.conversation(&self.system, &takes, window);
         // Saved sessions store only the file names of copies
         let copies = &self.agent.copies;
         for message in &mut conversation {
@@ -803,7 +804,7 @@ mod tests {
         let answer = agent.turn(&mut memory, "Print 1").expect("run");
         assert_eq!(answer, Some("42".to_owned()));
 
-        let conversation = memory.conversation("", None).into_iter().skip(1);
+        let conversation = memory.conversation("", &|_| true, None).into_iter().skip(1);
         let contents: Vec<String> = conversation.map(|message| content(&message)).collect();
         let expected = [
             "New task:\nPrint 1",

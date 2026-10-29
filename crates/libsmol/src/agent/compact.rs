@@ -322,7 +322,11 @@ mod tests {
 
         let saved = serde_json::to_string(&memory).expect("serialize");
         let loaded: AgentMemory = serde_json::from_str(&saved).expect("deserialize");
-        assert_eq!(loaded.conversation("", None), memory.conversation("", None));
+        let all = |_| true;
+        assert_eq!(
+            loaded.conversation("", &all, None),
+            memory.conversation("", &all, None)
+        );
     }
 
     #[test]
@@ -559,7 +563,7 @@ mod tests {
         let requests = run.requests.lock().expect("requests");
         let asked = content(&requests[0][1]);
         assert!(!asked.contains("log log"), "{asked}");
-        let conversation = memory.conversation("", None);
+        let conversation = memory.conversation("", &|_| true, None);
         let texts = contents(&conversation);
         assert_eq!(texts.last(), Some(&printed), "{texts:?}");
     }
@@ -666,7 +670,7 @@ mod tests {
         run.agent.compact(&mut memory).expect("compact");
 
         assert!(summarized(&memory));
-        let conversation = memory.conversation("", None);
+        let conversation = memory.conversation("", &|_| true, None);
         let texts = contents(&conversation);
         assert!(
             texts.iter().all(|text| !text.contains("brûlée crème")),

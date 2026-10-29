@@ -10,6 +10,8 @@ const BYTES_PER_TOKEN: usize = 3;
 /// Providers count differently, so this takes the high end
 const IMAGE_TOKENS: usize = 1500;
 const VIDEO_TOKENS: usize = 25_000;
+/// Older images and videos drop out this many at a time, so up to twice as many are sent
+const KEPT_MEDIA: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[serde(tag = "type", content = "message", rename_all = "snake_case")]
@@ -359,7 +361,12 @@ impl AgentMemory {
         visible
     }
 
-    pub(crate) fn conversation(&self, system: &str, window: Option<u64>) -> Vec<ChatMessage> {
+    pub(crate) fn conversation(
+        &self,
+        system: &str,
+        takes: &dyn Fn(MediaKind) -> bool,
+        window: Option<u64>,
+    ) -> Vec<ChatMessage> {
         let visible = self.visible();
         let message = ChatMessage::System(system.to_owned());
         let mut messages = vec![message];
@@ -373,6 +380,25 @@ impl AgentMemory {
         for step in visible.steps {
             let added = step.messages(&mut calls);
             messages.extend(added);
+        }
+
+        // Media the model doesn't take is never sent and doesn't count
+        let mut attached = Vec::new();
+        for message in &mut messages {
+            if let ChatMessage::User(parts) | ChatMessage::Tool { parts, .. } = message {
+                let taken =
+                    |part: &&mut Part| matches!(part, Part::Media(_, media) if takes(media.kind));
+                let media = parts.iter_mut().filter(taken);
+                attached.extend(media);
+            }
+        }
+        // A batch at a time keeps the prompt cache matching until the next batch goes
+        let dropped = attached.len().saturating_sub(KEPT_MEDIA) / KEPT_MEDIA * KEPT_MEDIA;
+        for part in attached.into_iter().take(dropped) {
+            if let Part::Media(label, media) = part {
+                let note = prompt::dropped(label, media);
+                *part = Part::Text(note);
+            }
         }
 
         messages
@@ -419,7 +445,7 @@ impl AgentMemory {
             return measured + estimate(unmeasured + after);
         }
 
-        let conversation = self.conversation(system, window);
+        let conversation = self.conversation(system, takes, window);
         let sent = bytes(&conversation, takes);
         estimate(sent)
     }
@@ -641,7 +667,7 @@ pub(crate) mod tests {
     }
 
     fn contents(memory: &AgentMemory) -> Vec<String> {
-        let messages = memory.conversation("", None).into_iter().skip(1);
+        let messages = memory.conversation("", &|_| true, None).into_iter().skip(1);
         messages.map(|message| content(&message)).collect()
     }
 
@@ -716,7 +742,7 @@ pub(crate) mod tests {
             ],
         };
 
-        let conversation = memory.conversation("", Some(1000));
+        let conversation = memory.conversation("", &|_| true, Some(1000));
         let first = content(&conversation[1]);
         let recent = ["Make it winter", "Only four lines"];
         let fitted = prompt::summarized("s1", Some("Write a poem about autumn"), &recent);
@@ -804,7 +830,7 @@ pub(crate) mod tests {
             ..SummaryStep::default()
         };
         memory.steps.push(MemoryStep::Summary(summarized));
-        let conversation = memory.conversation("", None);
+        let conversation = memory.conversation("", &|_| true, None);
         let sent = bytes(&conversation, &|_| true);
         assert_eq!(tokens(&memory), estimate(sent));
     }
@@ -914,6 +940,65 @@ pub(crate) mod tests {
         let placeholder = "[Task update]: Look at this one\n\n[Attached image screenshot.png]\n\n\
             [Attached notes.txt]: Crème brûlée";
         assert_eq!(transcript, placeholder);
+    }
+
+    /// Older images give way to a note a batch at a time,
+    /// which leaves the start of the conversation as it was until the next batch
+    #[test]
+    fn old_media_dropped() {
+        let viewing = |count: usize, takes: &dyn Fn(MediaKind) -> bool| {
+            let mut steps = vec![MemoryStep::Task(asked("Compare the café menus"))];
+            for n in 0..count {
+                let label = format!("menu {n}.png");
+                let result = CodeResult {
+                    media: vec![(label, png("café.png"))],
+                    ..CodeResult::default()
+                };
+                let mut step = coded("view('menu.png')", None);
+                step.calls[0].result = Some(result);
+                steps.push(MemoryStep::Action(Box::new(step)));
+            }
+            AgentMemory { steps }.conversation("", takes, None)
+        };
+        let note = prompt::dropped("menu 0.png", &png("café.png"));
+        let counted = |messages: &[ChatMessage]| {
+            let (mut shown, mut noted) = (0, 0);
+            for message in messages {
+                let (ChatMessage::User(parts) | ChatMessage::Tool { parts, .. }) = message else {
+                    continue;
+                };
+                for part in parts {
+                    match part {
+                        Part::Media(..) => shown += 1,
+                        Part::Text(text)
+                            if text.ends_with("only the latest images and videos are.") =>
+                        {
+                            noted += 1
+                        }
+                        Part::Text(_) => {}
+                    }
+                }
+            }
+            (shown, noted)
+        };
+
+        let all = |_| true;
+        assert_eq!(counted(&viewing(15, &all)), (15, 0));
+        let dropped = viewing(16, &all);
+        assert_eq!(counted(&dropped), (8, 8));
+        assert!(
+            dropped.iter().any(|message| content(message) == note),
+            "{dropped:?}"
+        );
+        let fewer = viewing(17, &all);
+        let more = viewing(23, &all);
+        assert_eq!(counted(&more), (15, 8));
+        assert_eq!(more[..fewer.len()], fewer[..]);
+        assert_eq!(counted(&viewing(24, &all)), (8, 16));
+
+        // Media the model doesn't take don't count toward a batch
+        let videos = |kind| kind == MediaKind::Video;
+        assert_eq!(counted(&viewing(16, &videos)), (16, 0));
     }
 
     #[test]

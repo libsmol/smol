@@ -361,6 +361,11 @@ pub(crate) fn missing(label: &str, media: &Media) -> String {
     format!("The {named} is not shown: its saved copy is gone.")
 }
 
+pub(crate) fn dropped(label: &str, media: &Media) -> String {
+    let named = named(label, media);
+    format!("The {named} is not shown: only the latest images and videos are.")
+}
+
 /// Viewed and attached media go by path, and media from MCP by the function called
 fn named(label: &str, media: &Media) -> String {
     let word = media.kind.word();
