@@ -186,13 +186,14 @@ pub(crate) fn system(
         Place::Main { .. } => format!(
             "\n\n# Sub-agents
 
-`agent()` gives a task to a new agent. It has the same files, built-in functions and MCP servers as you, but not this Python session or this conversation, so the task must state everything it needs.
+`agent()` gives a task to a new agent with the same environment as you, but not this Python session or this conversation, so the task must state everything it needs.
 
 | Situation | Call | Effect |
 |---|---|---|
 | The task has independent parts | `agent([task1, task2, ...])` | They run in parallel |
 | Long side work where only the result matters | `agent(task)` | Its steps stay out of this conversation |
 | Work that can go on in the background | `agent(task, name=\"...\")` | It runs while you continue |
+| The task asks for agents | `agent([part1, part2, ...])` once the parts are clear | Each part is done by an agent |
 
 - Without `name`, `agent()` waits for the answer. A single task that fails raises `RuntimeError`; a list of tasks returns the answers in order, with a `RuntimeError` in place of each task that failed.
 - With `name`, `agent()` returns a handle at once. The task goes on after your answer until the agent ends, and an `{DONE}:` message tells you when.

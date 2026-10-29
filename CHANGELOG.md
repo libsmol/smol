@@ -7,6 +7,13 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- The system prompt says an agent `agent()` starts has the same environment as
+  the one that starts it, and that a task asking for agents has each of its
+  parts done by an agent once the parts are clear. In a session that asked for
+  agents, the model drew every part itself first.
+
 ## 0.4.2 - 2026-10-29
 
 - On macOS the Python process applies its Seatbelt profile itself with
