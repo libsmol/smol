@@ -170,11 +170,11 @@ pub(crate) fn system(
         let entry = format!("- `{}`: {}", role.name, role.description);
         entries.push(entry);
     }
-    let agents = match entries.is_empty() {
+    let roles = match entries.is_empty() {
         true => String::new(),
         false => {
             let entries = entries.join("\n");
-            format!("\n\n# Agents\n\nTo give a task to an agent in one of these roles, call agent(task, role=role). For a list of tasks, role is one role for all of them or a list with one role per task:\n\n{entries}")
+            format!("\n\n# Roles\n\nTo give a task to an agent in one of these roles, call agent(task, role=role). For a list of tasks, role is one role for all of them or a list with one role per task:\n\n{entries}")
         }
     };
     let role = match place.role() {
@@ -230,7 +230,7 @@ These functions need no import. Use them instead of writing your own. Create new
 
 ## Built-in
 
-{functions}{listed}{skills}{agents}
+{functions}{listed}{skills}{roles}
 
 # Rules
 
@@ -721,7 +721,7 @@ mod tests {
         let plain = system(&[], &[], &[], cwd, true, &[], &main);
         assert!(!plain.contains("<instructions"), "{plain}");
         assert!(!plain.contains("# Skills"), "{plain}");
-        assert!(!plain.contains("# Agents"), "{plain}");
+        assert!(!plain.contains("# Roles"), "{plain}");
         let sandbox = "are there.\n- Your code runs in a sandbox: writing outside /home/zoë/work and $TMPDIR, ";
         assert!(plain.contains(sandbox), "{plain}");
     }
@@ -739,7 +739,7 @@ mod tests {
 
         let place = main_place(roles);
         let main = system(&[], &[], &[], cwd, false, &[], &place);
-        let listed = "\n\n# Agents\n\n\
+        let listed = "\n\n# Roles\n\n\
                       To give a task to an agent in one of these roles, call agent(task, role=role). \
                       For a list of tasks, role is one role for all of them or a list with one role per task:\n\n\
                       - `reviewer`: Reviews the café's code\n\
@@ -752,7 +752,7 @@ mod tests {
         let own = "include everything the task asks for.\n\n# Role\n\n\
                    Your role is `reviewer`: Reviews the café's code\n\n# Running code";
         assert!(helper.contains(own), "{helper}");
-        assert!(!helper.contains("# Agents"), "{helper}");
+        assert!(!helper.contains("# Roles"), "{helper}");
         let plain = system(&[], &[], &[], cwd, false, &[], &Place::Delegated(None));
         assert!(!plain.contains("# Role"), "{plain}");
     }
