@@ -18,12 +18,13 @@ pub(crate) const TOOL_DOC: &str = "Runs Python code.";
 
 const UPDATE: &str = "Task update";
 
-const RULES: &str = "- Never make up data or functions; check unfamiliar ones with help() first.
+const RULES: &str = "- Never make up data or functions; check unfamiliar ones with `help()` first.
 - Do the task instead of describing it.
 - Report only results you obtained, and state what failed or is uncertain.";
 
-const ANSWER: &str = "without a tool call. This ends the task. Answer as soon as you have the result; if no code is needed, answer immediately.";
-const UPDATES: &str = "The user may send a \"Task update:\" while you work; it adds to or changes the current task. Text you write in a reply that runs code is shown to the user.";
+const SHOWN: &str = " Text you write in a reply that runs code is shown to the user.";
+const UPDATES: &str =
+    "A user message that starts with `Task update:` adds to or changes the current task.";
 const HANDED_BACK: &str = "Only your answer is returned to the agent that assigned this task, so include everything the task asks for.";
 /// Errors of `agent()` and its handles go unlabeled, as the worker labels them with the function
 /// the code called
@@ -88,9 +89,9 @@ pub(crate) fn done(agents: &[String]) -> String {
 /// None leaves view() out of the prompt
 pub(crate) fn view_summary(image: bool, video: bool) -> Option<&'static str> {
     match (image, video) {
-        (true, true) => Some("attaches an image or video file to this call's result"),
-        (true, false) => Some("attaches an image file to this call's result"),
-        (false, true) => Some("attaches a video file to this call's result"),
+        (true, true) => Some("Attaches an image or video file to this call's result."),
+        (true, false) => Some("Attaches an image file to this call's result."),
+        (false, true) => Some("Attaches a video file to this call's result."),
         (false, false) => None,
     }
 }
@@ -104,12 +105,24 @@ pub(crate) fn system(
     instructions: &[String],
     place: &Place,
 ) -> String {
-    let mut lines = Vec::new();
+    let mut stubs = Vec::new();
+    let mut handed = Vec::new();
     for function in functions {
-        let line = format!("- {}  # {}", function.header, function.summary);
-        lines.push(line);
+        let mut stub = function.header.clone();
+        for line in function.summary.lines() {
+            stub.push_str("\n    # ");
+            stub.push_str(line);
+        }
+        // The names builtins.py gives `agent()` and the `Agent` class and methods
+        let delegating =
+            function.name == "agent" || function.name.split('.').next() == Some("Agent");
+        match delegating {
+            true => handed.push(stub),
+            false => stubs.push(stub),
+        }
     }
-    let functions = lines.join("\n");
+    let stubs = stubs.join("\n\n");
+    let handed = handed.join("\n\n");
 
     let mut listed = String::new();
     for added in servers {
@@ -120,13 +133,10 @@ pub(crate) fn system(
         if !description.is_empty() {
             parts.push(description.to_owned());
         }
-        let mut signatures = Vec::new();
-        for header in &added.headers {
-            let line = format!("- {header}");
-            signatures.push(line);
-        }
-        if !signatures.is_empty() {
-            parts.push(signatures.join("\n"));
+        if !added.headers.is_empty() {
+            let headers = added.headers.join("\n");
+            let block = format!("```python\n{headers}\n```");
+            parts.push(block);
         }
 
         let section = parts.join("\n\n");
@@ -139,7 +149,7 @@ pub(crate) fn system(
         let name = &skill.name;
         let description = &skill.description;
         let path = skill.path.display();
-        let entry = format!("## Skill `{name}`\n\n{description}\n\n- {path}");
+        let entry = format!("## Skill `{name}`\n\n{description}\n\n- `{path}`");
         entries.push(entry);
     }
     // The sandbox gives Windows code TEMP instead of TMPDIR
@@ -151,31 +161,47 @@ pub(crate) fn system(
         true => String::new(),
         false => {
             let entries = entries.join("\n\n");
-            format!("\n\n# Skills\n\nWhen a task matches a skill below, read and follow its SKILL.md; paths in it are relative to its folder. Install packages its scripts need in a venv in {temp}.\n\n{entries}")
+            format!("\n\n# Skills\n\nWhen a task matches a skill below, read and follow its `SKILL.md`; paths in it are relative to its folder. Install packages its scripts need in a venv in `{temp}`.\n\n{entries}")
         }
     };
 
-    let (reply, note, hand_off, roles) = match place {
-        Place::Main { roles, .. } => {
-            let hand_off = format!("\n\nagent() gives a task to a new agent:
-- Pass independent parts of a task as a list to run them in parallel.
-- Give it long side work where only the result matters, so its steps stay out of this conversation.
-- With a name, it runs in the background: the task goes on after your answer until it ends, and an \"{DONE}:\" message tells you when.");
-            ("reply in Markdown", UPDATES, hand_off, roles.as_slice())
-        }
-        Place::Delegated(_) => ("reply", HANDED_BACK, String::new(), &[][..]),
+    let (shown, markdown, note, roles) = match place {
+        Place::Main { roles, .. } => (SHOWN, " in Markdown", UPDATES, roles.as_slice()),
+        Place::Delegated(_) => ("", "", HANDED_BACK, &[][..]),
     };
     let mut entries = Vec::new();
     for role in roles {
         let entry = format!("- `{}`: {}", role.name, role.description);
         entries.push(entry);
     }
-    let roles = match entries.is_empty() {
-        true => String::new(),
-        false => {
+    let roles = match roles.first() {
+        None => String::new(),
+        Some(first) => {
             let entries = entries.join("\n");
-            format!("\n\n# Roles\n\nTo give a task to an agent in one of these roles, call agent(task, role=role). For a list of tasks, role is one role for all of them or a list with one role per task:\n\n{entries}")
+            let name = &first.name;
+            format!("\n\n## Roles\n\nTo give a task to an agent in one of these roles, call `agent(task, role=\"{name}\")`. For a list of tasks, `role` is one role for all of them or a list with one role per task.\n\n{entries}")
         }
+    };
+    let agents = match place {
+        Place::Main { .. } => format!(
+            "\n\n# Sub-agents
+
+`agent()` gives a task to a new agent. It has the same files, built-in functions and MCP servers as you, but not this Python session or this conversation, so the task must state everything it needs.
+
+| Situation | Call | Effect |
+|---|---|---|
+| The task has independent parts | `agent([task1, task2, ...])` | They run in parallel |
+| Long side work where only the result matters | `agent(task)` | Its steps stay out of this conversation |
+| Work that can go on in the background | `agent(task, name=\"...\")` | It runs while you continue |
+
+- Without `name`, `agent()` waits for the answer. A single task that fails raises `RuntimeError`; a list of tasks returns the answers in order, with a `RuntimeError` in place of each task that failed.
+- With `name`, `agent()` returns a handle at once. The task goes on after your answer until the agent ends, and an `{DONE}:` message tells you when.
+
+```python
+{handed}
+```{roles}"
+        ),
+        Place::Delegated(_) => String::new(),
     };
     let role = match place.role() {
         Some(role) => format!(
@@ -201,45 +227,51 @@ pub(crate) fn system(
 
     let cwd = cwd.display();
     let sandbox = match sandboxed {
-        true => format!("\n- Your code runs in a sandbox: writing outside {cwd} and $TMPDIR, or reading some private files, fails with PermissionError. $TMPDIR is removed when the session ends.\n- If a tool fails because it cannot write its cache, rerun it with the cache in $TMPDIR."),
+        true => format!("\n- Your code runs in a sandbox: writing outside `{cwd}` and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- `$TMPDIR` is removed when the session ends.\n- If a tool fails because it cannot write its cache, rerun it with the cache in `$TMPDIR`."),
         false => String::new(),
     };
     let date = Utc::now().format("%Y-%m-%d");
     format!(
-        "You complete tasks by running Python code with the {TOOL} tool. Each reply does one of two things:
-- Run code: call {TOOL}. A reply may contain several calls; they run in order, and once one fails, the rest are skipped.
-- Answer: {reply} {ANSWER}
+        "You complete tasks by running Python code with the `{TOOL}` tool.
 
-{note}{hand_off}{role}
+# How to reply
+
+Each reply does exactly one of these:
+- Run code: call `{TOOL}`. A reply may contain several calls; they run in order, and once one fails, the rest are skipped.{shown}
+- Answer: reply{markdown} without a tool call. This ends the task.
+
+Answer as soon as you have the result; if the task needs no code, answer immediately. {note}{role}
 
 # Running code
 
 All calls share one Python session: variables, functions and imports persist across calls.
 
-A call returns what its code printed, plus the value of every top-level expression that is not None (strings verbatim, other values as repr). Output longer than {MAX_OBSERVATION_CHARS} characters is cut in the middle; this cut does not change the values in your variables. If the code fails, the result ends with \"Error:\" followed by the exception and the line that raised it.
+A call returns what its code printed, plus the value of every top-level expression that is not `None` (strings verbatim, other values as `repr`). Output longer than {MAX_OBSERVATION_CHARS} characters is cut in the middle; the values in your variables are not affected. If the code fails, the result ends with `Error:` followed by the exception and the line that raised it.
 
 Write each call as a complete program:
-- Do as much as possible with loops, conditions, the standard library and the functions below.
+- Do as much as possible in one call with loops, conditions, the standard library and the functions below.
 - Print only what you need to see.
 - Reuse the data, functions and imports the session already holds; reload data only if its source changed.
 - Put code you will run again in a function.
 
 # Functions
 
-These functions need no import. Use them instead of writing your own. Create new files with open().
+These need no import. Use them instead of writing your own, and create new files with `open()`.
 
 ## Built-in
 
-{functions}{listed}{skills}{roles}
-
-# Rules
-
-{RULES}
+```python
+{stubs}
+```{listed}{skills}{agents}
 
 # Environment
 
-- Your code runs on the user's computer ({OS}) in {cwd}; the files and programs a task mentions are there.{sandbox}
-- Today is {date} (UTC).{instructions}",
+- Your code runs on the user's computer ({OS}) in `{cwd}`; the files and programs a task mentions are there.{sandbox}
+- Today is {date} (UTC).
+
+# Rules
+
+{RULES}{instructions}",
     )
 }
 
@@ -544,7 +576,26 @@ pub(crate) const RESTARTED: &str =
 
 pub(crate) const NAMER: &str = "Reply with a short title for a conversation that starts with the message below: a few words in its language, without quotes or ending punctuation. Do not answer the message.";
 
-pub(crate) const SUMMARIZER: &str = "You summarize an AI agent's work so it can continue after its earlier messages are removed. In the conversation, [Agent] is the agent's message, [Code] the Python code it ran, [Observation] what the code printed and [Error] what failed. Write only the summary, in the language of the tasks; do not continue the work or answer the tasks.";
+/// Lists every label `transcript` writes
+pub(crate) const SUMMARIZER: &str =
+    "You summarize an AI agent's work so it can continue after its earlier messages are removed.
+
+# The conversation
+
+Each entry starts with a label:
+- `[Task]` and `[Task update]`: what the agent was asked to do
+- `[Agent]`: the agent's message
+- `[Code]`: Python code it ran
+- `[Observation]`: what the code printed
+- `[Error]`: what failed
+- `[Attached ...]`: a file attached to a task
+- `[Shell]`: a command the user ran
+- `[Agent done]`: agents started in the background that ended
+
+# Rules
+
+- Write only the summary, in the language of the tasks.
+- Do not continue the work or answer the tasks.";
 
 const SUMMARY_FORMAT: &str = "Use exactly this format with every section (\"(none)\" if empty), in short bullets with exact paths, names and values:
 
@@ -685,6 +736,7 @@ mod tests {
     use crate::prompt::{
         call_error, error, media_tag, shell, system, transcript, unseen, view_summary,
     };
+    use crate::worker::Function;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -697,10 +749,36 @@ mod tests {
         }];
         let cwd = Path::new("/home/zoë/work");
 
+        let function = |name: &str, header: &str, summary: &str| Function {
+            name: name.to_owned(),
+            header: header.to_owned(),
+            summary: summary.to_owned(),
+        };
+        let functions = [
+            function(
+                "ls",
+                "ls(path) -> list[str]",
+                "Sorted paths.\nThe café/ folder ends with /.",
+            ),
+            function("agent", "agent(task) -> str", "A new agent does each task."),
+            function("Agent", "class Agent", "The handle."),
+            function("Agent.get", "Agent.get(name) -> Agent", "Its handle."),
+            function("help", "help(request) -> None", "Prints the docs."),
+        ];
+
         let main = main_place(Vec::new());
-        let text = system(&[], &[], &skills, cwd, false, &instructions, &main);
+        let text = system(&functions, &[], &skills, cwd, false, &instructions, &main);
+        let built_in = "## Built-in\n\n```python\n\
+                        ls(path) -> list[str]\n    # Sorted paths.\n    # The café/ folder ends with /.\n\n\
+                        help(request) -> None\n    # Prints the docs.\n```\n\n# Skills";
+        assert!(text.contains(built_in), "{text}");
+        let handed = "```python\n\
+                      agent(task) -> str\n    # A new agent does each task.\n\n\
+                      class Agent\n    # The handle.\n\n\
+                      Agent.get(name) -> Agent\n    # Its handle.\n```\n\n# Environment";
+        assert!(text.contains(handed), "{text}");
         let place =
-            ") in /home/zoë/work; the files and programs a task mentions are there.\n- Today";
+            ") in `/home/zoë/work`; the files and programs a task mentions are there.\n- Today";
         assert!(text.contains(place), "{text}");
         let temp = match cfg!(windows) {
             true => "%TEMP%",
@@ -708,11 +786,11 @@ mod tests {
         };
         let skill = format!(
             "\n\n# Skills\n\n\
-             When a task matches a skill below, read and follow its SKILL.md; paths in it are relative to its folder. Install packages its scripts need in a venv in {temp}.\n\n\
-             ## Skill `weekly`\n\nWrite the weekly report\n\n- /home/zoë/.smol/skills/weekly/SKILL.md\n\n# Rules\n\n"
+             When a task matches a skill below, read and follow its `SKILL.md`; paths in it are relative to its folder. Install packages its scripts need in a venv in `{temp}`.\n\n\
+             ## Skill `weekly`\n\nWrite the weekly report\n\n- `/home/zoë/.smol/skills/weekly/SKILL.md`\n\n# Sub-agents\n\n"
         );
         assert!(text.contains(&skill), "{text}");
-        let files = " (UTC).\n\n# Instructions\n\n\
+        let files = " or is uncertain.\n\n# Instructions\n\n\
                      Follow these instructions:\n\n\
                      <instructions>\nReply in French\n</instructions>\n\n\
                      <instructions>\nIndent with tabs\n</instructions>";
@@ -722,7 +800,7 @@ mod tests {
         assert!(!plain.contains("<instructions"), "{plain}");
         assert!(!plain.contains("# Skills"), "{plain}");
         assert!(!plain.contains("# Roles"), "{plain}");
-        let sandbox = "are there.\n- Your code runs in a sandbox: writing outside /home/zoë/work and $TMPDIR, ";
+        let sandbox = "are there.\n- Your code runs in a sandbox: writing outside `/home/zoë/work` and `$TMPDIR`, ";
         assert!(plain.contains(sandbox), "{plain}");
     }
 
@@ -739,11 +817,11 @@ mod tests {
 
         let place = main_place(roles);
         let main = system(&[], &[], &[], cwd, false, &[], &place);
-        let listed = "\n\n# Roles\n\n\
-                      To give a task to an agent in one of these roles, call agent(task, role=role). \
-                      For a list of tasks, role is one role for all of them or a list with one role per task:\n\n\
+        let listed = "\n\n## Roles\n\n\
+                      To give a task to an agent in one of these roles, call `agent(task, role=\"reviewer\")`. \
+                      For a list of tasks, `role` is one role for all of them or a list with one role per task.\n\n\
                       - `reviewer`: Reviews the café's code\n\
-                      - `tester`: Writes naïve tests\n\n# Rules\n\n";
+                      - `tester`: Writes naïve tests\n\n# Environment\n\n";
         assert!(main.contains(listed), "{main}");
         assert!(!main.contains("# Role\n"), "{main}");
 
@@ -759,11 +837,11 @@ mod tests {
 
     #[test]
     fn view_summaries() {
-        let both = Some("attaches an image or video file to this call's result");
+        let both = Some("Attaches an image or video file to this call's result.");
         assert_eq!(view_summary(true, true), both);
-        let images = Some("attaches an image file to this call's result");
+        let images = Some("Attaches an image file to this call's result.");
         assert_eq!(view_summary(true, false), images);
-        let videos = Some("attaches a video file to this call's result");
+        let videos = Some("Attaches a video file to this call's result.");
         assert_eq!(view_summary(false, true), videos);
         assert_eq!(view_summary(false, false), None);
     }

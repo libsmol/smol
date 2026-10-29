@@ -26,7 +26,7 @@ A real run with DeepSeek on smol's own source:
   tools to choose from or route between; its attention goes to the task.
 - **Python.** The language models write most fluently, with a standard library
   that covers files, data, text, HTTP and more.
-- **A tiny prompt.** The system prompt is under 1,500 tokens: how the session
+- **A tiny prompt.** The system prompt is under 2,000 tokens: how the session
   works, the built-in functions and a few rules. No persona, no imposed
   workflow, nothing that holds a capable model back.
 - **No permission prompts.** It never stops to ask before running code,

@@ -39,7 +39,6 @@ _STDOUT, _STDERR = _stream(1), _stream(2)
 _SHOWN = None
 
 _MAX_PRINT_CHARS = 8192
-_FIELDS = ".name, .task and .role" if _AGENTS == "roles" else ".name and .task"
 
 def _open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
     opened = _REAL_OPEN(file, mode, buffering, encoding, errors, newline, closefd, opener)
@@ -94,8 +93,8 @@ def _builtin(function, header=None):
     builtin.__name__ = function.__name__
     builtin.__qualname__ = function.__qualname__
     builtin.__signature__ = signature
-    # The agent decides these values, so docs name them in braces
-    builtin.__doc__ = function.__doc__.format(agents=_MAX_AGENTS, done=_DONE, fields=_FIELDS)
+    # The agent sets these values too, so docs name them in braces
+    builtin.__doc__ = function.__doc__.format(agents=_MAX_AGENTS, done=_DONE)
     builtin._smol_header = header
     return builtin
 
@@ -113,9 +112,8 @@ def _path(function, name, value):
 
 @_builtin
 def edit(path: str | _os.PathLike, old: str, new: str) -> None:
-    """replaces old with new; raises ValueError and leaves the file unchanged unless old appears exactly once
-
-    Replaces old with new in a text file; raises unless old appears exactly once."""
+    """Replaces old with new in a text file.
+    Raises ValueError and leaves the file unchanged unless old appears exactly once."""
     path = _path("edit", "path", path)
     old = _str("edit", "old", old)
     new = _str("edit", "new", new)
@@ -164,7 +162,8 @@ def edit(path: str | _os.PathLike, old: str, new: str) -> None:
 
 @_builtin
 def ls(path: str | _os.PathLike = ".", recursive: bool = False) -> list[str]:
-    """sorted paths relative to path (ls('src') returns 'a.py', not 'src/a.py'); directories end with /; recursive=True skips .gitignore'd paths
+    """Sorted paths relative to path: ls('src') returns 'a.py', not 'src/a.py'.
+    Directories end with /. recursive=True skips .gitignore'd paths.
 
     Lists directory path as sorted paths relative to it, directories ending with /; recursive=True lists everything below it, skipping .git and .gitignore'd paths and not entering symbolic links."""
     path = "." if path is None else _path("ls", "path", path)
@@ -173,9 +172,14 @@ def ls(path: str | _os.PathLike = ".", recursive: bool = False) -> list[str]:
 
 @_builtin
 def grep(pattern: str, path: str | _os.PathLike = ".", glob: str | None = None) -> list[tuple[str, int, str]]:
-    """(path, line number from 1, line) for each matching line; Rust regex without lookaround or backreferences; skips .gitignore'd and binary files
+    """(path, line number from 1, line) for each matching line.
+    pattern is a Rust regex without lookaround or backreferences.
+    Skips .gitignore'd and binary files.
 
-    Searches a file, or every file below a directory except .git, symbolic links, .gitignore'd and binary files, for a Rust regex (Python re without lookaround or backreferences; (?i) ignores case); returns the matching lines, paths usable with open() and lines counted from 1.
+    Searches a file, or every file below a directory, for a Rust regex.
+    - Its syntax is that of Python re, without lookaround or backreferences; (?i) ignores case.
+    - Below a directory it skips .git, symbolic links, .gitignore'd and binary files.
+    - Returns the matching lines; paths work with open() and lines are counted from 1.
 
     Args:
         glob: Only search files whose names match this glob
@@ -187,7 +191,7 @@ def grep(pattern: str, path: str | _os.PathLike = ".", glob: str | None = None) 
 
 @_builtin
 def fetch(url: str) -> str:
-    """the page as Markdown
+    """The page as Markdown.
 
     Returns a web page: HTML as Markdown, other text as it is; binary content raises an error."""
     url = _str("fetch", "url", url)
@@ -195,7 +199,7 @@ def fetch(url: str) -> str:
 
 @_builtin
 def view(path: str | _os.PathLike) -> None:
-    """attaches an image or video file to this call's result
+    """Attaches an image or video file to this call's result.
 
     Attaches a PNG, JPEG, GIF or WebP image, or an MP4, WebM or MOV video, to this call's result."""
     path = _path("view", "path", path)
@@ -228,8 +232,10 @@ def _texts(function, name, value, count=None):
         raise ValueError(f"{function}: {name}: needs one {name} per task ({count}), not {len(texts)}")
     return texts
 
+_FIELDS = ".name, .task and .role" if _AGENTS == "roles" else ".name and .task"
+
 class Agent:
-    __doc__ = f"the handle of an agent that agent() started in the background; {_FIELDS} hold what it was started with"
+    __doc__ = f"The handle of an agent started with a name.\n{_FIELDS} hold what it was started with."
 
     _smol_header = "class Agent"
 
@@ -243,7 +249,7 @@ class Agent:
         return f"<Agent {self.name}>"
 
     def get(cls, name: str) -> Agent | None:
-        """the handle of the agent last started with this name, also after Python restarts; {fields} hold what it was started with
+        """The handle of the agent last started with this name, also after Python restarts.
 
         Returns the handle of the agent last started with this name in this session, also after Python restarts, or None if there is none."""
         name = _str("Agent.get", "name", name)
@@ -253,9 +259,13 @@ class Agent:
         return cls(**found)
 
     def wait(self, timeout: float | None = None) -> str | None:
-        """its answer once it ends, or None if it is still running after timeout seconds; raises RuntimeError if it failed or was stopped
+        """Its answer once it ends, or None if it is still running after timeout seconds.
+        Raises RuntimeError if it failed or was stopped.
 
-        Waits until the agent ends and returns its answer, or returns None if it is still running after timeout seconds; timeout=None waits until it ends. Raises RuntimeError if the agent failed or was stopped. Once the code has its result, no "{done}:" message is sent for it."""
+        Waits until the agent ends and returns its answer.
+        - With timeout, returns None if it is still running after that many seconds; timeout=None waits until it ends.
+        - Raises RuntimeError if the agent failed or was stopped.
+        - Once the code has its result, no "{done}:" message is sent for it."""
         if timeout is not None:
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
                 kind = type(timeout).__name__
@@ -272,13 +282,13 @@ class Agent:
         return answer
 
     def status(self) -> str:
-        """what it is doing now and the end of what it is writing or printing, or how it ended
+        """What it is doing now and the end of what it is writing or printing, or how it ended.
 
         Returns how long it has run and what it is doing now, followed by the last lines it is writing or printing; once it has ended, returns how it ended."""
         return _delegated("Agent.status", "status", {"id": self._id})
 
     def stop(self) -> None:
-        """stops it and returns once it has stopped
+        """Stops it and returns once it has stopped.
 
         Stops the agent and returns once it has stopped; no "{done}:" message is sent for it."""
         _delegated("Agent.stop", "stop", {"id": self._id})
@@ -289,11 +299,14 @@ for _method in [Agent.get, Agent.wait, Agent.status, Agent.stop]:
 Agent.get = classmethod(Agent.get)
 
 def agent(task: str | list[str], role: str | list[str] | None = None, *, name: str | list[str] | None = None) -> str | list[str | RuntimeError] | Agent | list[Agent]:
-    """a new agent does the task and returns its answer, or its handle at once when given a name; it has the same files, built-in functions and MCP servers, but not this Python session or this conversation, so the task must state everything it needs
+    """A new agent does each task and returns its answer, or with name its handle at once.
+    A list of tasks takes a list of names, one per task.
 
-    Gives the task to a new agent and returns its final answer, or raises RuntimeError if the agent fails. The agent has its own Python session and the same files, built-in functions, MCP servers, skills and instructions as you, but not your variables or this conversation, so the task must state everything it needs. A list of tasks runs up to {agents} agents at a time and returns their answers in the same order, with the exception in place of any task that failed. Agents started this way cannot call agent().
+    Gives each task to a new agent.
+    - Without name: returns its answer, or raises RuntimeError if the agent fails. A list of tasks runs up to {agents} agents at a time and returns their answers in order, with the exception in place of each task that failed.
+    - With name: the agent runs in the background and agent() returns its Agent handle at once. A list of tasks takes one name per task and returns a list of handles. A name cannot be given again while its agent is running.
 
-    With name, the agent runs in the background and agent() returns its Agent handle at once; a list of tasks takes a list of names, one per task, and returns a list of handles. A name cannot be given again while its agent is running."""
+    The agent has its own Python session and the same files, built-in functions, MCP servers, skills and instructions as you, but not your variables or this conversation, so the task must state everything it needs. Agents started this way cannot call agent()."""
     single = isinstance(task, str)
     tasks = _texts("agent", "task", task)
     if not tasks or not all(item.strip() for item in tasks):
@@ -330,7 +343,8 @@ agent = _builtin(agent)
 
 @_builtin
 def help(request: object) -> None:
-    """prints the signature and docs of a function, class, module or MCP server, and the code of functions and classes you defined
+    """Prints the signature and docs of a function, class, module or MCP server.
+    For functions and classes you defined, also prints their code.
 
     Prints the signature and documentation of an object, or of the function, module or MCP server a dotted name refers to; modules also list their public members, and functions and classes your code defined in an earlier call also show that code."""
     import importlib
@@ -397,8 +411,7 @@ def help(request: object) -> None:
 _BUILTINS = [edit, ls, grep, fetch, view, help]
 # Workers of agents that agent() started have none of it
 if _AGENTS:
-    _BUILTINS[5:5] = [agent, Agent.get, Agent.wait, Agent.status, Agent.stop]
-    _builtins.Agent = Agent
+    _BUILTINS[5:5] = [agent, Agent, Agent.get, Agent.wait, Agent.status, Agent.stop]
 _FUNCTIONS = []
 for _function in _BUILTINS:
     _name = _function.__qualname__

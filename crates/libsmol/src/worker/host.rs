@@ -1907,9 +1907,9 @@ pub(crate) mod tests {
         let main = main_place(Vec::new());
         let text = system(&[], &servers, &[], cwd, false, &[], &main);
         let listed = "\n\n## MCP `news_web`\n\nSearches the web and the news\n\nRead-only\n\n\
-                      - news_web.echo_text(the_text: str = None) -> str\n\n\
+                      ```python\nnews_web.echo_text(the_text: str = None) -> str\n```\n\n\
                       ## MCP `notes`\n\n\
-                      - notes.echo_text(the_text: str = None) -> str\n\n# Rules\n";
+                      ```python\nnotes.echo_text(the_text: str = None) -> str\n```\n\n# Sub-agents\n";
         assert!(text.contains(listed), "{text}");
     }
 
@@ -2037,7 +2037,7 @@ pub(crate) mod tests {
         assert!(ls.starts_with(header), "{ls}");
 
         let own = help("help");
-        let header = "help(request: object) -> None\nprints the signature and docs of a function, class, module or MCP server, and the code of functions and classes you defined\n\nPrints ";
+        let header = "help(request: object) -> None\nPrints the signature and docs of a function, class, module or MCP server.\nFor functions and classes you defined, also prints their code.\n\nPrints ";
         assert!(own.starts_with(header), "{own}");
 
         let zipfile = help("'zipfile.ZipFile'");

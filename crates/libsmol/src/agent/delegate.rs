@@ -853,9 +853,9 @@ mod tests {
         // Agents started by agent() don't see it or task updates, and answer the code
         let requests = requests.lock().expect("requests");
         let main = content(&requests[0][0]);
-        let listed = "\n- agent(task: str | list[str], *, name: str | list[str] | None = None) -> str | list[str | RuntimeError] | Agent | list[Agent]  # a new agent";
+        let listed = "\nagent(task: str | list[str], *, name: str | list[str] | None = None) -> str | list[str | RuntimeError] | Agent | list[Agent]\n    # A new agent";
         assert!(main.contains(listed), "{main}");
-        assert!(main.contains("\n- Agent.wait(timeout"), "{main}");
+        assert!(main.contains("\nAgent.wait(timeout"), "{main}");
         assert!(main.contains("Task update"), "{main}");
         let helped = requests.iter().map(|request| content(&request[0]));
         let helper = helped
@@ -865,7 +865,8 @@ mod tests {
         assert!(!helper.contains("agent("), "{helper}");
         assert!(!helper.contains("Agent."), "{helper}");
         assert!(!helper.contains("Task update"), "{helper}");
-        let returned = "\n\nOnly your answer is returned to the agent that assigned this task";
+        let returned =
+            "answer immediately. Only your answer is returned to the agent that assigned this task";
         assert!(helper.contains(returned), "{helper}");
     }
 

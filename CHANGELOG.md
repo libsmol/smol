@@ -7,6 +7,16 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- The system prompt is laid out as How to reply, Running code, Functions,
+  Sub-agents, Environment and Rules, with code and literal text in backticks.
+  Functions are listed as Python signatures with their descriptions as comments,
+  and `help()` shows the same descriptions. Sub-agents has a table of when to
+  call `agent()` and says that a single task that fails raises `RuntimeError`.
+- The prompt for compaction explains every label in the conversation it
+  summarizes, not just four of them.
+
 ## 0.4.0 - 2026-10-29
 
 Sessions are saved in format 8, so sessions from 0.3.1 and earlier are no longer

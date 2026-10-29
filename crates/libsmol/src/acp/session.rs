@@ -1230,9 +1230,9 @@ mod tests {
         let prompts = prompts.lock().expect("prompts");
         let prompt = &prompts[0];
         let header =
-            "- agent(task: str | list[str], role: str | list[str] | None = None, *, name: ";
+            "\nagent(task: str | list[str], role: str | list[str] | None = None, *, name: ";
         assert!(prompt.contains(header), "{prompt}");
-        let listed = "with one role per task:\n\n- `reviewer`: Reviews the café's code\n\n";
+        let listed = "with one role per task.\n\n- `reviewer`: Reviews the café's code\n\n";
         assert!(prompt.contains(listed), "{prompt}");
         fs::remove_dir_all(&dir).ok();
     }
