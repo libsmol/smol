@@ -293,7 +293,7 @@ mod tests {
         assert_eq!(
             after[1..],
             [
-                "Earlier messages were replaced by this summary:\n\n<summary>\nx holds 41.\n</summary>\n\nCurrent task:\nAdd 1 to x",
+                "Earlier messages were replaced by this summary of your work so far:\n\n<summary>\nx holds 41.\n</summary>\n\nCurrent task:\nAdd 1 to x",
                 "eval:\nprint('data')",
                 "data",
             ]
@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(
             after[1..],
             [
-                "Earlier messages were replaced by this summary:\n\n<summary>\nx holds 41.\n</summary>",
+                "Earlier messages were replaced by this summary of your work so far:\n\n<summary>\nx holds 41.\n</summary>",
                 "x is 41.",
                 "New task:\nAdd 1 to x",
             ]

@@ -761,7 +761,7 @@ pub(crate) mod tests {
                 summary("s1", 1),
             ],
         };
-        let text = "Earlier messages were replaced by this summary:\n\n\
+        let text = "Earlier messages were replaced by this summary of your work so far:\n\n\
             <summary>\ns1\n</summary>\n\n\
             Current task:\nWrite a poem about autumn\n\n\
             Task update:\nMake it winter\n\n\

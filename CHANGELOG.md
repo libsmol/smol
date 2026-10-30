@@ -15,6 +15,14 @@ but their files stay in `~/.smol/history` untouched.
 - The system prompt names the places `[allow] write` in `agent.toml` opens to
   the code. It said that writing anywhere but the working directory and
   `$TMPDIR` fails, which was not true of them.
+- The prompt for compaction asks for where the work stands when the summarized
+  part ends. A summary that follows an earlier one rewrites it instead of
+  merging the two, what the agent said it did is kept apart from what the
+  output showed, each check names what it ran against, long content in a file
+  is given by its path, and earlier tasks stay only where they still matter.
+  The summary is written in the language of the tasks, and the model is told
+  it covers its own work so far. In sessions that compacted often, the model
+  read the same files again after every summary instead of going on.
 
 ## 0.4.3 - 2026-10-30
 
