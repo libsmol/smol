@@ -1171,7 +1171,9 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// The code can write to the agent's connection itself, but a note naming anything but a copy is dropped
+    /// The code can write to the agent's connection itself, but a note naming anything but a copy is dropped.
+    /// Windows sockets are handles that `os.fstat` doesn't see, and Windows has no sandbox to get past
+    #[cfg(unix)]
     #[test]
     fn forged_views_dropped() {
         let code = "import json, os, stat\n\
