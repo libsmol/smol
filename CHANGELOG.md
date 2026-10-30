@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.4.3 - 2026-10-30
 
 - The system prompt says an agent `agent()` starts has the same environment as
   the one that starts it, and that a task asking for agents has each of its
