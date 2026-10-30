@@ -10,7 +10,7 @@ use crate::worker::host::Added;
 use crate::worker::Function;
 use chrono::Utc;
 use std::env::consts::OS;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) const TOOL: &str = "eval";
 /// Mentioning tags makes models write tags into the arguments
@@ -96,12 +96,14 @@ pub(crate) fn view_summary(image: bool, video: bool) -> Option<&'static str> {
     }
 }
 
+/// `writable` is where code may write besides `cwd` and `$TMPDIR`,
+/// and `None` when files aren't isolated
 pub(crate) fn system(
     functions: &[Function],
     servers: &[&Added],
     skills: &[Skill],
     cwd: &Path,
-    sandboxed: bool,
+    writable: Option<&[PathBuf]>,
     instructions: &[String],
     place: &Place,
 ) -> String {
@@ -227,9 +229,17 @@ pub(crate) fn system(
     };
 
     let cwd = cwd.display();
-    let sandbox = match sandboxed {
-        true => format!("\n- Your code runs in a sandbox: writing outside `{cwd}` and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- `$TMPDIR` is removed when the session ends.\n- If a tool fails because it cannot write its cache, rerun it with the cache in `$TMPDIR`."),
-        false => String::new(),
+    let sandbox = match writable {
+        Some(writable) => {
+            let mut places = vec![format!("`{cwd}`")];
+            for path in writable {
+                let place = format!("`{}`", path.display());
+                places.push(place);
+            }
+            let places = places.join(", ");
+            format!("\n- Your code runs in a sandbox: writing outside {places} and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- `$TMPDIR` is removed when the session ends.\n- If a tool fails because it cannot write its cache, rerun it with the cache in `$TMPDIR`.")
+        }
+        None => String::new(),
     };
     let date = Utc::now().format("%Y-%m-%d");
     format!(
@@ -768,7 +778,7 @@ mod tests {
         ];
 
         let main = main_place(Vec::new());
-        let text = system(&functions, &[], &skills, cwd, false, &instructions, &main);
+        let text = system(&functions, &[], &skills, cwd, None, &instructions, &main);
         let built_in = "## Built-in\n\n```python\n\
                         ls(path) -> list[str]\n    # Sorted paths.\n    # The café/ folder ends with /.\n\n\
                         help(request) -> None\n    # Prints the docs.\n```\n\n# Skills";
@@ -797,12 +807,17 @@ mod tests {
                      <instructions>\nIndent with tabs\n</instructions>";
         assert!(text.ends_with(files), "{text}");
 
-        let plain = system(&[], &[], &[], cwd, true, &[], &main);
+        let plain = system(&[], &[], &[], cwd, Some(&[]), &[], &main);
         assert!(!plain.contains("<instructions"), "{plain}");
         assert!(!plain.contains("# Skills"), "{plain}");
         assert!(!plain.contains("# Roles"), "{plain}");
         let sandbox = "are there.\n- Your code runs in a sandbox: writing outside `/home/zoë/work` and `$TMPDIR`, ";
         assert!(plain.contains(sandbox), "{plain}");
+        let registry = [PathBuf::from("/home/zoë/.cargo/registry")];
+        let allowed = system(&[], &[], &[], cwd, Some(&registry), &[], &main);
+        let sandbox =
+            "writing outside `/home/zoë/work`, `/home/zoë/.cargo/registry` and `$TMPDIR`, ";
+        assert!(allowed.contains(sandbox), "{allowed}");
     }
 
     #[test]
@@ -817,7 +832,7 @@ mod tests {
         let cwd = Path::new("/home/zoë/work");
 
         let place = main_place(roles);
-        let main = system(&[], &[], &[], cwd, false, &[], &place);
+        let main = system(&[], &[], &[], cwd, None, &[], &place);
         let listed = "\n\n## Roles\n\n\
                       To give a task to an agent in one of these roles, call `agent(task, role=\"reviewer\")`. \
                       For a list of tasks, `role` is one role for all of them or a list with one role per task.\n\n\
@@ -827,12 +842,12 @@ mod tests {
         assert!(!main.contains("# Role\n"), "{main}");
 
         let played = Place::Delegated(Some(reviewer));
-        let helper = system(&[], &[], &[], cwd, false, &[], &played);
+        let helper = system(&[], &[], &[], cwd, None, &[], &played);
         let own = "include everything the task asks for.\n\n# Role\n\n\
                    Your role is `reviewer`: Reviews the café's code\n\n# Running code";
         assert!(helper.contains(own), "{helper}");
         assert!(!helper.contains("# Roles"), "{helper}");
-        let plain = system(&[], &[], &[], cwd, false, &[], &Place::Delegated(None));
+        let plain = system(&[], &[], &[], cwd, None, &[], &Place::Delegated(None));
         assert!(!plain.contains("# Role"), "{plain}");
     }
 

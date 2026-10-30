@@ -161,10 +161,6 @@ impl Worker {
         &self.functions
     }
 
-    pub(crate) fn sandboxed(&self) -> bool {
-        self.sandbox.enforced()
-    }
-
     /// Takes the flag, which turns true again only when the worker is replaced
     pub(crate) fn restarted(&mut self) -> bool {
         self.reap();
@@ -1932,7 +1928,7 @@ pub(crate) mod tests {
         let servers: Vec<&Added> = worker.servers.iter().collect();
         let cwd = Path::new("/work");
         let main = main_place(Vec::new());
-        let text = system(&[], &servers, &[], cwd, false, &[], &main);
+        let text = system(&[], &servers, &[], cwd, None, &[], &main);
         let listed = "\n\n## MCP `news_web`\n\nSearches the web and the news\n\nRead-only\n\n\
                       ```python\nnews_web.echo_text(the_text: str = None) -> str\n```\n\n\
                       ## MCP `notes`\n\n\

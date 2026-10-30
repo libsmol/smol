@@ -110,6 +110,8 @@ pub(crate) struct Sandbox {
     cwd: PathBuf,
     pub(crate) copies: PathBuf,
     temp: PathBuf,
+    /// The places in `[allow] write` that existed when the session opened
+    writable: Vec<PathBuf>,
     lock: Option<File>,
     env: Vec<(OsString, OsString)>,
     isolation: Option<Isolation>,
@@ -139,6 +141,7 @@ impl Sandbox {
             cwd: cwd.to_owned(),
             copies: copies.to_owned(),
             temp: temp.clone(),
+            writable: Vec::new(),
             lock: None,
             env: Vec::new(),
             isolation: None,
@@ -173,6 +176,9 @@ impl Sandbox {
         }
         for path in &access.write {
             granted.push((path.clone(), true));
+            if path.exists() {
+                sandbox.writable.push(path.clone());
+            }
         }
         // Links resolve before the kernel checks a path, so rules compare real paths
         let mut real = Vec::new();
@@ -201,6 +207,12 @@ impl Sandbox {
 
     pub(crate) fn enforced(&self) -> bool {
         self.isolation.is_some()
+    }
+
+    /// Where code may write besides the working directory and its temporary folder,
+    /// or `None` when files aren't isolated
+    pub(crate) fn writable(&self) -> Option<&[PathBuf]> {
+        self.enforced().then_some(self.writable.as_slice())
     }
 
     /// The worker's command before its arguments, confined before it runs any code
@@ -610,7 +622,10 @@ pub(crate) mod tests {
         fs::create_dir_all(&cwd).expect("dir");
         write_file(&dir.join("secret/id_rsa"), b"key");
         write_file(&dir.join("notes.md"), b"notes");
+        let shared = dir.join("shared");
+        fs::create_dir_all(&shared).expect("dir");
         let access = Access {
+            write: vec![shared.clone(), dir.join("missing")],
             hidden: vec![dir.join("secret")],
             ..Access::default()
         };
@@ -623,6 +638,7 @@ pub(crate) mod tests {
             fs::remove_dir_all(&dir).ok();
             return;
         }
+        assert_eq!(sandbox.writable(), Some(&[shared][..]));
 
         let code = "import os, subprocess, tempfile\n\
             def tried(act):\n    try:\n        act()\n        return 'ok'\n    except PermissionError:\n        return 'denied'\n\
@@ -630,13 +646,14 @@ pub(crate) mod tests {
             [tried(lambda: open('../notes.md').read()), tried(lambda: open(key).read()),\n\
              tried(lambda: open('résumé.txt', 'w').write('x')), tried(lambda: tempfile.TemporaryFile().write(b'x')),\n\
              tried(lambda: open('../naïve.txt', 'w').write('x')), tried(lambda: open('../config/x', 'w').write('x')),\n\
+             tried(lambda: open('../shared/x', 'w').write('x')),\n\
              subprocess.run(['cat', key], capture_output=True).returncode, 'SMOL_SANDBOX' in os.environ]";
         let logs = evaluated(sandbox, code);
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(
             logs,
-            "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 1, False]\n"
+            "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 'ok', 1, False]\n"
         );
     }
 

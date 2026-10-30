@@ -12,6 +12,9 @@ but their files stay in `~/.smol/history` untouched.
 - The system prompt says that a task stays open after the answer only while an
   agent started with a name is still running. It said the task goes on after
   the answer, which read as if there were more to do.
+- The system prompt names the places `[allow] write` in `agent.toml` opens to
+  the code. It said that writing anywhere but the working directory and
+  `$TMPDIR` fails, which was not true of them.
 
 ## 0.4.3 - 2026-10-30
 

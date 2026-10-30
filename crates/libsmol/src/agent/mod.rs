@@ -271,7 +271,7 @@ impl Agent {
             servers,
             &self.skills,
             &self.cwd,
-            worker.sandboxed(),
+            self.sandbox.writable(),
             &self.instructions,
             &self.place,
         );
