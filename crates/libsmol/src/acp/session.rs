@@ -2,7 +2,7 @@ use crate::acp::rpc::{Notice, Peer};
 use crate::acp::servers::McpPool;
 use crate::acp::translator::Translator;
 use crate::acp::{rfc3339, task_of, to_value, App, QUEUED};
-use crate::agent::{title_of, Agent, Asking, Event, Helpers, Nudging, Place, Sink, Task};
+use crate::agent::{title_of, Agent, Asking, Event, Helpers, Nudging, Place, Queue, Sink, Task};
 use crate::config::{self, Access, McpConfig, Models};
 use crate::history::{Lock, SessionMeta, Settings};
 use crate::memory::{AgentMemory, Exit, MemoryStep};
@@ -96,7 +96,7 @@ struct Session {
     _lock: Option<Lock>,
 }
 
-/// Lent to the agent during a turn to show events, save and fetch queued updates
+/// Lent to the agent during a turn to show events and save
 struct Keeper {
     meta: SessionMeta,
     app: Arc<App>,
@@ -104,6 +104,12 @@ struct Keeper {
     titling: Option<(oneshot::Receiver<Option<String>>, AbortHandle)>,
     unsaved: Unsaved,
     translator: Translator,
+}
+
+/// The messages the client queues during a turn, which the session's agent takes as task updates
+struct ClientQueue {
+    peer: Arc<Peer>,
+    session: String,
     enqueued: Arc<Notify>,
 }
 
@@ -259,6 +265,11 @@ async fn start(opening: Opening) -> Result<Session> {
     let pool = McpPool::new(servers, &meta.settings, &copies, peer, meta.id.clone());
     pool.report();
 
+    let queue = ClientQueue {
+        peer: Arc::clone(&app.peer),
+        session: meta.id.clone(),
+        enqueued,
+    };
     let agent = Agent {
         model: Arc::from(built),
         instructions,
@@ -270,6 +281,7 @@ async fn start(opening: Opening) -> Result<Session> {
         place: Place::Main {
             roles,
             team: Arc::default(),
+            queue: Arc::new(queue),
         },
     };
     let keeper = Keeper {
@@ -278,7 +290,6 @@ async fn start(opening: Opening) -> Result<Session> {
         titling: None,
         unsaved: Unsaved::default(),
         translator,
-        enqueued,
     };
 
     Ok(Session {
@@ -546,10 +557,12 @@ impl Sink for Keeper {
     fn helpers(&mut self, index: usize) -> Box<dyn Helpers> {
         self.translator.helpers(index)
     }
+}
 
-    fn queued(&mut self) -> Asking<'_> {
-        let peer = &self.app.peer;
-        let session = &self.meta.id;
+impl Queue for ClientQueue {
+    fn queued(&self) -> Asking<'_> {
+        let peer = &self.peer;
+        let session = &self.session;
         Box::pin(async move {
             if !peer.queued() {
                 return Vec::new();
@@ -571,7 +584,7 @@ impl Sink for Keeper {
         })
     }
 
-    fn enqueued(&mut self) -> Nudging<'_> {
+    fn enqueued(&self) -> Nudging<'_> {
         Box::pin(self.enqueued.notified())
     }
 }

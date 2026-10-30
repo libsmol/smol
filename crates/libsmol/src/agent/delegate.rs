@@ -1,6 +1,5 @@
 use crate::agent::{
-    logged_tokens, Agent, Asking, Event, HelperView, Helpers, Nudging, Place, Sink, Status, Task,
-    Turn, Unseen,
+    logged_tokens, Agent, Event, HelperView, Helpers, Place, Sink, Status, Task, Turn, Unseen,
 };
 use crate::memory::{AgentMemory, Ending, Helper};
 use crate::prompt;
@@ -38,7 +37,7 @@ impl Agent {
         views: Box<dyn Helpers>,
         records: &Records,
     ) -> Box<Delegating<'a>> {
-        let Place::Main { roles, team } = &self.place else {
+        let Place::Main { roles, team, .. } = &self.place else {
             let refused = |_: AgentCall| -> Calling {
                 let reply = Err(prompt::NESTED.to_owned());
                 let called = Called::from(reply);
@@ -542,12 +541,12 @@ impl Turn<'_> {
     /// Waits for an agent started in the background to end, an interrupt or the client
     /// to queue a message, and returns the messages queued
     pub(crate) async fn news(&mut self) -> Vec<Task> {
-        let Some(team) = self.agent.place.team() else {
+        let Place::Main { team, queue, .. } = &self.agent.place else {
             return Vec::new();
         };
         let unfiled = |members: &[Member]| members.iter().any(Member::unfiled);
         let ended = team.until(unfiled);
-        let enqueued = self.sink.enqueued();
+        let enqueued = queue.enqueued();
         let queued = select! {
             biased;
             () = self.agent.interrupt.wait() => false,
@@ -707,14 +706,6 @@ impl Sink for Watched {
             status.steps = steps;
         }
         self.show(false);
-    }
-
-    fn queued(&mut self) -> Asking<'_> {
-        Box::pin(async { Vec::new() })
-    }
-
-    fn enqueued(&mut self) -> Nudging<'_> {
-        Box::pin(future::pending())
     }
 
     fn helpers(&mut self, _: usize) -> Box<dyn Helpers> {
@@ -1108,9 +1099,9 @@ mod tests {
         let code = "agent('Spell naïve after 1', name='naïve')";
         let model = Background(vec![code], Requests::default());
         let mut agent = scripted(model, Box::new(|_| {}));
-        agent.probe.nudge = Some(Duration::from_millis(200));
+        *agent.queue.nudge.lock().expect("nudge") = Some(Duration::from_millis(200));
         let mut pulls = 0;
-        agent.probe.updates = Box::new(move || {
+        let take = move || {
             pulls += 1;
             let update = Task {
                 text: "Also spell café".to_owned(),
@@ -1120,7 +1111,8 @@ mod tests {
                 2 => vec![update],
                 _ => Vec::new(),
             }
-        });
+        };
+        *agent.queue.updates.lock().expect("updates") = Some(Box::new(take));
 
         let mut memory = AgentMemory::default();
         let answer = agent.turn(&mut memory, "Spell it").expect("run");

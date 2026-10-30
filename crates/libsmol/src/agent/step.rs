@@ -802,7 +802,8 @@ mod tests {
             mentions: Vec::new(),
         };
         let mut pending = vec![update];
-        agent.probe.updates = Box::new(move || mem::take(&mut pending));
+        let take = move || mem::take(&mut pending);
+        *agent.queue.updates.lock().expect("updates") = Some(Box::new(take));
 
         let mut memory = AgentMemory::default();
         let answer = agent.turn(&mut memory, "Print 1").expect("run");
@@ -954,14 +955,15 @@ mod tests {
     fn update_beats_cancel() {
         let mut agent = running(&["print(1)"]);
         let interrupt = agent.agent.interrupt.clone();
-        agent.probe.updates = Box::new(move || {
+        let take = move || {
             interrupt.cancel(u64::MAX);
             let update = Task {
                 text: "One more thing".to_owned(),
                 mentions: Vec::new(),
             };
             vec![update]
-        });
+        };
+        *agent.queue.updates.lock().expect("updates") = Some(Box::new(take));
 
         let mut memory = AgentMemory::default();
         let answer = agent.turn(&mut memory, "task").expect("run");

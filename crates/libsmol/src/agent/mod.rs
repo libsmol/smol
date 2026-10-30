@@ -63,23 +63,26 @@ pub(crate) enum Event<'a> {
     CompactEnd(Result<&'a SummaryStep, &'a StepError>),
 }
 
-pub(crate) type Asking<'a> = Pin<Box<dyn Future<Output = Vec<Task>> + Send + 'a>>;
-pub(crate) type Nudging<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-
 pub(crate) trait Sink: Send {
     fn event(&mut self, event: Event);
 
     /// Must be called for every added step or an exit midway loses steps
     fn saved(&mut self, memory: &AgentMemory);
 
-    /// The returned messages are already taken off the client's queue
-    fn queued(&mut self) -> Asking<'_>;
-
-    /// Resolves once the client has queued a message for `queued` to return
-    fn enqueued(&mut self) -> Nudging<'_>;
-
     /// Shows the agents that the code of the call at `index` starts
     fn helpers(&mut self, index: usize) -> Box<dyn Helpers>;
+}
+
+pub(crate) type Asking<'a> = Pin<Box<dyn Future<Output = Vec<Task>> + Send + 'a>>;
+pub(crate) type Nudging<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// What the user queues while a turn of the session's agent runs
+pub(crate) trait Queue: Send + Sync {
+    /// The returned messages are already taken off the client's queue
+    fn queued(&self) -> Asking<'_>;
+
+    /// Resolves once the client has queued a message for `queued` to return
+    fn enqueued(&self) -> Nudging<'_>;
 }
 
 /// Helpers are numbered from 1 within the call that starts them,
@@ -163,14 +166,6 @@ impl Sink for Logged<'_> {
         self.0.saved(memory);
     }
 
-    fn queued(&mut self) -> Asking<'_> {
-        self.0.queued()
-    }
-
-    fn enqueued(&mut self) -> Nudging<'_> {
-        self.0.enqueued()
-    }
-
     fn helpers(&mut self, index: usize) -> Box<dyn Helpers> {
         self.0.helpers(index)
     }
@@ -204,9 +199,13 @@ pub(crate) struct Agent {
 
 #[derive(Clone)]
 pub(crate) enum Place {
-    /// The session's own agent, with the roles `agent()` can give tasks to
-    /// and the agents its code started in the background
-    Main { roles: Vec<Role>, team: Arc<Team> },
+    /// The session's own agent, with the roles `agent()` can give tasks to,
+    /// the agents its code started in the background and what the user queues meanwhile
+    Main {
+        roles: Vec<Role>,
+        team: Arc<Team>,
+        queue: Arc<dyn Queue>,
+    },
     /// Started by `agent()`, which it can't call itself
     Delegated(Option<Role>),
 }
@@ -421,7 +420,10 @@ impl Turn<'_> {
 
     /// Stays interruptible when the client never replies
     async fn queued(&mut self) -> Vec<Task> {
-        let asking = self.sink.queued();
+        let Place::Main { queue, .. } = &self.agent.place else {
+            return Vec::new();
+        };
+        let asking = queue.queued();
         select! {
             // The client already dequeued these, so they win over a cancel arriving with them
             biased;
@@ -594,7 +596,7 @@ pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::agent::{
-        title_of, Agent, Asking, Event, Helpers, Nudging, Place, Sink, Task, Turn, Unseen,
+        title_of, Agent, Asking, Event, Helpers, Nudging, Place, Queue, Sink, Task, Turn, Unseen,
         RETRY_WAIT,
     };
     use crate::config::Role;
@@ -750,9 +752,6 @@ pub(crate) mod tests {
 
     pub(crate) struct Probe {
         events: Box<dyn FnMut(Event) + Send>,
-        pub(crate) updates: Box<dyn FnMut() -> Vec<Task> + Send>,
-        /// How long until the client says once that it queued a message
-        pub(crate) nudge: Option<Duration>,
         /// Step count at each save
         pub(crate) saves: Vec<usize>,
     }
@@ -766,20 +765,36 @@ pub(crate) mod tests {
             self.saves.push(memory.steps.len());
         }
 
-        fn queued(&mut self) -> Asking<'_> {
-            let updates = (self.updates)();
-            Box::pin(async move { updates })
+        fn helpers(&mut self, _: usize) -> Box<dyn Helpers> {
+            Box::new(Unseen)
+        }
+    }
+
+    type Updates = Box<dyn FnMut() -> Vec<Task> + Send>;
+
+    #[derive(Default)]
+    pub(crate) struct Pending {
+        pub(crate) updates: Mutex<Option<Updates>>,
+        /// How long until the client says once that it queued a message
+        pub(crate) nudge: Mutex<Option<Duration>>,
+    }
+
+    impl Queue for Pending {
+        fn queued(&self) -> Asking<'_> {
+            let mut updates = self.updates.lock().expect("updates");
+            let queued = match updates.as_mut() {
+                Some(take) => take(),
+                None => Vec::new(),
+            };
+            Box::pin(async move { queued })
         }
 
-        fn enqueued(&mut self) -> Nudging<'_> {
-            match self.nudge.take() {
+        fn enqueued(&self) -> Nudging<'_> {
+            let nudge = self.nudge.lock().expect("nudge").take();
+            match nudge {
                 Some(wait) => Box::pin(time::sleep(wait)),
                 None => Box::pin(future::pending()),
             }
-        }
-
-        fn helpers(&mut self, _: usize) -> Box<dyn Helpers> {
-            Box::new(Unseen)
         }
     }
 
@@ -787,6 +802,7 @@ pub(crate) mod tests {
         pub(crate) agent: Agent,
         pub(crate) worker: Worker,
         pub(crate) probe: Probe,
+        pub(crate) queue: Arc<Pending>,
     }
 
     impl Tested {
@@ -840,6 +856,7 @@ pub(crate) mod tests {
         Place::Main {
             roles,
             team: Arc::default(),
+            queue: Arc::new(Pending::default()),
         }
     }
 
@@ -861,6 +878,12 @@ pub(crate) mod tests {
         let starting = Worker::new(&interrupt, Arc::clone(&sandbox), &[], delegation, restarted);
         let worker = block_on(starting).expect("worker");
 
+        let queue = Arc::new(Pending::default());
+        let place = Place::Main {
+            roles,
+            team: Arc::default(),
+            queue: Arc::clone(&queue) as Arc<dyn Queue>,
+        };
         let agent = Agent {
             model: Arc::new(model),
             instructions: Vec::new(),
@@ -869,18 +892,17 @@ pub(crate) mod tests {
             copies,
             interrupt,
             sandbox,
-            place: main_place(roles),
+            place,
         };
         let probe = Probe {
             events,
-            updates: Box::new(Vec::new),
-            nudge: None,
             saves: Vec::new(),
         };
         let value = Tested {
             agent,
             worker,
             probe,
+            queue,
         };
         Temp { value, dir }
     }
