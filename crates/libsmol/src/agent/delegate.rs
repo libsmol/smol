@@ -592,10 +592,6 @@ impl Turn<'_> {
 /// Follows the events of an agent `agent()` started and shows its status,
 /// at most every `SHOWN_EVERY` while text streams
 struct Watched {
-    /// The reasoning, text and code of each call in its current step
-    thought: String,
-    text: String,
-    codes: Vec<String>,
     status: Arc<Mutex<Status>>,
     /// The status last shown and when
     shown: Option<(Status, Instant)>,
@@ -605,9 +601,6 @@ struct Watched {
 impl Watched {
     fn new(view: Box<dyn HelperView>) -> Self {
         Self {
-            thought: String::new(),
-            text: String::new(),
-            codes: Vec::new(),
             status: Arc::default(),
             shown: None,
             view,
@@ -635,47 +628,34 @@ impl Sink for Watched {
     fn event(&mut self, event: Event) {
         let streamed = matches!(
             event,
-            Event::Thought(_) | Event::Text(_) | Event::Code(..) | Event::Output(_)
+            Event::Thought(_) | Event::Text(_) | Event::Code(..) | Event::Output(..)
         );
         let mut status = self.status.lock().expect("status");
         status.preview = match event {
             Event::Thought(text) => {
                 status.doing = prompt::THINKING.to_owned();
-                self.thought.push_str(text);
-                tail(&self.thought)
+                tail(text.whole)
             }
             Event::Text(text) => {
                 status.doing = prompt::WRITING.to_owned();
-                self.text.push_str(text);
-                tail(&self.text)
+                tail(text.whole)
             }
-            Event::Code(index, text) => {
-                if self.codes.len() <= index {
-                    self.codes.resize(index + 1, String::new());
-                }
-                self.codes[index].push_str(text);
-                let code = &self.codes[index];
-                let line = first_line(code);
+            Event::Code(_, code) => {
+                let line = first_line(code.whole);
                 status.doing = format!("{} {line}", prompt::WRITING);
-                tail(code)
+                tail(code.whole)
             }
-            Event::Execute(index) => {
-                let code = self.codes.get(index).map(String::as_str);
-                let code = code.unwrap_or_default();
-                let line = first_line(code);
+            Event::Execute(_, call) => {
+                let line = first_line(&call.code);
                 status.doing = format!("{} {line}", prompt::RUNNING);
-                tail(code)
+                tail(&call.code)
             }
-            Event::Output(output) => tail(output),
+            Event::Output(_, _, output) => tail(output),
             Event::Restarted => {
                 status.doing = prompt::PYTHON_RESTARTED.to_owned();
                 String::new()
             }
-            // The retried reply starts over
             Event::Retry { reason, .. } => {
-                self.thought.clear();
-                self.text.clear();
-                self.codes.clear();
                 status.doing = prompt::retrying(reason);
                 String::new()
             }
@@ -683,13 +663,7 @@ impl Sink for Watched {
                 status.doing = prompt::COMPACTING.to_owned();
                 String::new()
             }
-            Event::StepEnd(_) => {
-                self.thought.clear();
-                self.text.clear();
-                self.codes.clear();
-                return;
-            }
-            Event::Unread(..) | Event::Ran(..) | Event::CompactEnd(_) => return,
+            Event::Unread(..) | Event::Ran(..) | Event::StepEnd(_) | Event::CompactEnd(_) => return,
         };
         drop(status);
 
@@ -733,7 +707,7 @@ fn tail(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::agent::delegate::{tail, Records, Watched, MAX_PREVIEW_CHARS};
-    use crate::agent::tests::{scripted, with_roles};
+    use crate::agent::tests::{scripted, streamed, with_roles};
     use crate::agent::{Event, HelperView, Sink, Status, Task, Unseen};
     use crate::config::Role;
     use crate::memory::tests::metered;
@@ -1263,10 +1237,14 @@ mod tests {
         let shown = Arc::<Mutex<Vec<Status>>>::default();
         let view = Recorded(Arc::clone(&shown));
         let mut watched = Watched::new(Box::new(view));
-        watched.event(Event::Thought("Reading the menu"));
-        watched.event(Event::Code(0, "\nprint(len(cafés))\n"));
-        watched.event(Event::Execute(0));
-        watched.event(Event::Output("3\n"));
+        watched.event(Event::Thought(streamed("Reading the menu")));
+        watched.event(Event::Code(0, streamed("\nprint(len(cafés))\n")));
+        let call = Call {
+            code: "print(len(cafés))".to_owned(),
+            ..Call::default()
+        };
+        watched.event(Event::Execute(0, &call));
+        watched.event(Event::Output(0, &call, "3\n"));
         // A saved step shows the tokens so far, and one without any shows nothing new
         let counted = AgentStep {
             usage: metered(100, 20),

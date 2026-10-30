@@ -43,15 +43,15 @@ const RETRY_WAIT: Duration = match cfg!(test) {
 /// Only what happens live in a turn, as the display replays saved steps itself
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Event<'a> {
-    Thought(&'a str),
-    Text(&'a str),
-    /// Code streamed for the call at this index
-    Code(usize, &'a str),
+    Thought(Streamed<'a>),
+    Text(Streamed<'a>),
+    /// Code streamed for the call at this index, once it isn't blank
+    Code(usize, Streamed<'a>),
     /// A call with no readable code, shown as soon as it arrives
     Unread(usize, &'a Call),
-    Execute(usize),
-    /// Clipped output of the running code so far
-    Output(&'a str),
+    Execute(usize, &'a Call),
+    /// Clipped output so far of the call at this index
+    Output(usize, &'a Call, &'a str),
     Ran(usize, &'a Call),
     Restarted,
     Retry {
@@ -61,6 +61,13 @@ pub(crate) enum Event<'a> {
     StepEnd(&'a AgentStep),
     Compact,
     CompactEnd(Result<&'a SummaryStep, &'a StepError>),
+}
+
+/// What arrived since the last event for it, and all of it so far in this reply
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Streamed<'a> {
+    pub(crate) added: &'a str,
+    pub(crate) whole: &'a str,
 }
 
 pub(crate) trait Sink: Send {
@@ -596,8 +603,8 @@ pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::agent::{
-        title_of, Agent, Asking, Event, Helpers, Nudging, Place, Queue, Sink, Task, Turn, Unseen,
-        RETRY_WAIT,
+        title_of, Agent, Asking, Event, Helpers, Nudging, Place, Queue, Sink, Streamed, Task, Turn,
+        Unseen, RETRY_WAIT,
     };
     use crate::config::Role;
     use crate::history::MAX_TITLE_CHARS;
@@ -747,6 +754,14 @@ pub(crate) mod tests {
         Script {
             calls: vec![Ok(code.to_owned())],
             ..reply("")
+        }
+    }
+
+    /// The first piece of a stream, which is all of it so far
+    pub(crate) fn streamed(text: &str) -> Streamed<'_> {
+        Streamed {
+            added: text,
+            whole: text,
         }
     }
 

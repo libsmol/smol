@@ -32,8 +32,6 @@ pub(crate) struct Translator {
     window: u64,
     used: u64,
     calls: Vec<Opened>,
-    /// Index within this step of the call whose code is running
-    running: Option<usize>,
     /// The open compaction call
     thinking: Option<String>,
     /// The call for the user command that is running
@@ -46,8 +44,6 @@ pub(crate) struct Translator {
 struct Opened {
     index: usize,
     id: String,
-    code: String,
-    arguments: Option<String>,
     ended: bool,
 }
 
@@ -77,7 +73,6 @@ impl Translator {
             window: window.unwrap_or(0),
             used: 0,
             calls: Vec::new(),
-            running: None,
             thinking: None,
             shell: None,
             progress: Progress::default(),
@@ -110,48 +105,42 @@ impl Translator {
     pub(crate) fn translate(&mut self, event: Event) {
         match event {
             Event::Thought(text) => {
-                self.streamed(text);
-                let chunk = chunk(text);
+                self.streamed(text.added);
+                let chunk = chunk(text.added);
                 self.update(SessionUpdate::AgentThoughtChunk(chunk));
             }
             Event::Text(text) => {
-                self.streamed(text);
-                self.said(text);
+                self.streamed(text.added);
+                self.said(text.added);
             }
-            Event::Code(index, text) => {
-                self.streamed(text);
-                self.code(index, text);
+            Event::Code(index, code) => {
+                self.streamed(code.added);
+                self.code(index, code.whole);
             }
             Event::Unread(index, call) => self.unread(index, call),
-            Event::Execute(index) => {
-                self.running = Some(index);
-                if let Some(call) = self.opened(index) {
+            Event::Execute(index, _) => {
+                if let Some(opened) = self.opened(index) {
                     let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
-                    let update = ToolCallUpdate::new(call.id.clone(), fields);
+                    let update = ToolCallUpdate::new(opened.id.clone(), fields);
                     self.update(SessionUpdate::ToolCallUpdate(update));
                 }
             }
-            Event::Output(output) => {
-                let running = self.running.and_then(|index| self.opened(index));
-                if let Some(call) = running {
+            Event::Output(index, call, output) => {
+                if let Some(opened) = self.opened(index) {
                     let code = fenced(&call.code);
                     let output = ToolCallContent::from(output);
                     let content = vec![code, output];
                     let fields = ToolCallUpdateFields::new().content(content);
-                    let update = ToolCallUpdate::new(call.id.clone(), fields);
+                    let update = ToolCallUpdate::new(opened.id.clone(), fields);
                     self.update(SessionUpdate::ToolCallUpdate(update));
                 }
             }
             Event::Ran(index, call) => self.ran(index, call),
             Event::Restarted => self.notice(RESTARTED, None),
             Event::Retry { reason, wait } => {
-                for call in mem::take(&mut self.calls) {
-                    let head = head(&call.code, call.arguments.as_deref());
-                    let content = vec![head];
-                    let fields = ToolCallUpdateFields::new()
-                        .status(ToolCallStatus::Failed)
-                        .content(content);
-                    let update = ToolCallUpdate::new(call.id, fields);
+                for opened in mem::take(&mut self.calls) {
+                    let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Failed);
+                    let update = ToolCallUpdate::new(opened.id, fields);
                     self.update(SessionUpdate::ToolCallUpdate(update));
                 }
                 self.notice(reason, Some(wait));
@@ -307,25 +296,21 @@ impl Translator {
         }
     }
 
-    /// The title carries the code too, since clients such as Zed show it as the command that runs
-    fn code(&mut self, index: usize, text: &str) {
-        let opened = self.calls.iter_mut().find(|call| call.index == index);
-        let update = match opened {
-            Some(call) => {
-                call.code.push_str(text);
-                let title = call.code.trim_matches('\n').to_owned();
-                let code = fenced(&call.code);
-                let content = vec![code];
+    /// `written` is all of the code so far, and the title carries it too,
+    /// since clients such as Zed show it as the command that runs
+    fn code(&mut self, index: usize, written: &str) {
+        let title = written.trim_matches('\n');
+        let code = fenced(written);
+        let content = vec![code];
+        let update = match self.opened(index) {
+            Some(opened) => {
                 let fields = ToolCallUpdateFields::new().title(title).content(content);
-                let update = ToolCallUpdate::new(call.id.clone(), fields);
+                let update = ToolCallUpdate::new(opened.id.clone(), fields);
                 SessionUpdate::ToolCallUpdate(update)
             }
             None => {
                 self.ids += 1;
                 let id = format!("call_{}", self.ids);
-                let title = text.trim_matches('\n');
-                let code = fenced(text);
-                let content = vec![code];
                 let started = ToolCall::new(id.clone(), title)
                     .kind(ToolKind::Execute)
                     .status(ToolCallStatus::Pending)
@@ -333,8 +318,6 @@ impl Translator {
                 let opened = Opened {
                     index,
                     id,
-                    code: text.to_owned(),
-                    arguments: None,
                     ended: false,
                 };
                 self.calls.push(opened);
@@ -356,8 +339,7 @@ impl Translator {
         };
         self.ids += 1;
         let id = format!("call_{}", self.ids);
-        let arguments = call.arguments.clone();
-        let head = head("", arguments.as_deref());
+        let head = head("", call.arguments.as_deref());
         let started = ToolCall::new(id.clone(), title)
             .kind(kind)
             .status(ToolCallStatus::Pending)
@@ -365,8 +347,6 @@ impl Translator {
         let opened = Opened {
             index,
             id,
-            code: String::new(),
-            arguments,
             ended: false,
         };
         self.calls.push(opened);
@@ -392,7 +372,6 @@ impl Translator {
     }
 
     fn ran(&mut self, index: usize, ran: &Call) {
-        self.running = None;
         let opened = self.calls.iter_mut().find(|call| call.index == index);
         let Some(opened) = opened else {
             return;
@@ -451,7 +430,7 @@ impl Translator {
             let stored = step.calls.get(call.index);
             let mut content = match stored {
                 Some(stored) => self.content(stored),
-                None => vec![fenced(&call.code)],
+                None => Vec::new(),
             };
             let reason = match error {
                 // Unreadable calls already carry their own reason
@@ -725,7 +704,8 @@ mod tests {
     use crate::acp::rpc::{Lines, Out};
     use crate::acp::tests::drained;
     use crate::acp::translator::*;
-    use crate::agent::tests::{called, reply, scripted, Script, ScriptedModel};
+    use crate::agent::tests::{called, reply, scripted, streamed, Script, ScriptedModel};
+    use crate::agent::Streamed;
     use crate::memory::tests::{asked, coded, metered, replied};
     use crate::memory::{CodeResult, Helper};
     use crate::model::tests::png;
@@ -772,17 +752,25 @@ mod tests {
     #[test]
     fn output_streamed() {
         let (mut translator, mut sent) = translator(1000);
-        translator.translate(Event::Code(0, "\nfor i in range(3):\n"));
-        translator.translate(Event::Code(0, "    print('café', i)\n"));
-        translator.translate(Event::Execute(0));
-        translator.translate(Event::Output("café 0\ncafé 1\n"));
+        translator.translate(Event::Code(0, streamed("\nfor i in range(3):\n")));
+        let more = Streamed {
+            added: "    print('café', i)\n",
+            whole: "\nfor i in range(3):\n    print('café', i)\n",
+        };
+        translator.translate(Event::Code(0, more));
+        let code = "for i in range(3):\n    print('café', i)";
+        let call = Call {
+            code: code.to_owned(),
+            ..Call::default()
+        };
+        translator.translate(Event::Execute(0, &call));
+        translator.translate(Event::Output(0, &call, "café 0\ncafé 1\n"));
 
         let messages = drained(&mut sent);
         let titles = [
             &messages[0]["params"]["update"]["title"],
             &messages[1]["params"]["update"]["title"],
         ];
-        let code = "for i in range(3):\n    print('café', i)";
         assert_eq!(titles, [&json!("for i in range(3):"), &json!(code)]);
         let running = &messages[3]["params"]["update"];
         assert_eq!(running["sessionUpdate"], "tool_call_update");
@@ -915,9 +903,13 @@ mod tests {
     #[test]
     fn text_after_calls() {
         let (mut live, mut sent) = translator(1000);
-        live.translate(Event::Text("Running the café check first.\n"));
-        live.translate(Event::Code(0, "print('café')\n"));
-        live.translate(Event::Text("More once it has run.\n"));
+        live.translate(Event::Text(streamed("Running the café check first.\n")));
+        live.translate(Event::Code(0, streamed("print('café')\n")));
+        let more = Streamed {
+            added: "More once it has run.\n",
+            whole: "Running the café check first.\nMore once it has run.\n",
+        };
+        live.translate(Event::Text(more));
         let call = Call {
             code: "print('café')".to_owned(),
             at: "Running the café check first.\n".len(),
@@ -995,14 +987,17 @@ mod tests {
     #[test]
     fn calls_closed_apart() {
         let (mut translator, mut sent) = translator(1000);
-        translator.translate(Event::Code(0, "1 / 0\n"));
-        translator.translate(Event::Code(1, "print('second')\n"));
-        translator.translate(Event::Execute(0));
-        let failed = Call {
+        translator.translate(Event::Code(0, streamed("1 / 0\n")));
+        translator.translate(Event::Code(1, streamed("print('second')\n")));
+        let running = Call {
             code: "1 / 0".to_owned(),
+            ..Call::default()
+        };
+        translator.translate(Event::Execute(0, &running));
+        let failed = Call {
             result: Some(CodeResult::default()),
             error: Some(CallError::Execution("ZeroDivisionError".to_owned())),
-            ..Call::default()
+            ..running
         };
         translator.translate(Event::Ran(0, &failed));
         let skipped = Call {
@@ -1134,7 +1129,7 @@ mod tests {
     fn ran_code_shown() {
         let (mut translator, mut sent) = translator(1000);
         let written = "<parameter name=\"code\">\nprint('seven')\n</parameter>\n";
-        translator.translate(Event::Code(0, written));
+        translator.translate(Event::Code(0, streamed(written)));
         let step = coded("print('seven')", Some("seven".to_owned()));
         translator.translate(Event::Ran(0, &step.calls[0]));
         translator.translate(Event::StepEnd(&step));
@@ -1168,11 +1163,11 @@ mod tests {
         let earlier = Instant::now().checked_sub(ESTIMATE_EVERY);
         let earlier = earlier.expect("instant");
 
-        translator.translate(Event::Thought("Let me think"));
+        translator.translate(Event::Thought(streamed("Let me think")));
         assert!(usages().is_empty());
         translator.progress.since = Some(earlier);
-        translator.translate(Event::Text("Found 42 résumés"));
-        translator.translate(Event::Code(0, "pass()\n"));
+        translator.translate(Event::Text(streamed("Found 42 résumés")));
+        translator.translate(Event::Code(0, streamed("pass()\n")));
         let estimated = json!({
             "sessionUpdate": "usage_update",
             "used": 111,
@@ -1220,7 +1215,7 @@ mod tests {
     #[test]
     fn retry_fails_calls() {
         let (mut translator, mut sent) = translator(1000);
-        translator.translate(Event::Code(0, "print('café')\n"));
+        translator.translate(Event::Code(0, streamed("print('café')\n")));
         let retried = Event::Retry {
             reason: "model: connection dropped",
             wait: Duration::from_secs(1),
@@ -1234,7 +1229,8 @@ mod tests {
             (&closed["toolCallId"], &closed["status"]),
             (&json!("call_1"), &json!("failed"))
         );
-        let code = &closed["content"][0]["content"]["text"];
+        let call = &shown(&messages)[0];
+        let code = &call["content"][0]["content"]["text"];
         assert_eq!(code, "```python\nprint('café')\n```");
         assert_eq!(messages[2]["params"]["text"], "model: connection dropped");
     }
@@ -1302,8 +1298,15 @@ mod tests {
     #[test]
     fn helpers_shown() {
         let (mut live, mut sent) = translator(1000);
-        live.translate(Event::Code(0, "print(agent('Count the cafés'))\n"));
-        live.translate(Event::Execute(0));
+        live.translate(Event::Code(
+            0,
+            streamed("print(agent('Count the cafés'))\n"),
+        ));
+        let running = Call {
+            code: "print(agent('Count the cafés'))".to_owned(),
+            ..Call::default()
+        };
+        live.translate(Event::Execute(0, &running));
         let started = live.helpers(0);
         let counted = AgentStep {
             usage: metered(100, 20),
@@ -1341,9 +1344,8 @@ mod tests {
             ..CodeResult::default()
         };
         let ran = Call {
-            code: "print(agent('Count the cafés'))".to_owned(),
             result: Some(result),
-            ..Call::default()
+            ..running
         };
         live.translate(Event::Ran(0, &ran));
         let step = AgentStep {
@@ -1405,7 +1407,8 @@ mod tests {
             memory: AgentMemory::default(),
         };
         let (mut stopping, mut sent) = translator(1000);
-        stopping.translate(Event::Code(0, "agent('Count the cafés', name='counter')\n"));
+        let code = streamed("agent('Count the cafés', name='counter')\n");
+        stopping.translate(Event::Code(0, code));
         let started = stopping.helpers(0);
         let mut call = started.open(1, &stopped);
         call.close(&stopped);

@@ -1,5 +1,5 @@
 use crate::agent::delegate::Records;
-use crate::agent::{generate, retry, Event, Turn, MAX_RETRIES};
+use crate::agent::{generate, retry, Event, Streamed, Turn, MAX_RETRIES};
 use crate::memory::{
     estimate, text_bytes, AgentStep, Call, CallError, CodeResult, StepError, MAX_OBSERVATION_CHARS,
 };
@@ -43,7 +43,6 @@ impl Turn<'_> {
         let mut step = loop {
             let mut step = Box::<AgentStep>::default();
             let mut reply = Reply::default();
-            let mut reasoning = None;
             let enough = Notify::new();
 
             let mut shown = |event: Event| self.sink.event(event);
@@ -51,15 +50,23 @@ impl Turn<'_> {
                 match delta {
                     // Empty reasoning is kept too and sent back as it is
                     StreamDelta::Reasoning(text) => {
-                        let thought = reasoning.get_or_insert_with(String::new);
+                        let thought = reply.reasoning.get_or_insert_with(String::new);
                         thought.push_str(text);
                         if !text.is_empty() {
-                            shown(Event::Thought(text));
+                            let streamed = Streamed {
+                                added: text,
+                                whole: thought,
+                            };
+                            shown(Event::Thought(streamed));
                         }
                     }
                     StreamDelta::Content(text) => {
                         reply.text.push_str(text);
-                        shown(Event::Text(text));
+                        let streamed = Streamed {
+                            added: text,
+                            whole: &reply.text,
+                        };
+                        shown(Event::Text(streamed));
                     }
                     StreamDelta::CallCode(code) => reply.push_code(code, &mut shown),
                     StreamDelta::CallEnd(ended) => reply.end_call(ended, &mut shown),
@@ -80,7 +87,7 @@ impl Turn<'_> {
                 &mut on_delta,
             );
             let generated = generating.await;
-            step.reasoning = reasoning;
+            step.reasoning = reply.reasoning;
             step.usage.duration = started.elapsed().as_secs_f64();
 
             step.text = reply.text.trim_end().to_owned();
@@ -139,13 +146,14 @@ impl Turn<'_> {
             }
 
             let started = Instant::now();
-            self.sink.event(Event::Execute(index));
+            let call = &step.calls[index];
+            self.sink.event(Event::Execute(index, call));
 
             let views = self.sink.helpers(index);
             let records = Records::default();
             let mut delegate = self.agent.delegate(self.servers, views, &records);
-            let code = &step.calls[index].code;
-            let mut shown = |output: &str| self.sink.event(Event::Output(output));
+            let code = &call.code;
+            let mut shown = |output: &str| self.sink.event(Event::Output(index, call, output));
             let evaluating = self
                 .worker
                 .evaluate(code, self.servers, &mut shown, &mut *delegate);
@@ -217,6 +225,7 @@ impl Turn<'_> {
 /// The reply received so far, with calls in the order they appeared
 #[derive(Default)]
 struct Reply {
+    reasoning: Option<String>,
     text: String,
     calls: Vec<Call>,
     /// The last call is still streaming
@@ -249,8 +258,12 @@ impl Reply {
             (true, false) => Some(written.as_str()),
             (false, false) => Some(code),
         };
-        if let Some(shown) = shown {
-            on_event(Event::Code(index, shown));
+        if let Some(added) = shown {
+            let streamed = Streamed {
+                added,
+                whole: written,
+            };
+            on_event(Event::Code(index, streamed));
         }
 
         while let Some(end) = written[self.checked..].find('\n') {
@@ -443,7 +456,7 @@ mod tests {
         let executed = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&executed);
         let on_event = Box::new(move |event: Event| {
-            if let Event::Execute(index) = event {
+            if let Event::Execute(index, _) = event {
                 seen.lock().expect("executed").push(index);
             }
         });
@@ -652,7 +665,7 @@ mod tests {
         let mut events = Vec::new();
         let mut collect = |event: Event| {
             if let Event::Code(index, code) = event {
-                events.push((index, code.to_owned()));
+                events.push((index, code.added.to_owned()));
             }
         };
         let mut reply = Reply {
@@ -1116,7 +1129,7 @@ mod tests {
         let trigger = Arc::clone(&handle);
         let mut executed = 0;
         let on_event = Box::new(move |event: Event| {
-            if let (Event::Execute(_), Some(interrupt)) = (event, trigger.get()) {
+            if let (Event::Execute(..), Some(interrupt)) = (event, trigger.get()) {
                 executed += 1;
                 if executed == 2 {
                     interrupt.cancel(u64::MAX);
