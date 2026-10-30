@@ -13,6 +13,15 @@ but their files stay in `~/.smol/history` untouched.
   the one that starts it, and that a task asking for agents has each of its
   parts done by an agent once the parts are clear. In a session that asked for
   agents, the model drew every part itself first.
+- Code could get libsmol, which runs outside the sandbox, to read a hidden file
+  and send it to the model, by writing a fake `view()` notice to its own
+  connection. libsmol now takes only a file name in the copies folder from that
+  notice and reads copies only as plain files, never through a link.
+- Code in the sandbox can connect only to Unix sockets in the places it can
+  write, so no longer to ssh-agent, gpg-agent, Docker or D-Bus, and can't
+  signal programs outside the sandbox. On Linux this needs kernel 7.1 for
+  sockets with a path and 6.12 for signals and abstract sockets; older kernels
+  keep the rest of the sandbox and the log says what stays open.
 
 ## 0.4.2 - 2026-10-29
 

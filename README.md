@@ -249,7 +249,11 @@ process and the programs it starts:
   `~/Library/Keychains`, `~/.smol`, `~/.claude`, `~/.claude.json`, `~/.codex`,
   and the configuration directory when `SMOL_CONFIG_DIR` moves it;
 - get only `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `LANG`, `LC_ALL`,
-  `LC_CTYPE`, `TERM` and `TZ` from your environment.
+  `LC_CTYPE`, `TERM` and `TZ` from your environment;
+- can connect only to Unix sockets in the places they can write, so not to
+  ssh-agent, gpg-agent, Docker or D-Bus, and can't signal programs outside the
+  sandbox. On Linux this needs kernel 7.1 for sockets with a path, and 6.12 for
+  signals and abstract sockets.
 
 The network is not restricted, and MCP servers and `!` commands run outside the
 sandbox. Package managers can't write their caches (`~/.cargo/registry`,
@@ -275,7 +279,8 @@ subfolders.
 On Windows, and on Linux kernels without Landlock, files are not isolated; the
 environment is still cut down, on Windows to the system variables programs
 need. The log says `sandbox: enforced (landlock)` or
-`sandbox: enforced (seatbelt)` when a session's sandbox applies.
+`sandbox: enforced (seatbelt)` when a session's sandbox applies, and on older
+Linux kernels it also names what stays open.
 
 ## Instructions and skills
 

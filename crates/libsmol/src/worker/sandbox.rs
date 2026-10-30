@@ -4,15 +4,18 @@ use crate::utils::new_id;
 use crate::worker::SANDBOX_ENV;
 #[cfg(target_os = "linux")]
 use landlock::{
-    Access as _, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
+    Access as _, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
+    ABI,
 };
 use reaper::{cause, tilde};
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::convert::Infallible;
 use std::env;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::c_void;
 use std::ffi::OsString;
 #[cfg(target_os = "macos")]
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::fs::{self, File};
 use std::io;
 #[cfg(target_os = "macos")]
@@ -20,7 +23,7 @@ use std::mem;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ptr;
 use tokio::process::Command;
 use tracing::info;
@@ -30,6 +33,9 @@ use tracing::warn;
 const TEMP_PREFIX: &str = "smol-";
 /// The sandbox holds a lock on this file in its temporary folder while it lives
 const LOCK: &str = "lock";
+/// `LANDLOCK_CREATE_RULESET_VERSION`, which libc doesn't define
+#[cfg(target_os = "linux")]
+const LANDLOCK_VERSION: libc::c_uint = 1;
 /// Relative to the home folder
 const CREDENTIALS: &[&str] = &[
     ".ssh",
@@ -254,9 +260,10 @@ fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation
         spread(path, *write, &hidden, &mut allowed);
     }
 
-    // V9 also covers connecting to Unix sockets, which stay open like the network
-    let abi = ABI::V8;
+    // A kernel drops the rights and scopes it doesn't know, and the rest still holds
+    let abi = ABI::V9;
     let all = AccessFs::from_all(abi);
+    // Connecting to a Unix socket is a write right, so only writable folders allow it
     let read = AccessFs::from_read(abi);
     let mut rules = Vec::new();
     for (path, write) in allowed {
@@ -277,6 +284,7 @@ fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation
     let rules = rules.into_iter().map(Ok);
     let created = Ruleset::default()
         .handle_access(all)
+        .and_then(|ruleset| ruleset.scope(Scope::Signal | Scope::AbstractUnixSocket))
         .and_then(Ruleset::create)
         .and_then(|ruleset| ruleset.add_rules(rules));
     let ruleset: Option<OwnedFd> = match created {
@@ -286,11 +294,33 @@ fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation
             return None;
         }
     };
-    match ruleset {
-        Some(_) => info!("sandbox: enforced (landlock)"),
-        None => info!("sandbox: not enforced, landlock unavailable"),
+
+    let version = landlock_abi();
+    let open = match version {
+        ..6 => Some("signals and unix sockets"),
+        6..9 => Some("unix sockets"),
+        _ => None,
+    };
+    match (&ruleset, open) {
+        (Some(_), None) => info!("sandbox: enforced (landlock)"),
+        (Some(_), Some(open)) => info!("sandbox: enforced (landlock), {open} open [abi={version}]"),
+        (None, _) => info!("sandbox: not enforced, landlock unavailable"),
     }
     ruleset
+}
+
+/// Negative without Landlock
+#[cfg(target_os = "linux")]
+fn landlock_abi() -> libc::c_long {
+    // SAFETY: A null attribute with the version flag only asks for the kernel's ABI
+    unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            ptr::null::<c_void>(),
+            0_usize,
+            LANDLOCK_VERSION,
+        )
+    }
 }
 
 /// Landlock can't take back access below a granted folder,
@@ -403,23 +433,31 @@ fn profile(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> String {
     let mut rules = Vec::new();
     for (path, write) in granted {
         let rule = match write {
-            true => "allow file-read* file-write*",
+            true => "allow file-read* file-write* network-outbound",
             false => "allow file-read*",
         };
         rules.push((path, rule));
     }
     for path in hidden {
-        rules.push((path, "deny file-read* file-write*"));
+        rules.push((path, "deny file-read* file-write* network-outbound"));
     }
     rules.sort_by_key(|(path, _)| path.components().count());
 
-    let mut profile = "(version 1)\n(allow default)\n(deny file-write*)\n".to_owned();
+    // Only connecting to a Unix socket has a path, so TCP and UDP stay open
+    let mut profile = "(version 1)\n(allow default)\n(deny file-write*)\n\
+        (deny network-outbound (subpath \"/\"))\n"
+        .to_owned();
     for (path, rule) in rules {
         let path = path.to_string_lossy();
         let path = path.replace('\\', "\\\\").replace('"', "\\\"");
         let line = format!("({rule} (subpath \"{path}\"))\n");
         profile.push_str(&line);
     }
+    // Names resolve through this socket, and signals reach only the worker's own process group
+    profile.push_str(
+        "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n\
+        (deny signal (target others))\n",
+    );
     profile
 }
 
@@ -461,13 +499,19 @@ pub(crate) mod tests {
     use crate::worker::host::tests::no_agents;
     use crate::worker::host::Worker;
     #[cfg(target_os = "linux")]
-    use crate::worker::sandbox::spread;
+    use crate::worker::sandbox::{landlock_abi, spread};
     use crate::worker::sandbox::{profile, sweep, Sandbox, LOCK, PASSED_ENV, TEMP_PREFIX};
     use crate::worker::Delegation;
     use std::env;
     use std::fs;
     #[cfg(target_os = "linux")]
+    use std::os::linux::net::SocketAddrExt;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::symlink;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::SocketAddr;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -491,12 +535,15 @@ pub(crate) mod tests {
             PathBuf::from("/Users/zoë/.smol"),
         ];
         let expected = "(version 1)\n(allow default)\n(deny file-write*)\n\
+            (deny network-outbound (subpath \"/\"))\n\
             (allow file-read* (subpath \"/\"))\n\
-            (allow file-read* file-write* (subpath \"/Users/zoë/café\"))\n\
-            (deny file-read* file-write* (subpath \"/Users/zoë/.ssh\"))\n\
-            (deny file-read* file-write* (subpath \"/Users/zoë/.smol\"))\n\
+            (allow file-read* file-write* network-outbound (subpath \"/Users/zoë/café\"))\n\
+            (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.ssh\"))\n\
+            (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.smol\"))\n\
             (allow file-read* (subpath \"/Users/zoë/.smol/skills/pdf\"))\n\
-            (deny file-read* file-write* (subpath \"/Users/zoë/a/b/c/we\\\"ird\\\\name\"))\n";
+            (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/a/b/c/we\\\"ird\\\\name\"))\n\
+            (allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n\
+            (deny signal (target others))\n";
         assert_eq!(profile(&granted, &hidden), expected);
     }
 
@@ -591,6 +638,69 @@ pub(crate) mod tests {
             logs,
             "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 1, False]\n"
         );
+    }
+
+    /// Sockets and signals reach outside the sandbox only on kernels that can't stop them,
+    /// while names still resolve
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ipc_confined() {
+        let dir = temp_dir("ipc");
+        let cwd = dir.join("café");
+        fs::create_dir_all(&cwd).expect("dir");
+        fs::create_dir_all(dir.join("outside")).expect("dir");
+        let path = dir.join("outside/s.sock");
+        let _outside = UnixListener::bind(&path).expect("bind");
+        #[cfg(target_os = "linux")]
+        let name = format!("smol-ipc-{}", new_id());
+        #[cfg(target_os = "linux")]
+        let address = SocketAddr::from_abstract_name(&name).expect("name");
+        #[cfg(target_os = "linux")]
+        let _scoped = UnixListener::bind_addr(&address).expect("bind");
+        let config = dir.join("config");
+        let copies = config.join("copies");
+        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &Access::default());
+        let sandbox = sandbox.expect("sandbox");
+        #[cfg(target_os = "macos")]
+        assert!(sandbox.enforced());
+        if !sandbox.enforced() {
+            fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        let shown = path.display();
+        let probes = format!(
+            "tried(lambda: reach('own.sock')), tried(lambda: reach({shown:?})),\n \
+             tried(lambda: os.kill(os.getppid(), 0)), len(socket.getaddrinfo('localhost', 80)) > 0"
+        );
+        #[cfg(target_os = "linux")]
+        let probes = format!("{probes}, tried(lambda: reach('\\0{name}'))");
+        let code = format!(
+            "import os, socket\n\
+            def tried(act):\n    try:\n        act()\n        return 'ok'\n    except PermissionError:\n        return 'denied'\n\
+            def reach(address):\n    socket.socket(socket.AF_UNIX).connect(address)\n\
+            own = socket.socket(socket.AF_UNIX)\nown.bind('own.sock')\nown.listen()\n\
+            [{probes}]"
+        );
+        let logs = evaluated(sandbox, &code);
+        fs::remove_dir_all(&dir).ok();
+
+        #[cfg(target_os = "linux")]
+        let expected = {
+            let abi = landlock_abi();
+            let sockets = match abi >= 9 {
+                true => "denied",
+                false => "ok",
+            };
+            let scoped = match abi >= 6 {
+                true => "denied",
+                false => "ok",
+            };
+            format!("['ok', '{sockets}', '{scoped}', True, '{scoped}']\n")
+        };
+        #[cfg(target_os = "macos")]
+        let expected = "['ok', 'denied', 'denied', True]\n".to_owned();
+        assert_eq!(logs, expected);
     }
 
     #[test]

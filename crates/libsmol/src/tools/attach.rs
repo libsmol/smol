@@ -5,8 +5,10 @@ use crate::tools::files::{ls, slashed};
 use crate::tools::ToolError;
 use crate::utils::{new_id, truncated};
 use reaper::cause;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -213,6 +215,31 @@ fn copied(copies: &Path, data: &[u8], found: MediaType, from_call: bool) -> io::
     })
 }
 
+/// The code can write to the copies folder, so whatever stands in for a copy there is only read
+/// when it is a plain file
+pub(crate) fn read_copy(path: &Path) -> io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // Opening a pipe would block until something writes to it
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = options.open(path)?;
+    let meta = file.metadata()?;
+
+    // A hard link reaches a file the code may not read where it is
+    #[cfg(unix)]
+    let linked = meta.nlink() > 1;
+    #[cfg(not(unix))]
+    let linked = false;
+    if !meta.is_file() || linked {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    Ok(data)
+}
+
 pub(crate) fn shown_path(path: &Path, cwd: &Path) -> String {
     let relative = path.strip_prefix(cwd).unwrap_or(path);
     let mut shown = slashed(relative);
@@ -297,6 +324,8 @@ pub(crate) mod tests {
     use std::ffi::CString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     pub(crate) fn mentioned(path: &Path) -> Mention {
         Mention::File {
@@ -463,5 +492,34 @@ pub(crate) mod tests {
         assert!(failed.starts_with("not copied: "), "{failed}");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Links and pipes the code put in the copies folder are not read through
+    #[cfg(unix)]
+    #[test]
+    fn copies_read_plainly() {
+        let dir = temp_dir("read-copies");
+        let copies = dir.join("copies");
+        let secret = dir.join("secret/naïve.png");
+        write_file(&secret, b"\x89PNG secret");
+        write_file(&copies.join("café.png"), b"\x89PNG copy");
+        symlink(&secret, copies.join("linked.png")).expect("link");
+        fs::hard_link(&secret, copies.join("hard.png")).expect("link");
+        let pipe = copies.join("pipe.png");
+        let named = CString::new(pipe.as_os_str().as_bytes()).expect("path");
+        // SAFETY: The path is a NUL-terminated C string
+        let made = unsafe { libc::mkfifo(named.as_ptr(), 0o600) };
+        assert_eq!(made, 0);
+
+        let read = |name: &str| read_copy(&copies.join(name)).ok();
+        let found = [
+            read("café.png"),
+            read("linked.png"),
+            read("hard.png"),
+            read("pipe.png"),
+        ];
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(found, [Some(b"\x89PNG copy".to_vec()), None, None, None]);
     }
 }

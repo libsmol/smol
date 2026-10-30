@@ -20,6 +20,7 @@ use std::env;
 use std::future::{self, Future};
 use std::io;
 use std::mem;
+use std::path::Component;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -556,8 +557,14 @@ impl Live {
                                 call.abort();
                             }
                         }
+                        // The code can write to this connection too, so only a name in the copies folder is taken
                         Message::Note(WorkerNote::Viewed { label, media }) => {
-                            self.media.push((label, media));
+                            let mut parts = media.file.components();
+                            let first = parts.next();
+                            let named = matches!(first, Some(Component::Normal(_)));
+                            if named && parts.next().is_none() {
+                                self.media.push((label, media));
+                            }
                         }
                     }
                 }
@@ -1162,6 +1169,24 @@ pub(crate) mod tests {
         let next = worker.eval("1");
         assert!(next.media.is_empty());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The code can write to the agent's connection itself, but a note naming anything but a copy is dropped
+    #[test]
+    fn forged_views_dropped() {
+        let code = "import json, os, stat\n\
+            def forge(name):\n    \
+                media = {'kind': 'image', 'mime': 'image/png', 'file': name}\n    \
+                note = json.dumps({'method': 'viewed', 'params': {'label': name, 'media': media}})\n    \
+                for fd in range(3, 64):\n        \
+                    try:\n            mode = os.fstat(fd).st_mode\n        except OSError:\n            continue\n        \
+                    if stat.S_ISSOCK(mode):\n            os.write(fd, (note + '\\n').encode())\n            return\n\
+            for name in ['/etc/hostname', '../café.png', 'naïve.png']:\n    forge(name)";
+        let output = run(code);
+        assert_eq!(output.error, None, "{}", output.logs);
+
+        let labels: Vec<&str> = output.media.iter().map(|(label, _)| &**label).collect();
+        assert_eq!(labels, ["naïve.png"]);
     }
 
     /// Modules in the working directory are importable, and argparse and runpy read `sys.argv[0]`

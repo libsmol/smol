@@ -1,4 +1,5 @@
 use crate::prompt::{self, TOOL};
+use crate::tools::attach::read_copy;
 use crate::utils::{excerpt, http_cause, http_client};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -7,7 +8,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::env;
-use std::fs;
 use std::future::Future;
 use std::mem;
 use std::ops::Not;
@@ -310,7 +310,7 @@ impl OpenAIModel {
                 };
 
                 let accepted = self.takes(media.kind);
-                let read = accepted.then(|| fs::read(&media.file));
+                let read = accepted.then(|| read_copy(&media.file));
                 let bytes = match read {
                     Some(Ok(bytes)) => bytes,
                     Some(Err(_)) => {
@@ -1061,6 +1061,7 @@ pub(crate) mod tests {
     use crate::model::*;
     use crate::tests::{temp_dir, write_file};
     use crate::utils::block_on;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
     use std::thread;
