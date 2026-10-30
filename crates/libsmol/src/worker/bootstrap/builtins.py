@@ -3,6 +3,7 @@ import inspect as _inspect
 import io as _io
 import os as _os
 import re as _re
+import shutil as _shutil
 # Importing it installs the SIGINT handler the agent relies on to interrupt code
 import signal as _signal
 import sys as _sys
@@ -69,6 +70,8 @@ _builtins.open = _io.open = _open
 _builtins.print = _print
 _sys.stdout, _sys.stderr = _STDOUT, _STDERR
 _sys.__stdout__, _sys.__stderr__ = _STDOUT, _STDERR
+# RustPython names libsmol here, which cannot run Python scripts
+_sys.executable = _sys._base_executable = _shutil.which("python3") or _shutil.which("python") or ""
 
 def _bound(signature, header, args, kwargs):
     try:

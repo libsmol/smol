@@ -1187,7 +1187,8 @@ pub(crate) mod tests {
         assert_eq!(labels, ["naïve.png"]);
     }
 
-    /// Modules in the working directory are importable, and argparse and runpy read `sys.argv[0]`
+    /// Modules in the working directory are importable, argparse and runpy read `sys.argv[0]`,
+    /// and `sys.executable` is not the worker
     #[test]
     fn interpreter_settings() {
         let dir = temp_dir("settings");
@@ -1196,10 +1197,11 @@ pub(crate) mod tests {
         fs::write(&module, "value = 42\n").expect("write");
 
         let mut worker = build(Interrupt::default(), dir.clone(), Delegation::On);
-        let code = "import argparse, pathlib, runpy, smol_local\n\
+        let code = "import argparse, pathlib, runpy, smol_local, sys\n\
              print(smol_local.value)\n\
              _ = pathlib.Path('script.py').write_text('import sys\\nprint(sys.argv[0])')\n\
              _ = runpy.run_path('script.py')\n\
+             print(sys.executable)\n\
              parser = argparse.ArgumentParser()\n\
              _ = parser.add_argument('name')\n\
              parser.parse_args(['Zoë']).name";
@@ -1207,7 +1209,13 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "42\nscript.py\nZoë\n");
+        let lines: Vec<&str> = output.logs.lines().collect();
+        let [value, script, executable, name] = lines[..] else {
+            panic!("{}", output.logs);
+        };
+        assert_eq!([value, script, name], ["42", "script.py", "Zoë"]);
+        let itself = env::current_exe().expect("current exe");
+        assert_ne!(Path::new(executable), itself);
     }
 
     #[test]

@@ -23,6 +23,9 @@ but their files stay in `~/.smol/history` untouched.
   The summary is written in the language of the tasks, and the model is told
   it covers its own work so far. In sessions that compacted often, the model
   read the same files again after every summary instead of going on.
+- `sys.executable` in the code is the `python3` (or `python`) on `PATH`. It
+  named libsmol, so code that ran a script or `-m unittest` with it got
+  libsmol's usage message.
 
 ## 0.4.3 - 2026-10-30
 
