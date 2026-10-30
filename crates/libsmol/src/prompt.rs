@@ -196,7 +196,7 @@ pub(crate) fn system(
 | The task asks for agents | `agent([part1, part2, ...])` once the parts are clear | Each part is done by an agent |
 
 - Without `name`, `agent()` waits for the answer. A single task that fails raises `RuntimeError`; a list of tasks returns the answers in order, with a `RuntimeError` in place of each task that failed.
-- With `name`, `agent()` returns a handle at once. The task goes on after your answer until the agent ends, and an `{DONE}:` message tells you when.
+- With `name`, `agent()` returns a handle at once. If it is still running when you answer, the task stays open until it ends, and an `{DONE}:` message tells you when.
 
 ```python
 {handed}

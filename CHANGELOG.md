@@ -7,6 +7,12 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- The system prompt says that a task stays open after the answer only while an
+  agent started with a name is still running. It said the task goes on after
+  the answer, which read as if there were more to do.
+
 ## 0.4.3 - 2026-10-30
 
 - The system prompt says an agent `agent()` starts has the same environment as
