@@ -51,9 +51,9 @@ const BUILDS: [(&str, &str); 5] = [
     ),
 ];
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Holds the runtimes, the worker modules and their locks in the config directory
+/// Holds the runtimes, the worker modules, the venvs and their locks in the config directory
 const STORE: &str = "runtime";
-/// Holds a folder of venvs for each runtime in the config directory
+/// Holds a folder of venvs for each runtime in the store
 const VENVS: &str = "venvs";
 /// Held by an install or a repair in the store
 const STORE_LOCK: &str = "lock";
@@ -136,7 +136,7 @@ impl Runtime {
 
         let swept = store.clone();
         let current = [home.clone(), module.clone()];
-        let venvs = config.join(VENVS);
+        let venvs = store.join(VENVS);
         let span = Span::current();
         // Tokio runs every session on one thread, which removing a runtime and its venvs would hold
         let sweeping = move || {
@@ -259,7 +259,7 @@ impl Python {
         let runtime = Runtime::install(config).await?;
         let named = runtime.home.file_name().unwrap_or_default();
         let named = named.to_string_lossy();
-        let venv = venv_for(config, cwd, &named);
+        let venv = venv_for(&runtime.store, cwd, &named);
         let venvs = venv.parent().expect("venvs");
         let failed = |e: io::Error| {
             let reason = cause(&e);
@@ -394,17 +394,15 @@ fn stored(_: &Path, _: &str) -> (PathBuf, PathBuf) {
 
 /// Among the venvs of the runtime, named after the working directory
 #[cfg(not(test))]
-fn venv_for(config: &Path, cwd: &Path, runtime: &str) -> PathBuf {
+fn venv_for(store: &Path, cwd: &Path, runtime: &str) -> PathBuf {
     let name = venv_name(cwd);
-    config.join(VENVS).join(runtime).join(name)
+    store.join(VENVS).join(runtime).join(name)
 }
 
-/// Tests share one venv in the profile folder
+/// Tests share one venv in the store of the profile folder
 #[cfg(test)]
-fn venv_for(_: &Path, _: &Path, runtime: &str) -> PathBuf {
-    let exe = env::current_exe().expect("test binary");
-    let built = exe.parent().and_then(Path::parent).expect("profile");
-    built.join(VENVS).join(runtime).join("venv")
+fn venv_for(store: &Path, _: &Path, runtime: &str) -> PathBuf {
+    store.join(VENVS).join(runtime).join("venv")
 }
 
 /// The folder's name, kept short for the path's sake, and a hash of the whole path,

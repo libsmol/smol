@@ -396,10 +396,10 @@ the default is `warn,libsmol=info`, `SMOL_LOG=warn` keeps only problems,
 ## Limitations
 
 - **The Python is smol's own CPython 3.14**, the same on every machine, in a
-  venv kept for each working directory in `~/.smol/venvs`. `python`, `pip`
-  and imports resolve to that venv, not to the Pythons and virtualenvs you
-  installed, which stay on `PATH` after it. Every session in the directory and
-  the agents they start share the venv and keep what it installed, until a
+  venv kept for each working directory in `~/.smol/runtime/venvs`. `python`,
+  `pip` and imports resolve to that venv, not to the Pythons and virtualenvs
+  you installed, which stay on `PATH` after it. Every session in the directory
+  and the agents they start share the venv and keep what it installed, until a
   new runtime gets a new one or the directory is gone and no session has used
   the venv for a week. To start over, delete it while no session in that
   directory is open. `VIRTUAL_ENV` names it, so tools such as uv or poetry

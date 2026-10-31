@@ -18,8 +18,8 @@ but their files stay in `~/.smol/history` untouched.
   silicon and Intel) and Windows (x86_64); `libsmol` built for anything else
   can't open a session. Plain Python runs several times faster, and `libsmol`
   is 7 MB instead of 33 MB.
-- Each working directory has a venv in `~/.smol/venvs`, shared by its sessions
-  and the agents they start, which the code can write. `pip install` puts
+- Each working directory has a venv in `~/.smol/runtime/venvs`, shared by its
+  sessions and the agents they start, which the code can write. `pip install` puts
   packages there, C extensions such as numpy and pandas included, and the
   session can import them right away, editable installs too; `sys.executable`
   and the `python` and `pip` on `PATH` are the venv's, and in the sandbox pip
