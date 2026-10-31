@@ -151,9 +151,19 @@ impl Runtime {
             let result = task::spawn_blocking(unpacking).await.expect("unpack");
             result.map_err(failed)?;
             let unpacked = unpacked.join("python");
+            let python = unpacked.join(HOME_BIN).join(EXE);
+
+            // Venvs get pip from the wheel ensurepip keeps, and nothing reads manuals or terminfo
+            let mut trimming = Command::new(&python);
+            trimming
+                .args(["-I", "-m", "pip", "uninstall", "-y", "-q", "pip"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            trimming.status().await.map_err(failed)?;
+            fs::remove_dir_all(unpacked.join("share")).ok();
 
             // Compiled before anything runs it, since the code can't write its bytecode later
-            let python = unpacked.join(HOME_BIN).join(EXE);
             let mut compiling = Command::new(python);
             compiling
                 .args(["-I", "-m", "compileall", "-q", "-j0"])
