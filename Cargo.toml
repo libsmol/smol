@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/libsmol", "crates/reaper", "crates/smol"]
+members = ["crates/libsmol", "crates/reaper", "crates/smol", "crates/worker"]
 resolver = "2"
 
 [workspace.package]
@@ -9,11 +9,8 @@ repository = "https://github.com/libsmol/smol"
 version = "0.4.4"
 
 [workspace.dependencies]
+libsmol = { version = "0.4.4", path = "crates/libsmol" }
 reaper = { package = "libsmol-reaper", version = "0.4.4", path = "crates/reaper" }
-
-# Test workers run the RustPython built here, which is far too slow unoptimized
-[profile.dev.package."*"]
-opt-level = 2
 
 [profile.release]
 lto = true

@@ -104,7 +104,7 @@ pub(crate) enum Part {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Media {
+pub struct Media {
     pub(crate) kind: MediaKind,
     pub(crate) mime: String,
     /// The file name in the copies directory, which still resolves after the config directory moves

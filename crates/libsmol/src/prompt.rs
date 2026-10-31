@@ -7,6 +7,7 @@ use crate::memory::{
 use crate::model::{Media, Part};
 use crate::utils::truncated;
 use crate::worker::host::Added;
+use crate::worker::python::PYTHON;
 use crate::worker::Function;
 use chrono::Utc;
 use std::env::consts::OS;
@@ -34,7 +35,7 @@ pub(crate) const NO_AGENT: &str = "no such agent";
 pub(crate) const UNFINISHED: &str = "stopped before it answered";
 pub(crate) const STOPPED_BY_CODE: &str = "stopped by stop()";
 /// The worker puts it in the docs of `Agent.wait` and `Agent.stop`
-pub(crate) const DONE: &str = "Agent done";
+pub const DONE: &str = "Agent done";
 
 pub(crate) fn unknown_role(name: &str, roles: &[Role]) -> String {
     let names: Vec<&str> = roles.iter().map(|role| role.name.as_str()).collect();
@@ -154,16 +155,11 @@ pub(crate) fn system(
         let entry = format!("## Skill `{name}`\n\n{description}\n\n- `{path}`");
         entries.push(entry);
     }
-    // The sandbox gives Windows code TEMP instead of TMPDIR
-    let temp = match cfg!(windows) {
-        true => "%TEMP%",
-        false => "$TMPDIR",
-    };
     let skills = match entries.is_empty() {
         true => String::new(),
         false => {
             let entries = entries.join("\n\n");
-            format!("\n\n# Skills\n\nWhen a task matches a skill below, read and follow its `SKILL.md`; paths in it are relative to its folder. Install packages its scripts need in a venv in `{temp}`.\n\n{entries}")
+            format!("\n\n# Skills\n\nWhen a task matches a skill below, read and follow its `SKILL.md`; paths in it are relative to its folder.\n\n{entries}")
         }
     };
 
@@ -237,7 +233,7 @@ pub(crate) fn system(
                 places.push(place);
             }
             let places = places.join(", ");
-            format!("\n- Your code runs in a sandbox: writing outside {places} and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- `$TMPDIR` is removed when the session ends.\n- If a tool fails because it cannot write its cache, rerun it with the cache in `$TMPDIR`.")
+            format!("\n- Your code runs in a sandbox: writing outside {places}, the venv and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- `$TMPDIR` is removed when the session ends.\n- If a tool fails because it cannot write its cache, rerun it with the cache in `$TMPDIR`.")
         }
         None => String::new(),
     };
@@ -277,7 +273,8 @@ These need no import. Use them instead of writing your own, and create new files
 
 # Environment
 
-- Your code runs on the user's computer ({OS}) in `{cwd}`; the files and programs a task mentions are there.{sandbox}
+- Your code runs on the user's computer ({OS}) in `{cwd}`; the files and programs a task mentions are there.
+- Python is CPython {PYTHON} in a venv kept for this folder: packages you install with `pip install` can be imported in this session right away.{sandbox}
 - Today is {date} (UTC).
 - Your answer goes to the user; no hidden tests or graders check your work.
 
@@ -535,7 +532,7 @@ pub(crate) fn undecoded(size: u64) -> String {
     format!("{size} bytes, not UTF-8 text; if it is text in another encoding, decode it in code")
 }
 
-pub(crate) fn unserializable(key: &str, kind: &str) -> String {
+pub fn unserializable(key: &str, kind: &str) -> String {
     format!("{key}: {kind} is not JSON-serializable")
 }
 
@@ -754,6 +751,7 @@ mod tests {
     use crate::prompt::{
         call_error, error, media_tag, shell, system, transcript, unseen, view_summary,
     };
+    use crate::worker::python::PYTHON;
     use crate::worker::Function;
     use std::path::{Path, PathBuf};
 
@@ -795,19 +793,16 @@ mod tests {
                       class Agent\n    # The handle.\n\n\
                       Agent.get(name) -> Agent\n    # Its handle.\n```\n\n# Environment";
         assert!(text.contains(handed), "{text}");
-        let place =
-            ") in `/home/zoë/work`; the files and programs a task mentions are there.\n- Today";
-        assert!(text.contains(place), "{text}");
-        let temp = match cfg!(windows) {
-            true => "%TEMP%",
-            false => "$TMPDIR",
-        };
-        let skill = format!(
-            "\n\n# Skills\n\n\
-             When a task matches a skill below, read and follow its `SKILL.md`; paths in it are relative to its folder. Install packages its scripts need in a venv in `{temp}`.\n\n\
-             ## Skill `weekly`\n\nWrite the weekly report\n\n- `/home/zoë/.smol/skills/weekly/SKILL.md`\n\n# Sub-agents\n\n"
+        let place = format!(
+            ") in `/home/zoë/work`; the files and programs a task mentions are there.\n\
+             - Python is CPython {PYTHON} in a venv kept for this folder: packages you install with `pip install` can be imported in this session right away.\n\
+             - Today"
         );
-        assert!(text.contains(&skill), "{text}");
+        assert!(text.contains(&place), "{text}");
+        let skill = "\n\n# Skills\n\n\
+             When a task matches a skill below, read and follow its `SKILL.md`; paths in it are relative to its folder.\n\n\
+             ## Skill `weekly`\n\nWrite the weekly report\n\n- `/home/zoë/.smol/skills/weekly/SKILL.md`\n\n# Sub-agents\n\n";
+        assert!(text.contains(skill), "{text}");
         let files = " or is uncertain.\n\n# Instructions\n\n\
                      Follow these instructions:\n\n\
                      <instructions>\nReply in French\n</instructions>\n\n\
@@ -818,12 +813,12 @@ mod tests {
         assert!(!plain.contains("<instructions"), "{plain}");
         assert!(!plain.contains("# Skills"), "{plain}");
         assert!(!plain.contains("# Roles"), "{plain}");
-        let sandbox = "are there.\n- Your code runs in a sandbox: writing outside `/home/zoë/work` and `$TMPDIR`, ";
+        let sandbox = "right away.\n- Your code runs in a sandbox: writing outside `/home/zoë/work`, the venv and `$TMPDIR`, ";
         assert!(plain.contains(sandbox), "{plain}");
         let registry = [PathBuf::from("/home/zoë/.cargo/registry")];
         let allowed = system(&[], &[], &[], cwd, Some(&registry), &[], &main);
         let sandbox =
-            "writing outside `/home/zoë/work`, `/home/zoë/.cargo/registry` and `$TMPDIR`, ";
+            "writing outside `/home/zoë/work`, `/home/zoë/.cargo/registry`, the venv and `$TMPDIR`, ";
         assert!(allowed.contains(sandbox), "{allowed}");
     }
 

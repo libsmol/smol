@@ -1,5 +1,6 @@
 use crate::config::{Access, Skill};
 use crate::utils::new_id;
+use crate::worker::python::Python;
 #[cfg(target_os = "macos")]
 use crate::worker::SANDBOX_ENV;
 #[cfg(target_os = "linux")]
@@ -18,6 +19,7 @@ use std::ffi::OsString;
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::fs::{self, File};
 use std::io;
+use std::iter;
 #[cfg(target_os = "macos")]
 use std::mem;
 #[cfg(target_os = "linux")]
@@ -90,6 +92,7 @@ const PASSED_ENV: &[&str] = &[
 const TEMP_ENV: &[&str] = &["TMPDIR"];
 #[cfg(windows)]
 const TEMP_ENV: &[&str] = &["TEMP", "TMP"];
+const VENV_ENV: &str = "VIRTUAL_ENV";
 
 /// The Landlock ruleset the worker restricts itself with
 #[cfg(target_os = "linux")]
@@ -109,6 +112,7 @@ type Isolation = Infallible;
 pub(crate) struct Sandbox {
     cwd: PathBuf,
     pub(crate) copies: PathBuf,
+    pub(crate) python: Python,
     temp: PathBuf,
     /// The places in `[allow] write` that existed when the session opened
     writable: Vec<PathBuf>,
@@ -118,13 +122,15 @@ pub(crate) struct Sandbox {
 }
 
 impl Sandbox {
-    /// `config` is hidden like the credential locations, but `copies` and skill folders in it are not
+    /// `config` is hidden like the credential locations,
+    /// but `copies`, skill folders and the parts of `python` in it are not
     pub(crate) fn new(
         cwd: &Path,
         copies: &Path,
         config: &Path,
         skills: &[Skill],
         access: &Access,
+        python: Python,
     ) -> Result<Self, String> {
         let id = new_id();
         let name = format!("{TEMP_PREFIX}{id}");
@@ -140,6 +146,7 @@ impl Sandbox {
         let mut sandbox = Self {
             cwd: cwd.to_owned(),
             copies: copies.to_owned(),
+            python,
             temp: temp.clone(),
             writable: Vec::new(),
             lock: None,
@@ -150,20 +157,41 @@ impl Sandbox {
         let lock = File::create(&path).map_err(|e| failed(&path, e))?;
         lock.lock().map_err(|e| failed(&path, e))?;
         sandbox.lock = Some(lock);
-        // A Landlock rule holds on to the folder that exists when the rule is made
-        fs::create_dir_all(copies).map_err(|e| failed(copies, e))?;
+        // A Landlock rule holds on to the folder that exists when the rule is made.
+        // An earlier session's code may have swapped one for a link, which the grant would follow
+        let python = &sandbox.python;
+        for folder in [copies, &python.venv] {
+            let swapped = fs::symlink_metadata(folder).is_ok_and(|found| !found.is_dir());
+            if swapped {
+                let removed = fs::remove_file(folder).or_else(|_| fs::remove_dir(folder));
+                removed.map_err(|e| failed(folder, e))?;
+            }
+            fs::create_dir_all(folder).map_err(|e| failed(folder, e))?;
+        }
 
         let passed = PASSED_ENV.iter().copied();
         let named = access.env.iter().map(String::as_str);
         for name in passed.chain(named) {
-            if let Some(value) = env::var_os(name) {
-                sandbox.env.push((OsString::from(name), value));
+            let Some(mut value) = env::var_os(name) else {
+                continue;
+            };
+            // Programs the code starts find the venv's `python` and `pip` first
+            if name == "PATH" {
+                let bin = iter::once(python.bin());
+                let rest = env::split_paths(&value);
+                let paths = bin.chain(rest);
+                if let Ok(joined) = env::join_paths(paths) {
+                    value = joined;
+                }
             }
+            sandbox.env.push((OsString::from(name), value));
         }
         for name in TEMP_ENV {
             let value = scratch.clone().into_os_string();
             sandbox.env.push((OsString::from(name), value));
         }
+        let venv = python.venv.clone().into_os_string();
+        sandbox.env.push((OsString::from(VENV_ENV), venv));
 
         let mut granted = vec![(PathBuf::from("/"), false)];
         for skill in skills {
@@ -171,7 +199,10 @@ impl Sandbox {
                 granted.push((folder.to_owned(), false));
             }
         }
-        for path in [cwd, &scratch, copies, Path::new("/dev")] {
+        for path in [&python.runtime.home, &python.runtime.module] {
+            granted.push((path.clone(), false));
+        }
+        for path in [cwd, &scratch, copies, &python.venv, Path::new("/dev")] {
             granted.push((path.to_owned(), true));
         }
         for path in &access.write {
@@ -406,7 +437,7 @@ fn seatbelt() -> Option<(SandboxInit, FreeError)> {
 
 /// Confines this process and every program it starts from now on, which can't be undone
 #[cfg(target_os = "macos")]
-pub(crate) fn confine(profile: &str) -> Result<(), String> {
+pub fn confine(profile: &str) -> Result<(), String> {
     let Some((init, free)) = seatbelt() else {
         return Err("sandbox: sandbox_init not found".to_owned());
     };
@@ -448,21 +479,30 @@ fn profile(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> String {
             true => "allow file-read* file-write* network-outbound",
             false => "allow file-read*",
         };
-        rules.push((path, rule));
+        rules.push((path, rule, "subpath"));
+        // Unlike Landlock, a subpath rule lets the code swap the folder itself for a link,
+        // which a later session would grant
+        if *write {
+            rules.push((path, "deny file-write-unlink file-write-create", "literal"));
+        }
     }
     for path in hidden {
-        rules.push((path, "deny file-read* file-write* network-outbound"));
+        rules.push((
+            path,
+            "deny file-read* file-write* network-outbound",
+            "subpath",
+        ));
     }
-    rules.sort_by_key(|(path, _)| path.components().count());
+    rules.sort_by_key(|(path, _, _)| path.components().count());
 
     // Only connecting to a Unix socket has a path, so TCP and UDP stay open
     let mut profile = "(version 1)\n(allow default)\n(deny file-write*)\n\
         (deny network-outbound (subpath \"/\"))\n"
         .to_owned();
-    for (path, rule) in rules {
+    for (path, rule, matched) in rules {
         let path = path.to_string_lossy();
         let path = path.replace('\\', "\\\\").replace('"', "\\\"");
-        let line = format!("({rule} (subpath \"{path}\"))\n");
+        let line = format!("({rule} ({matched} \"{path}\"))\n");
         profile.push_str(&line);
     }
     // Names resolve through this socket, and signals reach only the worker's own process group
@@ -510,9 +550,12 @@ pub(crate) mod tests {
     use crate::utils::{block_on, new_id, Interrupt};
     use crate::worker::host::tests::no_agents;
     use crate::worker::host::Worker;
+    use crate::worker::python::tests::installed;
     #[cfg(target_os = "linux")]
     use crate::worker::sandbox::{landlock_abi, spread};
-    use crate::worker::sandbox::{profile, sweep, Sandbox, LOCK, PASSED_ENV, TEMP_PREFIX};
+    use crate::worker::sandbox::{
+        profile, sweep, Sandbox, LOCK, PASSED_ENV, TEMP_PREFIX, VENV_ENV,
+    };
     use crate::worker::Delegation;
     use std::env;
     use std::fs;
@@ -531,7 +574,8 @@ pub(crate) mod tests {
     pub(crate) fn opened(cwd: &Path, copies: &Path) -> Sandbox {
         let config = copies.parent().expect("parent");
         let access = Access::default();
-        Sandbox::new(cwd, copies, config, &[], &access).expect("sandbox")
+        let python = installed(config, cwd);
+        Sandbox::new(cwd, copies, config, &[], &access, python).expect("sandbox")
     }
 
     #[test]
@@ -550,6 +594,7 @@ pub(crate) mod tests {
             (deny network-outbound (subpath \"/\"))\n\
             (allow file-read* (subpath \"/\"))\n\
             (allow file-read* file-write* network-outbound (subpath \"/Users/zoë/café\"))\n\
+            (deny file-write-unlink file-write-create (literal \"/Users/zoë/café\"))\n\
             (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.ssh\"))\n\
             (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.smol\"))\n\
             (allow file-read* (subpath \"/Users/zoë/.smol/skills/pdf\"))\n\
@@ -614,7 +659,7 @@ pub(crate) mod tests {
         output.logs
     }
 
-    /// Programs the code starts are confined too
+    /// Programs the code starts are confined too, and the folders the code writes stay in place
     #[test]
     fn files_confined() {
         let dir = temp_dir("confined");
@@ -631,7 +676,9 @@ pub(crate) mod tests {
         };
         let config = dir.join("config");
         let copies = config.join("copies");
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access).expect("sandbox");
+        let python = installed(&config, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, python);
+        let sandbox = sandbox.expect("sandbox");
         #[cfg(target_os = "macos")]
         assert!(sandbox.enforced());
         if !sandbox.enforced() {
@@ -640,20 +687,21 @@ pub(crate) mod tests {
         }
         assert_eq!(sandbox.writable(), Some(&[shared][..]));
 
-        let code = "import os, subprocess, tempfile\n\
+        let code = "import os, subprocess, sys, tempfile\n\
             def tried(act):\n    try:\n        act()\n        return 'ok'\n    except PermissionError:\n        return 'denied'\n\
             key = '../secret/id_rsa'\n\
             [tried(lambda: open('../notes.md').read()), tried(lambda: open(key).read()),\n\
              tried(lambda: open('résumé.txt', 'w').write('x')), tried(lambda: tempfile.TemporaryFile().write(b'x')),\n\
              tried(lambda: open('../naïve.txt', 'w').write('x')), tried(lambda: open('../config/x', 'w').write('x')),\n\
              tried(lambda: open('../shared/x', 'w').write('x')),\n\
+             tried(lambda: os.rename(os.getcwd(), '../moved')), tried(lambda: os.rename(sys.prefix, sys.prefix + '-moved')),\n\
              subprocess.run(['cat', key], capture_output=True).returncode, 'SMOL_SANDBOX' in os.environ]";
         let logs = evaluated(sandbox, code);
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(
             logs,
-            "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 'ok', 1, False]\n"
+            "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 'ok', 'denied', 'denied', 1, False]\n"
         );
     }
 
@@ -676,7 +724,8 @@ pub(crate) mod tests {
         let _scoped = UnixListener::bind_addr(&address).expect("bind");
         let config = dir.join("config");
         let copies = config.join("copies");
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &Access::default());
+        let python = installed(&config, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &Access::default(), python);
         let sandbox = sandbox.expect("sandbox");
         #[cfg(target_os = "macos")]
         assert!(sandbox.enforced());
@@ -730,7 +779,7 @@ pub(crate) mod tests {
             let passed = PASSED_ENV
                 .iter()
                 .any(|known| known.eq_ignore_ascii_case(&name));
-            if !passed && !name.starts_with("SMOL_") {
+            if !passed && !name.starts_with("SMOL_") && name != VENV_ENV {
                 unpassed.push(name);
             }
         }
@@ -746,7 +795,8 @@ pub(crate) mod tests {
             ..Access::default()
         };
         let copies = dir.join("copies");
-        let sandbox = Sandbox::new(&cwd, &copies, &dir, &[], &access).expect("sandbox");
+        let python = installed(&dir, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &dir, &[], &access, python).expect("sandbox");
         let scratch = sandbox.temp.join("tmp").display().to_string();
         let code = format!(
             "import os, tempfile\n[name in os.environ for name in ({allowed:?}, {dropped:?})] + [tempfile.gettempdir() == {scratch:?}]"

@@ -60,6 +60,13 @@ jobs:
             cp "target/${{ matrix.target }}/release/$program$suffix" "dist/$name/"
           done
           cp README.md LICENSE CHANGELOG.md THIRD-PARTY-LICENSES.html "dist/$name/"
+          # libsmol downloads its worker module from the release of its version on first use
+          case "${{ matrix.target }}" in
+            *windows*) module=_smol.dll ;;
+            *apple*) module=lib_smol.dylib ;;
+            *) module=lib_smol.so ;;
+          esac
+          cp "target/${{ matrix.target }}/release/$module" "dist/smol-worker-${{ matrix.target }}"
           cd dist
           case "${{ matrix.target }}" in
             *windows*) 7z a "$name.zip" "$name" ;;
@@ -82,6 +89,16 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # libsmol downloads the worker module of its own target, which it knows from python.rs
+      - name: Check worker modules
+        run: |
+          builds=$(sed -n 's/^ *"\([a-z0-9_]*-[a-z0-9_-]*\)",$/\1/p' crates/libsmol/src/worker/python.rs | sort)
+          shipped=$(ls dist | sed -n 's/^smol-worker-//p' | sort)
+          if [ -z "$builds" ] || [ "$builds" != "$shipped" ]; then
+            echo "runtimes in python.rs:" $builds
+            echo "worker modules built:" $shipped
+            exit 1
+          fi
       - name: Checksums
         run: |
           cd dist

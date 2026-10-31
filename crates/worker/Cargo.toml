@@ -1,0 +1,30 @@
+[package]
+name = "libsmol-worker"
+description = "The Python module that runs the code of a libsmol session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "_smol"
+# With an rlib, `cargo test` builds the library for doc tests and so refreshes the module tests load
+crate-type = ["cdylib", "rlib"]
+# A test binary would leave the Python API unresolved, which only a module may do
+test = false
+
+[build-dependencies]
+pyo3-build-config = "0.30"
+
+[dependencies]
+libc = "0.2"
+libsmol.workspace = true
+pyo3 = { version = "0.30", features = [
+    "abi3-py314",
+    "extension-module",
+    "generate-import-lib",
+] }
+reaper.workspace = true
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["sync", "time"] }

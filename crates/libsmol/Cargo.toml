@@ -21,6 +21,7 @@ chrono = { version = "0.4", default-features = false, features = [
     "now",
 ] }
 encoding_rs = "0.8"
+flate2 = "1"
 grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
@@ -35,28 +36,11 @@ rmcp = { version = "3", features = [
     "transport-async-rw",
     "transport-streamable-http-client-reqwest",
 ] }
-rustls = { version = "0.23", default-features = false, features = [
-    "aws_lc_rs",
-] }
-rustpython-common = "0.6"
-rustpython-host_env = { version = "0.6", features = ["rustls"] }
-rustpython-pylib = { version = "0.6", features = ["freeze-stdlib"] }
-rustpython-stdlib = { version = "0.6", features = [
-    "sqlite",
-    "ssl-rustls",
-    "threading",
-] }
-rustpython-vm = { version = "0.6", features = [
-    "compiler",
-    "serde",
-    "host_env",
-    "stdio",
-    "freeze-stdlib",
-    "threading",
-] }
 scraper = "0.27"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
+tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = [
     "io-util",

@@ -2,13 +2,12 @@ import builtins as _builtins
 import inspect as _inspect
 import io as _io
 import os as _os
+import pickle as _pickle
 import re as _re
-import shutil as _shutil
-# Importing it installs the SIGINT handler the agent relies on to interrupt code
-import signal as _signal
 import sys as _sys
 import types as _types
 import weakref as _weakref
+from multiprocessing.reduction import ForkingPickler as _ForkingPickler
 
 _FILENAME = "<smolcode>"
 _BOOTSTRAP = (lambda: None).__code__.co_filename
@@ -17,23 +16,23 @@ _MAIN = _types.ModuleType("__main__")
 _sys.modules["__main__"] = _MAIN
 _STATE = vars(_MAIN)
 
+def _unsent(self, obj):
+    if isinstance(obj, (_types.FunctionType, type)) and getattr(obj, "__module__", None) == "__main__":
+        raise _pickle.PicklingError(f"{obj.__qualname__} is defined in your code, which other Python processes can't import; put it in a .py file and import it")
+    return NotImplemented
+
+# Other processes can't import a __main__ without a file, and a Pool waits forever on a worker that fails to
+_ForkingPickler.reducer_override = _unsent
+
 _REAL_OPEN = _io.open
 _REAL_PRINT = print
 # Flushed after each snippet, which lets other programs read files left open
 _OPEN_FILES = _weakref.WeakSet()
 
-# RustPython's own line buffering drops errors from its flush, an interrupt among them
-class _LineStream(_io.TextIOWrapper):
-    def write(self, text):
-        written = super().write(text)
-        if "\n" in text or "\r" in text:
-            self.flush()
-        return written
-
 def _stream(fd):
     buffered = _REAL_OPEN(fd, "wb", closefd=False)
     # Windows would write \r\n, and every \r would count toward cut output
-    return _LineStream(buffered, encoding="utf-8", errors="backslashreplace", newline="\n")
+    return _io.TextIOWrapper(buffered, encoding="utf-8", errors="backslashreplace", newline="\n", line_buffering=True)
 
 _STDOUT, _STDERR = _stream(1), _stream(2)
 # Only prints to this stream are capped, not ones captured by redirect_stdout
@@ -70,8 +69,6 @@ _builtins.open = _io.open = _open
 _builtins.print = _print
 _sys.stdout, _sys.stderr = _STDOUT, _STDERR
 _sys.__stdout__, _sys.__stderr__ = _STDOUT, _STDERR
-# RustPython names libsmol here, which cannot run Python scripts
-_sys.executable = _sys._base_executable = _shutil.which("python3") or _shutil.which("python") or ""
 
 def _bound(signature, header, args, kwargs):
     try:

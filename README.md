@@ -84,6 +84,15 @@ cargo install --locked libsmol libsmol-tui
 
 To build from a checkout, run `./build.sh` (`build.ps1` on Windows).
 
+`libsmol setup`, or else the first session, downloads the Python the code runs
+in: CPython 3.14 from
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+(about 30 MB) and the worker module of your `libsmol` version from its GitHub
+release, both checked against their checksums and kept in `~/.smol/runtime`.
+The runtime's checksum is built into `libsmol`; the module's comes from the
+same release's `SHA256SUMS`, as with the install scripts. Versions that no
+session has used for a week are removed.
+
 ## Configure a model
 
 Configuration lives in `~/.smol` (or the directory in `SMOL_CONFIG_DIR`). It is
@@ -169,7 +178,10 @@ at.
 
 ### What the code can use
 
-Besides the Python standard library, every session has these functions:
+The code runs in CPython 3.14, in a venv of its working directory, so
+`pip install` adds packages, C extensions such as numpy and pandas included,
+that the same session can import right away. Every session also has these
+functions:
 
 | Function | |
 | --- | --- |
@@ -239,17 +251,19 @@ On Linux (with Landlock, kernel 5.13 or later) and macOS (with Seatbelt, which
 the Python process applies to itself before running any code), the Python
 process and the programs it starts:
 
-- can write only in the working directory, in a temporary folder of their own
-  (`TMPDIR`) and in the session's copies of viewed images;
+- can write only in the working directory, in its venv, in a temporary folder
+  of their own (`TMPDIR`) and in the session's copies of viewed images;
 - can read everything else except these credential locations, which they can
   neither read nor list: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`,
   `~/.docker`, `~/.config/gcloud`, `~/.config/gh`, `~/.netrc`,
   `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials.toml`,
   `~/.cargo/credentials`, `~/.password-store`, `~/.local/share/keyrings`,
   `~/Library/Keychains`, `~/.smol`, `~/.claude`, `~/.claude.json`, `~/.codex`,
-  and the configuration directory when `SMOL_CONFIG_DIR` moves it;
+  and the configuration directory when `SMOL_CONFIG_DIR` moves it, except for
+  the runtime, the worker module, skills and the venv and copies they write;
 - get only `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `LANG`, `LC_ALL`,
-  `LC_CTYPE`, `TERM` and `TZ` from your environment;
+  `LC_CTYPE`, `TERM` and `TZ` from your environment, with the venv's `python`
+  and `pip` first on `PATH` and `VIRTUAL_ENV` naming it;
 - can connect only to Unix sockets in the places they can write, so not to
   ssh-agent, gpg-agent, Docker or D-Bus, and can't signal programs outside the
   sandbox. On Linux this needs kernel 7.1 for sockets with a path, and 6.12 for
@@ -375,15 +389,20 @@ the default is `warn,libsmol=info`, `SMOL_LOG=warn` keeps only problems,
 
 ## Limitations
 
-- **The Python is [RustPython](https://github.com/RustPython/RustPython)**,
-  built into `libsmol`. Pure-Python code and the standard library work, but
-  C extensions such as numpy or pandas cannot be imported. Code can still run
-  a system Python through `subprocess` when one is installed.
+- **The Python is smol's own CPython 3.14**, the same on every machine, in a
+  venv kept for each working directory in `~/.smol/venvs`. `python`, `pip`
+  and imports resolve to that venv, not to the Pythons and virtualenvs you
+  installed, which stay on `PATH` after it. Every session in the directory and
+  the agents they start share the venv and keep what it installed, until a
+  new runtime gets a new one or the directory is gone. To start over, delete
+  it while no session in that directory is open. `VIRTUAL_ENV` names it, so
+  tools such as uv or poetry install into it too, and a venv the code makes
+  for itself is based on the runtime, which a later smol may replace.
 - **Interrupting** stops code in place, and the session keeps its variables.
-  Code blocked where an interrupt cannot reach it (for example `os.system`,
-  waiting on a lock, or most blocking calls on Windows) gets 3 seconds, then
-  the Python process is restarted and its variables are lost. The model is
-  told when that happens.
+  Code blocked where an interrupt cannot reach it (for example `os.system`, a
+  long call inside a C extension, or most blocking calls on Windows) gets 3
+  seconds, then the Python process is restarted and its variables are lost.
+  The model is told when that happens.
 - **Only OpenAI-compatible chat completions endpoints** are supported for now.
 - **The prompts have mostly been tuned with DeepSeek models.** Other models
   should work, but expect rough edges.

@@ -8,7 +8,7 @@ pub(crate) mod mcp;
 pub(crate) mod web;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ToolError {
+pub enum ToolError {
     #[error("{}", prompt::failure(.action, .path, &cause(.source)))]
     Os {
         action: &'static str,

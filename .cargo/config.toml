@@ -1,4 +1,6 @@
 [env]
+# The worker module targets the stable ABI of the bundled Python, never the Python on PATH
+PYO3_NO_PYTHON = "1"
 CC_x86_64_pc_windows_gnu = { value = ".cargo/zig-cc", relative = true }
 AR_x86_64_pc_windows_gnu = { value = ".cargo/zig-ar", relative = true }
 

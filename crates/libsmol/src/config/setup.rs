@@ -1,6 +1,7 @@
 use crate::config::{self, parse_url, MIN_CONTEXT, MODEL_FILE};
 use crate::model::{listed, ListError, ModelSpec, DEFAULT_API};
 use crate::utils::block_on;
+use crate::worker::python::{Runtime, PYTHON};
 use crate::{Error, Result};
 use inquire::error::CustomUserError;
 use inquire::validator::Validation;
@@ -155,6 +156,20 @@ pub fn run() -> Result<()> {
 
     config::save_model(&dir, &name, &api, &key, &spec)?;
     eprintln!("Wrote {shown}, edit it to add models or set max_tokens, effort, image and video");
+
+    // A session that installs it opens without a word until it is done, since ACP has no way
+    // to tell the client before the reply
+    eprintln!(
+        "Getting CPython {PYTHON} ready for the code, a download of about 30 MB the first time"
+    );
+    let installing = Runtime::install(&dir);
+    match block_on(installing) {
+        Ok(runtime) => {
+            let home = tilde(&runtime.home);
+            eprintln!("Python is ready in {home}");
+        }
+        Err(problem) => eprintln!("{problem}, and the first session will try again"),
+    }
     Ok(())
 }
 

@@ -16,11 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const MAX_GREP_BYTES: usize = 32 * 1024 * 1024;
 
 /// Once `stop` is set it returns early with a result nobody reads
-pub(crate) fn ls(
-    root: &Path,
-    recursive: bool,
-    stop: &AtomicBool,
-) -> Result<Vec<OsString>, ToolError> {
+pub fn ls(root: &Path, recursive: bool, stop: &AtomicBool) -> Result<Vec<OsString>, ToolError> {
     let shown = root.to_string_lossy();
     let failed = |e| ToolError::os("list", &shown, e);
     // Read it even when recursing to report a missing path or a non-directory
@@ -63,7 +59,7 @@ pub(crate) fn ls(
 }
 
 /// Once `stop` is set it returns early with a result nobody reads
-pub(crate) fn grep(
+pub fn grep(
     pattern: &str,
     root: &Path,
     glob: Option<&str>,

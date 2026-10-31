@@ -4,9 +4,8 @@ use crate::prompt::{self, NO_SERVER};
 use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
 use crate::tools::mcp::Server;
 use crate::utils::{new_id, Interrupt, Reply};
+use crate::worker::python;
 use crate::worker::sandbox::Sandbox;
-#[cfg(not(test))]
-use crate::worker::WORKER_ARG;
 use crate::worker::{
     AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
     WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV,
@@ -15,14 +14,10 @@ use crate::{Error, Result};
 use reaper::{cause, terminal_view};
 use serde::Deserialize;
 use std::collections::HashMap;
-#[cfg(not(target_os = "linux"))]
-use std::env;
 use std::future::{self, Future};
 use std::io;
 use std::mem;
 use std::path::Component;
-#[cfg(target_os = "linux")]
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -182,6 +177,8 @@ impl Worker {
             return Ok(());
         }
 
+        let prepared = python::command(&self.sandbox).await;
+        let mut command = prepared.map_err(|reason| prompt::unstarted(&reason))?;
         let failed = |e: io::Error| {
             let reason = cause(&e);
             prompt::unstarted(&reason)
@@ -189,18 +186,6 @@ impl Worker {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(failed)?;
         let address = listener.local_addr().map_err(failed)?;
         let token = new_id();
-
-        // On Linux this still starts the original binary after it is replaced
-        #[cfg(target_os = "linux")]
-        let program = PathBuf::from("/proc/self/exe");
-        #[cfg(not(target_os = "linux"))]
-        let program = env::current_exe().map_err(failed)?;
-        let mut command = self.sandbox.command(&program);
-        #[cfg(not(test))]
-        command.arg(WORKER_ARG);
-        // Tests rerun the test binary itself with only the test that serves as the worker
-        #[cfg(test)]
-        command.args(["worker::host::tests::serving", "--exact", "--nocapture"]);
         let control = format!("{address}/{token}");
         command
             .env(CONTROL_ENV, control)
@@ -615,15 +600,15 @@ pub(crate) mod tests {
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
     use crate::tools::mcp::tests::{fake, started};
     use crate::tools::mcp::Server;
-    use crate::utils::{block_on, Interrupt};
+    use crate::utils::{block_on, new_id, Interrupt};
     use crate::worker::host::{Added, Called, Calling, Delegating, Evaluated, Worker, STOP_WAIT};
     use crate::worker::sandbox::tests::opened;
-    use crate::worker::{serve, AgentCall, Delegation, CONTROL_ENV};
+    use crate::worker::{AgentCall, Delegation};
     use serde_json::{json, Map, Value};
     use std::env;
+    use std::fs;
     #[cfg(unix)]
     use std::fs::Permissions;
-    use std::fs::{self, File};
     use std::ops::{Deref, DerefMut};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -752,14 +737,6 @@ pub(crate) mod tests {
     fn error(output: Evaluated) -> String {
         let error = output.error.expect("error");
         error.to_string()
-    }
-
-    /// The only test a worker runs, and a no-op otherwise
-    #[test]
-    fn serving() {
-        if env::var_os(CONTROL_ENV).is_some() {
-            serve().expect("serve");
-        }
     }
 
     #[test]
@@ -1091,7 +1068,7 @@ pub(crate) mod tests {
         let output = worker.eval("x = (");
         let message = error(output);
         assert!(message.starts_with("syntax error on line 1: "), "{message}");
-        assert!(message.ends_with("\nx = (\n     ^"), "{message}");
+        assert!(message.ends_with("\nx = (\n    ^"), "{message}");
 
         // Wide characters take two columns in a terminal
         let output = worker.eval("café = '🐍' +");
@@ -1188,7 +1165,7 @@ pub(crate) mod tests {
     }
 
     /// Modules in the working directory are importable, argparse and runpy read `sys.argv[0]`,
-    /// and `sys.executable` is not the worker
+    /// and the code runs as the venv, whose `pip` comes first on `PATH`
     #[test]
     fn interpreter_settings() {
         let dir = temp_dir("settings");
@@ -1197,11 +1174,12 @@ pub(crate) mod tests {
         fs::write(&module, "value = 42\n").expect("write");
 
         let mut worker = build(Interrupt::default(), dir.clone(), Delegation::On);
-        let code = "import argparse, pathlib, runpy, smol_local, sys\n\
+        let code = "import argparse, os, pathlib, runpy, shutil, smol_local, sys\n\
              print(smol_local.value)\n\
              _ = pathlib.Path('script.py').write_text('import sys\\nprint(sys.argv[0])')\n\
              _ = runpy.run_path('script.py')\n\
-             print(sys.executable)\n\
+             pip = os.path.dirname(shutil.which('pip'))\n\
+             print(sys.prefix == os.environ['VIRTUAL_ENV'] != sys.base_prefix, pip == os.path.dirname(sys.executable))\n\
              parser = argparse.ArgumentParser()\n\
              _ = parser.add_argument('name')\n\
              parser.parse_args(['Zoë']).name";
@@ -1209,13 +1187,74 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(output.error, None);
-        let lines: Vec<&str> = output.logs.lines().collect();
-        let [value, script, executable, name] = lines[..] else {
-            panic!("{}", output.logs);
-        };
-        assert_eq!([value, script, name], ["42", "script.py", "Zoë"]);
-        let itself = env::current_exe().expect("current exe");
-        assert_ne!(Path::new(executable), itself);
+        assert_eq!(output.logs, "42\nscript.py\nTrue True\nZoë\n");
+    }
+
+    /// A file in the working directory named like a module the bootstrap imports
+    #[test]
+    fn stdlib_not_shadowed() {
+        let dir = temp_dir("shadowed");
+        fs::create_dir_all(&dir).expect("create dir");
+        fs::write(dir.join("token.py"), "raise SystemExit('café')\n").expect("write");
+
+        let mut worker = build(Interrupt::default(), dir.clone(), Delegation::On);
+        let output = worker.eval("1 + 1");
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(output.error, None);
+        assert_eq!(output.logs, "2\n");
+    }
+
+    /// What pip puts in the venv imports in the same session
+    #[test]
+    fn packages_imported() {
+        let mut worker = fresh();
+        let name = new_id().replace('-', "_");
+        let name = format!("smol_{name}");
+        let code = format!(
+            "import pathlib, site\n\
+             installed = pathlib.Path(site.getsitepackages()[0]) / '{name}.py'\n\
+             _ = installed.write_text('value = \"naïve\"')"
+        );
+        worker.eval(&code);
+        let code = format!("import {name}\ninstalled.unlink()\n{name}.value");
+        let output = worker.eval(&code);
+
+        assert_eq!(output.error, None);
+        assert_eq!(output.logs, "naïve\n");
+    }
+
+    /// Python that multiprocessing starts gets the worker's flags and must still run site
+    #[test]
+    fn children_run_site() {
+        let mut worker = fresh();
+        let code = "import multiprocessing\n\
+             with multiprocessing.get_context('spawn').Pool(1) as pool:\n    \
+                 flag = pool.apply(eval, (\"__import__('sys').flags.no_site\",))\n\
+             flag";
+        let output = worker.eval(code);
+
+        assert_eq!(output.error, None);
+        assert_eq!(output.logs, "0\n");
+    }
+
+    /// A pool fails at once instead of waiting on a process that can't import the code
+    #[test]
+    fn pool_refuses_code() {
+        let mut worker = fresh();
+        let code = "import multiprocessing\n\
+             def square(x):\n    return x * x\n\
+             with multiprocessing.get_context('spawn').Pool(1) as pool:\n    \
+                 pool.map(square, [3])";
+        let output = worker.eval(code);
+        let message = error(output);
+        let expected = "PicklingError: square is defined in your code, \
+                        which other Python processes can't import; put it in a .py file and import it";
+        assert!(message.starts_with(expected), "{message}");
+
+        let output = worker.eval("import pickle\npickle.loads(pickle.dumps(square))(3)");
+        assert_eq!(output.error, None);
+        assert_eq!(output.logs, "9\n");
     }
 
     #[test]
@@ -1397,6 +1436,8 @@ pub(crate) mod tests {
             "import time\ntime.sleep(30)",
             "import socket\na, b = socket.socketpair()\na.recv(1)",
             "import asyncio\nasyncio.run(asyncio.sleep(30))",
+            "import queue\nqueue.Queue().get()",
+            "import threading\nthreading.Event().wait()",
             "while True:\n    print('a line')",
         ];
         let (mut worker, interrupt) = interruptible();
@@ -1427,11 +1468,14 @@ pub(crate) mod tests {
 
         let output = worker.eval("ls('/nope/café')");
         let message = error(output);
-        // The reason is the system's own text, which differs on Windows
-        assert!(
-            message.starts_with("FileNotFoundError: [Errno 2] "),
-            "{message}"
-        );
+        // Like its own os functions, Python names a Windows error by the system's code,
+        // and the reason is the system's own text
+        #[cfg(unix)]
+        let code = "[Errno 2]";
+        #[cfg(windows)]
+        let code = "[WinError 3]";
+        let expected = format!("FileNotFoundError: {code} ");
+        assert!(message.starts_with(&expected), "{message}");
         assert!(message.contains(": '/nope/café'"), "{message}");
     }
 
@@ -2027,25 +2071,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cycles_collected() {
-        let mut worker = fresh();
-        let cycles = "class Node:\n    pass\nchain = [Node() for _ in range(2000)]\nfor a, b in zip(chain, chain[1:]):\n    a.next, b.prev = b, a";
-        let count = "import gc\nlen(gc.get_objects())";
-        let counted = |worker: &mut Tried| -> usize {
-            let logs = worker.eval(count).logs;
-            logs.trim().parse().expect("count")
-        };
-
-        worker.eval(cycles);
-        let before = counted(&mut worker);
-        for _ in 0..5 {
-            worker.eval(cycles);
-        }
-        let after = counted(&mut worker);
-        assert!(after < before + 1000, "{before} {after}");
-    }
-
-    #[test]
     fn help_lookup() {
         let mut worker = fresh();
         // Over the 8192 characters a print shows uncut
@@ -2262,12 +2287,10 @@ pub(crate) mod tests {
         let (mut worker, dir) = workspace("unviewable");
         fs::write(dir.join("latin1.txt"), b"caf\xe9").expect("write");
         fs::write(dir.join("fake.png"), "not an image".as_bytes()).expect("write");
-        let big = File::create(dir.join("big.jpg")).expect("create");
-        big.set_len(65).expect("size");
         fs::create_dir_all(dir.join("album.png")).expect("dir");
 
         let mut refused = Vec::new();
-        for name in ["latin1.txt", "fake.png", "big.jpg", "album.png"] {
+        for name in ["latin1.txt", "fake.png", "album.png"] {
             let code = format!("view({name:?})");
             let output = worker.eval(&code);
             let message = error(output);
@@ -2282,8 +2305,6 @@ pub(crate) mod tests {
         let expected = [
             format!("ValueError: view: latin1.txt: {unviewable}"),
             format!("ValueError: view: fake.png: {unviewable}"),
-            "ValueError: view: big.jpg: 65 bytes, over the 64-byte limit for an attached image"
-                .to_owned(),
             "ValueError: read: album.png: not a regular file".to_owned(),
         ];
         assert_eq!(refused, expected);

@@ -7,6 +7,29 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- The code runs in CPython 3.14 instead of RustPython. It is the same pinned
+  build of [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+  on every machine, which `libsmol setup`, or else the first session,
+  downloads into `~/.smol/runtime` together with the worker module of the
+  `libsmol` version, and it runs as a venv kept for each working directory in
+  `~/.smol/venvs` and shared by its sessions, until the directory is gone.
+  `pip install` puts packages there, C extensions such as numpy and pandas
+  included, and the session can import them right away; `sys.executable` and
+  the `python` and `pip` on `PATH` are the venv's. Functions and classes the
+  code defines can't be sent to other processes, which can't import them, so
+  `multiprocessing` and `concurrent.futures` raise an error that says to put
+  them in a `.py` file. On Linux and macOS, code
+  that waits on a lock or a queue can now be interrupted. A syntax error points
+  at an unclosed bracket instead of the end of the line, and plain Python runs
+  several times faster. The system prompt says which Python it is, that its
+  venv is kept for the folder and can be written, and that installed packages
+  import at once, and no longer tells the model to install a skill's packages
+  in a venv in `$TMPDIR`. Runtimes exist for Linux (x86_64 and arm64 with
+  glibc), macOS (Apple silicon and Intel) and Windows (x86_64); `libsmol`
+  built for anything else can't run code. `libsmol` is 7 MB instead of 33 MB.
+
 ## 0.4.4 - 2026-10-31
 
 - The system prompt says that a task stays open after the answer only while an

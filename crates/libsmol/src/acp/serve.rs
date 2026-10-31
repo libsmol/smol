@@ -605,10 +605,11 @@ mod tests {
             assert!(matches!(asked, Ok(None)), "{asked:?}");
             assert!(interrupt.cancelled(0));
 
-            // Replayed notifications come before the reply
+            // Replayed notifications come before the reply.
+            // Opening may first make the venv tests share, which takes Windows long
             let answered = loop {
                 let receiving = sent.recv();
-                let waiting = time::timeout(Duration::from_secs(10), receiving);
+                let waiting = time::timeout(Duration::from_secs(60), receiving);
                 let line = waiting
                     .await
                     .expect("answered")
