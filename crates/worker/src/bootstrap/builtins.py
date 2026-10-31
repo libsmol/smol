@@ -18,10 +18,10 @@ _STATE = vars(_MAIN)
 
 def _unsent(self, obj):
     if isinstance(obj, (_types.FunctionType, type)) and getattr(obj, "__module__", None) == "__main__":
-        raise _pickle.PicklingError(f"{obj.__qualname__} is defined in your code, which other Python processes can't import; put it in a .py file and import it")
+        raise _pickle.PicklingError(f"{obj.__qualname__} is defined in your code and can't be sent to another process; put it in a .py file and import it")
     return NotImplemented
 
-# Other processes can't import a __main__ without a file, and a Pool waits forever on a worker that fails to
+# Spawned processes can't import a __main__ without a file, and a Pool waits forever on one that fails to load it
 _ForkingPickler.reducer_override = _unsent
 
 _REAL_OPEN = _io.open
@@ -272,7 +272,8 @@ class Agent:
                 raise TypeError(f"Agent.wait: timeout must be a number or None, not {kind}")
             if not timeout >= 0:
                 raise ValueError(f"Agent.wait: timeout must be 0 or more, not {timeout}")
-            timeout = float(timeout)
+            # JSON has no infinity, and waiting that long is waiting until it ends
+            timeout = None if timeout == float("inf") else float(timeout)
         result = _delegated("Agent.wait", "wait", {"id": self._id, "timeout": timeout})
         if result is None:
             return None

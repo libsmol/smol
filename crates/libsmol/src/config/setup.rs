@@ -10,6 +10,7 @@ use reaper::{cause, tilde};
 use reqwest::Url;
 use std::fmt;
 use std::io::{self, IsTerminal};
+use std::path::Path;
 
 pub const SETUP_ARG: &str = "setup";
 const PAGE_SIZE: usize = 10;
@@ -51,6 +52,7 @@ pub fn run() -> Result<()> {
             .prompt()
             .map_err(failed)?;
         if !replace {
+            prepare(&dir);
             return Ok(());
         }
     }
@@ -156,21 +158,24 @@ pub fn run() -> Result<()> {
 
     config::save_model(&dir, &name, &api, &key, &spec)?;
     eprintln!("Wrote {shown}, edit it to add models or set max_tokens, effort, image and video");
+    prepare(&dir);
+    Ok(())
+}
 
-    // A session that installs it opens without a word until it is done, since ACP has no way
-    // to tell the client before the reply
+/// A session that installs the runtime opens without a word until it is done,
+/// since ACP has no way to tell the client before the reply
+fn prepare(dir: &Path) {
     eprintln!(
         "Getting CPython {PYTHON} ready for the code, a download of about 30 MB the first time"
     );
-    let installing = Runtime::install(&dir);
+    let installing = Runtime::install(dir);
     match block_on(installing) {
         Ok(runtime) => {
             let home = tilde(&runtime.home);
             eprintln!("Python is ready in {home}");
         }
-        Err(problem) => eprintln!("{problem}, and the first session will try again"),
+        Err(problem) => eprintln!("python: {problem}, and the first session will try again"),
     }
-    Ok(())
 }
 
 fn failed(error: InquireError) -> Error {

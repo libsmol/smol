@@ -97,7 +97,7 @@ pub(crate) fn view_summary(image: bool, video: bool) -> Option<&'static str> {
     }
 }
 
-/// `writable` is where code may write besides `cwd` and `$TMPDIR`,
+/// `writable` is where code may write besides `cwd`, the venv and `$TMPDIR`,
 /// and `None` when files aren't isolated
 pub(crate) fn system(
     functions: &[Function],

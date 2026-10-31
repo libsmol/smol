@@ -11,7 +11,7 @@ use std::env;
 #[cfg(test)]
 use std::env::consts::DLL_PREFIX;
 use std::env::consts::{ARCH, DLL_SUFFIX, OS};
-use std::fs::{self, File};
+use std::fs::{self, File, Metadata};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -55,19 +55,21 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STORE: &str = "runtime";
 /// Holds a folder of venvs for each runtime in the config directory
 const VENVS: &str = "venvs";
-const LOCK: &str = "lock";
+/// Held by an install or a repair in the store
+const STORE_LOCK: &str = "lock";
 const MAX_NAME_CHARS: usize = 48;
 const DOWNLOAD_WAIT: Duration = Duration::from_secs(30);
-/// How long another version's runtime or module goes unused before it is removed
+/// How long a runtime, a module or the venv of a directory that is gone stays unused before it is removed
 const MIN_IDLE: Duration = Duration::from_hours(7 * 24);
 #[cfg(unix)]
 const HOME_BIN: &str = "bin";
 #[cfg(windows)]
 const HOME_BIN: &str = "";
+/// Where pip puts the scripts it installs, in a venv and in the runtime
 #[cfg(unix)]
-const VENV_BIN: &str = "bin";
+const SCRIPTS: &str = "bin";
 #[cfg(windows)]
-const VENV_BIN: &str = "Scripts";
+const SCRIPTS: &str = "Scripts";
 #[cfg(unix)]
 const EXE: &str = "python";
 #[cfg(windows)]
@@ -114,16 +116,17 @@ impl Runtime {
         let target = format!("{ARCH}-{system}");
         let built = BUILDS.into_iter().find(|(name, _)| *name == target);
         let Some((target, sha)) = built else {
-            return Err(format!("runtime: {target}: no build"));
+            return Err(format!("{target}: no build"));
         };
 
-        let (store, module) = stored(config);
-        let named = format!("cpython-{PYTHON}+{RELEASE}");
+        // Named by target too, since machines of different targets may share one home folder
+        let (store, module) = stored(config, target);
+        let named = format!("cpython-{PYTHON}+{RELEASE}-{target}");
         let home = store.join(named);
         let failed = |e: io::Error| {
             let reason = cause(&e);
             let shown = tilde(&store);
-            format!("runtime: {shown}: {reason}")
+            format!("{shown}: {reason}")
         };
         fs::create_dir_all(&store).map_err(failed)?;
         // Taken before looking, which waits out a removal under way
@@ -135,60 +138,10 @@ impl Runtime {
         let current = [home.clone(), module.clone()];
         let venvs = config.join(VENVS);
         let span = Span::current();
-        // Tokio runs every session on one thread, which removing a runtime and its venvs would hold.
-        // Lock files stay, since another session may be about to lock the one it opened
+        // Tokio runs every session on one thread, which removing a runtime and its venvs would hold
         let sweeping = move || {
             let _entered = span.enter();
-            let Ok(entries) = fs::read_dir(&swept) else {
-                return;
-            };
-            // Every install holds it, so a dot name found while it is free is what a stopped install left.
-            // Held through the sweep, or an install that starts meanwhile would lose its folder
-            let store_lock = File::options().write(true).open(swept.join(LOCK));
-            let installing = match &store_lock {
-                Ok(file) => file.try_lock().is_err(),
-                Err(_) => true,
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if current.contains(&path) || name == LOCK || name.ends_with(".lock") {
-                    continue;
-                }
-                let leftover = name.starts_with('.') && !installing;
-                let locking = lock_of(&path);
-                let lock = File::options().write(true).open(locking);
-                // Kept locked until the removal is done.
-                // What no session ever held has none, like what an install that stopped left
-                let used = match &lock {
-                    Ok(file) => match file.try_lock() {
-                        Ok(()) => file.metadata(),
-                        Err(_) => continue,
-                    },
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => entry.metadata(),
-                    Err(_) => continue,
-                };
-                let modified = used.and_then(|found| found.modified());
-                let idle = modified.ok().and_then(|time| time.elapsed().ok());
-                let unused = idle.is_some_and(|idle| idle > MIN_IDLE);
-                if !leftover && !unused {
-                    continue;
-                }
-
-                // Moved aside first, so a removal that stops halfway leaves nothing that looks installed
-                let id = new_id();
-                let aside = swept.join(format!(".{id}"));
-                if fs::rename(&path, &aside).is_err() {
-                    continue;
-                }
-                fs::remove_dir_all(&aside)
-                    .or_else(|_| fs::remove_file(&aside))
-                    .ok();
-                let venvs = venvs.join(&*name);
-                fs::remove_dir_all(venvs).ok();
-                info!("python: removed [name={name}]");
-            }
+            sweep_store(&swept, &current, &venvs);
         };
         task::spawn_blocking(sweeping);
 
@@ -215,24 +168,33 @@ impl Runtime {
             // Inside the store, because a rename moves a folder only within one file system
             let id = new_id();
             let folder = store.join(format!(".{id}"));
+            let unpacked = folder.join("python");
             let into = folder.clone();
-            let unpacking = move || Archive::new(GzDecoder::new(&archive[..])).unpack(into);
+            let trimmed = unpacked.clone();
+            let unpacking = move || {
+                Archive::new(GzDecoder::new(&archive[..])).unpack(into)?;
+                // Venvs get pip from the wheel ensurepip keeps, and nothing reads manuals or terminfo
+                if let Ok(entries) = fs::read_dir(trimmed.join(SCRIPTS)) {
+                    for entry in entries.flatten() {
+                        if entry.file_name().to_string_lossy().starts_with("pip") {
+                            fs::remove_file(entry.path()).ok();
+                        }
+                    }
+                }
+                fs::remove_dir_all(trimmed.join(SITE)).ok();
+                fs::remove_dir_all(trimmed.join("share")).ok();
+                io::Result::Ok(())
+            };
             let result = task::spawn_blocking(unpacking).await.expect("unpack");
             result.map_err(failed)?;
-            let unpacked = folder.join("python");
+
+            // Compiled by timestamp before anything runs it, since the code can't write its bytecode
+            // later and SOURCE_DATE_EPOCH would have every import hash its source
             let python = unpacked.join(HOME_BIN).join(EXE);
-
-            // Venvs get pip from the wheel ensurepip keeps, and nothing reads manuals or terminfo
-            let mut trimming = Command::new(&python);
-            trimming.args(["-I", "-m", "pip", "uninstall", "-y", "-q", "pip"]);
-            finished(trimming).await.map_err(failed)?;
-            fs::remove_dir_all(unpacked.join(SITE)).ok();
-            fs::remove_dir_all(unpacked.join("share")).ok();
-
-            // Compiled before anything runs it, since the code can't write its bytecode later
             let mut compiling = Command::new(python);
             compiling
                 .args(["-I", "-m", "compileall", "-q", "-j0"])
+                .args(["--invalidation-mode", "timestamp"])
                 .arg(&unpacked);
             finished(compiling).await.map_err(failed)?;
             fs::rename(&unpacked, &home).map_err(failed)?;
@@ -244,7 +206,7 @@ impl Runtime {
             // Tests load the module cargo built, never a released one
             if cfg!(test) {
                 let shown = module.display();
-                return Err(format!("runtime: {shown}: not built"));
+                return Err(format!("{shown}: not built"));
             }
             info!("python: downloading worker module [version={VERSION}]");
             let base = format!("https://github.com/libsmol/smol/releases/download/v{VERSION}");
@@ -253,7 +215,7 @@ impl Runtime {
             let sums = String::from_utf8_lossy(&sums);
             let name = format!("smol-worker-{target}");
             let Some(sha) = summed(&sums, &name) else {
-                return Err(format!("runtime: {name}: not in SHA256SUMS"));
+                return Err(format!("{name}: not in SHA256SUMS"));
             };
             let url = format!("{base}/{name}");
             let bytes = fetched(&client, &url, &name, sha).await?;
@@ -292,7 +254,7 @@ pub(crate) struct Python {
 
 impl Python {
     /// Also removes in the background the venvs of working directories that are gone,
-    /// unless a session holds them
+    /// once no session used them for `MIN_IDLE`
     pub(crate) async fn install(config: &Path, cwd: &Path) -> Result<Self, String> {
         let runtime = Runtime::install(config).await?;
         let named = runtime.home.file_name().unwrap_or_default();
@@ -302,7 +264,7 @@ impl Python {
         let failed = |e: io::Error| {
             let reason = cause(&e);
             let shown = tilde(venvs);
-            format!("venv: {shown}: {reason}")
+            format!("{shown}: {reason}")
         };
         fs::create_dir_all(venvs).map_err(failed)?;
         // A working directory that isn't UTF-8 can't be named, and its venv stays
@@ -315,42 +277,7 @@ impl Python {
         // Tokio runs every session on one thread, which removing a large venv would hold for seconds
         let sweeping = move || {
             let _entered = span.enter();
-            let Ok(entries) = fs::read_dir(&swept) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let lock = entry.path();
-                let locking = lock.extension().is_some_and(|ext| ext == "lock");
-                if lock == own || !locking {
-                    continue;
-                }
-                let recorded = fs::read_to_string(&lock).unwrap_or_default();
-                // One that can't be looked up now, like on a share that doesn't answer, is not gone
-                let looked = Path::new(&recorded).try_exists();
-                if recorded.is_empty() || !matches!(looked, Ok(false)) {
-                    continue;
-                }
-                let Ok(file) = File::open(&lock) else {
-                    continue;
-                };
-                if file.try_lock().is_err() {
-                    continue;
-                }
-                // The lock goes only with the venv, or a venv left behind would have none
-                let folder = lock.with_extension("");
-                let removed = match fs::remove_dir_all(&folder) {
-                    Ok(()) => true,
-                    Err(e) => e.kind() == io::ErrorKind::NotFound,
-                };
-                if !removed {
-                    continue;
-                }
-                // Windows removes no file that is still open
-                drop(file);
-                fs::remove_file(&lock).ok();
-                let shown = tilde(&folder);
-                info!("python: venv removed [path={shown}]");
-            }
+            sweep_venvs(&swept, &own);
         };
         task::spawn_blocking(sweeping);
 
@@ -363,7 +290,7 @@ impl Python {
 
     /// Holds `python` and `pip`, which programs the code starts find first on `PATH`
     pub(crate) fn bin(&self) -> PathBuf {
-        self.venv.join(VENV_BIN)
+        self.venv.join(SCRIPTS)
     }
 
     /// Complete once `venv` has installed pip, which it does after the interpreter.
@@ -387,11 +314,10 @@ pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
         if !python.ready() {
             let mut repairing = loading(sandbox, "repair", &venv);
             repairing.stdin(Stdio::null());
-            // Names the venv, which the user deletes to start over when it can't be fixed
             let shown = tilde(&python.venv);
             let failed = |e: io::Error| {
                 let reason = cause(&e);
-                format!("venv: {shown}: {reason}")
+                format!("{shown}: {reason}")
             };
             let (mut group, mut pieces) = Group::start(repairing).map_err(failed)?;
             let mut output = Clip::new(KEPT_BYTES);
@@ -410,12 +336,18 @@ pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
 
             if exit != Some(Exit::Exited(0)) {
                 let (said, _) = output.text();
-                let said = said.trim();
-                let reason = match exit {
-                    Some(exit) if said.is_empty() => exit.to_string(),
-                    _ => said.to_owned(),
+                // The last line, where a traceback names its exception, keeps the error on one line
+                let last = said
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty());
+                let reason = match (last, exit) {
+                    (Some(last), _) => last.to_owned(),
+                    (None, Some(exit)) => exit.to_string(),
+                    (None, None) => String::new(),
                 };
-                return Err(format!("venv: {shown}: {reason}"));
+                return Err(format!("{shown}: {reason}"));
             }
             info!("python: venv made [path={shown}]");
         }
@@ -442,9 +374,9 @@ fn loading(sandbox: &Sandbox, function: &str, venv: &Path) -> Command {
 
 /// The store and the worker module
 #[cfg(not(test))]
-fn stored(config: &Path) -> (PathBuf, PathBuf) {
+fn stored(config: &Path, target: &str) -> (PathBuf, PathBuf) {
     let store = config.join(STORE);
-    let module = format!("worker-{VERSION}{DLL_SUFFIX}");
+    let module = format!("worker-{VERSION}-{target}{DLL_SUFFIX}");
     let module = store.join(module);
     (store, module)
 }
@@ -452,7 +384,7 @@ fn stored(config: &Path) -> (PathBuf, PathBuf) {
 /// Tests share the store in the profile folder and load the module `cargo test` built in `deps`,
 /// which only `cargo build` copies up
 #[cfg(test)]
-fn stored(_: &Path) -> (PathBuf, PathBuf) {
+fn stored(_: &Path, _: &str) -> (PathBuf, PathBuf) {
     let exe = env::current_exe().expect("test binary");
     let deps = exe.parent().expect("deps");
     let built = deps.parent().expect("profile");
@@ -475,13 +407,127 @@ fn venv_for(_: &Path, _: &Path, runtime: &str) -> PathBuf {
     built.join(VENVS).join(runtime).join("venv")
 }
 
-/// The folder's name, kept short for the path's sake, and a hash of the whole path
+/// The folder's name, kept short for the path's sake, and a hash of the whole path,
+/// written alike however the client spells it
 fn venv_name(cwd: &Path) -> String {
+    let cwd: PathBuf = cwd.components().collect();
     let digest = Sha256::digest(cwd.as_os_str().as_encoded_bytes());
     let hash = hex(&digest);
     let named = cwd.file_name().unwrap_or_default().to_string_lossy();
     let named: String = named.chars().take(MAX_NAME_CHARS).collect();
     format!("{named}-{}", &hash[..16])
+}
+
+/// Removes the runtimes and modules no session used for `MIN_IDLE`, with each runtime's venvs,
+/// and what stopped installs left.
+/// Lock files stay, since another session may be about to lock the one it opened
+fn sweep_store(store: &Path, current: &[PathBuf], venvs: &Path) {
+    let Ok(entries) = fs::read_dir(store) else {
+        return;
+    };
+    // Every install holds it, so a dot name found while it is free is what a stopped install left.
+    // Held through the sweep, or an install that starts meanwhile would lose its folder
+    let store_lock = File::options().write(true).open(store.join(STORE_LOCK));
+    let installing = match &store_lock {
+        Ok(file) => file.try_lock().is_err(),
+        Err(_) => true,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let runtime = name.starts_with("cpython-");
+        let dotted = name.starts_with('.');
+        // What a later version keeps here is not this one's to remove
+        let known = runtime || dotted || name.starts_with("worker-");
+        if !known || current.contains(&path) || name.ends_with(".lock") {
+            continue;
+        }
+        let locking = lock_of(&path);
+        let lock = File::options().write(true).open(locking);
+        // Kept locked until the removal is done.
+        // What no session ever held has none, like what an install that stopped left
+        let used = match &lock {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => file.metadata(),
+                Err(_) => continue,
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => entry.metadata(),
+            Err(_) => continue,
+        };
+        let leftover = dotted && !installing;
+        if !leftover && !unused(used) {
+            continue;
+        }
+
+        // First, so the runtime that names them is found again when this stops halfway
+        if runtime {
+            let named = venvs.join(&*name);
+            fs::remove_dir_all(named).ok();
+        }
+        // Moved aside first, so a removal that stops halfway leaves nothing that looks installed
+        let id = new_id();
+        let aside = store.join(format!(".{id}"));
+        if fs::rename(&path, &aside).is_err() {
+            continue;
+        }
+        fs::remove_dir_all(&aside)
+            .or_else(|_| fs::remove_file(&aside))
+            .ok();
+        info!("python: removed [name={name}]");
+    }
+}
+
+/// Removes the venvs of working directories that are gone, once no session used them for `MIN_IDLE`
+fn sweep_venvs(venvs: &Path, own: &Path) {
+    let Ok(entries) = fs::read_dir(venvs) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let lock = entry.path();
+        let locking = lock.extension().is_some_and(|ext| ext == "lock");
+        if lock == own || !locking {
+            continue;
+        }
+        let recorded = fs::read_to_string(&lock).unwrap_or_default();
+        // One that can't be looked up now is not gone
+        let looked = Path::new(&recorded).try_exists();
+        if recorded.is_empty() || !matches!(looked, Ok(false)) {
+            continue;
+        }
+        let Ok(file) = File::open(&lock) else {
+            continue;
+        };
+        if file.try_lock().is_err() {
+            continue;
+        }
+        // A drive or share that is away reads as gone too
+        if !unused(file.metadata()) {
+            continue;
+        }
+
+        // The lock goes only with the venv, or a venv left behind would have none
+        let folder = lock.with_extension("");
+        let removed = match fs::remove_dir_all(&folder) {
+            Ok(()) => true,
+            Err(e) => e.kind() == io::ErrorKind::NotFound,
+        };
+        if !removed {
+            continue;
+        }
+        // Windows removes no file that is still open
+        drop(file);
+        fs::remove_file(&lock).ok();
+        let shown = tilde(&folder);
+        info!("python: venv removed [path={shown}]");
+    }
+}
+
+/// Last used, by the time a session last took its lock, more than `MIN_IDLE` ago
+fn unused(found: io::Result<Metadata>) -> bool {
+    let modified = found.and_then(|found| found.modified());
+    let idle = modified.ok().and_then(|time| time.elapsed().ok());
+    idle.is_some_and(|idle| idle > MIN_IDLE)
 }
 
 /// The sha256 that a `SHA256SUMS` file lists for the file
@@ -497,14 +543,16 @@ async fn fetched(client: &Client, url: &str, name: &str, sha: &str) -> Result<Ve
     let digest = hex(&digest);
     match digest == sha {
         true => Ok(data),
-        false => Err(format!("runtime: {name}: checksum mismatch")),
+        false => Err(format!("{name}: checksum mismatch")),
     }
 }
 
 async fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
+    // The URL leads the message, so the error's own text leaves it out
     let failed = |e: reqwest::Error| {
+        let e = e.without_url();
         let reason = http_cause(&e);
-        format!("runtime: {url}: {reason}")
+        format!("{url}: {reason}")
     };
     let response = client.get(url).send().await.map_err(failed)?;
     let response = response.error_for_status().map_err(failed)?;
@@ -519,7 +567,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Waits off the runtime's thread while another libsmol installs
 async fn locked(store: &Path) -> Result<File, String> {
-    let path = store.join(LOCK);
+    let path = store.join(STORE_LOCK);
     lock(path, "", File::lock).await
 }
 
@@ -546,7 +594,7 @@ async fn finished(mut command: Command) -> io::Result<()> {
     Ok(())
 }
 
-/// Next to the item, out of the code's sight because only the item itself is granted
+/// Next to the item, hidden from the code with the config directory, of which only the item is granted
 fn lock_of(item: &Path) -> PathBuf {
     let mut path = item.as_os_str().to_owned();
     path.push(".lock");
@@ -572,13 +620,14 @@ async fn lock(
         if !record.is_empty() && file.metadata()?.len() == 0 {
             file.write_all(record.as_bytes()).ok();
         }
-        locking(&file)?;
+        // A file system without locks only loses the protection, as the history does
+        locking(&file).ok();
         io::Result::Ok(file)
     };
     let opened = task::spawn_blocking(opening).await.expect("lock");
     let failed = |e: io::Error| {
         let reason = cause(&e);
-        format!("lock: {shown}: {reason}")
+        format!("{shown}: {reason}")
     };
     opened.map_err(failed)
 }
@@ -587,15 +636,144 @@ async fn lock(
 pub(crate) mod tests {
     use crate::tests::temp_dir;
     use crate::utils::block_on;
-    use crate::worker::python::{held, lock_of, summed, venv_name, Python, Runtime};
-    use std::fs;
+    use crate::worker::python::{
+        held, lock_of, summed, sweep_store, sweep_venvs, venv_name, Python, Runtime, MIN_IDLE,
+    };
+    use std::fs::{self, File};
     use std::path::{Path, PathBuf};
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     /// The runtime and venv tests share
     pub(crate) fn installed(config: &Path, cwd: &Path) -> Python {
         let installing = Python::install(config, cwd);
         block_on(installing).expect("python")
+    }
+
+    /// A file holding the text, last changed at the time
+    fn dated(path: &Path, text: &str, time: SystemTime) {
+        fs::write(path, text).expect("write");
+        let file = File::options().write(true).open(path).expect("open");
+        file.set_modified(time).expect("date");
+    }
+
+    #[test]
+    fn store_swept() {
+        let config = temp_dir("store");
+        let store = config.join("runtime");
+        let venvs = config.join("venvs");
+        let now = SystemTime::now();
+        let aged = now - MIN_IDLE - Duration::from_secs(60);
+
+        let current = store.join("cpython-3.14.10+20261026-café");
+        let old = store.join("cpython-3.14.9+20260901-café");
+        let old_venv = venvs.join("cpython-3.14.9+20260901-café/naïve");
+        for folder in [&current, &old, &old_venv] {
+            fs::create_dir_all(folder).expect("folder");
+            let lock = lock_of(folder);
+            dated(&lock, "", aged);
+        }
+        fs::write(store.join("lock"), "").expect("store lock");
+        for (name, lock) in [
+            ("worker-0.4.0.so", Some(aged)),
+            ("worker-0.4.1.so", Some(now)),
+            ("worker-0.4.2.so", None),
+            ("worker-0.4.3.so", Some(aged)),
+        ] {
+            let module = store.join(name);
+            fs::write(&module, "").expect("module");
+            if let Some(time) = lock {
+                let lock = lock_of(&module);
+                dated(&lock, "", time);
+            }
+        }
+        // Named as a removal or a stopped install does
+        fs::write(store.join(".1a1925684a1-117463bc"), "").expect("leftover");
+        for name in ["worker-0.3.0.so", "résumé"] {
+            let unheld = store.join(name);
+            dated(&unheld, "", aged);
+        }
+        let held_lock = store.join("worker-0.4.3.so.lock");
+        let holding = File::open(held_lock).expect("open");
+        holding.lock_shared().expect("hold");
+
+        let kept = [current];
+        sweep_store(&store, &kept, &venvs);
+        let mut left: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&store).expect("store").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            left.push(name);
+        }
+        left.sort();
+        let venvs_left = venvs.join("cpython-3.14.9+20260901-café").exists();
+        drop(holding);
+        fs::remove_dir_all(&config).ok();
+
+        let expected = [
+            "cpython-3.14.10+20261026-café",
+            "cpython-3.14.10+20261026-café.lock",
+            "cpython-3.14.9+20260901-café.lock",
+            "lock",
+            "résumé",
+            "worker-0.4.0.so.lock",
+            "worker-0.4.1.so",
+            "worker-0.4.1.so.lock",
+            "worker-0.4.2.so",
+            "worker-0.4.3.so",
+            "worker-0.4.3.so.lock",
+        ];
+        assert_eq!(left, expected);
+        assert!(!venvs_left);
+    }
+
+    #[test]
+    fn venvs_swept() {
+        let config = temp_dir("venvs");
+        let venvs = config.join("venvs");
+        let here = config.join("naïve");
+        let gone = config.join("café").display().to_string();
+        let now = SystemTime::now();
+        let aged = now - MIN_IDLE - Duration::from_secs(60);
+        fs::create_dir_all(&here).expect("here");
+        let here = here.display().to_string();
+
+        let venvs_made = [
+            ("unused", &gone, aged),
+            ("recent", &gone, now),
+            ("present", &here, aged),
+            ("held", &gone, aged),
+            ("own", &gone, aged),
+        ];
+        for (name, record, time) in venvs_made {
+            let venv = venvs.join(name);
+            fs::create_dir_all(&venv).expect("venv");
+            let lock = lock_of(&venv);
+            dated(&lock, record, time);
+        }
+        let holding = File::open(venvs.join("held.lock")).expect("open");
+        holding.lock_shared().expect("hold");
+
+        let own = venvs.join("own.lock");
+        sweep_venvs(&venvs, &own);
+        let mut left: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&venvs).expect("venvs").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            left.push(name);
+        }
+        left.sort();
+        drop(holding);
+        fs::remove_dir_all(&config).ok();
+
+        let expected = [
+            "held",
+            "held.lock",
+            "own",
+            "own.lock",
+            "present",
+            "present.lock",
+            "recent",
+            "recent.lock",
+        ];
+        assert_eq!(left, expected);
     }
 
     /// The runtime's own interpreter, for programs tests start outside the sandbox
@@ -652,6 +830,10 @@ pub(crate) mod tests {
         assert_ne!(
             venv_name(Path::new("/a/work")),
             venv_name(Path::new("/b/work"))
+        );
+        assert_eq!(
+            venv_name(Path::new("/a/./work/")),
+            venv_name(Path::new("/a/work"))
         );
     }
 }

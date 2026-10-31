@@ -36,7 +36,10 @@ foreach ($file in $files) {
 $config = if ($env:SMOL_CONFIG_DIR) { $env:SMOL_CONFIG_DIR } else { Join-Path $HOME ".smol" }
 $store = Join-Path $config "runtime"
 $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
-$module = Join-Path $store "worker-$version.dll"
+# libsmol names its target for the msvc runtime whichever toolchain built it
+$host_line = rustc -vV | Select-String '^host: (.*)'
+$target = $host_line.Matches[0].Groups[1].Value -replace '-gnu$', '-msvc'
+$module = Join-Path $store "worker-$version-$target.dll"
 New-Item -ItemType Directory -Force -Path $store | Out-Null
 if (Test-Path $module) {
     $stamp = Get-Date -Format "yyyyMMddHHmmss"

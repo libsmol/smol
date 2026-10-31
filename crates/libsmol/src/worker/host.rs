@@ -76,13 +76,14 @@ pub(crate) struct Added {
 
 /// Callers keep track of the installed MCP servers and pass them in on every call
 pub(crate) struct Worker {
+    /// Dropped before the sandbox, which removes the worker's temporary folder and lets go of the venv
+    live: Option<Live>,
     /// Shared with the workers of agents the code starts
     sandbox: Arc<Sandbox>,
     interrupt: Interrupt,
     delegation: Delegation,
     functions: Vec<Function>,
     restarted: bool,
-    live: Option<Live>,
 }
 
 /// Dropping it kills the worker
@@ -448,10 +449,12 @@ impl Worker {
 
         let outcome = match outcome {
             Outcome::Gone(_) => {
-                drain(&mut live.pieces, &mut live.output).await;
                 let exiting = live.group.exited();
                 let end = time::timeout(DRAIN_WAIT, exiting).await;
                 let end = end.ok().flatten();
+                // Programs it left, like the helpers multiprocessing starts, would keep the pipe open
+                live.group.kill();
+                drain(&mut live.pieces, &mut live.output).await;
                 let exited = prompt::exited(end.as_ref());
                 Outcome::Gone(exited)
             }
@@ -826,7 +829,7 @@ pub(crate) mod tests {
         assert_eq!(output.logs, "noted\n");
     }
 
-    /// With a small thread stack, deep recursion crashes once the limit is raised
+    /// The code runs on the main thread, whose stack takes deep recursion that a raised limit allows
     #[test]
     fn deep_recursion() {
         let code = "import sys\n\
@@ -1088,6 +1091,21 @@ pub(crate) mod tests {
         let message = error(output);
         let expected = "syntax error on line 2: 'return' outside function\nreturn 1\n^";
         assert_eq!(message, expected);
+
+        // The compiler counts this column in bytes
+        let output = worker.eval("x = 'café'; return 1");
+        let message = error(output);
+        assert!(
+            message.ends_with("\nx = 'café'; return 1\n            ^"),
+            "{message}"
+        );
+
+        let output = worker.eval("x = 1\0");
+        let message = error(output);
+        assert_eq!(
+            message,
+            "syntax error: source code string cannot contain null bytes"
+        );
     }
 
     #[test]
@@ -1224,18 +1242,45 @@ pub(crate) mod tests {
         assert_eq!(output.logs, "naïve\n");
     }
 
-    /// Python that multiprocessing starts gets the worker's flags and must still run site
+    /// Like what `pip install -e` leaves, a .pth file in the venv imports in the same session
+    #[test]
+    fn pth_processed() {
+        let dir = temp_dir("editable");
+        fs::create_dir_all(&dir).expect("create dir");
+        let name = new_id().replace('-', "_");
+        let name = format!("smol_{name}");
+        let module = dir.join(format!("{name}.py"));
+        fs::write(&module, "value = 'naïve'\n").expect("write");
+
+        let mut worker = fresh();
+        let shown = dir.display();
+        let code = format!(
+            "import pathlib, site\n\
+             pth = pathlib.Path(site.getsitepackages()[0]) / '{name}.pth'\n\
+             _ = pth.write_text({shown:?})"
+        );
+        worker.eval(&code);
+        let code = format!("import {name}\npth.unlink()\n{name}.value");
+        let output = worker.eval(&code);
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(output.error, None);
+        assert_eq!(output.logs, "naïve\n");
+    }
+
+    /// Python that multiprocessing starts gets the worker's flags and must still run site as the venv
     #[test]
     fn children_run_site() {
         let mut worker = fresh();
-        let code = "import multiprocessing\n\
+        let code = "import multiprocessing, sys\n\
+             probe = \"(__import__('sys').prefix, __import__('sys').flags.no_site)\"\n\
              with multiprocessing.get_context('spawn').Pool(1) as pool:\n    \
-                 flag = pool.apply(eval, (\"__import__('sys').flags.no_site\",))\n\
-             flag";
+                 child = pool.apply(eval, (probe,))\n\
+             child == (sys.prefix, 0)";
         let output = worker.eval(code);
 
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "0\n");
+        assert_eq!(output.logs, "True\n");
     }
 
     /// A pool fails at once instead of waiting on a process that can't import the code
@@ -1248,8 +1293,8 @@ pub(crate) mod tests {
                  pool.map(square, [3])";
         let output = worker.eval(code);
         let message = error(output);
-        let expected = "PicklingError: square is defined in your code, \
-                        which other Python processes can't import; put it in a .py file and import it";
+        let expected = "PicklingError: square is defined in your code \
+                        and can't be sent to another process; put it in a .py file and import it";
         assert!(message.starts_with(expected), "{message}");
 
         let output = worker.eval("import pickle\npickle.loads(pickle.dumps(square))(3)");

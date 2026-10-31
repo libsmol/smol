@@ -11,24 +11,31 @@ but their files stay in `~/.smol/history` untouched.
 
 - The code runs in CPython 3.14 instead of RustPython. It is the same pinned
   build of [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
-  on every machine, which `libsmol setup`, or else the first session,
-  downloads into `~/.smol/runtime` together with the worker module of the
-  `libsmol` version, and it runs as a venv kept for each working directory in
-  `~/.smol/venvs` and shared by its sessions, until the directory is gone.
-  `pip install` puts packages there, C extensions such as numpy and pandas
-  included, and the session can import them right away; `sys.executable` and
-  the `python` and `pip` on `PATH` are the venv's. Functions and classes the
-  code defines can't be sent to other processes, which can't import them, so
-  `multiprocessing` and `concurrent.futures` raise an error that says to put
-  them in a `.py` file. On Linux and macOS, code
-  that waits on a lock or a queue can now be interrupted. A syntax error points
-  at an unclosed bracket instead of the end of the line, and plain Python runs
-  several times faster. The system prompt says which Python it is, that its
-  venv is kept for the folder and can be written, and that installed packages
-  import at once, and no longer tells the model to install a skill's packages
-  in a venv in `$TMPDIR`. Runtimes exist for Linux (x86_64 and arm64 with
-  glibc), macOS (Apple silicon and Intel) and Windows (x86_64); `libsmol`
-  built for anything else can't run code. `libsmol` is 7 MB instead of 33 MB.
+  on every machine, which `libsmol setup`, or else the first session before
+  it opens, downloads into `~/.smol/runtime` together with the worker module
+  of the `libsmol` version, and a session can't open until that has worked
+  once. Runtimes exist for Linux (x86_64 and arm64 with glibc), macOS (Apple
+  silicon and Intel) and Windows (x86_64); `libsmol` built for anything else
+  can't open a session. Plain Python runs several times faster, and `libsmol`
+  is 7 MB instead of 33 MB.
+- Each working directory has a venv in `~/.smol/venvs`, shared by its sessions
+  and the agents they start, which the code can write. `pip install` puts
+  packages there, C extensions such as numpy and pandas included, and the
+  session can import them right away, editable installs too; `sys.executable`
+  and the `python` and `pip` on `PATH` are the venv's, and in the sandbox pip
+  keeps its cache in the session's temporary folder. A venv goes once its
+  directory is gone and no session has used it for a week, and another
+  version's runtime or module once no session has used it for a week.
+- Functions and classes the code defines can't be sent to other processes,
+  which can't import them, so `multiprocessing` and `ProcessPoolExecutor`
+  raise an error that says to put them in a `.py` file.
+- On Linux and macOS, code that waits on a lock or a queue can now be
+  interrupted. A syntax error points at an unclosed bracket instead of the end
+  of the line.
+- The system prompt says which Python it is, that its venv is kept for the
+  folder and can be written, and that installed packages import at once, and
+  no longer tells the model to install a skill's packages in a venv in
+  `$TMPDIR`.
 
 ## 0.4.4 - 2026-10-31
 

@@ -12,6 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyDict, PyList};
 use reaper::cause;
 use serde_json::{json, Value};
+use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -53,12 +54,18 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     let environ = py.import("os")?.getattr("environ")?;
     confined(&environ)?;
     // Programs the code starts would inherit these, and they must go before any thread starts
-    let control = taken(&environ, CONTROL_ENV)?;
-    let copies = taken(&environ, COPIES_ENV)?;
-    let agents = taken(&environ, AGENTS_ENV)?;
+    let control: String = taken(&environ, CONTROL_ENV)?.extract()?;
+    let copies: OsString = taken(&environ, COPIES_ENV)?.extract()?;
+    let agents: String = taken(&environ, AGENTS_ENV)?.extract()?;
+    // Python leaves SIGINT ignored when libsmol was started with it ignored, and no interrupt would land
+    let signal = py.import("signal")?;
+    let sigint = signal.getattr("SIGINT")?;
+    let handler = signal.getattr("default_int_handler")?;
+    signal.call_method1("signal", (sigint, handler))?;
+    // Taken before site runs the venv's .pth files, which could change it
+    let cwd = env::current_dir().unwrap_or_default();
 
-    // Runs site again as the venv's own interpreter would, once sys names the venv.
-    // Site took its prefixes from the runtime when it ran at start
+    // Site runs again as the venv's interpreter would, with the prefixes it took at start replaced
     let venv = venv_of(&python);
     let sys = py.import("sys")?;
     sys.setattr("executable", &python)?;
@@ -85,12 +92,13 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
 
     let globals = PyDict::new(py);
     let copies = PathBuf::from(copies);
-    for (name, function) in builtins(py, copies)? {
+    for (name, function) in builtins(py, copies, cwd)? {
         globals.set_item(name, function)?;
     }
     globals.set_item("_AGENTS", agents)?;
     globals.set_item("_MAX_AGENTS", MAX_PARALLEL_AGENTS)?;
     globals.set_item("_DONE", DONE)?;
+
     let builtin = py.import("builtins")?;
     let compile = builtin.getattr("compile")?;
     let exec = builtin.getattr("exec")?;
@@ -98,11 +106,13 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
         let code = compile.call1((source, "<libsmol_bootstrap>", "exec"))?;
         exec.call1((code, &globals))?;
     }
+
     let scope = globals.as_any();
     let run = scope.get_item("_run")?;
     let server = scope.get_item("_server")?;
     let unserver = scope.get_item("_unserver")?;
     let listed: Vec<(String, String, String)> = scope.get_item("_FUNCTIONS")?.extract()?;
+
     // Added earlier, a file in the working directory named like a standard module breaks the bootstrap
     sys.getattr("path")?.call_method1("insert", (0, ""))?;
     // argparse and runpy read it, and it is empty as in the interactive interpreter
@@ -150,8 +160,10 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
         let result = match call {
             HostCall::Run { code } => {
                 *RUNNING.lock().expect("running lock") = Some(id);
-                let ran = run.call1((code,)).and_then(|result| json_of(&result));
+                let ran = run.call1((code,));
+                // Cleared first, since an interrupt while the result converts would lose it
                 *RUNNING.lock().expect("running lock") = None;
+                let ran = ran.and_then(|result| json_of(&result));
 
                 // The output is all written and reading this tells the agent it is complete
                 ended();
@@ -219,7 +231,7 @@ fn venv_of(python: &OsStr) -> OsString {
 /// before anything the code could have written runs
 #[cfg(target_os = "macos")]
 fn confined(environ: &Bound<'_, PyAny>) -> PyResult<()> {
-    let profile = taken(environ, SANDBOX_ENV)?;
+    let profile: String = taken(environ, SANDBOX_ENV)?.extract()?;
     if !profile.is_empty() {
         confine(&profile).map_err(PyRuntimeError::new_err)?;
     }
@@ -233,9 +245,8 @@ fn confined(_: &Bound<'_, PyAny>) -> PyResult<()> {
 }
 
 /// Also unsets it for the programs the code starts
-fn taken(environ: &Bound<'_, PyAny>, name: &str) -> PyResult<String> {
-    let value = environ.call_method1("pop", (name, ""))?;
-    value.extract()
+fn taken<'py>(environ: &Bound<'py, PyAny>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+    environ.call_method1("pop", (name, ""))
 }
 
 /// Cancels and replies are handled here, where they arrive even while the code thread is busy
@@ -259,7 +270,7 @@ fn listen(stream: TcpStream, queue: UnboundedSender<ToWorker>) {
             }
         }
     }
-    // The agent hung up and the running code need not finish.
+    // The agent hung up, and the running code need not finish
     // SAFETY: Ends the process at once, without running C extensions' cleanup under the code
     unsafe { libc::_exit(0) }
 }
@@ -280,7 +291,7 @@ fn interrupt() {
 
 /// Marks the end of the output on the pipe the code also writes to
 fn ended() {
-    // C extensions print through C's stdio, which holds what goes to a pipe until flushed.
+    // C extensions print through C's stdio, which holds what goes to a pipe until flushed
     // SAFETY: A null stream flushes every open one
     unsafe { libc::fflush(ptr::null_mut()) };
     let mut stdout = io::stdout();

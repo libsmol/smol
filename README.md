@@ -43,9 +43,10 @@ A real run with DeepSeek on smol's own source:
 > **The sandbox guards your credentials and keeps other files from being
 > changed, but there is no permission prompt.** On Linux and macOS the model's
 > code, and every program it starts, can write only in the session's working
-> directory and its own temporary folder, can't read the usual credential
-> locations and gets only a few of your environment variables. It can still
-> read your other files, use the network and run the programs on your `PATH`.
+> directory, its venv and its own temporary folder, can't read the usual
+> credential locations and gets only a few of your environment variables. It
+> can still read your other files, use the network and run the programs on
+> your `PATH`.
 > On Windows files are not isolated at all. Never give it tasks that need
 > accounts or secrets you would not hand to the model. See
 > [Sandbox](#sandbox).
@@ -90,8 +91,10 @@ in: CPython 3.14 from
 (about 30 MB) and the worker module of your `libsmol` version from its GitHub
 release, both checked against their checksums and kept in `~/.smol/runtime`.
 The runtime's checksum is built into `libsmol`; the module's comes from the
-same release's `SHA256SUMS`, as with the install scripts. Versions that no
-session has used for a week are removed.
+same release's `SHA256SUMS`, as with the install scripts. A session can't
+open until this download has worked once. Another version's runtime or
+module, with that runtime's venvs, is removed once no session has used it for
+a week.
 
 ## Configure a model
 
@@ -259,8 +262,9 @@ process and the programs it starts:
   `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials.toml`,
   `~/.cargo/credentials`, `~/.password-store`, `~/.local/share/keyrings`,
   `~/Library/Keychains`, `~/.smol`, `~/.claude`, `~/.claude.json`, `~/.codex`,
-  and the configuration directory when `SMOL_CONFIG_DIR` moves it, except for
-  the runtime, the worker module, skills and the venv and copies they write;
+  and the configuration directory when `SMOL_CONFIG_DIR` moves it; of the
+  configuration directory they still see the runtime, the worker module, the
+  skills, the venv and the copies of viewed images;
 - get only `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `LANG`, `LC_ALL`,
   `LC_CTYPE`, `TERM` and `TZ` from your environment, with the venv's `python`
   and `pip` first on `PATH` and `VIRTUAL_ENV` naming it;
@@ -271,8 +275,10 @@ process and the programs it starts:
 
 The network is not restricted, and MCP servers and `!` commands run outside the
 sandbox. Package managers can't write their caches (`~/.cargo/registry`,
-`~/.npm` and the like), so a download fails unless it is already cached; run
-the install as a `!` command, or open the cache in `~/.smol/agent.toml`:
+`~/.npm` and the like), so a download fails unless it is already cached; pip
+keeps its cache in `TMPDIR` instead. Run the install as a `!` command, which
+runs with your own environment, so `!pip install` installs into your Python
+rather than the venv, or open the cache in `~/.smol/agent.toml`:
 
 ```toml
 [allow]
@@ -394,10 +400,11 @@ the default is `warn,libsmol=info`, `SMOL_LOG=warn` keeps only problems,
   and imports resolve to that venv, not to the Pythons and virtualenvs you
   installed, which stay on `PATH` after it. Every session in the directory and
   the agents they start share the venv and keep what it installed, until a
-  new runtime gets a new one or the directory is gone. To start over, delete
-  it while no session in that directory is open. `VIRTUAL_ENV` names it, so
-  tools such as uv or poetry install into it too, and a venv the code makes
-  for itself is based on the runtime, which a later smol may replace.
+  new runtime gets a new one or the directory is gone and no session has used
+  the venv for a week. To start over, delete it while no session in that
+  directory is open. `VIRTUAL_ENV` names it, so tools such as uv or poetry
+  install into it too, and a venv the code makes for itself is based on the
+  runtime, which a later smol may replace.
 - **Interrupting** stops code in place, and the session keeps its variables.
   Code blocked where an interrupt cannot reach it (for example `os.system`, a
   long call inside a C extension, or most blocking calls on Windows) gets 3
@@ -419,8 +426,8 @@ filling in JSON tool calls. That approach goes back to the CodeAct paper,
 [Executable Code Actions Elicit Better LLM Agents](https://arxiv.org/abs/2402.01030).
 
 smolagents is a Python library for building agents. smol is a ready-made agent
-for the terminal and any ACP client, shipped as a single binary with its own
-embedded Python. It is an independent project, not affiliated with Hugging Face.
+for the terminal and any ACP client that runs the code in its own pinned
+CPython. It is an independent project, not affiliated with Hugging Face.
 
 ## License
 

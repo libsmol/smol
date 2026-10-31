@@ -8,7 +8,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict};
 use reaper::described;
 use serde_json::{json, Map};
-use std::env;
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::future::Future;
@@ -26,12 +25,12 @@ const CHECK_EVERY: Duration = Duration::from_millis(50);
 /// The copies folder and the session directory, which `view` labels paths against
 static PLACES: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
 
+/// `cwd` is the session directory
 pub(crate) fn builtins(
     py: Python<'_>,
     copies: PathBuf,
+    cwd: PathBuf,
 ) -> PyResult<[(&'static str, Bound<'_, PyCFunction>); 6]> {
-    // No code has run yet at startup and this is still the session directory
-    let cwd = env::current_dir().unwrap_or_default();
     PLACES.set((copies, cwd)).ok();
 
     Ok([
@@ -82,13 +81,17 @@ fn call_tool<'py>(
     let mut arguments = Map::new();
     for (key, value) in args {
         let key = key.str()?.to_string();
+        // Only what json raises for a value it can't hold, so an interrupt stays one
         let json = match json_of(&value) {
             Ok(json) => json,
-            Err(_) => {
+            Err(e)
+                if e.is_instance_of::<PyTypeError>(py) || e.is_instance_of::<PyValueError>(py) =>
+            {
                 let kind = value.get_type().name()?.to_string();
                 let message = unserializable(&key, &kind);
                 return Err(PyTypeError::new_err(message));
             }
+            Err(e) => return Err(e),
         };
         arguments.insert(key, json);
     }

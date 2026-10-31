@@ -93,6 +93,7 @@ const TEMP_ENV: &[&str] = &["TMPDIR"];
 #[cfg(windows)]
 const TEMP_ENV: &[&str] = &["TEMP", "TMP"];
 const VENV_ENV: &str = "VIRTUAL_ENV";
+const PIP_CACHE_ENV: &str = "PIP_CACHE_DIR";
 
 /// The Landlock ruleset the worker restricts itself with
 #[cfg(target_os = "linux")]
@@ -233,6 +234,14 @@ impl Sandbox {
         }
 
         sandbox.isolation = isolated(&real, &hidden);
+        // pip's own cache can't be written, which building a package from source needs.
+        // First, so a cache that `[allow] env` passes wins
+        if sandbox.isolation.is_some() {
+            let cache = scratch.join("pip").into_os_string();
+            sandbox
+                .env
+                .insert(0, (OsString::from(PIP_CACHE_ENV), cache));
+        }
         Ok(sandbox)
     }
 
@@ -240,7 +249,7 @@ impl Sandbox {
         self.isolation.is_some()
     }
 
-    /// Where code may write besides the working directory and its temporary folder,
+    /// Where code may write besides the working directory, the venv and its temporary folder,
     /// or `None` when files aren't isolated
     pub(crate) fn writable(&self) -> Option<&[PathBuf]> {
         self.enforced().then_some(self.writable.as_slice())
@@ -554,7 +563,7 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     use crate::worker::sandbox::{landlock_abi, spread};
     use crate::worker::sandbox::{
-        profile, sweep, Sandbox, LOCK, PASSED_ENV, TEMP_PREFIX, VENV_ENV,
+        profile, sweep, Sandbox, LOCK, PASSED_ENV, PIP_CACHE_ENV, TEMP_PREFIX, VENV_ENV,
     };
     use crate::worker::Delegation;
     use std::env;
@@ -779,7 +788,8 @@ pub(crate) mod tests {
             let passed = PASSED_ENV
                 .iter()
                 .any(|known| known.eq_ignore_ascii_case(&name));
-            if !passed && !name.starts_with("SMOL_") && name != VENV_ENV {
+            let set = name.starts_with("SMOL_") || name == VENV_ENV || name == PIP_CACHE_ENV;
+            if !passed && !set {
                 unpassed.push(name);
             }
         }
@@ -798,13 +808,19 @@ pub(crate) mod tests {
         let python = installed(&dir, &cwd);
         let sandbox = Sandbox::new(&cwd, &copies, &dir, &[], &access, python).expect("sandbox");
         let scratch = sandbox.temp.join("tmp").display().to_string();
+        let cached = match sandbox.enforced() {
+            true => "True",
+            false => "False",
+        };
         let code = format!(
-            "import os, tempfile\n[name in os.environ for name in ({allowed:?}, {dropped:?})] + [tempfile.gettempdir() == {scratch:?}]"
+            "import os, tempfile\n\
+             cache = os.environ.get('PIP_CACHE_DIR', '').startswith({scratch:?})\n\
+             [name in os.environ for name in ({allowed:?}, {dropped:?})] + [tempfile.gettempdir() == {scratch:?}, cache]"
         );
         let logs = evaluated(sandbox, &code);
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(logs, "[True, False, True]\n");
+        assert_eq!(logs, format!("[True, False, True, {cached}]\n"));
     }
 
     /// Only folders whose lock nobody holds are removed

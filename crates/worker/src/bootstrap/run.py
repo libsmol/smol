@@ -2,6 +2,7 @@ import ast as _ast
 import io as _io
 import linecache as _linecache
 import re as _re
+import site as _site
 import sys as _sys
 import textwrap as _textwrap
 import tokenize as _tokenize
@@ -84,6 +85,19 @@ def _untagged(code):
             return candidate
     return None
 
+def _pths():
+    found = set()
+    for folder in _site.getsitepackages():
+        try:
+            names = _os.listdir(folder)
+        except OSError:
+            continue
+        found.update((folder, name) for name in names if name.endswith(".pth"))
+    return found
+
+# The ones site processed at start
+_PTHS = _pths()
+
 def _run(code):
     global _SHOWN, _STDOUT, _STDERR
     # Streams the code closed are reopened on fds that are still open
@@ -93,6 +107,11 @@ def _run(code):
     # Streams the previous snippet swapped in are not kept
     _sys.stdout, _sys.stderr = _STDOUT, _STDERR
     _SHOWN = _STDOUT
+
+    # Packages installed since, like editable ones, add their paths as site would after a restart
+    for folder, name in sorted(_pths() - _PTHS):
+        _PTHS.add((folder, name))
+        _site.addpackage(folder, name, None)
 
     error = repaired = None
     blocks = []
@@ -118,12 +137,15 @@ def _run(code):
         except SyntaxError as exc:
             blocks = []
             source = exc.text
-            # Errors found only when compiling (like return outside a function) carry no source line
+            column = max((exc.offset or 1) - 1, 0)
+            # Errors found only when compiling (like return outside a function) carry no source line,
+            # and their column counts UTF-8 bytes
             lines = code.split("\n")
             if source is None and exc.lineno and 0 < exc.lineno <= len(lines):
                 source = lines[exc.lineno - 1]
+                before = source.encode("utf-8", "surrogatepass")[:column]
+                column = len(before.decode("utf-8", "ignore"))
             source = (source or "").rstrip()
-            column = max((exc.offset or 1) - 1, 0)
             padding = []
             for c in source[:column]:
                 # Wide characters take two terminal columns
@@ -135,7 +157,11 @@ def _run(code):
                 else:
                     padding.append(" ")
             caret = "".join(padding) + "^"
-            error = f"syntax error on line {exc.lineno}: {exc.msg}\n{source}\n{caret}"
+            # Like the error for null bytes, which belongs to no line
+            if exc.lineno is None:
+                error = f"syntax error: {exc.msg}"
+            else:
+                error = f"syntax error on line {exc.lineno}: {exc.msg}\n{source}\n{caret}"
 
         # The last statement rebinding each global name,
         # outside functions, classes and comprehensions

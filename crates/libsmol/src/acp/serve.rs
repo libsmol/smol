@@ -606,7 +606,7 @@ mod tests {
             assert!(interrupt.cancelled(0));
 
             // Replayed notifications come before the reply.
-            // Opening may first make the venv tests share, which takes Windows long
+            // Opening may first make the venv tests share, which is slow on Windows
             let answered = loop {
                 let receiving = sent.recv();
                 let waiting = time::timeout(Duration::from_secs(60), receiving);
