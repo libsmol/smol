@@ -12,7 +12,7 @@ use std::env;
 use std::env::consts::DLL_PREFIX;
 use std::env::consts::{ARCH, DLL_SUFFIX, OS};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -51,7 +51,7 @@ const BUILDS: [(&str, &str); 5] = [
 ];
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Holds the runtimes, the worker modules and their locks in the config directory
-const STORE: &str = "python";
+const STORE: &str = "runtime";
 /// Holds a folder of venvs for each runtime in the config directory
 const VENVS: &str = "venvs";
 const LOCK: &str = "lock";
@@ -70,6 +70,10 @@ const VENV_BIN: &str = "Scripts";
 const EXE: &str = "python";
 #[cfg(windows)]
 const EXE: &str = "python.exe";
+#[cfg(unix)]
+const PIP: &str = "pip";
+#[cfg(windows)]
+const PIP: &str = "pip.exe";
 /// Loads the worker module from `sys.argv[1]` whatever its file name,
 /// and calls the function named in `sys.argv[2]` with the venv's interpreter
 const LOADER: &str = "import sys
@@ -89,15 +93,14 @@ pub(crate) struct Python {
     pub(crate) module: PathBuf,
     /// Kept for the working directory, where the code installs packages
     pub(crate) venv: PathBuf,
-    /// Written by the agent once the venv is complete, where the code can't see it
-    ready: PathBuf,
-    /// Shared locks on the runtime and the module, which other libsmol versions don't remove
-    _held: [File; 2],
+    /// Shared locks on the runtime, the module and the venv, which no other session removes
+    _held: [File; 3],
 }
 
 impl Python {
     /// Downloads the runtime and the worker module that are missing,
-    /// and removes those of other versions that no session holds
+    /// and removes those of other versions, and venvs of working directories that are gone,
+    /// that no session holds
     pub(crate) async fn install(config: &Path, cwd: &Path) -> Result<Self, String> {
         let system = match OS {
             "linux" if cfg!(target_env = "gnu") => "unknown-linux-gnu",
@@ -119,9 +122,18 @@ impl Python {
             let shown = tilde(&store);
             format!("runtime: {shown}: {reason}")
         };
-        fs::create_dir_all(&store).map_err(failed)?;
+        let venvs = venv.parent().expect("venvs");
+        for folder in [&store, venvs] {
+            fs::create_dir_all(folder).map_err(failed)?;
+        }
         // Taken before looking, so a removal that is under way finishes first
-        let held = [held(&store, &home).await?, held(&store, &module).await?];
+        let runtime_held = held(&home).await?;
+        let module_held = held(&module).await?;
+        let mut venv_held = held(&venv).await?;
+        // A venv's lock names its working directory, unless that isn't UTF-8 and so can't be told
+        if let Some(cwd) = cwd.to_str() {
+            venv_held.write_all(cwd.as_bytes()).map_err(failed)?;
+        }
 
         if !home.exists() || !module.exists() {
             let _lock = locked(&store).await?;
@@ -200,10 +212,9 @@ impl Python {
                 }
                 // Unfinished installs start with a dot, and this one holds the install lock
                 let unfinished = name.starts_with('.');
-                let lock = store.join(format!("{name}.lock"));
                 let lock = match unfinished {
                     true => None,
-                    false => File::create(lock).ok(),
+                    false => File::create(lock_of(&path)).ok(),
                 };
                 // Kept locked until the removal is done
                 let free = lock.as_ref().is_some_and(|file| file.try_lock().is_ok());
@@ -219,15 +230,36 @@ impl Python {
             }
         }
 
-        let mut ready = venv.clone().into_os_string();
-        ready.push(".ready");
+        // A lock that names no working directory is never removed
+        let own = lock_of(&venv);
+        let entries = fs::read_dir(venvs).map_err(failed)?;
+        for entry in entries.flatten() {
+            let lock = entry.path();
+            let named = lock
+                .extension()
+                .is_some_and(|extension| extension == "lock");
+            if lock == own || !named {
+                continue;
+            }
+            let recorded = fs::read_to_string(&lock).unwrap_or_default();
+            if recorded.is_empty() || Path::new(&recorded).exists() {
+                continue;
+            }
+            let opened = File::open(&lock);
+            let free = opened.is_ok_and(|file| file.try_lock().is_ok());
+            if free {
+                let gone = lock.with_extension("");
+                fs::remove_dir_all(gone).ok();
+                fs::remove_file(&lock).ok();
+            }
+        }
+
         Ok(Self {
             store,
             home,
             module,
             venv,
-            ready: PathBuf::from(ready),
-            _held: held,
+            _held: [runtime_held, module_held, venv_held],
         })
     }
 
@@ -236,10 +268,12 @@ impl Python {
         self.venv.join(VENV_BIN)
     }
 
-    /// The code can break the venv but never the record, so a missing interpreter also counts
+    /// Complete once `venv` has installed pip, which it does after the interpreter.
+    /// Only looked up, never read or followed, since the code can write the venv
     fn ready(&self) -> bool {
-        let python = self.bin().join(EXE);
-        self.ready.exists() && python.exists()
+        let bin = self.bin();
+        let found = |name: &str| fs::symlink_metadata(bin.join(name)).is_ok();
+        found(EXE) && found(PIP)
     }
 }
 
@@ -283,7 +317,6 @@ pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
                 };
                 return Err(format!("venv: {reason}"));
             }
-            fs::write(&python.ready, "").map_err(failed)?;
             let shown = tilde(&python.venv);
             info!("python: venv created [path={shown}]");
         }
@@ -329,7 +362,8 @@ fn places(_: &Path, _: &Path, _: &str) -> (PathBuf, PathBuf, PathBuf) {
     let deps = exe.parent().expect("deps");
     let built = deps.parent().expect("profile");
     let module = format!("{DLL_PREFIX}_smol{DLL_SUFFIX}");
-    (built.join(STORE), deps.join(module), built.join("venv"))
+    let venv = built.join(VENVS).join("venv");
+    (built.join(STORE), deps.join(module), venv)
 }
 
 async fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
@@ -363,11 +397,17 @@ async fn locked(store: &Path) -> Result<File, String> {
     lock(path, File::lock).await
 }
 
-/// Waits off the runtime's thread while another libsmol removes it
-async fn held(store: &Path, item: &Path) -> Result<File, String> {
-    let name = item.file_name().unwrap_or_default().to_string_lossy();
-    let path = store.join(format!("{name}.lock"));
+/// Waits off the runtime's thread while another session removes it
+async fn held(item: &Path) -> Result<File, String> {
+    let path = lock_of(item);
     lock(path, File::lock_shared).await
+}
+
+/// Next to the item, out of the code's sight because only the item itself is granted
+fn lock_of(item: &Path) -> PathBuf {
+    let mut path = item.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
 async fn lock(path: PathBuf, locking: fn(&File) -> io::Result<()>) -> Result<File, String> {

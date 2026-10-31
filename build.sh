@@ -17,7 +17,7 @@ for file in target/release/{smol,libsmol}; do
 done
 
 # libsmol looks for the worker module of its own version here
-store="${SMOL_CONFIG_DIR:-$HOME/.smol}/python"
+store="${SMOL_CONFIG_DIR:-$HOME/.smol}/runtime"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
 case "$(uname -s)" in
 Darwin) suffix=dylib ;;

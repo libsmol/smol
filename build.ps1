@@ -34,7 +34,7 @@ foreach ($file in $files) {
 # libsmol looks for the worker module of its own version here,
 # and a worker that still has the old one loaded keeps it until it exits
 $config = if ($env:SMOL_CONFIG_DIR) { $env:SMOL_CONFIG_DIR } else { Join-Path $HOME ".smol" }
-$store = Join-Path $config "python"
+$store = Join-Path $config "runtime"
 $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
 $module = Join-Path $store "worker-$version.dll"
 New-Item -ItemType Directory -Force -Path $store | Out-Null

@@ -11,7 +11,7 @@ but their files stay in `~/.smol/history` untouched.
 
 - The code runs in CPython 3.14 instead of RustPython. It is the same pinned
   build of [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
-  on every machine, which the first session downloads into `~/.smol/python`
+  on every machine, which the first session downloads into `~/.smol/runtime`
   together with the worker module of the `libsmol` version, and it runs as a
   venv kept for each working directory in `~/.smol/venvs` and shared by its
   sessions. `pip install` puts packages there, C extensions such as numpy and
