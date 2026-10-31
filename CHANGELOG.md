@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.4.4 - 2026-10-31
 
 - The system prompt says that a task stays open after the answer only while an
   agent started with a name is still running. It said the task goes on after
