@@ -1404,11 +1404,14 @@ pub(crate) mod tests {
 
         let output = worker.eval("ls('/nope/café')");
         let message = error(output);
-        // The reason is the system's own text, which differs on Windows
-        assert!(
-            message.starts_with("FileNotFoundError: [Errno 2] "),
-            "{message}"
-        );
+        // Like its own os functions, Python names a Windows error by the system's code,
+        // and the reason is the system's own text
+        #[cfg(unix)]
+        let code = "[Errno 2]";
+        #[cfg(windows)]
+        let code = "[WinError 3]";
+        let expected = format!("FileNotFoundError: {code} ");
+        assert!(message.starts_with(&expected), "{message}");
         assert!(message.contains(": '/nope/café'"), "{message}");
     }
 
