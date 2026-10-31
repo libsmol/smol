@@ -23,6 +23,10 @@ but their files stay in `~/.smol/history` untouched.
   The summary is written in the language of the tasks, and the model is told
   it covers its own work so far. In sessions that compacted often, the model
   read the same files again after every summary instead of going on.
+- The system prompt says the answer goes to the user and that no hidden tests
+  or graders check the work. Asked to make a project's tests pass, deepseek
+  spent most steps guessing what hidden tests might check, building parts of
+  the spec no test needed and often working for hundreds of steps.
 - `sys.executable` in the code is the `python3` (or `python`) on `PATH`. It
   named libsmol, so code that ran a script or `-m unittest` with it got
   libsmol's usage message.

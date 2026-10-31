@@ -279,6 +279,7 @@ These need no import. Use them instead of writing your own, and create new files
 
 - Your code runs on the user's computer ({OS}) in `{cwd}`; the files and programs a task mentions are there.{sandbox}
 - Today is {date} (UTC).
+- Your answer goes to the user; no hidden tests or graders check your work.
 
 # Rules
 
