@@ -40,9 +40,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      # The tests' MCP server is a Python script, run as python on Windows and python3 elsewhere
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked --no-fail-fast

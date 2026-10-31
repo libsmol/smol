@@ -430,6 +430,7 @@ pub(crate) mod tests {
     use crate::tests::temp_dir;
     use crate::tools::mcp::{connect, Link, Server};
     use crate::utils::block_on;
+    use crate::worker::python::tests::interpreter;
     use serde_json::{json, Map, Value};
     use std::collections::BTreeMap;
     use std::fs;
@@ -437,10 +438,6 @@ pub(crate) mod tests {
     use std::time::Duration;
     use tokio::{task, time};
 
-    pub(crate) const PYTHON: &str = match cfg!(windows) {
-        true => "python",
-        false => "python3",
-    };
     pub(crate) const SCRIPT: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/src/tools/mcp_test_server.py");
     const CWD: &str = env!("CARGO_MANIFEST_DIR");
@@ -469,7 +466,7 @@ pub(crate) mod tests {
 
     fn stdio(name: &str, args: Vec<String>) -> McpConfig {
         let kind = McpKind::Stdio {
-            command: PathBuf::from(PYTHON),
+            command: interpreter(),
             args,
             env: BTreeMap::new(),
         };

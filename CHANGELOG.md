@@ -11,10 +11,10 @@ but their files stay in `~/.smol/history` untouched.
 
 - The code runs in CPython 3.14 instead of RustPython. It is the same pinned
   build of [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
-  on every machine, which the first session downloads into `~/.smol/runtime`
-  together with the worker module of the `libsmol` version, and it runs as a
-  venv kept for each working directory in `~/.smol/venvs` and shared by its
-  sessions. `pip install` puts packages there, C extensions such as numpy and
+  on every machine, which `libsmol setup`, or else the first session,
+  downloads into `~/.smol/runtime` together with the worker module of the
+  `libsmol` version, and it runs as a venv kept for each working directory in
+  `~/.smol/venvs` and shared by its sessions, until the directory is gone. `pip install` puts packages there, C extensions such as numpy and
   pandas included, and the session can import them right away;
   `sys.executable` and the `python` and `pip` on `PATH` are the venv's. Code
   that waits on a lock or a queue can now be interrupted, a syntax error points

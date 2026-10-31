@@ -646,8 +646,9 @@ mod tests {
     use crate::memory::{AgentMemory, MemoryStep};
     use crate::prompt::{NAMER, RESTARTED};
     use crate::tests::temp_dir;
-    use crate::tools::mcp::tests::{PYTHON, SCRIPT};
+    use crate::tools::mcp::tests::SCRIPT;
     use crate::utils::block_on;
+    use crate::worker::python::tests::interpreter;
     use crate::Error;
     use reaper::tilde;
     use serde_json::{json, Value};
@@ -1090,8 +1091,10 @@ mod tests {
     fn mcp_status() {
         let dir = temp_dir("mcp-status");
         // Single quotes keep the backslashes of a Windows path out of TOML escapes
+        let python = interpreter();
+        let python = python.display();
         let servers = format!(
-            "[mcp.fake]\ntype = \"stdio\"\ncommand = \"{PYTHON}\"\nargs = ['{SCRIPT}']\n\n\
+            "[mcp.fake]\ntype = \"stdio\"\ncommand = '{python}'\nargs = ['{SCRIPT}']\n\n\
             [mcp.down]\ntype = \"http\"\nurl = \"http://127.0.0.1:1/mcp\"\n\n\
             [mcp.off]\ntype = \"http\"\nurl = \"http://127.0.0.1:1/mcp\"\nenabled = false\n"
         );

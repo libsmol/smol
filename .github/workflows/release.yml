@@ -89,6 +89,16 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # libsmol downloads the worker module of its own target, which it knows from python.rs
+      - name: Check worker modules
+        run: |
+          builds=$(sed -n 's/^ *"\([a-z0-9_]*-[a-z0-9_-]*\)",$/\1/p' crates/libsmol/src/worker/python.rs | sort)
+          shipped=$(ls dist | sed -n 's/^smol-worker-//p' | sort)
+          if [ -z "$builds" ] || [ "$builds" != "$shipped" ]; then
+            echo "runtimes in python.rs:" $builds
+            echo "worker modules built:" $shipped
+            exit 1
+          fi
       - name: Checksums
         run: |
           cd dist

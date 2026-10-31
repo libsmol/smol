@@ -55,7 +55,6 @@ const STORE: &str = "runtime";
 /// Holds a folder of venvs for each runtime in the config directory
 const VENVS: &str = "venvs";
 const LOCK: &str = "lock";
-#[cfg(not(test))]
 const MAX_NAME_CHARS: usize = 48;
 const DOWNLOAD_WAIT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
@@ -84,24 +83,20 @@ module = module_from_spec(spec_from_loader('_smol', loader))
 loader.exec_module(module)
 getattr(module, sys.argv[2])(sys.argv[3])";
 
-/// The Python a session's worker runs, kept in place while the session lasts
-pub(crate) struct Python {
+/// The interpreter and the worker module of this libsmol version, kept in place while held
+pub(crate) struct Runtime {
     store: PathBuf,
-    /// The runtime, which the code only reads
+    /// The interpreter and its standard library, which the code only reads
     pub(crate) home: PathBuf,
     /// The worker module, which the code only reads
     pub(crate) module: PathBuf,
-    /// Kept for the working directory, where the code installs packages
-    pub(crate) venv: PathBuf,
-    /// Shared locks on the runtime, the module and the venv, which no other session removes
-    _held: [File; 3],
+    /// Shared locks, which keep other libsmol versions from removing them
+    _held: [File; 2],
 }
 
-impl Python {
-    /// Downloads the runtime and the worker module that are missing,
-    /// and removes those of other versions, and venvs of working directories that are gone,
-    /// that no session holds
-    pub(crate) async fn install(config: &Path, cwd: &Path) -> Result<Self, String> {
+impl Runtime {
+    /// Downloads what is missing, and then removes what other versions left that no session holds
+    pub(crate) async fn install(config: &Path) -> Result<Self, String> {
         let system = match OS {
             "linux" if cfg!(target_env = "gnu") => "unknown-linux-gnu",
             "macos" => "apple-darwin",
@@ -114,154 +109,186 @@ impl Python {
             return Err(format!("runtime: {target}: no build"));
         };
 
-        let runtime = format!("cpython-{PYTHON}+{RELEASE}");
-        let (store, module, venv) = places(config, cwd, &runtime);
-        let home = store.join(&runtime);
+        let (store, module) = stored(config);
+        let named = format!("cpython-{PYTHON}+{RELEASE}");
+        let home = store.join(named);
         let failed = |e: io::Error| {
             let reason = cause(&e);
             let shown = tilde(&store);
             format!("runtime: {shown}: {reason}")
         };
-        let venvs = venv.parent().expect("venvs");
-        for folder in [&store, venvs] {
-            fs::create_dir_all(folder).map_err(failed)?;
-        }
+        fs::create_dir_all(&store).map_err(failed)?;
         // Taken before looking, so a removal that is under way finishes first
-        let runtime_held = held(&home, "").await?;
+        let home_held = held(&home, "").await?;
         let module_held = held(&module, "").await?;
-        // A venv's lock names its working directory, unless that isn't UTF-8 and so can't be told
-        let record = cwd.to_str().unwrap_or_default();
-        let venv_held = held(&venv, record).await?;
-
-        if !home.exists() || !module.exists() {
-            let _lock = locked(&store).await?;
-            let builder = Client::builder().read_timeout(DOWNLOAD_WAIT);
-            let client = http_client(builder)?;
-
-            if !home.exists() {
-                info!("python: downloading runtime [version={PYTHON}+{RELEASE}]");
-                let name = format!("{runtime}-{target}-install_only_stripped.tar.gz");
-                let url = format!(
-                    "https://github.com/astral-sh/python-build-standalone/releases/download/{RELEASE}/{name}"
-                );
-                let archive = download(&client, &url).await?;
-                checked(&name, &archive, sha)?;
-
-                // Inside the store, because a rename moves a folder only within one file system
-                let id = new_id();
-                let unpacked = store.join(format!(".{id}"));
-                let into = unpacked.clone();
-                let unpacking = move || Archive::new(GzDecoder::new(&archive[..])).unpack(into);
-                let result = task::spawn_blocking(unpacking).await.expect("unpack");
-                result.map_err(failed)?;
-                let unpacked = unpacked.join("python");
-                // The code can't write the runtime's bytecode, and nothing has run it yet.
-                // Bytecode only speeds up imports, so files that fail to compile don't stop this
-                let python = unpacked.join(HOME_BIN).join(EXE);
-                let mut compiling = Command::new(python);
-                compiling
-                    .args(["-I", "-m", "compileall", "-q", "-j0"])
-                    .arg(&unpacked)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-                compiling.status().await.map_err(failed)?;
-                fs::rename(&unpacked, &home).map_err(failed)?;
-                info!("python: runtime installed [version={PYTHON}+{RELEASE}]");
-            }
-
-            if !module.exists() {
-                // Tests load the module cargo built, never a released one
-                if cfg!(test) {
-                    let shown = module.display();
-                    return Err(format!("runtime: {shown}: not built"));
-                }
-                info!("python: downloading worker module [version={VERSION}]");
-                let base = format!("https://github.com/libsmol/smol/releases/download/v{VERSION}");
-                let name = format!("smol-worker-{target}");
-                let url = format!("{base}/SHA256SUMS");
-                let sums = download(&client, &url).await?;
-                let sums = String::from_utf8_lossy(&sums);
-                let suffix = format!("  {name}");
-                let listed = sums.lines().find_map(|line| line.strip_suffix(&suffix));
-                let Some(sha) = listed else {
-                    return Err(format!("runtime: {name}: not in SHA256SUMS"));
-                };
-                let url = format!("{base}/{name}");
-                let bytes = download(&client, &url).await?;
-                checked(&name, &bytes, sha)?;
-
-                let id = new_id();
-                let written = store.join(format!(".{id}"));
-                fs::write(&written, bytes).map_err(failed)?;
-                fs::rename(&written, &module).map_err(failed)?;
-                info!("python: worker module installed [version={VERSION}]");
-            }
-
-            // Lock files stay, since another session may be about to lock the one it opened
-            let entries = fs::read_dir(&store).map_err(failed)?;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                let current = path == home || path == module;
-                if current || name == LOCK || name.ends_with(".lock") {
-                    continue;
-                }
-                // Unfinished installs start with a dot, and this one holds the install lock
-                let unfinished = name.starts_with('.');
-                let lock = match unfinished {
-                    true => None,
-                    false => opened(&lock_of(&path)).ok(),
-                };
-                // Kept locked until the removal is done
-                let free = lock.as_ref().is_some_and(|file| file.try_lock().is_ok());
-                if !unfinished && !free {
-                    continue;
-                }
-                fs::remove_dir_all(&path)
-                    .or_else(|_| fs::remove_file(&path))
-                    .ok();
-                // The venvs of a runtime that is gone
-                let venvs = config.join(VENVS).join(&*name);
-                fs::remove_dir_all(venvs).ok();
-            }
+        let holds = [home_held, module_held];
+        if home.exists() && module.exists() {
+            return Ok(Self {
+                store,
+                home,
+                module,
+                _held: holds,
+            });
         }
 
-        // A lock that names no working directory is never removed
-        let own = lock_of(&venv);
-        let entries = fs::read_dir(venvs).map_err(failed)?;
-        for entry in entries.flatten() {
-            let lock = entry.path();
-            let named = lock
-                .extension()
-                .is_some_and(|extension| extension == "lock");
-            if lock == own || !named {
-                continue;
+        let _lock = locked(&store).await?;
+        let builder = Client::builder().read_timeout(DOWNLOAD_WAIT);
+        let client = http_client(builder)?;
+        if !home.exists() {
+            info!("python: downloading runtime [version={PYTHON}+{RELEASE}]");
+            let name = format!("cpython-{PYTHON}+{RELEASE}-{target}-install_only_stripped.tar.gz");
+            let url = format!(
+                "https://github.com/astral-sh/python-build-standalone/releases/download/{RELEASE}/{name}"
+            );
+            let archive = fetched(&client, &url, &name, sha).await?;
+
+            // Inside the store, because a rename moves a folder only within one file system
+            let id = new_id();
+            let unpacked = store.join(format!(".{id}"));
+            let into = unpacked.clone();
+            let unpacking = move || Archive::new(GzDecoder::new(&archive[..])).unpack(into);
+            let result = task::spawn_blocking(unpacking).await.expect("unpack");
+            result.map_err(failed)?;
+            let unpacked = unpacked.join("python");
+
+            // The code can't write the runtime's bytecode, and nothing has run it yet.
+            // Bytecode only speeds up imports, so files that fail to compile don't stop this
+            let python = unpacked.join(HOME_BIN).join(EXE);
+            let mut compiling = Command::new(python);
+            compiling
+                .args(["-I", "-m", "compileall", "-q", "-j0"])
+                .arg(&unpacked)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            compiling.status().await.map_err(failed)?;
+            fs::rename(&unpacked, &home).map_err(failed)?;
+            info!("python: runtime installed [version={PYTHON}+{RELEASE}]");
+        }
+
+        if !module.exists() {
+            // Tests load the module cargo built, never a released one
+            if cfg!(test) {
+                let shown = module.display();
+                return Err(format!("runtime: {shown}: not built"));
             }
-            let recorded = fs::read_to_string(&lock).unwrap_or_default();
-            if recorded.is_empty() || Path::new(&recorded).exists() {
-                continue;
-            }
-            let Ok(opened) = File::open(&lock) else {
-                continue;
+            info!("python: downloading worker module [version={VERSION}]");
+            let base = format!("https://github.com/libsmol/smol/releases/download/v{VERSION}");
+            let url = format!("{base}/SHA256SUMS");
+            let sums = download(&client, &url).await?;
+            let sums = String::from_utf8_lossy(&sums);
+            let name = format!("smol-worker-{target}");
+            let Some(sha) = summed(&sums, &name) else {
+                return Err(format!("runtime: {name}: not in SHA256SUMS"));
             };
-            if opened.try_lock().is_err() {
+            let url = format!("{base}/{name}");
+            let bytes = fetched(&client, &url, &name, sha).await?;
+
+            let id = new_id();
+            let written = store.join(format!(".{id}"));
+            fs::write(&written, bytes).map_err(failed)?;
+            fs::rename(&written, &module).map_err(failed)?;
+            info!("python: worker module installed [version={VERSION}]");
+        }
+
+        // Lock files stay, since another session may be about to lock the one it opened
+        let entries = fs::read_dir(&store).map_err(failed)?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let current = path == home || path == module;
+            if current || name == LOCK || name.ends_with(".lock") {
                 continue;
             }
-            let gone = lock.with_extension("");
-            fs::remove_dir_all(gone).ok();
-            // Windows removes no file that is still open
-            drop(opened);
-            fs::remove_file(&lock).ok();
+            // Unfinished installs start with a dot, and this one holds the install lock
+            let unfinished = name.starts_with('.');
+            let lock = match unfinished {
+                true => None,
+                false => opened(&lock_of(&path)).ok(),
+            };
+            // Kept locked until the removal is done
+            let free = lock.as_ref().is_some_and(|file| file.try_lock().is_ok());
+            if !unfinished && !free {
+                continue;
+            }
+            fs::remove_dir_all(&path)
+                .or_else(|_| fs::remove_file(&path))
+                .ok();
+            // The venvs of a runtime that is gone
+            let venvs = config.join(VENVS).join(&*name);
+            fs::remove_dir_all(venvs).ok();
         }
 
         Ok(Self {
             store,
             home,
             module,
+            _held: holds,
+        })
+    }
+
+    pub(crate) fn interpreter(&self) -> PathBuf {
+        self.home.join(HOME_BIN).join(EXE)
+    }
+}
+
+/// The Python a session's worker runs: the runtime, as the venv kept for the working directory
+pub(crate) struct Python {
+    pub(crate) runtime: Runtime,
+    /// Where the code installs packages
+    pub(crate) venv: PathBuf,
+    /// Shared, and naming the working directory so the venv goes once that is gone
+    _held: File,
+}
+
+impl Python {
+    /// Also removes the venvs of working directories that are gone, unless a session holds them
+    pub(crate) async fn install(config: &Path, cwd: &Path) -> Result<Self, String> {
+        let runtime = Runtime::install(config).await?;
+        let named = runtime.home.file_name().unwrap_or_default();
+        let named = named.to_string_lossy();
+        let venv = venv_for(config, cwd, &named);
+        let venvs = venv.parent().expect("venvs");
+        let failed = |e: io::Error| {
+            let reason = cause(&e);
+            let shown = tilde(venvs);
+            format!("venv: {shown}: {reason}")
+        };
+        fs::create_dir_all(venvs).map_err(failed)?;
+        // A working directory that isn't UTF-8 can't be named, and its venv stays
+        let record = cwd.to_str().unwrap_or_default();
+        let hold = held(&venv, record).await?;
+
+        let own = lock_of(&venv);
+        let entries = fs::read_dir(venvs).map_err(failed)?;
+        for entry in entries.flatten() {
+            let lock = entry.path();
+            let locking = lock.extension().is_some_and(|ext| ext == "lock");
+            if lock == own || !locking {
+                continue;
+            }
+            let recorded = fs::read_to_string(&lock).unwrap_or_default();
+            if recorded.is_empty() || Path::new(&recorded).exists() {
+                continue;
+            }
+            let Ok(file) = File::open(&lock) else {
+                continue;
+            };
+            if file.try_lock().is_err() {
+                continue;
+            }
+            let gone = lock.with_extension("");
+            fs::remove_dir_all(gone).ok();
+            // Windows removes no file that is still open
+            drop(file);
+            fs::remove_file(&lock).ok();
+        }
+
+        Ok(Self {
+            runtime,
             venv,
-            _held: [runtime_held, module_held, venv_held],
+            _held: hold,
         })
     }
 
@@ -282,14 +309,14 @@ impl Python {
 /// The worker's command, with the venv made or completed first when it lacks `python` or `pip`
 pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
     let python = &sandbox.python;
-    let runtime = python.home.join(HOME_BIN).join(EXE);
+    let runtime = &python.runtime;
     let venv = python.bin().join(EXE);
 
     if !python.ready() {
         // Another session in this directory may have made it while this one waited
-        let _lock = locked(&python.store).await?;
+        let _lock = locked(&runtime.store).await?;
         if !python.ready() {
-            let mut repairing = loading(sandbox, &runtime, "repair", &venv);
+            let mut repairing = loading(sandbox, "repair", &venv);
             repairing.stdin(Stdio::null());
             let failed = |e: io::Error| {
                 let reason = cause(&e);
@@ -324,48 +351,83 @@ pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
         }
     }
 
-    let serving = loading(sandbox, &runtime, "serve", &venv);
+    let serving = loading(sandbox, "serve", &venv);
     Ok(serving)
 }
 
 /// Starts the runtime's interpreter, which the code can't write, unlike the venv's.
 /// Without site, nothing the code wrote runs before the module confines itself
-fn loading(sandbox: &Sandbox, runtime: &Path, function: &str, venv: &Path) -> Command {
-    let mut command = sandbox.command(runtime);
+fn loading(sandbox: &Sandbox, function: &str, venv: &Path) -> Command {
+    let runtime = &sandbox.python.runtime;
+    let interpreter = runtime.interpreter();
+    let mut command = sandbox.command(&interpreter);
     command
         .args(["-I", "-S", "-B", "-X", "utf8", "-c", LOADER])
-        .arg(&sandbox.python.module)
+        .arg(&runtime.module)
         .arg(function)
         .arg(venv);
     command
 }
 
-/// The store, the worker module and the venv, which is named after the working directory
+/// The store and the worker module
 #[cfg(not(test))]
-fn places(config: &Path, cwd: &Path, runtime: &str) -> (PathBuf, PathBuf, PathBuf) {
+fn stored(config: &Path) -> (PathBuf, PathBuf) {
     let store = config.join(STORE);
     let module = format!("worker-{VERSION}{DLL_SUFFIX}");
     let module = store.join(module);
-
-    let digest = Sha256::digest(cwd.as_os_str().as_encoded_bytes());
-    let hash = hex(&digest);
-    let named = cwd.file_name().unwrap_or_default().to_string_lossy();
-    let named: String = named.chars().take(MAX_NAME_CHARS).collect();
-    let name = format!("{named}-{}", &hash[..16]);
-    let venv = config.join(VENVS).join(runtime).join(name);
-    (store, module, venv)
+    (store, module)
 }
 
-/// Tests share one runtime and venv, and load the worker module `cargo test` built next to them,
-/// which only `cargo build` copies up into the profile folder
+/// Tests share the store in the profile folder and load the module `cargo test` built in `deps`,
+/// which only `cargo build` copies up
 #[cfg(test)]
-fn places(_: &Path, _: &Path, _: &str) -> (PathBuf, PathBuf, PathBuf) {
+fn stored(_: &Path) -> (PathBuf, PathBuf) {
     let exe = env::current_exe().expect("test binary");
     let deps = exe.parent().expect("deps");
     let built = deps.parent().expect("profile");
     let module = format!("{DLL_PREFIX}_smol{DLL_SUFFIX}");
-    let venv = built.join(VENVS).join("venv");
-    (built.join(STORE), deps.join(module), venv)
+    (built.join(STORE), deps.join(module))
+}
+
+/// Among the venvs of the runtime, named after the working directory
+#[cfg(not(test))]
+fn venv_for(config: &Path, cwd: &Path, runtime: &str) -> PathBuf {
+    let name = venv_name(cwd);
+    config.join(VENVS).join(runtime).join(name)
+}
+
+/// Tests share one venv in the profile folder
+#[cfg(test)]
+fn venv_for(_: &Path, _: &Path, _: &str) -> PathBuf {
+    let exe = env::current_exe().expect("test binary");
+    let built = exe.parent().and_then(Path::parent).expect("profile");
+    built.join(VENVS).join("venv")
+}
+
+/// The folder's name, kept short for the path's sake, and a hash of the whole path
+fn venv_name(cwd: &Path) -> String {
+    let digest = Sha256::digest(cwd.as_os_str().as_encoded_bytes());
+    let hash = hex(&digest);
+    let named = cwd.file_name().unwrap_or_default().to_string_lossy();
+    let named: String = named.chars().take(MAX_NAME_CHARS).collect();
+    format!("{named}-{}", &hash[..16])
+}
+
+/// The sha256 that a `SHA256SUMS` file lists for the file
+fn summed<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
+    let suffix = format!("  {name}");
+    sums.lines().find_map(|line| line.strip_suffix(&suffix))
+}
+
+/// Refuses what doesn't match the sha256
+async fn fetched(client: &Client, url: &str, name: &str, sha: &str) -> Result<Vec<u8>, String> {
+    let data = download(client, url).await?;
+    let digest = Sha256::digest(&data);
+    let digest = hex(&digest);
+    match digest == sha {
+        true => Ok(data),
+        false => Err(format!("runtime: {name}: checksum mismatch")),
+    }
 }
 
 async fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
@@ -377,15 +439,6 @@ async fn download(client: &Client, url: &str) -> Result<Vec<u8>, String> {
     let response = response.error_for_status().map_err(failed)?;
     let body = response.bytes().await.map_err(failed)?;
     Ok(body.to_vec())
-}
-
-fn checked(name: &str, data: &[u8], sha: &str) -> Result<(), String> {
-    let digest = Sha256::digest(data);
-    let digest = hex(&digest);
-    match digest == sha {
-        true => Ok(()),
-        false => Err(format!("runtime: {name}: checksum mismatch")),
-    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -449,12 +502,47 @@ async fn lock(
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::utils::block_on;
-    use crate::worker::python::Python;
-    use std::path::Path;
+    use crate::worker::python::{summed, venv_name, Python, Runtime};
+    use std::path::{Path, PathBuf};
 
     /// The runtime and venv tests share
     pub(crate) fn installed(config: &Path, cwd: &Path) -> Python {
         let installing = Python::install(config, cwd);
         block_on(installing).expect("python")
+    }
+
+    /// The runtime's own interpreter, for programs tests start outside the sandbox
+    pub(crate) fn interpreter() -> PathBuf {
+        let installing = Runtime::install(Path::new(""));
+        let runtime = block_on(installing).expect("runtime");
+        runtime.interpreter()
+    }
+
+    #[test]
+    fn sums_parsed() {
+        let sums = "1f2e  smol-aarch64-apple-darwin.tar.gz\n\
+                    9a8b  smol-worker-aarch64-apple-darwin\n\
+                    3c4d  smol-worker-x86_64-apple-darwin\n";
+        assert_eq!(
+            summed(sums, "smol-worker-x86_64-apple-darwin"),
+            Some("3c4d")
+        );
+        assert_eq!(summed(sums, "smol-worker-apple-darwin"), None);
+    }
+
+    #[test]
+    fn venvs_named() {
+        let name = venv_name(Path::new("/home/zoë/naïve café"));
+        assert!(name.starts_with("naïve café-"), "{name}");
+        assert_eq!(name.chars().count(), "naïve café-".chars().count() + 16);
+
+        let long = "🐍".repeat(100);
+        let path = Path::new("/home").join(&long);
+        let name = venv_name(&path);
+        assert_eq!(name.chars().count(), 48 + 1 + 16, "{name}");
+        assert_ne!(
+            venv_name(Path::new("/a/work")),
+            venv_name(Path::new("/b/work"))
+        );
     }
 }

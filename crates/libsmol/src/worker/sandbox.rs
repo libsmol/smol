@@ -191,7 +191,7 @@ impl Sandbox {
                 granted.push((folder.to_owned(), false));
             }
         }
-        for path in [&python.home, &python.module] {
+        for path in [&python.runtime.home, &python.runtime.module] {
             granted.push((path.clone(), false));
         }
         for path in [cwd, &scratch, copies, &python.venv, Path::new("/dev")] {

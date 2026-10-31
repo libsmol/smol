@@ -84,7 +84,8 @@ cargo install --locked libsmol libsmol-tui
 
 To build from a checkout, run `./build.sh` (`build.ps1` on Windows).
 
-The first session downloads the Python the code runs in: CPython 3.14 from
+`libsmol setup`, or else the first session, downloads the Python the code runs
+in: CPython 3.14 from
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
 (about 30 MB) and the worker module of your `libsmol` version from its GitHub
 release, both checked against their checksums and kept in `~/.smol/runtime`.
