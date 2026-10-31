@@ -6,14 +6,17 @@ use libsmol::guest::{
 #[cfg(target_os = "macos")]
 use libsmol::guest::{confine, SANDBOX_ENV};
 use pyo3::exceptions::PyRuntimeError;
+#[cfg(windows)]
+use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyDict};
 use reaper::cause;
 use serde_json::{json, Value};
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
-use std::process;
+use std::path::{Path, PathBuf};
+use std::ptr;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -46,17 +49,22 @@ fn _smol(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 /// Runs on the main thread, where Python raises `KeyboardInterrupt`, until the agent hangs up
 #[pyfunction]
-fn serve(py: Python<'_>) -> PyResult<()> {
+fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     let environ = py.import("os")?.getattr("environ")?;
     confined(&environ)?;
     // Programs the code starts would inherit these, and they must go before any thread starts
     let control = taken(&environ, CONTROL_ENV)?;
     let copies = taken(&environ, COPIES_ENV)?;
     let agents = taken(&environ, AGENTS_ENV)?;
-    py.import("site")?.call_method0("main")?;
 
-    // Like `python -c`, which also makes argparse and runpy read `sys.argv[0]`
+    // Runs as the venv its own interpreter would run, with sys set before site reads it
+    let venv = venv_of(&python);
     let sys = py.import("sys")?;
+    sys.setattr("executable", &python)?;
+    sys.setattr("prefix", &venv)?;
+    sys.setattr("exec_prefix", &venv)?;
+    py.import("site")?.call_method0("main")?;
+    // Like `python -c`, which also makes argparse and runpy read `sys.argv[0]`
     sys.getattr("path")?.call_method1("insert", (0, ""))?;
     sys.setattr("argv", [""])?;
 
@@ -116,8 +124,12 @@ fn serve(py: Python<'_>) -> PyResult<()> {
     let ready = WorkerNote::Ready { functions };
     send(&Message::Note(ready));
 
-    // Threads the code started run between snippets only while this waits without the GIL
-    while let Some(message) = py.detach(|| block_on(inbox.recv())) {
+    loop {
+        // Threads the code started run between snippets only while this waits without the GIL
+        let receiving = inbox.recv();
+        let Some(message) = py.detach(|| block_on(receiving)) else {
+            return Ok(());
+        };
         // An interrupt that arrived after the previous snippet finished isn't for this one
         py.check_signals().ok();
         let (id, call) = match message {
@@ -165,18 +177,24 @@ fn serve(py: Python<'_>) -> PyResult<()> {
         let reply = Message::reply(id, result);
         send(&reply);
     }
+}
+
+/// Makes the venv of `python` anew for the runtime running this, confined like the worker
+#[pyfunction]
+fn renew(py: Python<'_>, python: OsString) -> PyResult<()> {
+    let environ = py.import("os")?.getattr("environ")?;
+    confined(&environ)?;
+    let venv = venv_of(&python);
+    let args = [venv, OsString::from("--clear")];
+    py.import("venv")?.call_method1("main", (args,))?;
     Ok(())
 }
 
-/// Makes the venv in `VIRTUAL_ENV` anew for the Python running this, confined like the worker
-#[pyfunction]
-fn renew(py: Python<'_>) -> PyResult<()> {
-    let environ = py.import("os")?.getattr("environ")?;
-    confined(&environ)?;
-    let venv: String = environ.get_item("VIRTUAL_ENV")?.extract()?;
-    let args = [venv.as_str(), "--clear"];
-    py.import("venv")?.call_method1("main", (args,))?;
-    Ok(())
+/// The venv holding the interpreter in its `bin` or `Scripts` folder
+fn venv_of(python: &OsStr) -> OsString {
+    let python = Path::new(python);
+    let venv = python.parent().and_then(Path::parent).unwrap_or(python);
+    venv.as_os_str().to_owned()
 }
 
 /// Takes the Seatbelt profile from the environment and applies it,
@@ -223,8 +241,9 @@ fn listen(stream: TcpStream, queue: UnboundedSender<ToWorker>) {
             }
         }
     }
-    // The agent hung up and the running code need not finish
-    process::exit(0);
+    // The agent hung up and the running code need not finish.
+    // SAFETY: Ends the process at once, without running C extensions' cleanup under the code
+    unsafe { libc::_exit(0) }
 }
 
 /// Like Ctrl-C, it also wakes code blocked in a system call
@@ -238,11 +257,14 @@ fn interrupt() {
 #[cfg(windows)]
 fn interrupt() {
     // SAFETY: Python allows it from any thread without the GIL, and SIGINT is 2 on Windows too
-    unsafe { pyo3::ffi::PyErr_SetInterruptEx(2) };
+    unsafe { ffi::PyErr_SetInterruptEx(2) };
 }
 
-/// The output is written to the same pipe as the code's, after everything it printed
+/// Marks the end of the output on the pipe the code also writes to
 fn ended() {
+    // C extensions print through C's stdio, which holds what goes to a pipe until flushed.
+    // SAFETY: A null stream flushes every open one
+    unsafe { libc::fflush(ptr::null_mut()) };
     let mut stdout = io::stdout();
     stdout.write_all(END).ok();
     stdout.flush().ok();

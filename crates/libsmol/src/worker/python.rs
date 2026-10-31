@@ -1,5 +1,5 @@
 use crate::memory::Exit;
-use crate::spawn::{drain, Clip, Group, KEPT_BYTES};
+use crate::spawn::{drain, Clip, Group, Piece, KEPT_BYTES};
 use crate::utils::{http_cause, http_client, new_id};
 use crate::worker::sandbox::Sandbox;
 use flate2::read::GzDecoder;
@@ -15,8 +15,10 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tar::Archive;
 use tokio::process::Command;
+use tokio::select;
 use tokio::task;
 use tracing::info;
 
@@ -48,10 +50,14 @@ const BUILDS: [(&str, &str); 5] = [
     ),
 ];
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Holds the runtime and the worker module in the config directory
+/// Holds the runtimes, the worker modules and their locks in the config directory
 const STORE: &str = "python";
+/// Holds a folder of venvs for each runtime in the config directory
+const VENVS: &str = "venvs";
 const LOCK: &str = "lock";
-/// Venvs name the folder of the interpreter they run as their home
+#[cfg(not(test))]
+const MAX_NAME_CHARS: usize = 48;
+const DOWNLOAD_WAIT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const HOME_BIN: &str = "bin";
 #[cfg(windows)]
@@ -64,68 +70,35 @@ const VENV_BIN: &str = "Scripts";
 const EXE: &str = "python";
 #[cfg(windows)]
 const EXE: &str = "python.exe";
-/// Loads the worker module from the path in `sys.argv[1]` whatever its file name,
-/// then calls its function named in `sys.argv[2]`
+/// Loads the worker module from `sys.argv[1]` whatever its file name,
+/// and calls the function named in `sys.argv[2]` with the venv's interpreter
 const LOADER: &str = "import sys
 from importlib.machinery import ExtensionFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 loader = ExtensionFileLoader('_smol', sys.argv[1])
 module = module_from_spec(spec_from_loader('_smol', loader))
 loader.exec_module(module)
-getattr(module, sys.argv[2])()";
+getattr(module, sys.argv[2])(sys.argv[3])";
 
-/// Where a session's worker finds Python, made to exist by `command`
+/// The Python a session's worker runs, kept in place while the session lasts
 pub(crate) struct Python {
-    /// Shared by every session and only read by the code
-    pub(crate) store: PathBuf,
-    home: PathBuf,
-    module: PathBuf,
-    /// Kept for each working directory, where the code installs packages
+    store: PathBuf,
+    /// The runtime, which the code only reads
+    pub(crate) home: PathBuf,
+    /// The worker module, which the code only reads
+    pub(crate) module: PathBuf,
+    /// Kept for the working directory, where the code installs packages
     pub(crate) venv: PathBuf,
+    /// Written by the agent once the venv is complete, where the code can't see it
+    ready: PathBuf,
+    /// Shared locks on the runtime and the module, which other libsmol versions don't remove
+    _held: [File; 2],
 }
 
 impl Python {
-    pub(crate) fn new(config: &Path, cwd: &Path) -> Self {
-        let (store, module, venv) = places(config, cwd);
-        let home = format!("cpython-{PYTHON}+{RELEASE}");
-        let home = store.join(home);
-        Self {
-            store,
-            home,
-            module,
-            venv,
-        }
-    }
-
-    /// Holds `python` and `pip`, so programs the code starts find them first on `PATH`
-    pub(crate) fn bin(&self) -> PathBuf {
-        self.venv.join(VENV_BIN)
-    }
-
-    /// Installs what is missing first
-    pub(crate) async fn command(&self, sandbox: &Sandbox) -> Result<Command, String> {
-        if !self.home.exists() || !self.module.exists() {
-            self.install().await?;
-        }
-        self.renew(sandbox).await?;
-
-        let python = self.bin().join(EXE);
-        let command = self.loading(sandbox, &python, "serve");
-        Ok(command)
-    }
-
-    /// Without site, nothing the code could have written runs before the module confines itself
-    fn loading(&self, sandbox: &Sandbox, python: &Path, function: &str) -> Command {
-        let mut command = sandbox.command(python);
-        command
-            .args(["-I", "-S", "-B", "-X", "utf8", "-c", LOADER])
-            .arg(&self.module)
-            .arg(function);
-        command
-    }
-
-    /// Downloads the runtime and the worker module, and removes those of other versions
-    async fn install(&self) -> Result<(), String> {
+    /// Downloads the runtime and the worker module that are missing,
+    /// and removes those of other versions that no session holds
+    pub(crate) async fn install(config: &Path, cwd: &Path) -> Result<Self, String> {
         let system = match OS {
             "linux" if cfg!(target_env = "gnu") => "unknown-linux-gnu",
             "macos" => "apple-darwin",
@@ -137,138 +110,221 @@ impl Python {
         let Some((target, sha)) = built else {
             return Err(format!("runtime: {target}: no build"));
         };
-        let _lock = locked(&self.store).await?;
-        let client = http_client(Client::builder())?;
 
-        if !self.home.exists() {
-            let name = format!("cpython-{PYTHON}+{RELEASE}-{target}-install_only_stripped.tar.gz");
-            let url = format!(
-                "https://github.com/astral-sh/python-build-standalone/releases/download/{RELEASE}/{name}"
-            );
-            let archive = download(&client, &url).await?;
-            checked(&name, &archive, sha)?;
-
-            // Unpacked next to it, so the rename that puts it in place stays on one device
-            let unpacked = self.store.join(new_id());
-            let into = unpacked.clone();
-            let unpacking = move || Archive::new(GzDecoder::new(&archive[..])).unpack(into);
-            let failed = |e: io::Error| {
-                let reason = cause(&e);
-                format!("runtime: {name}: {reason}")
-            };
-            let result = task::spawn_blocking(unpacking).await.expect("unpack");
-            result.map_err(failed)?;
-            fs::rename(unpacked.join("python"), &self.home).map_err(failed)?;
-            info!("python: runtime installed [version={PYTHON}+{RELEASE}]");
-        }
-
-        if !self.module.exists() {
-            let base = format!("https://github.com/libsmol/smol/releases/download/v{VERSION}");
-            let name = format!("smol-worker-{target}");
-            let url = format!("{base}/SHA256SUMS");
-            let sums = download(&client, &url).await?;
-            let sums = String::from_utf8_lossy(&sums);
-            let suffix = format!("  {name}");
-            let listed = sums.lines().find_map(|line| line.strip_suffix(&suffix));
-            let Some(sha) = listed else {
-                return Err(format!("runtime: {name}: not in SHA256SUMS"));
-            };
-            let url = format!("{base}/{name}");
-            let module = download(&client, &url).await?;
-            checked(&name, &module, sha)?;
-
-            let written = self.store.join(new_id());
-            let failed = |e: io::Error| {
-                let reason = cause(&e);
-                format!("runtime: {name}: {reason}")
-            };
-            fs::write(&written, module).map_err(failed)?;
-            fs::rename(&written, &self.module).map_err(failed)?;
-            info!("python: worker module installed [version={VERSION}]");
-        }
-
-        // A worker of another version that still runs keeps the files it already opened
-        let Ok(entries) = fs::read_dir(&self.store) else {
-            return Ok(());
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path == self.home || path == self.module || entry.file_name() == LOCK {
-                continue;
-            }
-            fs::remove_dir_all(&path)
-                .or_else(|_| fs::remove_file(&path))
-                .ok();
-        }
-        Ok(())
-    }
-
-    /// Makes the venv anew unless it runs the current runtime, which it has no way to switch to
-    async fn renew(&self, sandbox: &Sandbox) -> Result<(), String> {
-        if self.current() {
-            return Ok(());
-        }
-        // Another session in this directory may have made it while this one waited
-        let _lock = locked(&self.store).await?;
-        if self.current() {
-            return Ok(());
-        }
-
-        // The code can write the venv, so only a confined Python may touch it
-        let home = self.home.join(HOME_BIN);
-        let python = home.join(EXE);
-        let mut command = self.loading(sandbox, &python, "renew");
-        command.stdin(Stdio::null());
+        let runtime = format!("cpython-{PYTHON}+{RELEASE}");
+        let (store, module, venv) = places(config, cwd, &runtime);
+        let home = store.join(&runtime);
         let failed = |e: io::Error| {
             let reason = cause(&e);
-            format!("venv: {reason}")
+            let shown = tilde(&store);
+            format!("runtime: {shown}: {reason}")
         };
-        let (mut group, mut pieces) = Group::start(command).map_err(failed)?;
-        let exit = group.exited().await;
-        let mut output = Clip::new(KEPT_BYTES);
-        drain(&mut pieces, &mut output).await;
+        fs::create_dir_all(&store).map_err(failed)?;
+        // Taken before looking, so a removal that is under way finishes first
+        let held = [held(&store, &home).await?, held(&store, &module).await?];
 
-        if exit != Some(Exit::Exited(0)) {
-            let (said, _) = output.text();
-            let said = said.trim();
-            return Err(format!("venv: {said}"));
+        if !home.exists() || !module.exists() {
+            let _lock = locked(&store).await?;
+            let builder = Client::builder().read_timeout(DOWNLOAD_WAIT);
+            let client = http_client(builder)?;
+
+            if !home.exists() {
+                info!("python: downloading runtime [version={PYTHON}+{RELEASE}]");
+                let name = format!("{runtime}-{target}-install_only_stripped.tar.gz");
+                let url = format!(
+                    "https://github.com/astral-sh/python-build-standalone/releases/download/{RELEASE}/{name}"
+                );
+                let archive = download(&client, &url).await?;
+                checked(&name, &archive, sha)?;
+
+                // Inside the store, because a rename moves a folder only within one file system
+                let id = new_id();
+                let unpacked = store.join(format!(".{id}"));
+                let into = unpacked.clone();
+                let unpacking = move || Archive::new(GzDecoder::new(&archive[..])).unpack(into);
+                let result = task::spawn_blocking(unpacking).await.expect("unpack");
+                result.map_err(failed)?;
+                let unpacked = unpacked.join("python");
+                // The code can't write the runtime's bytecode, and nothing has run it yet.
+                // Bytecode only speeds up imports, so files that fail to compile don't stop this
+                let python = unpacked.join(HOME_BIN).join(EXE);
+                let mut compiling = Command::new(python);
+                compiling
+                    .args(["-I", "-m", "compileall", "-q", "-j0"])
+                    .arg(&unpacked)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                compiling.status().await.map_err(failed)?;
+                fs::rename(&unpacked, &home).map_err(failed)?;
+                info!("python: runtime installed [version={PYTHON}+{RELEASE}]");
+            }
+
+            if !module.exists() {
+                // Tests load the module cargo built, never a released one
+                if cfg!(test) {
+                    let shown = module.display();
+                    return Err(format!("runtime: {shown}: not built"));
+                }
+                info!("python: downloading worker module [version={VERSION}]");
+                let base = format!("https://github.com/libsmol/smol/releases/download/v{VERSION}");
+                let name = format!("smol-worker-{target}");
+                let url = format!("{base}/SHA256SUMS");
+                let sums = download(&client, &url).await?;
+                let sums = String::from_utf8_lossy(&sums);
+                let suffix = format!("  {name}");
+                let listed = sums.lines().find_map(|line| line.strip_suffix(&suffix));
+                let Some(sha) = listed else {
+                    return Err(format!("runtime: {name}: not in SHA256SUMS"));
+                };
+                let url = format!("{base}/{name}");
+                let bytes = download(&client, &url).await?;
+                checked(&name, &bytes, sha)?;
+
+                let id = new_id();
+                let written = store.join(format!(".{id}"));
+                fs::write(&written, bytes).map_err(failed)?;
+                fs::rename(&written, &module).map_err(failed)?;
+                info!("python: worker module installed [version={VERSION}]");
+            }
+
+            // Lock files stay, since another session may be about to lock the one it opened
+            let entries = fs::read_dir(&store).map_err(failed)?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let current = path == home || path == module;
+                if current || name == LOCK || name.ends_with(".lock") {
+                    continue;
+                }
+                // Unfinished installs start with a dot, and this one holds the install lock
+                let unfinished = name.starts_with('.');
+                let lock = store.join(format!("{name}.lock"));
+                let lock = match unfinished {
+                    true => None,
+                    false => File::create(lock).ok(),
+                };
+                // Kept locked until the removal is done
+                let free = lock.as_ref().is_some_and(|file| file.try_lock().is_ok());
+                if !unfinished && !free {
+                    continue;
+                }
+                fs::remove_dir_all(&path)
+                    .or_else(|_| fs::remove_file(&path))
+                    .ok();
+                // The venvs of a runtime that is gone
+                let venvs = config.join(VENVS).join(&*name);
+                fs::remove_dir_all(venvs).ok();
+            }
         }
-        let shown = tilde(&self.venv);
-        info!("python: venv created [path={shown}]");
-        Ok(())
+
+        let mut ready = venv.clone().into_os_string();
+        ready.push(".ready");
+        Ok(Self {
+            store,
+            home,
+            module,
+            venv,
+            ready: PathBuf::from(ready),
+            _held: held,
+        })
     }
 
-    /// The venv names the current runtime as its home
-    fn current(&self) -> bool {
-        let config = self.venv.join("pyvenv.cfg");
-        let text = fs::read_to_string(config).unwrap_or_default();
-        let named = text.lines().find_map(|line| line.strip_prefix("home = "));
-        let named = named.and_then(|named| fs::canonicalize(named).ok());
-        let home = self.home.join(HOME_BIN);
-        named.is_some() && named == fs::canonicalize(home).ok()
+    /// Holds `python` and `pip`, which programs the code starts find first on `PATH`
+    pub(crate) fn bin(&self) -> PathBuf {
+        self.venv.join(VENV_BIN)
     }
+
+    /// The code can break the venv but never the record, so a missing interpreter also counts
+    fn ready(&self) -> bool {
+        let python = self.bin().join(EXE);
+        self.ready.exists() && python.exists()
+    }
+}
+
+/// The worker's command, with the venv made anew unless the agent recorded it complete
+pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
+    let python = &sandbox.python;
+    let runtime = python.home.join(HOME_BIN).join(EXE);
+    let venv = python.bin().join(EXE);
+
+    if !python.ready() {
+        // Another session in this directory may have made it while this one waited
+        let _lock = locked(&python.store).await?;
+        if !python.ready() {
+            let mut renewing = loading(sandbox, &runtime, "renew", &venv);
+            renewing.stdin(Stdio::null());
+            let failed = |e: io::Error| {
+                let reason = cause(&e);
+                format!("venv: {reason}")
+            };
+            let (mut group, mut pieces) = Group::start(renewing).map_err(failed)?;
+            let mut output = Clip::new(KEPT_BYTES);
+            // Read while it runs, since a full pipe would stall it
+            let exit = loop {
+                select! {
+                    exit = group.exited() => break exit,
+                    Some(piece) = pieces.recv() => {
+                        if let Piece::Output(bytes) = piece {
+                            output.push(&bytes);
+                        }
+                    }
+                }
+            };
+            drain(&mut pieces, &mut output).await;
+
+            if exit != Some(Exit::Exited(0)) {
+                let (said, _) = output.text();
+                let said = said.trim();
+                let reason = match exit {
+                    Some(exit) if said.is_empty() => exit.to_string(),
+                    _ => said.to_owned(),
+                };
+                return Err(format!("venv: {reason}"));
+            }
+            fs::write(&python.ready, "").map_err(failed)?;
+            let shown = tilde(&python.venv);
+            info!("python: venv created [path={shown}]");
+        }
+    }
+
+    let serving = loading(sandbox, &runtime, "serve", &venv);
+    Ok(serving)
+}
+
+/// Starts the runtime's interpreter, which the code can't write, unlike the venv's.
+/// Without site, nothing the code wrote runs before the module confines itself
+fn loading(sandbox: &Sandbox, runtime: &Path, function: &str, venv: &Path) -> Command {
+    let mut command = sandbox.command(runtime);
+    command
+        .args(["-I", "-S", "-B", "-X", "utf8", "-c", LOADER])
+        .arg(&sandbox.python.module)
+        .arg(function)
+        .arg(venv);
+    command
 }
 
 /// The store, the worker module and the venv, which is named after the working directory
 #[cfg(not(test))]
-fn places(config: &Path, cwd: &Path) -> (PathBuf, PathBuf, PathBuf) {
+fn places(config: &Path, cwd: &Path, runtime: &str) -> (PathBuf, PathBuf, PathBuf) {
     let store = config.join(STORE);
     let module = format!("worker-{VERSION}{DLL_SUFFIX}");
     let module = store.join(module);
 
     let digest = Sha256::digest(cwd.as_os_str().as_encoded_bytes());
     let hash = hex(&digest);
-    let mut name = cwd.file_name().unwrap_or_default().to_owned();
-    name.push("-");
-    name.push(&hash[..16]);
-    let venv = config.join("venvs").join(name);
+    let named = cwd.file_name().unwrap_or_default().to_string_lossy();
+    let named: String = named.chars().take(MAX_NAME_CHARS).collect();
+    let name = format!("{named}-{}", &hash[..16]);
+    let venv = config.join(VENVS).join(runtime).join(name);
     (store, module, venv)
 }
 
 /// Tests share one runtime and venv, and load the worker module `cargo test` built next to them,
 /// which only `cargo build` copies up into the profile folder
 #[cfg(test)]
-fn places(_: &Path, _: &Path) -> (PathBuf, PathBuf, PathBuf) {
+fn places(_: &Path, _: &Path, _: &str) -> (PathBuf, PathBuf, PathBuf) {
     let exe = env::current_exe().expect("test binary");
     let deps = exe.parent().expect("deps");
     let built = deps.parent().expect("profile");
@@ -301,18 +357,43 @@ fn hex(bytes: &[u8]) -> String {
     digits.concat()
 }
 
-/// Waits off the runtime's thread while another libsmol holds the lock
+/// Waits off the runtime's thread while another libsmol installs
 async fn locked(store: &Path) -> Result<File, String> {
     let path = store.join(LOCK);
-    let locking = move || {
+    lock(path, File::lock).await
+}
+
+/// Waits off the runtime's thread while another libsmol removes it
+async fn held(store: &Path, item: &Path) -> Result<File, String> {
+    let name = item.file_name().unwrap_or_default().to_string_lossy();
+    let path = store.join(format!("{name}.lock"));
+    lock(path, File::lock_shared).await
+}
+
+async fn lock(path: PathBuf, locking: fn(&File) -> io::Result<()>) -> Result<File, String> {
+    let shown = tilde(&path);
+    let opening = move || {
         let file = File::create(&path)?;
-        file.lock()?;
+        locking(&file)?;
         io::Result::Ok(file)
     };
-    let locked = task::spawn_blocking(locking).await.expect("lock");
+    let opened = task::spawn_blocking(opening).await.expect("lock");
     let failed = |e: io::Error| {
         let reason = cause(&e);
-        format!("runtime: {LOCK}: {reason}")
+        format!("runtime: {shown}: {reason}")
     };
-    locked.map_err(failed)
+    opened.map_err(failed)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use crate::utils::block_on;
+    use crate::worker::python::Python;
+    use std::path::Path;
+
+    /// The runtime and venv tests share
+    pub(crate) fn installed(config: &Path, cwd: &Path) -> Python {
+        let installing = Python::install(config, cwd);
+        block_on(installing).expect("python")
+    }
 }

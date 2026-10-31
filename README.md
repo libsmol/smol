@@ -88,6 +88,9 @@ The first session downloads the Python the code runs in: CPython 3.14 from
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
 (about 30 MB) and the worker module of your `libsmol` version from its GitHub
 release, both checked against their checksums and kept in `~/.smol/python`.
+The runtime's checksum is built into `libsmol`; the module's comes from the
+same release's `SHA256SUMS`, as with the install scripts. Versions no open
+session uses are removed when another version installs.
 
 ## Configure a model
 
@@ -385,9 +388,12 @@ the default is `warn,libsmol=info`, `SMOL_LOG=warn` keeps only problems,
 ## Limitations
 
 - **The Python is smol's own CPython 3.14**, the same on every machine, in a
-  venv kept for each working directory in `~/.smol/venvs`. The code doesn't
-  see the Pythons and virtualenvs you installed, and the packages it installs
-  stay in that venv.
+  venv kept for each working directory in `~/.smol/venvs`. `python`, `pip`
+  and imports resolve to that venv, not to the Pythons and virtualenvs you
+  installed, which stay on `PATH` after it. Every session in the directory and
+  the agents they start share the venv and keep what it installed, until a
+  new runtime gets a new one; to start over, delete it while no session in
+  that directory is open.
 - **Interrupting** stops code in place, and the session keeps its variables.
   Code blocked where an interrupt cannot reach it (for example `os.system`, a
   long call inside a C extension, or most blocking calls on Windows) gets 3

@@ -274,7 +274,7 @@ These need no import. Use them instead of writing your own, and create new files
 # Environment
 
 - Your code runs on the user's computer ({OS}) in `{cwd}`; the files and programs a task mentions are there.
-- Python is CPython {PYTHON} in a venv of its own: packages you install with `pip install` can be imported in this session right away.{sandbox}
+- Python is CPython {PYTHON} in a venv kept for this folder: packages you install with `pip install` can be imported in this session right away.{sandbox}
 - Today is {date} (UTC).
 - Your answer goes to the user; no hidden tests or graders check your work.
 
@@ -795,7 +795,7 @@ mod tests {
         assert!(text.contains(handed), "{text}");
         let place = format!(
             ") in `/home/zoë/work`; the files and programs a task mentions are there.\n\
-             - Python is CPython {PYTHON} in a venv of its own: packages you install with `pip install` can be imported in this session right away.\n\
+             - Python is CPython {PYTHON} in a venv kept for this folder: packages you install with `pip install` can be imported in this session right away.\n\
              - Today"
         );
         assert!(text.contains(&place), "{text}");

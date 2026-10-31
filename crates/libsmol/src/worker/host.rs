@@ -4,6 +4,7 @@ use crate::prompt::{self, NO_SERVER};
 use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
 use crate::tools::mcp::Server;
 use crate::utils::{new_id, Interrupt, Reply};
+use crate::worker::python;
 use crate::worker::sandbox::Sandbox;
 use crate::worker::{
     AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
@@ -176,8 +177,7 @@ impl Worker {
             return Ok(());
         }
 
-        let python = &self.sandbox.python;
-        let prepared = python.command(&self.sandbox).await;
+        let prepared = python::command(&self.sandbox).await;
         let mut command = prepared.map_err(|reason| prompt::unstarted(&reason))?;
         let failed = |e: io::Error| {
             let reason = cause(&e);
@@ -600,7 +600,7 @@ pub(crate) mod tests {
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
     use crate::tools::mcp::tests::{fake, started};
     use crate::tools::mcp::Server;
-    use crate::utils::{block_on, Interrupt};
+    use crate::utils::{block_on, new_id, Interrupt};
     use crate::worker::host::{Added, Called, Calling, Delegating, Evaluated, Worker, STOP_WAIT};
     use crate::worker::sandbox::tests::opened;
     use crate::worker::{AgentCall, Delegation};
@@ -1165,7 +1165,7 @@ pub(crate) mod tests {
     }
 
     /// Modules in the working directory are importable, argparse and runpy read `sys.argv[0]`,
-    /// and `sys.executable` is not the worker
+    /// and the code runs as the venv, whose `pip` comes first on `PATH`
     #[test]
     fn interpreter_settings() {
         let dir = temp_dir("settings");
@@ -1174,11 +1174,12 @@ pub(crate) mod tests {
         fs::write(&module, "value = 42\n").expect("write");
 
         let mut worker = build(Interrupt::default(), dir.clone(), Delegation::On);
-        let code = "import argparse, pathlib, runpy, smol_local, sys\n\
+        let code = "import argparse, os, pathlib, runpy, shutil, smol_local, sys\n\
              print(smol_local.value)\n\
              _ = pathlib.Path('script.py').write_text('import sys\\nprint(sys.argv[0])')\n\
              _ = runpy.run_path('script.py')\n\
-             print(sys.executable)\n\
+             pip = os.path.dirname(shutil.which('pip'))\n\
+             print(sys.prefix == os.environ['VIRTUAL_ENV'] != sys.base_prefix, pip == os.path.dirname(sys.executable))\n\
              parser = argparse.ArgumentParser()\n\
              _ = parser.add_argument('name')\n\
              parser.parse_args(['Zoë']).name";
@@ -1186,13 +1187,26 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(output.error, None);
-        let lines: Vec<&str> = output.logs.lines().collect();
-        let [value, script, executable, name] = lines[..] else {
-            panic!("{}", output.logs);
-        };
-        assert_eq!([value, script, name], ["42", "script.py", "Zoë"]);
-        let itself = env::current_exe().expect("current exe");
-        assert_ne!(Path::new(executable), itself);
+        assert_eq!(output.logs, "42\nscript.py\nTrue True\nZoë\n");
+    }
+
+    /// What pip puts in the venv imports in the same session
+    #[test]
+    fn packages_imported() {
+        let mut worker = fresh();
+        let name = new_id().replace('-', "_");
+        let name = format!("smol_{name}");
+        let code = format!(
+            "import pathlib, site\n\
+             installed = pathlib.Path(site.getsitepackages()[0]) / '{name}.py'\n\
+             _ = installed.write_text('value = \"naïve\"')"
+        );
+        worker.eval(&code);
+        let code = format!("import {name}\ninstalled.unlink()\n{name}.value");
+        let output = worker.eval(&code);
+
+        assert_eq!(output.error, None);
+        assert_eq!(output.logs, "naïve\n");
     }
 
     #[test]
@@ -1374,6 +1388,8 @@ pub(crate) mod tests {
             "import time\ntime.sleep(30)",
             "import socket\na, b = socket.socketpair()\na.recv(1)",
             "import asyncio\nasyncio.run(asyncio.sleep(30))",
+            "import queue\nqueue.Queue().get()",
+            "import threading\nthreading.Event().wait()",
             "while True:\n    print('a line')",
         ];
         let (mut worker, interrupt) = interruptible();

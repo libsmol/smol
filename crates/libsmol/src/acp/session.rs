@@ -9,6 +9,7 @@ use crate::memory::{AgentMemory, Exit, MemoryStep};
 use crate::spawn::{spawn_shell, Group};
 use crate::utils::Interrupt;
 use crate::worker::host::Worker;
+use crate::worker::python::Python;
 use crate::worker::sandbox::Sandbox;
 use crate::worker::Delegation;
 use crate::{Error, Result};
@@ -224,7 +225,10 @@ async fn start(opening: Opening) -> Result<Session> {
     );
     translator.replay(&memory);
 
-    let sandbox = Sandbox::new(&cwd, &copies, &app.config, &skills, &access);
+    // The sandbox grants the runtime by the folders that exist when it is made
+    let python = Python::install(&app.config, &cwd).await;
+    let python = python.map_err(Error::Python)?;
+    let sandbox = Sandbox::new(&cwd, &copies, &app.config, &skills, &access, python);
     let sandbox = sandbox.map_err(Error::Python)?;
     let sandbox = Arc::new(sandbox);
     // No restart notice again when no code has run since the last restart

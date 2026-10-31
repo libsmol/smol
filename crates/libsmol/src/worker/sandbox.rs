@@ -92,6 +92,7 @@ const PASSED_ENV: &[&str] = &[
 const TEMP_ENV: &[&str] = &["TMPDIR"];
 #[cfg(windows)]
 const TEMP_ENV: &[&str] = &["TEMP", "TMP"];
+const VENV_ENV: &str = "VIRTUAL_ENV";
 
 /// The Landlock ruleset the worker restricts itself with
 #[cfg(target_os = "linux")]
@@ -121,13 +122,15 @@ pub(crate) struct Sandbox {
 }
 
 impl Sandbox {
-    /// `config` is hidden like the credential locations, but `copies` and skill folders in it are not
+    /// `config` is hidden like the credential locations,
+    /// but `copies`, skill folders and the parts of `python` in it are not
     pub(crate) fn new(
         cwd: &Path,
         copies: &Path,
         config: &Path,
         skills: &[Skill],
         access: &Access,
+        python: Python,
     ) -> Result<Self, String> {
         let id = new_id();
         let name = format!("{TEMP_PREFIX}{id}");
@@ -143,7 +146,7 @@ impl Sandbox {
         let mut sandbox = Self {
             cwd: cwd.to_owned(),
             copies: copies.to_owned(),
-            python: Python::new(config, cwd),
+            python,
             temp: temp.clone(),
             writable: Vec::new(),
             lock: None,
@@ -156,29 +159,31 @@ impl Sandbox {
         sandbox.lock = Some(lock);
         // A Landlock rule holds on to the folder that exists when the rule is made
         let python = &sandbox.python;
-        for folder in [copies, &python.store, &python.venv] {
+        for folder in [copies, &python.venv] {
             fs::create_dir_all(folder).map_err(|e| failed(folder, e))?;
         }
 
         let passed = PASSED_ENV.iter().copied();
         let named = access.env.iter().map(String::as_str);
         for name in passed.chain(named) {
-            if let Some(value) = env::var_os(name) {
-                sandbox.env.push((OsString::from(name), value));
+            let Some(mut value) = env::var_os(name) else {
+                continue;
+            };
+            // Programs the code starts find the venv's `python` and `pip` first
+            if name == "PATH" {
+                let paths = iter::once(python.bin()).chain(env::split_paths(&value));
+                if let Ok(joined) = env::join_paths(paths) {
+                    value = joined;
+                }
             }
+            sandbox.env.push((OsString::from(name), value));
         }
         for name in TEMP_ENV {
             let value = scratch.clone().into_os_string();
             sandbox.env.push((OsString::from(name), value));
         }
-        // Comes after the passed `PATH` and overrides it, with the venv's `python` and `pip` first
-        let path = env::var_os("PATH").unwrap_or_default();
-        let paths = iter::once(python.bin()).chain(env::split_paths(&path));
-        if let Ok(path) = env::join_paths(paths) {
-            sandbox.env.push((OsString::from("PATH"), path));
-        }
         let venv = python.venv.clone().into_os_string();
-        sandbox.env.push((OsString::from("VIRTUAL_ENV"), venv));
+        sandbox.env.push((OsString::from(VENV_ENV), venv));
 
         let mut granted = vec![(PathBuf::from("/"), false)];
         for skill in skills {
@@ -186,7 +191,9 @@ impl Sandbox {
                 granted.push((folder.to_owned(), false));
             }
         }
-        granted.push((python.store.clone(), false));
+        for path in [&python.home, &python.module] {
+            granted.push((path.clone(), false));
+        }
         for path in [cwd, &scratch, copies, &python.venv, Path::new("/dev")] {
             granted.push((path.to_owned(), true));
         }
@@ -526,9 +533,12 @@ pub(crate) mod tests {
     use crate::utils::{block_on, new_id, Interrupt};
     use crate::worker::host::tests::no_agents;
     use crate::worker::host::Worker;
+    use crate::worker::python::tests::installed;
     #[cfg(target_os = "linux")]
     use crate::worker::sandbox::{landlock_abi, spread};
-    use crate::worker::sandbox::{profile, sweep, Sandbox, LOCK, PASSED_ENV, TEMP_PREFIX};
+    use crate::worker::sandbox::{
+        profile, sweep, Sandbox, LOCK, PASSED_ENV, TEMP_PREFIX, VENV_ENV,
+    };
     use crate::worker::Delegation;
     use std::env;
     use std::fs;
@@ -547,7 +557,8 @@ pub(crate) mod tests {
     pub(crate) fn opened(cwd: &Path, copies: &Path) -> Sandbox {
         let config = copies.parent().expect("parent");
         let access = Access::default();
-        Sandbox::new(cwd, copies, config, &[], &access).expect("sandbox")
+        let python = installed(config, cwd);
+        Sandbox::new(cwd, copies, config, &[], &access, python).expect("sandbox")
     }
 
     #[test]
@@ -647,7 +658,9 @@ pub(crate) mod tests {
         };
         let config = dir.join("config");
         let copies = config.join("copies");
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access).expect("sandbox");
+        let python = installed(&config, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, python);
+        let sandbox = sandbox.expect("sandbox");
         #[cfg(target_os = "macos")]
         assert!(sandbox.enforced());
         if !sandbox.enforced() {
@@ -692,7 +705,8 @@ pub(crate) mod tests {
         let _scoped = UnixListener::bind_addr(&address).expect("bind");
         let config = dir.join("config");
         let copies = config.join("copies");
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &Access::default());
+        let python = installed(&config, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &Access::default(), python);
         let sandbox = sandbox.expect("sandbox");
         #[cfg(target_os = "macos")]
         assert!(sandbox.enforced());
@@ -746,7 +760,7 @@ pub(crate) mod tests {
             let passed = PASSED_ENV
                 .iter()
                 .any(|known| known.eq_ignore_ascii_case(&name));
-            if !passed && !name.starts_with("SMOL_") {
+            if !passed && !name.starts_with("SMOL_") && name != VENV_ENV {
                 unpassed.push(name);
             }
         }
@@ -762,7 +776,8 @@ pub(crate) mod tests {
             ..Access::default()
         };
         let copies = dir.join("copies");
-        let sandbox = Sandbox::new(&cwd, &copies, &dir, &[], &access).expect("sandbox");
+        let python = installed(&dir, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &dir, &[], &access, python).expect("sandbox");
         let scratch = sandbox.temp.join("tmp").display().to_string();
         let code = format!(
             "import os, tempfile\n[name in os.environ for name in ({allowed:?}, {dropped:?})] + [tempfile.gettempdir() == {scratch:?}]"
