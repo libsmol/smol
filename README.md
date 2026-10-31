@@ -90,8 +90,8 @@ in: CPython 3.14 from
 (about 30 MB) and the worker module of your `libsmol` version from its GitHub
 release, both checked against their checksums and kept in `~/.smol/runtime`.
 The runtime's checksum is built into `libsmol`; the module's comes from the
-same release's `SHA256SUMS`, as with the install scripts. Versions no open
-session uses are removed when another version installs.
+same release's `SHA256SUMS`, as with the install scripts. Versions that no
+session has used for a week are removed.
 
 ## Configure a model
 

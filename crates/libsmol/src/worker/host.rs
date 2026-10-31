@@ -1224,6 +1224,39 @@ pub(crate) mod tests {
         assert_eq!(output.logs, "naïve\n");
     }
 
+    /// Python that multiprocessing starts gets the worker's flags and must still run site
+    #[test]
+    fn children_run_site() {
+        let mut worker = fresh();
+        let code = "import multiprocessing\n\
+             with multiprocessing.get_context('spawn').Pool(1) as pool:\n    \
+                 flag = pool.apply(eval, (\"__import__('sys').flags.no_site\",))\n\
+             flag";
+        let output = worker.eval(code);
+
+        assert_eq!(output.error, None);
+        assert_eq!(output.logs, "0\n");
+    }
+
+    /// A pool fails at once instead of waiting on a process that can't import the code
+    #[test]
+    fn pool_refuses_code() {
+        let mut worker = fresh();
+        let code = "import multiprocessing\n\
+             def square(x):\n    return x * x\n\
+             with multiprocessing.get_context('spawn').Pool(1) as pool:\n    \
+                 pool.map(square, [3])";
+        let output = worker.eval(code);
+        let message = error(output);
+        let expected = "PicklingError: square is defined in your code, \
+                        which other Python processes can't import; put it in a .py file and import it";
+        assert!(message.starts_with(expected), "{message}");
+
+        let output = worker.eval("import pickle\npickle.loads(pickle.dumps(square))(3)");
+        assert_eq!(output.error, None);
+        assert_eq!(output.logs, "9\n");
+    }
+
     #[test]
     fn argument_binding() {
         let mut worker = fresh();

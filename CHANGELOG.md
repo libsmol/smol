@@ -17,7 +17,10 @@ but their files stay in `~/.smol/history` untouched.
   `~/.smol/venvs` and shared by its sessions, until the directory is gone.
   `pip install` puts packages there, C extensions such as numpy and pandas
   included, and the session can import them right away; `sys.executable` and
-  the `python` and `pip` on `PATH` are the venv's. On Linux and macOS, code
+  the `python` and `pip` on `PATH` are the venv's. Functions and classes the
+  code defines can't be sent to other processes, which can't import them, so
+  `multiprocessing` and `concurrent.futures` raise an error that says to put
+  them in a `.py` file. On Linux and macOS, code
   that waits on a lock or a queue can now be interrupted. A syntax error points
   at an unclosed bracket instead of the end of the line, and plain Python runs
   several times faster. The system prompt says which Python it is, that its

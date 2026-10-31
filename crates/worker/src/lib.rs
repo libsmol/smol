@@ -57,13 +57,16 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     let copies = taken(&environ, COPIES_ENV)?;
     let agents = taken(&environ, AGENTS_ENV)?;
 
-    // Runs as the venv its own interpreter would run, with sys set before site reads it
+    // Runs site again as the venv's own interpreter would, once sys names the venv.
+    // Site took its prefixes from the runtime when it ran at start
     let venv = venv_of(&python);
     let sys = py.import("sys")?;
     sys.setattr("executable", &python)?;
     sys.setattr("prefix", &venv)?;
     sys.setattr("exec_prefix", &venv)?;
-    py.import("site")?.call_method0("main")?;
+    let site = py.import("site")?;
+    site.setattr("PREFIXES", [&venv])?;
+    site.call_method0("main")?;
 
     let Some((address, token)) = control.split_once('/') else {
         let message = format!("worker: {CONTROL_ENV}: not set by the agent");

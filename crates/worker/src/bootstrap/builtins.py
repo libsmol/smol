@@ -2,10 +2,12 @@ import builtins as _builtins
 import inspect as _inspect
 import io as _io
 import os as _os
+import pickle as _pickle
 import re as _re
 import sys as _sys
 import types as _types
 import weakref as _weakref
+from multiprocessing.reduction import ForkingPickler as _ForkingPickler
 
 _FILENAME = "<smolcode>"
 _BOOTSTRAP = (lambda: None).__code__.co_filename
@@ -13,6 +15,14 @@ _BOOTSTRAP = (lambda: None).__code__.co_filename
 _MAIN = _types.ModuleType("__main__")
 _sys.modules["__main__"] = _MAIN
 _STATE = vars(_MAIN)
+
+def _unsent(self, obj):
+    if isinstance(obj, (_types.FunctionType, type)) and getattr(obj, "__module__", None) == "__main__":
+        raise _pickle.PicklingError(f"{obj.__qualname__} is defined in your code, which other Python processes can't import; put it in a .py file and import it")
+    return NotImplemented
+
+# Other processes can't import a __main__ without a file, and a Pool waits forever on a worker that fails to
+_ForkingPickler.reducer_override = _unsent
 
 _REAL_OPEN = _io.open
 _REAL_PRINT = print

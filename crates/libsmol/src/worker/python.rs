@@ -15,12 +15,12 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tar::Archive;
 use tokio::process::Command;
 use tokio::select;
 use tokio::task;
-use tracing::info;
+use tracing::{info, Span};
 
 /// The python-build-standalone release the worker runs
 const RELEASE: &str = "20261026";
@@ -58,6 +58,8 @@ const VENVS: &str = "venvs";
 const LOCK: &str = "lock";
 const MAX_NAME_CHARS: usize = 48;
 const DOWNLOAD_WAIT: Duration = Duration::from_secs(30);
+/// How long another version's runtime or module goes unused before it is removed
+const MIN_IDLE: Duration = Duration::from_hours(7 * 24);
 #[cfg(unix)]
 const HOME_BIN: &str = "bin";
 #[cfg(windows)]
@@ -74,6 +76,11 @@ const EXE: &str = "python.exe";
 const PIP: &str = "pip";
 #[cfg(windows)]
 const PIP: &str = "pip.exe";
+/// The runtime's own site-packages, removed since site at start would put it ahead of the venv's
+#[cfg(unix)]
+const SITE: &str = "lib/python3.14/site-packages";
+#[cfg(windows)]
+const SITE: &str = "Lib/site-packages";
 /// Loads the worker module from `sys.argv[1]` whatever its file name,
 /// and calls the function named in `sys.argv[2]` with the venv's interpreter
 const LOADER: &str = "import sys
@@ -96,7 +103,7 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
-    /// Downloads what is missing, and then removes what other versions left that no session holds
+    /// Downloads what is missing, and removes in the background what no session used for `MIN_IDLE`
     pub(crate) async fn install(config: &Path) -> Result<Self, String> {
         let system = match OS {
             "linux" if cfg!(target_env = "gnu") => "unknown-linux-gnu",
@@ -123,6 +130,68 @@ impl Runtime {
         let home_held = held(&home, "").await?;
         let module_held = held(&module, "").await?;
         let holds = [home_held, module_held];
+
+        let swept = store.clone();
+        let current = [home.clone(), module.clone()];
+        let venvs = config.join(VENVS);
+        let span = Span::current();
+        // Tokio runs every session on one thread, which removing a runtime and its venvs would hold.
+        // Lock files stay, since another session may be about to lock the one it opened
+        let sweeping = move || {
+            let _entered = span.enter();
+            let Ok(entries) = fs::read_dir(&swept) else {
+                return;
+            };
+            // Every install holds it, so a dot name found while it is free is what a stopped install left.
+            // Held through the sweep, or an install that starts meanwhile would lose its folder
+            let store_lock = File::options().write(true).open(swept.join(LOCK));
+            let installing = match &store_lock {
+                Ok(file) => file.try_lock().is_err(),
+                Err(_) => true,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if current.contains(&path) || name == LOCK || name.ends_with(".lock") {
+                    continue;
+                }
+                let leftover = name.starts_with('.') && !installing;
+                let locking = lock_of(&path);
+                let lock = File::options().write(true).open(locking);
+                // Kept locked until the removal is done.
+                // What no session ever held has none, like what an install that stopped left
+                let used = match &lock {
+                    Ok(file) => match file.try_lock() {
+                        Ok(()) => file.metadata(),
+                        Err(_) => continue,
+                    },
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => entry.metadata(),
+                    Err(_) => continue,
+                };
+                let modified = used.and_then(|found| found.modified());
+                let idle = modified.ok().and_then(|time| time.elapsed().ok());
+                let unused = idle.is_some_and(|idle| idle > MIN_IDLE);
+                if !leftover && !unused {
+                    continue;
+                }
+
+                // Moved aside first, so a removal that stops halfway leaves nothing that looks installed
+                let id = new_id();
+                let aside = swept.join(format!(".{id}"));
+                if fs::rename(&path, &aside).is_err() {
+                    continue;
+                }
+                fs::remove_dir_all(&aside)
+                    .or_else(|_| fs::remove_file(&aside))
+                    .ok();
+                let venvs = venvs.join(&*name);
+                fs::remove_dir_all(venvs).ok();
+                info!("python: removed [name={name}]");
+            }
+        };
+        task::spawn_blocking(sweeping);
+
         if home.exists() && module.exists() {
             return Ok(Self {
                 store,
@@ -145,34 +214,29 @@ impl Runtime {
 
             // Inside the store, because a rename moves a folder only within one file system
             let id = new_id();
-            let unpacked = store.join(format!(".{id}"));
-            let into = unpacked.clone();
+            let folder = store.join(format!(".{id}"));
+            let into = folder.clone();
             let unpacking = move || Archive::new(GzDecoder::new(&archive[..])).unpack(into);
             let result = task::spawn_blocking(unpacking).await.expect("unpack");
             result.map_err(failed)?;
-            let unpacked = unpacked.join("python");
+            let unpacked = folder.join("python");
             let python = unpacked.join(HOME_BIN).join(EXE);
 
             // Venvs get pip from the wheel ensurepip keeps, and nothing reads manuals or terminfo
             let mut trimming = Command::new(&python);
-            trimming
-                .args(["-I", "-m", "pip", "uninstall", "-y", "-q", "pip"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            trimming.status().await.map_err(failed)?;
+            trimming.args(["-I", "-m", "pip", "uninstall", "-y", "-q", "pip"]);
+            finished(trimming).await.map_err(failed)?;
+            fs::remove_dir_all(unpacked.join(SITE)).ok();
             fs::remove_dir_all(unpacked.join("share")).ok();
 
             // Compiled before anything runs it, since the code can't write its bytecode later
             let mut compiling = Command::new(python);
             compiling
                 .args(["-I", "-m", "compileall", "-q", "-j0"])
-                .arg(&unpacked)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            compiling.status().await.map_err(failed)?;
+                .arg(&unpacked);
+            finished(compiling).await.map_err(failed)?;
             fs::rename(&unpacked, &home).map_err(failed)?;
+            fs::remove_dir(&folder).ok();
             info!("python: runtime installed [version={PYTHON}+{RELEASE}]");
         }
 
@@ -204,41 +268,6 @@ impl Runtime {
             info!("python: worker module installed [version={VERSION}]");
         }
 
-        // Lock files stay, since another session may be about to lock the one it opened.
-        // What no session ever held has none, like what an install that stopped left
-        let entries = fs::read_dir(&store).map_err(failed)?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let current = path == home || path == module;
-            if current || name == LOCK || name.ends_with(".lock") {
-                continue;
-            }
-            let locking = lock_of(&path);
-            let lock = File::options().write(true).open(locking);
-            // Kept locked until the removal is done
-            let free = match &lock {
-                Ok(file) => file.try_lock().is_ok(),
-                Err(e) => e.kind() == io::ErrorKind::NotFound,
-            };
-            if !free {
-                continue;
-            }
-            // Moved aside first, so a removal that stops halfway leaves nothing that looks installed
-            let id = new_id();
-            let aside = store.join(format!(".{id}"));
-            if fs::rename(&path, &aside).is_err() {
-                continue;
-            }
-            fs::remove_dir_all(&aside)
-                .or_else(|_| fs::remove_file(&aside))
-                .ok();
-            let venvs = config.join(VENVS).join(&*name);
-            fs::remove_dir_all(venvs).ok();
-            info!("python: removed [name={name}]");
-        }
-
         Ok(Self {
             store,
             home,
@@ -262,7 +291,8 @@ pub(crate) struct Python {
 }
 
 impl Python {
-    /// Also removes the venvs of working directories that are gone, unless a session holds them
+    /// Also removes in the background the venvs of working directories that are gone,
+    /// unless a session holds them
     pub(crate) async fn install(config: &Path, cwd: &Path) -> Result<Self, String> {
         let runtime = Runtime::install(config).await?;
         let named = runtime.home.file_name().unwrap_or_default();
@@ -280,40 +310,49 @@ impl Python {
         let hold = held(&venv, record).await?;
 
         let own = lock_of(&venv);
-        let entries = fs::read_dir(venvs).map_err(failed)?;
-        for entry in entries.flatten() {
-            let lock = entry.path();
-            let locking = lock.extension().is_some_and(|ext| ext == "lock");
-            if lock == own || !locking {
-                continue;
-            }
-            let recorded = fs::read_to_string(&lock).unwrap_or_default();
-            // One that can't be looked up now, like on a drive that is away, is not gone
-            let looked = Path::new(&recorded).try_exists();
-            if recorded.is_empty() || !matches!(looked, Ok(false)) {
-                continue;
-            }
-            let Ok(file) = File::open(&lock) else {
-                continue;
+        let swept = venvs.to_owned();
+        let span = Span::current();
+        // Tokio runs every session on one thread, which removing a large venv would hold for seconds
+        let sweeping = move || {
+            let _entered = span.enter();
+            let Ok(entries) = fs::read_dir(&swept) else {
+                return;
             };
-            if file.try_lock().is_err() {
-                continue;
+            for entry in entries.flatten() {
+                let lock = entry.path();
+                let locking = lock.extension().is_some_and(|ext| ext == "lock");
+                if lock == own || !locking {
+                    continue;
+                }
+                let recorded = fs::read_to_string(&lock).unwrap_or_default();
+                // One that can't be looked up now, like on a share that doesn't answer, is not gone
+                let looked = Path::new(&recorded).try_exists();
+                if recorded.is_empty() || !matches!(looked, Ok(false)) {
+                    continue;
+                }
+                let Ok(file) = File::open(&lock) else {
+                    continue;
+                };
+                if file.try_lock().is_err() {
+                    continue;
+                }
+                // The lock goes only with the venv, or a venv left behind would have none
+                let folder = lock.with_extension("");
+                let removed = match fs::remove_dir_all(&folder) {
+                    Ok(()) => true,
+                    Err(e) => e.kind() == io::ErrorKind::NotFound,
+                };
+                if !removed {
+                    continue;
+                }
+                // Windows removes no file that is still open
+                drop(file);
+                fs::remove_file(&lock).ok();
+                let shown = tilde(&folder);
+                info!("python: venv removed [path={shown}]");
             }
-            // The lock goes only with the venv, or a venv left behind would have none
-            let folder = lock.with_extension("");
-            let removed = match fs::remove_dir_all(&folder) {
-                Ok(()) => true,
-                Err(e) => e.kind() == io::ErrorKind::NotFound,
-            };
-            if !removed {
-                continue;
-            }
-            // Windows removes no file that is still open
-            drop(file);
-            fs::remove_file(&lock).ok();
-            let shown = tilde(&folder);
-            info!("python: venv removed [path={shown}]");
-        }
+        };
+        task::spawn_blocking(sweeping);
 
         Ok(Self {
             runtime,
@@ -387,13 +426,14 @@ pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
 }
 
 /// Starts the runtime's interpreter, which the code can't write, unlike the venv's.
-/// Without site, nothing the code wrote runs before the module confines itself
+/// Its site at start reads only the runtime, since `-I` leaves out the working directory,
+/// the user's site and the environment, and multiprocessing passes these flags on
 fn loading(sandbox: &Sandbox, function: &str, venv: &Path) -> Command {
     let runtime = &sandbox.python.runtime;
     let interpreter = runtime.interpreter();
     let mut command = sandbox.command(&interpreter);
     command
-        .args(["-I", "-S", "-B", "-X", "utf8", "-c", LOADER])
+        .args(["-I", "-B", "-X", "utf8", "-c", LOADER])
         .arg(&runtime.module)
         .arg(function)
         .arg(venv);
@@ -483,10 +523,27 @@ async fn locked(store: &Path) -> Result<File, String> {
     lock(path, "", File::lock).await
 }
 
-/// Waits off the runtime's thread while another session removes it
+/// Waits off the runtime's thread while another session removes it,
+/// and dates the lock, which says when a session last used the item
 async fn held(item: &Path, record: &str) -> Result<File, String> {
     let path = lock_of(item);
-    lock(path, record, File::lock_shared).await
+    let file = lock(path, record, File::lock_shared).await?;
+    // Windows allows changing the time of a file that other sessions hold
+    file.set_modified(SystemTime::now()).ok();
+    Ok(file)
+}
+
+/// Runs it to the end with no output, in a group that goes when libsmol does
+async fn finished(mut command: Command) -> io::Result<()> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mark = reaper::prepare(command.as_std_mut());
+    let child = command.spawn()?;
+    let mut group = Group::new(child, mark)?;
+    group.exited().await;
+    Ok(())
 }
 
 /// Next to the item, out of the code's sight because only the item itself is granted
@@ -530,8 +587,10 @@ async fn lock(
 pub(crate) mod tests {
     use crate::tests::temp_dir;
     use crate::utils::block_on;
-    use crate::worker::python::{summed, venv_name, Python, Runtime};
+    use crate::worker::python::{held, lock_of, summed, venv_name, Python, Runtime};
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
 
     /// The runtime and venv tests share
     pub(crate) fn installed(config: &Path, cwd: &Path) -> Python {
@@ -557,6 +616,27 @@ pub(crate) mod tests {
             Some("3c4d")
         );
         assert_eq!(summed(sums, "smol-worker-apple-darwin"), None);
+    }
+
+    #[test]
+    fn marks_use() {
+        let dir = temp_dir("held");
+        fs::create_dir_all(&dir).expect("dir");
+        let item = dir.join("item");
+        let holding = held(&item, "");
+        let first = block_on(holding).expect("hold");
+        first.set_modified(SystemTime::UNIX_EPOCH).expect("age");
+
+        // Another session takes it while the first still holds it
+        let holding = held(&item, "");
+        let second = block_on(holding).expect("hold");
+        let lock = lock_of(&item);
+        let used = fs::metadata(lock).and_then(|found| found.modified());
+        let used = used.expect("time");
+        assert!(used > SystemTime::UNIX_EPOCH, "{used:?}");
+
+        drop((first, second));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
