@@ -60,6 +60,13 @@ jobs:
             cp "target/${{ matrix.target }}/release/$program$suffix" "dist/$name/"
           done
           cp README.md LICENSE CHANGELOG.md THIRD-PARTY-LICENSES.html "dist/$name/"
+          # libsmol downloads its worker module from the release of its version on first use
+          case "${{ matrix.target }}" in
+            *windows*) module=_smol.dll ;;
+            *apple*) module=lib_smol.dylib ;;
+            *) module=lib_smol.so ;;
+          esac
+          cp "target/${{ matrix.target }}/release/$module" "dist/smol-worker-${{ matrix.target }}"
           cd dist
           case "${{ matrix.target }}" in
             *windows*) 7z a "$name.zip" "$name" ;;

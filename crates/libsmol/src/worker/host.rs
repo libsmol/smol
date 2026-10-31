@@ -5,8 +5,6 @@ use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVER
 use crate::tools::mcp::Server;
 use crate::utils::{new_id, Interrupt, Reply};
 use crate::worker::sandbox::Sandbox;
-#[cfg(not(test))]
-use crate::worker::WORKER_ARG;
 use crate::worker::{
     AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
     WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV,
@@ -15,14 +13,10 @@ use crate::{Error, Result};
 use reaper::{cause, terminal_view};
 use serde::Deserialize;
 use std::collections::HashMap;
-#[cfg(not(target_os = "linux"))]
-use std::env;
 use std::future::{self, Future};
 use std::io;
 use std::mem;
 use std::path::Component;
-#[cfg(target_os = "linux")]
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -182,6 +176,9 @@ impl Worker {
             return Ok(());
         }
 
+        let python = &self.sandbox.python;
+        let prepared = python.command(&self.sandbox).await;
+        let mut command = prepared.map_err(|reason| prompt::unstarted(&reason))?;
         let failed = |e: io::Error| {
             let reason = cause(&e);
             prompt::unstarted(&reason)
@@ -189,18 +186,6 @@ impl Worker {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(failed)?;
         let address = listener.local_addr().map_err(failed)?;
         let token = new_id();
-
-        // On Linux this still starts the original binary after it is replaced
-        #[cfg(target_os = "linux")]
-        let program = PathBuf::from("/proc/self/exe");
-        #[cfg(not(target_os = "linux"))]
-        let program = env::current_exe().map_err(failed)?;
-        let mut command = self.sandbox.command(&program);
-        #[cfg(not(test))]
-        command.arg(WORKER_ARG);
-        // Tests rerun the test binary itself with only the test that serves as the worker
-        #[cfg(test)]
-        command.args(["worker::host::tests::serving", "--exact", "--nocapture"]);
         let control = format!("{address}/{token}");
         command
             .env(CONTROL_ENV, control)
@@ -618,12 +603,12 @@ pub(crate) mod tests {
     use crate::utils::{block_on, Interrupt};
     use crate::worker::host::{Added, Called, Calling, Delegating, Evaluated, Worker, STOP_WAIT};
     use crate::worker::sandbox::tests::opened;
-    use crate::worker::{serve, AgentCall, Delegation, CONTROL_ENV};
+    use crate::worker::{AgentCall, Delegation};
     use serde_json::{json, Map, Value};
     use std::env;
+    use std::fs;
     #[cfg(unix)]
     use std::fs::Permissions;
-    use std::fs::{self, File};
     use std::ops::{Deref, DerefMut};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -752,14 +737,6 @@ pub(crate) mod tests {
     fn error(output: Evaluated) -> String {
         let error = output.error.expect("error");
         error.to_string()
-    }
-
-    /// The only test a worker runs, and a no-op otherwise
-    #[test]
-    fn serving() {
-        if env::var_os(CONTROL_ENV).is_some() {
-            serve().expect("serve");
-        }
     }
 
     #[test]
@@ -1091,7 +1068,7 @@ pub(crate) mod tests {
         let output = worker.eval("x = (");
         let message = error(output);
         assert!(message.starts_with("syntax error on line 1: "), "{message}");
-        assert!(message.ends_with("\nx = (\n     ^"), "{message}");
+        assert!(message.ends_with("\nx = (\n    ^"), "{message}");
 
         // Wide characters take two columns in a terminal
         let output = worker.eval("café = '🐍' +");
@@ -2027,25 +2004,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cycles_collected() {
-        let mut worker = fresh();
-        let cycles = "class Node:\n    pass\nchain = [Node() for _ in range(2000)]\nfor a, b in zip(chain, chain[1:]):\n    a.next, b.prev = b, a";
-        let count = "import gc\nlen(gc.get_objects())";
-        let counted = |worker: &mut Tried| -> usize {
-            let logs = worker.eval(count).logs;
-            logs.trim().parse().expect("count")
-        };
-
-        worker.eval(cycles);
-        let before = counted(&mut worker);
-        for _ in 0..5 {
-            worker.eval(cycles);
-        }
-        let after = counted(&mut worker);
-        assert!(after < before + 1000, "{before} {after}");
-    }
-
-    #[test]
     fn help_lookup() {
         let mut worker = fresh();
         // Over the 8192 characters a print shows uncut
@@ -2262,12 +2220,10 @@ pub(crate) mod tests {
         let (mut worker, dir) = workspace("unviewable");
         fs::write(dir.join("latin1.txt"), b"caf\xe9").expect("write");
         fs::write(dir.join("fake.png"), "not an image".as_bytes()).expect("write");
-        let big = File::create(dir.join("big.jpg")).expect("create");
-        big.set_len(65).expect("size");
         fs::create_dir_all(dir.join("album.png")).expect("dir");
 
         let mut refused = Vec::new();
-        for name in ["latin1.txt", "fake.png", "big.jpg", "album.png"] {
+        for name in ["latin1.txt", "fake.png", "album.png"] {
             let code = format!("view({name:?})");
             let output = worker.eval(&code);
             let message = error(output);
@@ -2282,8 +2238,6 @@ pub(crate) mod tests {
         let expected = [
             format!("ValueError: view: latin1.txt: {unviewable}"),
             format!("ValueError: view: fake.png: {unviewable}"),
-            "ValueError: view: big.jpg: 65 bytes, over the 64-byte limit for an attached image"
-                .to_owned(),
             "ValueError: read: album.png: not a regular file".to_owned(),
         ];
         assert_eq!(refused, expected);

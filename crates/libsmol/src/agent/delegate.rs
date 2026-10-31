@@ -18,7 +18,7 @@ use tokio::task::{self, AbortHandle, JoinSet};
 use tokio::time;
 use tracing::{error_span, info, warn, Instrument};
 
-pub(crate) const MAX_PARALLEL_AGENTS: usize = 8;
+pub const MAX_PARALLEL_AGENTS: usize = 8;
 const MAX_PREVIEW_LINES: usize = 4;
 const MAX_PREVIEW_CHARS: usize = 800;
 /// Agents get this long to stop by themselves on an interrupt, and a worker of theirs may take `STOP_WAIT`

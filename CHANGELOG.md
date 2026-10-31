@@ -7,6 +7,22 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- The code runs in CPython 3.14 instead of RustPython. It is the same pinned
+  build of [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+  on every machine, which the first session downloads into `~/.smol/python`
+  together with the worker module of the `libsmol` version, and it runs in a
+  venv kept for each working directory in `~/.smol/venvs`. `pip install` puts
+  packages there, C extensions such as numpy and pandas included, and the
+  session can import them right away; `sys.executable` and the `python` and
+  `pip` on `PATH` are the venv's. Code that waits on a lock or a queue can now
+  be interrupted, a syntax error points at an unclosed bracket instead of the
+  end of the line, and plain Python runs several times faster. The system
+  prompt says which Python it is and that installed packages import at once,
+  and no longer tells the model to install a skill's packages in a venv in
+  `$TMPDIR`. `libsmol` is 7 MB instead of 33 MB.
+
 ## 0.4.4 - 2026-10-31
 
 - The system prompt says that a task stays open after the answer only while an

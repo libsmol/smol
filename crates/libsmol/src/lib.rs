@@ -15,7 +15,26 @@ mod worker;
 
 pub use crate::acp::run;
 pub use crate::config::setup::{run as setup, SETUP_ARG};
-pub use crate::worker::{serve as worker, WORKER_ARG};
+
+/// What the worker module in `crates/worker` builds on, the worker's side of `worker::host`
+#[doc(hidden)]
+pub mod guest {
+    pub use crate::agent::MAX_PARALLEL_AGENTS;
+    pub use crate::prompt::{unserializable, DONE};
+    pub use crate::tools::attach::{shown_path, viewed};
+    pub use crate::tools::files::{grep, ls};
+    pub use crate::tools::web::fetch;
+    pub use crate::tools::ToolError;
+    pub use crate::utils::{block_on, Waiting};
+    #[cfg(target_os = "macos")]
+    pub use crate::worker::sandbox::confine;
+    #[cfg(target_os = "macos")]
+    pub use crate::worker::SANDBOX_ENV;
+    pub use crate::worker::{
+        AgentCall, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
+        WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, END,
+    };
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

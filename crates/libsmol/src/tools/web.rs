@@ -34,7 +34,7 @@ static CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
     http_client(builder)
 });
 
-pub(crate) async fn fetch(url: &str) -> Result<String, ToolError> {
+pub async fn fetch(url: &str) -> Result<String, ToolError> {
     let client = match &*CLIENT {
         Ok(client) => client,
         Err(reason) => {

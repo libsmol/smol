@@ -1,5 +1,4 @@
 import ast as _ast
-import gc as _gc
 import io as _io
 import linecache as _linecache
 import re as _re
@@ -124,11 +123,9 @@ def _run(code):
             if source is None and exc.lineno and 0 < exc.lineno <= len(lines):
                 source = lines[exc.lineno - 1]
             source = (source or "").rstrip()
-            # RustPython's ast.parse reports the column in UTF-8 bytes
             column = max((exc.offset or 1) - 1, 0)
-            before = source.encode("utf-8", "surrogatepass")[:column]
             padding = []
-            for c in before.decode("utf-8", "ignore"):
+            for c in source[:column]:
                 # Wide characters take two terminal columns
                 # and tabs are copied to expand like the line above
                 if c == "\t":
@@ -231,8 +228,6 @@ def _run(code):
                     opened.flush()
             except Exception:
                 pass
-        # RustPython's automatic GC only scans generation 0, so promoted cycles are only freed here
-        _gc.collect()
 
     # An interrupt may land here and then no source is attached
     try:

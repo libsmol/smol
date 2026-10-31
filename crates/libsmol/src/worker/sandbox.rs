@@ -1,5 +1,6 @@
 use crate::config::{Access, Skill};
 use crate::utils::new_id;
+use crate::worker::python::Python;
 #[cfg(target_os = "macos")]
 use crate::worker::SANDBOX_ENV;
 #[cfg(target_os = "linux")]
@@ -18,6 +19,7 @@ use std::ffi::OsString;
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::fs::{self, File};
 use std::io;
+use std::iter;
 #[cfg(target_os = "macos")]
 use std::mem;
 #[cfg(target_os = "linux")]
@@ -109,6 +111,7 @@ type Isolation = Infallible;
 pub(crate) struct Sandbox {
     cwd: PathBuf,
     pub(crate) copies: PathBuf,
+    pub(crate) python: Python,
     temp: PathBuf,
     /// The places in `[allow] write` that existed when the session opened
     writable: Vec<PathBuf>,
@@ -140,6 +143,7 @@ impl Sandbox {
         let mut sandbox = Self {
             cwd: cwd.to_owned(),
             copies: copies.to_owned(),
+            python: Python::new(config, cwd),
             temp: temp.clone(),
             writable: Vec::new(),
             lock: None,
@@ -151,7 +155,10 @@ impl Sandbox {
         lock.lock().map_err(|e| failed(&path, e))?;
         sandbox.lock = Some(lock);
         // A Landlock rule holds on to the folder that exists when the rule is made
-        fs::create_dir_all(copies).map_err(|e| failed(copies, e))?;
+        let python = &sandbox.python;
+        for folder in [copies, &python.store, &python.venv] {
+            fs::create_dir_all(folder).map_err(|e| failed(folder, e))?;
+        }
 
         let passed = PASSED_ENV.iter().copied();
         let named = access.env.iter().map(String::as_str);
@@ -164,6 +171,14 @@ impl Sandbox {
             let value = scratch.clone().into_os_string();
             sandbox.env.push((OsString::from(name), value));
         }
+        // Comes after the passed `PATH` and overrides it, with the venv's `python` and `pip` first
+        let path = env::var_os("PATH").unwrap_or_default();
+        let paths = iter::once(python.bin()).chain(env::split_paths(&path));
+        if let Ok(path) = env::join_paths(paths) {
+            sandbox.env.push((OsString::from("PATH"), path));
+        }
+        let venv = python.venv.clone().into_os_string();
+        sandbox.env.push((OsString::from("VIRTUAL_ENV"), venv));
 
         let mut granted = vec![(PathBuf::from("/"), false)];
         for skill in skills {
@@ -171,7 +186,8 @@ impl Sandbox {
                 granted.push((folder.to_owned(), false));
             }
         }
-        for path in [cwd, &scratch, copies, Path::new("/dev")] {
+        granted.push((python.store.clone(), false));
+        for path in [cwd, &scratch, copies, &python.venv, Path::new("/dev")] {
             granted.push((path.to_owned(), true));
         }
         for path in &access.write {
@@ -406,7 +422,7 @@ fn seatbelt() -> Option<(SandboxInit, FreeError)> {
 
 /// Confines this process and every program it starts from now on, which can't be undone
 #[cfg(target_os = "macos")]
-pub(crate) fn confine(profile: &str) -> Result<(), String> {
+pub fn confine(profile: &str) -> Result<(), String> {
     let Some((init, free)) = seatbelt() else {
         return Err("sandbox: sandbox_init not found".to_owned());
     };

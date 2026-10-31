@@ -47,22 +47,22 @@ static DRIVER: LazyLock<()> = LazyLock::new(|| {
     started.recv().ok();
 });
 
-pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+pub fn block_on<F: Future>(future: F) -> F::Output {
     #[cfg(test)]
     LazyLock::force(&DRIVER);
     RUNTIME.block_on(future)
 }
 
-pub(crate) type Reply = Result<Value, String>;
+pub type Reply = Result<Value, String>;
 
 #[derive(Default)]
-pub(crate) struct Waiting {
+pub struct Waiting {
     next: AtomicU64,
     waiters: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
 }
 
 impl Waiting {
-    pub(crate) fn ask(&self) -> (u64, oneshot::Receiver<Reply>) {
+    pub fn ask(&self) -> (u64, oneshot::Receiver<Reply>) {
         let (sender, receiver) = oneshot::channel();
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let mut waiters = self.waiters.lock().expect("waiting lock");
@@ -70,12 +70,12 @@ impl Waiting {
         (id, receiver)
     }
 
-    pub(crate) fn take(&self, id: u64) -> Option<oneshot::Sender<Reply>> {
+    pub fn take(&self, id: u64) -> Option<oneshot::Sender<Reply>> {
         let mut waiters = self.waiters.lock().expect("waiting lock");
         waiters.remove(&id)
     }
 
-    pub(crate) fn answer(&self, id: u64, reply: Reply) {
+    pub fn answer(&self, id: u64, reply: Reply) {
         if let Some(sender) = self.take(id) {
             sender.send(reply).ok();
         }
