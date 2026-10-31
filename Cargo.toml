@@ -9,6 +9,7 @@ repository = "https://github.com/libsmol/smol"
 version = "0.4.4"
 
 [workspace.dependencies]
+libsmol = { version = "0.4.4", path = "crates/libsmol" }
 reaper = { package = "libsmol-reaper", version = "0.4.4", path = "crates/reaper" }
 
 [profile.release]

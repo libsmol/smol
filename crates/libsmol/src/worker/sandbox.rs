@@ -157,9 +157,15 @@ impl Sandbox {
         let lock = File::create(&path).map_err(|e| failed(&path, e))?;
         lock.lock().map_err(|e| failed(&path, e))?;
         sandbox.lock = Some(lock);
-        // A Landlock rule holds on to the folder that exists when the rule is made
+        // A Landlock rule holds on to the folder that exists when the rule is made.
+        // An earlier session's code may have swapped one for a link, which the grant would follow
         let python = &sandbox.python;
         for folder in [copies, &python.venv] {
+            let swapped = fs::symlink_metadata(folder).is_ok_and(|found| !found.is_dir());
+            if swapped {
+                let removed = fs::remove_file(folder).or_else(|_| fs::remove_dir(folder));
+                removed.map_err(|e| failed(folder, e))?;
+            }
             fs::create_dir_all(folder).map_err(|e| failed(folder, e))?;
         }
 
@@ -171,7 +177,9 @@ impl Sandbox {
             };
             // Programs the code starts find the venv's `python` and `pip` first
             if name == "PATH" {
-                let paths = iter::once(python.bin()).chain(env::split_paths(&value));
+                let bin = iter::once(python.bin());
+                let rest = env::split_paths(&value);
+                let paths = bin.chain(rest);
                 if let Ok(joined) = env::join_paths(paths) {
                     value = joined;
                 }
@@ -471,21 +479,30 @@ fn profile(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> String {
             true => "allow file-read* file-write* network-outbound",
             false => "allow file-read*",
         };
-        rules.push((path, rule));
+        rules.push((path, rule, "subpath"));
+        // Unlike Landlock, a subpath rule lets the code swap the folder itself for a link,
+        // which a later session would grant
+        if *write {
+            rules.push((path, "deny file-write-unlink file-write-create", "literal"));
+        }
     }
     for path in hidden {
-        rules.push((path, "deny file-read* file-write* network-outbound"));
+        rules.push((
+            path,
+            "deny file-read* file-write* network-outbound",
+            "subpath",
+        ));
     }
-    rules.sort_by_key(|(path, _)| path.components().count());
+    rules.sort_by_key(|(path, _, _)| path.components().count());
 
     // Only connecting to a Unix socket has a path, so TCP and UDP stay open
     let mut profile = "(version 1)\n(allow default)\n(deny file-write*)\n\
         (deny network-outbound (subpath \"/\"))\n"
         .to_owned();
-    for (path, rule) in rules {
+    for (path, rule, matched) in rules {
         let path = path.to_string_lossy();
         let path = path.replace('\\', "\\\\").replace('"', "\\\"");
-        let line = format!("({rule} (subpath \"{path}\"))\n");
+        let line = format!("({rule} ({matched} \"{path}\"))\n");
         profile.push_str(&line);
     }
     // Names resolve through this socket, and signals reach only the worker's own process group
@@ -577,6 +594,7 @@ pub(crate) mod tests {
             (deny network-outbound (subpath \"/\"))\n\
             (allow file-read* (subpath \"/\"))\n\
             (allow file-read* file-write* network-outbound (subpath \"/Users/zoë/café\"))\n\
+            (deny file-write-unlink file-write-create (literal \"/Users/zoë/café\"))\n\
             (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.ssh\"))\n\
             (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.smol\"))\n\
             (allow file-read* (subpath \"/Users/zoë/.smol/skills/pdf\"))\n\
@@ -641,7 +659,7 @@ pub(crate) mod tests {
         output.logs
     }
 
-    /// Programs the code starts are confined too
+    /// Programs the code starts are confined too, and the folders the code writes stay in place
     #[test]
     fn files_confined() {
         let dir = temp_dir("confined");
@@ -669,20 +687,21 @@ pub(crate) mod tests {
         }
         assert_eq!(sandbox.writable(), Some(&[shared][..]));
 
-        let code = "import os, subprocess, tempfile\n\
+        let code = "import os, subprocess, sys, tempfile\n\
             def tried(act):\n    try:\n        act()\n        return 'ok'\n    except PermissionError:\n        return 'denied'\n\
             key = '../secret/id_rsa'\n\
             [tried(lambda: open('../notes.md').read()), tried(lambda: open(key).read()),\n\
              tried(lambda: open('résumé.txt', 'w').write('x')), tried(lambda: tempfile.TemporaryFile().write(b'x')),\n\
              tried(lambda: open('../naïve.txt', 'w').write('x')), tried(lambda: open('../config/x', 'w').write('x')),\n\
              tried(lambda: open('../shared/x', 'w').write('x')),\n\
+             tried(lambda: os.rename(os.getcwd(), '../moved')), tried(lambda: os.rename(sys.prefix, sys.prefix + '-moved')),\n\
              subprocess.run(['cat', key], capture_output=True).returncode, 'SMOL_SANDBOX' in os.environ]";
         let logs = evaluated(sandbox, code);
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(
             logs,
-            "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 'ok', 1, False]\n"
+            "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 'ok', 'denied', 'denied', 1, False]\n"
         );
     }
 

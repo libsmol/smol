@@ -1190,6 +1190,21 @@ pub(crate) mod tests {
         assert_eq!(output.logs, "42\nscript.py\nTrue True\nZoë\n");
     }
 
+    /// A file in the working directory named like a module the bootstrap imports
+    #[test]
+    fn stdlib_not_shadowed() {
+        let dir = temp_dir("shadowed");
+        fs::create_dir_all(&dir).expect("create dir");
+        fs::write(dir.join("token.py"), "raise SystemExit('café')\n").expect("write");
+
+        let mut worker = build(Interrupt::default(), dir.clone(), Delegation::On);
+        let output = worker.eval("1 + 1");
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(output.error, None);
+        assert_eq!(output.logs, "2\n");
+    }
+
     /// What pip puts in the venv imports in the same session
     #[test]
     fn packages_imported() {

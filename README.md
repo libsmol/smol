@@ -259,7 +259,8 @@ process and the programs it starts:
   `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials.toml`,
   `~/.cargo/credentials`, `~/.password-store`, `~/.local/share/keyrings`,
   `~/Library/Keychains`, `~/.smol`, `~/.claude`, `~/.claude.json`, `~/.codex`,
-  and the configuration directory when `SMOL_CONFIG_DIR` moves it;
+  and the configuration directory when `SMOL_CONFIG_DIR` moves it, except for
+  the runtime, the worker module, skills and the venv and copies they write;
 - get only `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `LANG`, `LC_ALL`,
   `LC_CTYPE`, `TERM` and `TZ` from your environment, with the venv's `python`
   and `pip` first on `PATH` and `VIRTUAL_ENV` naming it;
@@ -394,7 +395,9 @@ the default is `warn,libsmol=info`, `SMOL_LOG=warn` keeps only problems,
   installed, which stay on `PATH` after it. Every session in the directory and
   the agents they start share the venv and keep what it installed, until a
   new runtime gets a new one or the directory is gone. To start over, delete
-  it while no session in that directory is open.
+  it while no session in that directory is open. `VIRTUAL_ENV` names it, so
+  tools such as uv or poetry install into it too, and a venv the code makes
+  for itself is based on the runtime, which a later smol may replace.
 - **Interrupting** stops code in place, and the session keeps its variables.
   Code blocked where an interrupt cannot reach it (for example `os.system`, a
   long call inside a C extension, or most blocking calls on Windows) gets 3

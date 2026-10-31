@@ -9,7 +9,7 @@ use pyo3::exceptions::PyRuntimeError;
 #[cfg(windows)]
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyDict};
+use pyo3::types::{IntoPyDict, PyDict, PyList};
 use reaper::cause;
 use serde_json::{json, Value};
 use std::ffi::{OsStr, OsString};
@@ -64,9 +64,6 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     sys.setattr("prefix", &venv)?;
     sys.setattr("exec_prefix", &venv)?;
     py.import("site")?.call_method0("main")?;
-    // Like `python -c`, which also makes argparse and runpy read `sys.argv[0]`
-    sys.getattr("path")?.call_method1("insert", (0, ""))?;
-    sys.setattr("argv", [""])?;
 
     let Some((address, token)) = control.split_once('/') else {
         let message = format!("worker: {CONTROL_ENV}: not set by the agent");
@@ -91,9 +88,9 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     globals.set_item("_AGENTS", agents)?;
     globals.set_item("_MAX_AGENTS", MAX_PARALLEL_AGENTS)?;
     globals.set_item("_DONE", DONE)?;
-    let python = py.import("builtins")?;
-    let compile = python.getattr("compile")?;
-    let exec = python.getattr("exec")?;
+    let builtin = py.import("builtins")?;
+    let compile = builtin.getattr("compile")?;
+    let exec = builtin.getattr("exec")?;
     for source in BOOTSTRAP {
         let code = compile.call1((source, "<libsmol_bootstrap>", "exec"))?;
         exec.call1((code, &globals))?;
@@ -103,6 +100,10 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     let server = scope.get_item("_server")?;
     let unserver = scope.get_item("_unserver")?;
     let listed: Vec<(String, String, String)> = scope.get_item("_FUNCTIONS")?.extract()?;
+    // Added earlier, a file in the working directory named like a standard module breaks the bootstrap
+    sys.getattr("path")?.call_method1("insert", (0, ""))?;
+    // argparse and runpy read it, and it is empty as in the interactive interpreter
+    sys.setattr("argv", [""])?;
 
     // SAFETY: Only reads the current thread's id
     #[cfg(unix)]
@@ -186,7 +187,21 @@ fn repair(py: Python<'_>, python: OsString) -> PyResult<()> {
     let environ = py.import("os")?.getattr("environ")?;
     confined(&environ)?;
     let venv = venv_of(&python);
-    py.import("venv")?.call_method1("main", ([venv],))?;
+    let making = py.import("venv")?.getattr("main")?;
+    making.call1(([&venv],))?;
+
+    // ensurepip leaves an installed pip alone, also one that lost its script
+    let bin = Path::new(&python).parent().unwrap_or(Path::new(""));
+    let searched = [("path", bin)].into_py_dict(py)?;
+    let script = py
+        .import("shutil")?
+        .call_method("which", ("pip",), Some(&searched))?;
+    if script.is_none() {
+        let removing = PyList::new(py, ["-m", "pip", "uninstall", "-y", "pip"])?;
+        removing.insert(0, &python)?;
+        py.import("subprocess")?.call_method1("run", (removing,))?;
+        making.call1(([&venv],))?;
+    }
     Ok(())
 }
 

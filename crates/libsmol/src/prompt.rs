@@ -233,7 +233,7 @@ pub(crate) fn system(
                 places.push(place);
             }
             let places = places.join(", ");
-            format!("\n- Your code runs in a sandbox: writing outside {places} and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- `$TMPDIR` is removed when the session ends.\n- If a tool fails because it cannot write its cache, rerun it with the cache in `$TMPDIR`.")
+            format!("\n- Your code runs in a sandbox: writing outside {places}, the venv and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- `$TMPDIR` is removed when the session ends.\n- If a tool fails because it cannot write its cache, rerun it with the cache in `$TMPDIR`.")
         }
         None => String::new(),
     };
@@ -813,12 +813,12 @@ mod tests {
         assert!(!plain.contains("<instructions"), "{plain}");
         assert!(!plain.contains("# Skills"), "{plain}");
         assert!(!plain.contains("# Roles"), "{plain}");
-        let sandbox = "right away.\n- Your code runs in a sandbox: writing outside `/home/zoë/work` and `$TMPDIR`, ";
+        let sandbox = "right away.\n- Your code runs in a sandbox: writing outside `/home/zoë/work`, the venv and `$TMPDIR`, ";
         assert!(plain.contains(sandbox), "{plain}");
         let registry = [PathBuf::from("/home/zoë/.cargo/registry")];
         let allowed = system(&[], &[], &[], cwd, Some(&registry), &[], &main);
         let sandbox =
-            "writing outside `/home/zoë/work`, `/home/zoë/.cargo/registry` and `$TMPDIR`, ";
+            "writing outside `/home/zoë/work`, `/home/zoë/.cargo/registry`, the venv and `$TMPDIR`, ";
         assert!(allowed.contains(sandbox), "{allowed}");
     }
 

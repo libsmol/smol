@@ -26,7 +26,8 @@ use tracing::info;
 const RELEASE: &str = "20261026";
 pub(crate) const PYTHON: &str = "3.14.10";
 /// Rust and python-build-standalone name targets alike,
-/// and each has the sha256 of its `install_only_stripped` archive
+/// and each has the sha256 of its `install_only_stripped` archive.
+/// release.yml reads the targets from here, each a quoted triple on a line of its own
 const BUILDS: [(&str, &str); 5] = [
     (
         "x86_64-unknown-linux-gnu",
@@ -118,7 +119,7 @@ impl Runtime {
             format!("runtime: {shown}: {reason}")
         };
         fs::create_dir_all(&store).map_err(failed)?;
-        // Taken before looking, so a removal that is under way finishes first
+        // Taken before looking, which waits out a removal under way
         let home_held = held(&home, "").await?;
         let module_held = held(&module, "").await?;
         let holds = [home_held, module_held];
@@ -151,8 +152,7 @@ impl Runtime {
             result.map_err(failed)?;
             let unpacked = unpacked.join("python");
 
-            // The code can't write the runtime's bytecode, and nothing has run it yet.
-            // Bytecode only speeds up imports, so files that fail to compile don't stop this
+            // Compiled before anything runs it, since the code can't write its bytecode later
             let python = unpacked.join(HOME_BIN).join(EXE);
             let mut compiling = Command::new(python);
             compiling
@@ -186,12 +186,16 @@ impl Runtime {
 
             let id = new_id();
             let written = store.join(format!(".{id}"));
-            fs::write(&written, bytes).map_err(failed)?;
+            let mut file = File::create(&written).map_err(failed)?;
+            file.write_all(&bytes).map_err(failed)?;
+            // A crash could otherwise leave an empty module under the name that means installed
+            file.sync_all().map_err(failed)?;
             fs::rename(&written, &module).map_err(failed)?;
             info!("python: worker module installed [version={VERSION}]");
         }
 
-        // Lock files stay, since another session may be about to lock the one it opened
+        // Lock files stay, since another session may be about to lock the one it opened.
+        // What no session ever held has none, like what an install that stopped left
         let entries = fs::read_dir(&store).map_err(failed)?;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -201,23 +205,28 @@ impl Runtime {
             if current || name == LOCK || name.ends_with(".lock") {
                 continue;
             }
-            // Unfinished installs start with a dot, and this one holds the install lock
-            let unfinished = name.starts_with('.');
-            let lock = match unfinished {
-                true => None,
-                false => opened(&lock_of(&path)).ok(),
-            };
+            let locking = lock_of(&path);
+            let lock = File::options().write(true).open(locking);
             // Kept locked until the removal is done
-            let free = lock.as_ref().is_some_and(|file| file.try_lock().is_ok());
-            if !unfinished && !free {
+            let free = match &lock {
+                Ok(file) => file.try_lock().is_ok(),
+                Err(e) => e.kind() == io::ErrorKind::NotFound,
+            };
+            if !free {
                 continue;
             }
-            fs::remove_dir_all(&path)
-                .or_else(|_| fs::remove_file(&path))
+            // Moved aside first, so a removal that stops halfway leaves nothing that looks installed
+            let id = new_id();
+            let aside = store.join(format!(".{id}"));
+            if fs::rename(&path, &aside).is_err() {
+                continue;
+            }
+            fs::remove_dir_all(&aside)
+                .or_else(|_| fs::remove_file(&aside))
                 .ok();
-            // The venvs of a runtime that is gone
             let venvs = config.join(VENVS).join(&*name);
             fs::remove_dir_all(venvs).ok();
+            info!("python: removed [name={name}]");
         }
 
         Ok(Self {
@@ -269,7 +278,9 @@ impl Python {
                 continue;
             }
             let recorded = fs::read_to_string(&lock).unwrap_or_default();
-            if recorded.is_empty() || Path::new(&recorded).exists() {
+            // One that can't be looked up now, like on a drive that is away, is not gone
+            let looked = Path::new(&recorded).try_exists();
+            if recorded.is_empty() || !matches!(looked, Ok(false)) {
                 continue;
             }
             let Ok(file) = File::open(&lock) else {
@@ -278,11 +289,20 @@ impl Python {
             if file.try_lock().is_err() {
                 continue;
             }
-            let gone = lock.with_extension("");
-            fs::remove_dir_all(gone).ok();
+            // The lock goes only with the venv, or a venv left behind would have none
+            let folder = lock.with_extension("");
+            let removed = match fs::remove_dir_all(&folder) {
+                Ok(()) => true,
+                Err(e) => e.kind() == io::ErrorKind::NotFound,
+            };
+            if !removed {
+                continue;
+            }
             // Windows removes no file that is still open
             drop(file);
             fs::remove_file(&lock).ok();
+            let shown = tilde(&folder);
+            info!("python: venv removed [path={shown}]");
         }
 
         Ok(Self {
@@ -318,9 +338,11 @@ pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
         if !python.ready() {
             let mut repairing = loading(sandbox, "repair", &venv);
             repairing.stdin(Stdio::null());
+            // Names the venv, which the user deletes to start over when it can't be fixed
+            let shown = tilde(&python.venv);
             let failed = |e: io::Error| {
                 let reason = cause(&e);
-                format!("venv: {reason}")
+                format!("venv: {shown}: {reason}")
             };
             let (mut group, mut pieces) = Group::start(repairing).map_err(failed)?;
             let mut output = Clip::new(KEPT_BYTES);
@@ -344,9 +366,8 @@ pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
                     Some(exit) if said.is_empty() => exit.to_string(),
                     _ => said.to_owned(),
                 };
-                return Err(format!("venv: {reason}"));
+                return Err(format!("venv: {shown}: {reason}"));
             }
-            let shown = tilde(&python.venv);
             info!("python: venv made [path={shown}]");
         }
     }
@@ -398,10 +419,10 @@ fn venv_for(config: &Path, cwd: &Path, runtime: &str) -> PathBuf {
 
 /// Tests share one venv in the profile folder
 #[cfg(test)]
-fn venv_for(_: &Path, _: &Path, _: &str) -> PathBuf {
+fn venv_for(_: &Path, _: &Path, runtime: &str) -> PathBuf {
     let exe = env::current_exe().expect("test binary");
     let built = exe.parent().and_then(Path::parent).expect("profile");
-    built.join(VENVS).join("venv")
+    built.join(VENVS).join(runtime).join("venv")
 }
 
 /// The folder's name, kept short for the path's sake, and a hash of the whole path
@@ -465,15 +486,6 @@ fn lock_of(item: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Never truncated, since Windows refuses to write a file that another session holds
-fn opened(path: &Path) -> io::Result<File> {
-    File::options()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-}
-
 /// Writes `record` into a lock that is still empty, before any lock forbids it on Windows
 async fn lock(
     path: PathBuf,
@@ -483,7 +495,12 @@ async fn lock(
     let shown = tilde(&path);
     let record = record.to_owned();
     let opening = move || {
-        let mut file = opened(&path)?;
+        // Never truncated, since Windows refuses to write a file that another session holds
+        let mut file = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
         // A record that can't be written only keeps the venv from being cleaned up
         if !record.is_empty() && file.metadata()?.len() == 0 {
             file.write_all(record.as_bytes()).ok();
@@ -494,13 +511,14 @@ async fn lock(
     let opened = task::spawn_blocking(opening).await.expect("lock");
     let failed = |e: io::Error| {
         let reason = cause(&e);
-        format!("runtime: {shown}: {reason}")
+        format!("lock: {shown}: {reason}")
     };
     opened.map_err(failed)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::tests::temp_dir;
     use crate::utils::block_on;
     use crate::worker::python::{summed, venv_name, Python, Runtime};
     use std::path::{Path, PathBuf};
@@ -513,7 +531,8 @@ pub(crate) mod tests {
 
     /// The runtime's own interpreter, for programs tests start outside the sandbox
     pub(crate) fn interpreter() -> PathBuf {
-        let installing = Runtime::install(Path::new(""));
+        let config = temp_dir("runtime");
+        let installing = Runtime::install(&config);
         let runtime = block_on(installing).expect("runtime");
         runtime.interpreter()
     }
