@@ -127,13 +127,11 @@ impl Python {
             fs::create_dir_all(folder).map_err(failed)?;
         }
         // Taken before looking, so a removal that is under way finishes first
-        let runtime_held = held(&home).await?;
-        let module_held = held(&module).await?;
-        let mut venv_held = held(&venv).await?;
+        let runtime_held = held(&home, "").await?;
+        let module_held = held(&module, "").await?;
         // A venv's lock names its working directory, unless that isn't UTF-8 and so can't be told
-        if let Some(cwd) = cwd.to_str() {
-            venv_held.write_all(cwd.as_bytes()).map_err(failed)?;
-        }
+        let record = cwd.to_str().unwrap_or_default();
+        let venv_held = held(&venv, record).await?;
 
         if !home.exists() || !module.exists() {
             let _lock = locked(&store).await?;
@@ -214,7 +212,7 @@ impl Python {
                 let unfinished = name.starts_with('.');
                 let lock = match unfinished {
                     true => None,
-                    false => File::create(lock_of(&path)).ok(),
+                    false => opened(&lock_of(&path)).ok(),
                 };
                 // Kept locked until the removal is done
                 let free = lock.as_ref().is_some_and(|file| file.try_lock().is_ok());
@@ -245,13 +243,17 @@ impl Python {
             if recorded.is_empty() || Path::new(&recorded).exists() {
                 continue;
             }
-            let opened = File::open(&lock);
-            let free = opened.is_ok_and(|file| file.try_lock().is_ok());
-            if free {
-                let gone = lock.with_extension("");
-                fs::remove_dir_all(gone).ok();
-                fs::remove_file(&lock).ok();
+            let Ok(opened) = File::open(&lock) else {
+                continue;
+            };
+            if opened.try_lock().is_err() {
+                continue;
             }
+            let gone = lock.with_extension("");
+            fs::remove_dir_all(gone).ok();
+            // Windows removes no file that is still open
+            drop(opened);
+            fs::remove_file(&lock).ok();
         }
 
         Ok(Self {
@@ -277,7 +279,7 @@ impl Python {
     }
 }
 
-/// The worker's command, with the venv made anew unless the agent recorded it complete
+/// The worker's command, with the venv made or completed first when it lacks `python` or `pip`
 pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
     let python = &sandbox.python;
     let runtime = python.home.join(HOME_BIN).join(EXE);
@@ -287,13 +289,13 @@ pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
         // Another session in this directory may have made it while this one waited
         let _lock = locked(&python.store).await?;
         if !python.ready() {
-            let mut renewing = loading(sandbox, &runtime, "renew", &venv);
-            renewing.stdin(Stdio::null());
+            let mut repairing = loading(sandbox, &runtime, "repair", &venv);
+            repairing.stdin(Stdio::null());
             let failed = |e: io::Error| {
                 let reason = cause(&e);
                 format!("venv: {reason}")
             };
-            let (mut group, mut pieces) = Group::start(renewing).map_err(failed)?;
+            let (mut group, mut pieces) = Group::start(repairing).map_err(failed)?;
             let mut output = Clip::new(KEPT_BYTES);
             // Read while it runs, since a full pipe would stall it
             let exit = loop {
@@ -318,7 +320,7 @@ pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
                 return Err(format!("venv: {reason}"));
             }
             let shown = tilde(&python.venv);
-            info!("python: venv created [path={shown}]");
+            info!("python: venv made [path={shown}]");
         }
     }
 
@@ -394,13 +396,13 @@ fn hex(bytes: &[u8]) -> String {
 /// Waits off the runtime's thread while another libsmol installs
 async fn locked(store: &Path) -> Result<File, String> {
     let path = store.join(LOCK);
-    lock(path, File::lock).await
+    lock(path, "", File::lock).await
 }
 
 /// Waits off the runtime's thread while another session removes it
-async fn held(item: &Path) -> Result<File, String> {
+async fn held(item: &Path, record: &str) -> Result<File, String> {
     let path = lock_of(item);
-    lock(path, File::lock_shared).await
+    lock(path, record, File::lock_shared).await
 }
 
 /// Next to the item, out of the code's sight because only the item itself is granted
@@ -410,10 +412,29 @@ fn lock_of(item: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-async fn lock(path: PathBuf, locking: fn(&File) -> io::Result<()>) -> Result<File, String> {
+/// Never truncated, since Windows refuses to write a file that another session holds
+fn opened(path: &Path) -> io::Result<File> {
+    File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Writes `record` into a lock that is still empty, before any lock forbids it on Windows
+async fn lock(
+    path: PathBuf,
+    record: &str,
+    locking: fn(&File) -> io::Result<()>,
+) -> Result<File, String> {
     let shown = tilde(&path);
+    let record = record.to_owned();
     let opening = move || {
-        let file = File::create(&path)?;
+        let mut file = opened(&path)?;
+        // A record that can't be written only keeps the venv from being cleaned up
+        if !record.is_empty() && file.metadata()?.len() == 0 {
+            file.write_all(record.as_bytes()).ok();
+        }
         locking(&file)?;
         io::Result::Ok(file)
     };

@@ -43,8 +43,8 @@ static MAIN: AtomicUsize = AtomicUsize::new(0);
 fn _smol(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let serving = wrap_pyfunction!(serve, module)?;
     module.add_function(serving)?;
-    let renewing = wrap_pyfunction!(renew, module)?;
-    module.add_function(renewing)
+    let repairing = wrap_pyfunction!(repair, module)?;
+    module.add_function(repairing)
 }
 
 /// Runs on the main thread, where Python raises `KeyboardInterrupt`, until the agent hangs up
@@ -179,14 +179,14 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     }
 }
 
-/// Makes the venv of `python` anew for the runtime running this, confined like the worker
+/// Makes the venv of `python`, or adds what it lacks and keeps the packages it has,
+/// confined like the worker since the code may be using it
 #[pyfunction]
-fn renew(py: Python<'_>, python: OsString) -> PyResult<()> {
+fn repair(py: Python<'_>, python: OsString) -> PyResult<()> {
     let environ = py.import("os")?.getattr("environ")?;
     confined(&environ)?;
     let venv = venv_of(&python);
-    let args = [venv, OsString::from("--clear")];
-    py.import("venv")?.call_method1("main", (args,))?;
+    py.import("venv")?.call_method1("main", ([venv],))?;
     Ok(())
 }
 
