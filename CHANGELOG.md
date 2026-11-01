@@ -7,6 +7,16 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- The runtime and the worker module in `~/.smol/runtime` are no longer named
+  after the machine's target, so a configuration directory serves one
+  operating system and architecture; machines of different kinds that share a
+  home folder each need their own `SMOL_CONFIG_DIR`. The runtime is downloaded
+  again and each working directory gets a new venv, so packages installed with
+  0.5.0 have to be installed again; the 0.5.0 runtime, module and venvs are
+  removed a week after their last use.
+
 ## 0.5.0 - 2026-11-01
 
 - The code runs in CPython 3.14 instead of RustPython. It is the same pinned

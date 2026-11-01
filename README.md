@@ -94,7 +94,9 @@ The runtime's checksum is built into `libsmol`; the module's comes from the
 same release's `SHA256SUMS`, as with the install scripts. A session can't
 open until this download has worked once. Another version's runtime or
 module, with that runtime's venvs, is removed once no session has used it for
-a week.
+a week. A configuration directory serves one operating system and
+architecture, so machines of different kinds that share a home folder each
+need their own `SMOL_CONFIG_DIR`.
 
 ## Configure a model
 

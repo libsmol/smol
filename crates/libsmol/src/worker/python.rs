@@ -120,9 +120,8 @@ impl Runtime {
             return Err(format!("{target}: no build"));
         };
 
-        // Named by target too, since machines of different targets may share one home folder
-        let (store, module) = stored(config, target);
-        let named = format!("cpython-{PYTHON}+{RELEASE}-{target}");
+        let (store, module) = stored(config);
+        let named = format!("cpython-{PYTHON}+{RELEASE}");
         let home = store.join(named);
         let failed = |e: io::Error| {
             let reason = cause(&e);
@@ -375,9 +374,9 @@ fn loading(sandbox: &Sandbox, function: &str, venv: &Path) -> Command {
 
 /// The store and the worker module
 #[cfg(not(test))]
-fn stored(config: &Path, target: &str) -> (PathBuf, PathBuf) {
+fn stored(config: &Path) -> (PathBuf, PathBuf) {
     let store = config.join(STORE);
-    let module = format!("worker-{VERSION}-{target}{DLL_SUFFIX}");
+    let module = format!("worker-{VERSION}{DLL_SUFFIX}");
     let module = store.join(module);
     (store, module)
 }
@@ -385,7 +384,7 @@ fn stored(config: &Path, target: &str) -> (PathBuf, PathBuf) {
 /// Tests share the store in the profile folder and load the module `cargo test` built in `deps`,
 /// which only `cargo build` copies up
 #[cfg(test)]
-fn stored(_: &Path, _: &str) -> (PathBuf, PathBuf) {
+fn stored(_: &Path) -> (PathBuf, PathBuf) {
     let exe = env::current_exe().expect("test binary");
     let deps = exe.parent().expect("deps");
     let built = deps.parent().expect("profile");
@@ -664,9 +663,9 @@ pub(crate) mod tests {
         let now = SystemTime::now();
         let aged = now - MIN_IDLE - Duration::from_secs(60);
 
-        let current = store.join("cpython-3.14.10+20261026-café");
-        let old = store.join("cpython-3.14.9+20260901-café");
-        let old_venv = venvs.join("cpython-3.14.9+20260901-café/naïve");
+        let current = store.join("cpython-3.14.10+20261026");
+        let old = store.join("cpython-3.14.9+20260901");
+        let old_venv = venvs.join("cpython-3.14.9+20260901/naïve");
         for folder in [&current, &old, &old_venv] {
             fs::create_dir_all(folder).expect("folder");
             let lock = lock_of(folder);
@@ -704,14 +703,14 @@ pub(crate) mod tests {
             left.push(name);
         }
         left.sort();
-        let venvs_left = venvs.join("cpython-3.14.9+20260901-café").exists();
+        let venvs_left = venvs.join("cpython-3.14.9+20260901").exists();
         drop(holding);
         fs::remove_dir_all(&config).ok();
 
         let expected = [
-            "cpython-3.14.10+20261026-café",
-            "cpython-3.14.10+20261026-café.lock",
-            "cpython-3.14.9+20260901-café.lock",
+            "cpython-3.14.10+20261026",
+            "cpython-3.14.10+20261026.lock",
+            "cpython-3.14.9+20260901.lock",
             "lock",
             "résumé",
             "worker-0.4.0.so.lock",
