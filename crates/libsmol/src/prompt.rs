@@ -28,6 +28,8 @@ const REMEMBERING: &str = "- Keep with `remember()` what the user asks you to re
 - `forget()` a memory that turned out wrong.";
 
 const SHOWN: &str = " Text you write in a reply that runs code is shown to the user.";
+const NAMED: &str =
+    " MCP functions list their optional parameters by name only; `help()` on one prints their types and what they do.";
 const UPDATES: &str =
     "A user message that starts with `Task update:` adds to or changes the current task.";
 const HANDED_BACK: &str = "Only your answer is returned to the agent that assigned this task, so include everything the task asks for.";
@@ -158,6 +160,10 @@ pub(crate) fn system(
         listed.push_str("\n\n");
         listed.push_str(&section);
     }
+    let named = match servers.is_empty() {
+        true => "",
+        false => NAMED,
+    };
 
     let mut entries = Vec::new();
     for skill in &brief.skills {
@@ -329,7 +335,7 @@ Write each call as a complete program:
 
 # Functions
 
-These need no import. Use them instead of writing your own, and create new files with `open()`.
+These need no import. Use them instead of writing your own, and create new files with `open()`.{named}
 
 ## Built-in
 
@@ -891,6 +897,7 @@ mod tests {
         assert!(!plain.contains("# Roles"), "{plain}");
         assert!(!plain.contains("# Memories"), "{plain}");
         assert!(!plain.contains("remember()"), "{plain}");
+        assert!(!plain.contains("MCP functions"), "{plain}");
         let sandbox = "right away.\n- Your code runs in a sandbox: writing outside `/home/zoë/work`, the venv and `$TMPDIR`, ";
         assert!(plain.contains(sandbox), "{plain}");
 

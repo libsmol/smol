@@ -2107,6 +2107,10 @@ pub(crate) mod tests {
         let mut worker = fresh();
         let mut news = server("news-web", |_, _| Value::Null);
         news.description = "Searches the web and the news\n\nRead-only".to_owned();
+        let properties = json!({"query": {"type": "string"}, "days": {"type": "integer"}});
+        let schema = json!({"type": "object", "properties": properties, "required": ["query"]});
+        news.tools
+            .push(json!({"name": "search", "inputSchema": schema}));
         worker.add(&news).expect("add server");
         let mut notes = server("notes", |_, _| Value::Null);
         notes.description = String::new();
@@ -2118,10 +2122,14 @@ pub(crate) mod tests {
         let empty = Brief::default();
         let text = system(&[], &servers, &empty, cwd, None, &main);
 
+        let named = "`open()`. MCP functions list their optional parameters by name only; \
+                     `help()` on one prints their types and what they do.\n\n## Built-in";
+        assert!(text.contains(named), "{text}");
         let listed = "\n\n## MCP `news_web`\n\nSearches the web and the news\n\nRead-only\n\n\
-                      ```python\nnews_web.echo_text(the_text: str = None) -> str\n```\n\n\
+                      ```python\nnews_web.echo_text(the_text=None) -> str\n\
+                      news_web.search(query: str, days=None) -> str\n```\n\n\
                       ## MCP `notes`\n\n\
-                      ```python\nnotes.echo_text(the_text: str = None) -> str\n```\n\n# Sub-agents\n";
+                      ```python\nnotes.echo_text(the_text=None) -> str\n```\n\n# Sub-agents\n";
         assert!(text.contains(listed), "{text}");
     }
 

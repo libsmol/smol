@@ -7,6 +7,13 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- The system prompt lists the optional parameters of MCP functions by name
+  only and says that `help()` gives their types, which takes what tavily adds
+  to the prompt from about 1800 to 1200 characters; `help()` on a server or a
+  function still shows the full signatures.
+
 ## 0.6.0 - 2026-11-01
 
 - `remember(text, project=True)`, `recall(query="")` and `forget(id)` keep

@@ -102,10 +102,10 @@ def _server(source, description, tools):
     entries = []
     headers = []
     for spec in tools:
-        function, entry = _tool(name, spec, functions)
+        function, entry, header = _tool(name, spec, functions)
         functions[function.__name__] = function
         entries.append(entry)
-        headers.append(function._smol_header)
+        headers.append(header)
 
     titled = name if name == source else f"{name} (configured as {source})"
     about = description.strip()
@@ -146,15 +146,20 @@ def _tool(server, spec, used):
     params.sort(key=lambda param: param[4])
 
     typed = []
+    named = []
     for ident, _, kind, _, optional in params:
         default = " = None" if optional else ""
         typed.append(f"{ident}: {kind}{default}")
+        named.append(f"{ident}=None" if optional else f"{ident}: {kind}")
     typed = ", ".join(typed)
+    named = ", ".join(named)
     output = spec.get("outputSchema")
     returns = "dict" if output else "str"
     # Error prefixes and images in results both use this name
     called = f"{server}.{name}"
     header = f"{called}({typed}) -> {returns}"
+    # The system prompt names optional parameters only, and help() gives their types
+    brief = f"{called}({named}) -> {returns}"
 
     described = spec.get("description") or ""
     doc = described
@@ -198,4 +203,4 @@ def _tool(server, spec, used):
     if len(first) > _MAX_SUMMARY_CHARS:
         first = first[: _MAX_SUMMARY_CHARS - 1] + "…"
     entry = f"{header}\n    {first}" if first else header
-    return function, entry
+    return function, entry, brief
