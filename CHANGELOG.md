@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.5.0 - 2026-11-01
 
 - The code runs in CPython 3.14 instead of RustPython. It is the same pinned
   build of [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
