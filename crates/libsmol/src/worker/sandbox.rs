@@ -714,6 +714,38 @@ pub(crate) mod tests {
         );
     }
 
+    /// Renaming a folder above a hidden one doesn't uncover it
+    #[test]
+    fn hidden_moved() {
+        let dir = temp_dir("moved");
+        let cwd = dir.join("café");
+        write_file(&cwd.join("a/b/secret.txt"), b"key");
+        let access = Access {
+            hidden: vec![cwd.join("a/b")],
+            ..Access::default()
+        };
+        let config = dir.join("config");
+        let copies = config.join("copies");
+        let python = installed(&config, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, python);
+        let sandbox = sandbox.expect("sandbox");
+        #[cfg(target_os = "macos")]
+        assert!(sandbox.enforced());
+        if !sandbox.enforced() {
+            fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        let code = "import os\n\
+            def tried(act):\n    try:\n        return act()\n    except PermissionError:\n        return 'denied'\n\
+            def moved():\n    os.rename('a', 'moved')\n    return open('moved/b/secret.txt').read()\n\
+            [tried(lambda: open('a/b/secret.txt').read()), tried(moved)]";
+        let logs = evaluated(sandbox, code);
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(logs, "['denied', 'denied']\n");
+    }
+
     /// Sockets and signals reach outside the sandbox only on kernels that can't stop them,
     /// while names still resolve
     #[cfg(any(target_os = "linux", target_os = "macos"))]
