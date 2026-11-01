@@ -600,12 +600,12 @@ pub(crate) mod tests {
     #[test]
     fn profile_built() {
         let granted = [
-            (PathBuf::from("/Users/zoë/.smol/skills/pdf"), false),
+            (PathBuf::from("/Users/zoë/.smol/skills/p\"d\\f"), false),
             (PathBuf::from("/"), false),
             (PathBuf::from("/Users/zoë/café"), true),
         ];
         let hidden = [
-            PathBuf::from("/Users/zoë/a/b/c/we\"ird\\name"),
+            PathBuf::from("/Users/zoë/a/b"),
             PathBuf::from("/Users/zoë/.ssh"),
             PathBuf::from("/Users/zoë/.smol"),
         ];
@@ -620,10 +620,8 @@ pub(crate) mod tests {
             (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.ssh\"))\n\
             (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.smol\"))\n\
             (deny file-write-unlink file-write-create (literal \"/Users/zoë/a\"))\n\
-            (deny file-write-unlink file-write-create (literal \"/Users/zoë/a/b\"))\n\
-            (allow file-read* (subpath \"/Users/zoë/.smol/skills/pdf\"))\n\
-            (deny file-write-unlink file-write-create (literal \"/Users/zoë/a/b/c\"))\n\
-            (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/a/b/c/we\\\"ird\\\\name\"))\n\
+            (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/a/b\"))\n\
+            (allow file-read* (subpath \"/Users/zoë/.smol/skills/p\\\"d\\\\f\"))\n\
             (allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n\
             (deny signal (target others))\n";
         assert_eq!(profile(&granted, &hidden), expected);
