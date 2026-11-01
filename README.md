@@ -294,7 +294,8 @@ wins: with `~/.cargo` in `write`, `~/.cargo/credentials.toml` stays hidden.
 On Linux a folder that holds a hidden path is opened entry by entry, so files
 created or replaced directly in it after the session opens can't be read, and
 when the working directory is your home folder, new files go into its
-subfolders.
+subfolders. On macOS the folders above a hidden path can't be renamed or
+removed.
 
 On Windows, and on Linux kernels without Landlock, files are not isolated; the
 environment is still cut down, on Windows to the system variables programs
