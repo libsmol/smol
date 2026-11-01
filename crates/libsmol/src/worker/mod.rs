@@ -12,9 +12,6 @@ pub const CONTROL_ENV: &str = "SMOL_CONTROL";
 pub const COPIES_ENV: &str = "SMOL_COPIES";
 /// Holds `on`, or `roles` when `agent()` takes a role, and is unset for workers without `agent()`
 pub const AGENTS_ENV: &str = "SMOL_AGENTS";
-/// Holds the Seatbelt profile the worker confines itself with
-#[cfg(target_os = "macos")]
-pub const SANDBOX_ENV: &str = "SMOL_SANDBOX";
 pub const END: &[u8] = b"\x02smol\x03end\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

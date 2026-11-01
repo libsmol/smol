@@ -26,10 +26,6 @@ pub mod guest {
     pub use crate::tools::web::fetch;
     pub use crate::tools::ToolError;
     pub use crate::utils::{block_on, Waiting};
-    #[cfg(target_os = "macos")]
-    pub use crate::worker::sandbox::confine;
-    #[cfg(target_os = "macos")]
-    pub use crate::worker::SANDBOX_ENV;
     pub use crate::worker::{
         AgentCall, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
         WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, END,

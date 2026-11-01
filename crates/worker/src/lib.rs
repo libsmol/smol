@@ -3,8 +3,6 @@ use libsmol::guest::{
     block_on, FromWorker, Function, HostCall, HostNote, Message, ToWorker, ToolError, Waiting,
     WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, DONE, END, MAX_PARALLEL_AGENTS,
 };
-#[cfg(target_os = "macos")]
-use libsmol::guest::{confine, SANDBOX_ENV};
 use pyo3::exceptions::PyRuntimeError;
 #[cfg(windows)]
 use pyo3::ffi;
@@ -52,7 +50,6 @@ fn _smol(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyfunction]
 fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     let environ = py.import("os")?.getattr("environ")?;
-    confined(&environ)?;
     // Programs the code starts would inherit these, and they must go before any thread starts
     let control: String = taken(&environ, CONTROL_ENV)?.extract()?;
     let copies: OsString = taken(&environ, COPIES_ENV)?.extract()?;
@@ -199,8 +196,6 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
 /// confined like the worker since the code may be using it
 #[pyfunction]
 fn repair(py: Python<'_>, python: OsString) -> PyResult<()> {
-    let environ = py.import("os")?.getattr("environ")?;
-    confined(&environ)?;
     let venv = venv_of(&python);
     let making = py.import("venv")?.getattr("main")?;
     making.call1(([&venv],))?;
@@ -225,23 +220,6 @@ fn venv_of(python: &OsStr) -> OsString {
     let python = Path::new(python);
     let venv = python.parent().and_then(Path::parent).unwrap_or(python);
     venv.as_os_str().to_owned()
-}
-
-/// Takes the Seatbelt profile from the environment and applies it,
-/// before anything the code could have written runs
-#[cfg(target_os = "macos")]
-fn confined(environ: &Bound<'_, PyAny>) -> PyResult<()> {
-    let profile: String = taken(environ, SANDBOX_ENV)?.extract()?;
-    if !profile.is_empty() {
-        confine(&profile).map_err(PyRuntimeError::new_err)?;
-    }
-    Ok(())
-}
-
-/// Linux confines the worker before it starts and Windows not at all
-#[cfg(not(target_os = "macos"))]
-fn confined(_: &Bound<'_, PyAny>) -> PyResult<()> {
-    Ok(())
 }
 
 /// Also unsets it for the programs the code starts

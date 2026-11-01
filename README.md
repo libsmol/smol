@@ -251,8 +251,8 @@ enabled = false
 ## Sandbox
 
 On Linux (with Landlock, kernel 5.13 or later) and macOS (with Seatbelt, which
-the Python process applies to itself before running any code), the Python
-process and the programs it starts:
+`sandbox-exec` applies before Python starts), the Python process and the
+programs it starts:
 
 - can write only in the working directory, in its venv, in a temporary folder
   of their own (`TMPDIR`) and in the session's copies of viewed images;

@@ -41,6 +41,9 @@ but their files stay in `~/.smol/history` untouched.
   deeper path in `[deny] read`, by renaming that folder, since Seatbelt rules
   go by path. The folders above a hidden path can no longer be renamed or
   removed.
+- On macOS Python starts through `/usr/bin/sandbox-exec` again, so its
+  Seatbelt profile holds before Python starts, as Landlock does on Linux,
+  rather than from when the worker module loads.
 
 ## 0.4.4 - 2026-10-31
 
