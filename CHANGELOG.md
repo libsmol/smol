@@ -7,6 +7,20 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- The system prompt gives `remember()`'s 300-character limit and says that
+  `recall()` returns up to 10 memories matching any word of the query, which
+  `help()` used to say alone, and it asks to search memories by the task's
+  key words. A table in its Memories section says when to save and forget,
+  where the rules used to. Besides what the user asks for and their
+  preferences and corrections, the model now saves only pitfalls and failed
+  approaches in the folder that no file records, instead of anything it
+  worked out about the folder, which saved descriptions of code that went
+  stale. A memory is for every folder only when the user says it holds there.
+- The system prompt lists `agent()` and its handle's methods with the other
+  functions, and says that a single `print()` over 8192 characters is cut too.
+
 ## 0.6.1 - 2026-11-01
 
 - The system prompt lists the optional parameters of MCP functions by name

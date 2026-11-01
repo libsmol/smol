@@ -2,7 +2,7 @@ use crate::agent::{Brief, Place, Status};
 use crate::config::Role;
 use crate::memory::{
     exit_code, AgentStep, Call, CallError, Ending, Exit, MemoryStep, ShellStep, StepError,
-    TaskStep, MAX_OBSERVATION_CHARS,
+    TaskStep, MAX_OBSERVATION_CHARS, MAX_PRINT_CHARS,
 };
 use crate::model::{Media, Part};
 use crate::tools::memories::MAX_MEMORY_CHARS;
@@ -24,8 +24,14 @@ const RULES: &str = "- Never make up data or functions; check unfamiliar ones wi
 - Do the task instead of describing it.
 - Report only results you obtained, and state what failed or is uncertain.";
 /// Only for agents whose worker offers `remember()`
-const REMEMBERING: &str = "- Keep with `remember()` what the user asks you to remember, their preferences and corrections (with `project=False` when they hold in every folder), and facts about this folder you had to work out; not what its files already say.
-- `forget()` a memory that turned out wrong.";
+const REMEMBERING: &str = "| Situation | Call |
+|---|---|
+| The user asks you to remember something, or states a preference or correction | `remember(text)` |
+| You found a pitfall or a failed approach in this folder that no file records | `remember(text)` |
+| The user says it holds in every folder | `remember(text, project=False)` |
+| A memory turns out wrong or outdated | `forget(id)`, then `remember()` the corrected fact |
+
+Keep one fact per memory.";
 
 const SHOWN: &str = " Text you write in a reply that runs code is shown to the user.";
 const NAMED: &str =
@@ -123,23 +129,15 @@ pub(crate) fn system(
     place: &Place,
 ) -> String {
     let mut stubs = Vec::new();
-    let mut handed = Vec::new();
     for function in functions {
         let mut stub = function.header.clone();
         for line in function.summary.lines() {
             stub.push_str("\n    # ");
             stub.push_str(line);
         }
-        // The names builtins.py gives `agent()` and the `Agent` class and methods
-        let delegating =
-            function.name == "agent" || function.name.split('.').next() == Some("Agent");
-        match delegating {
-            true => handed.push(stub),
-            false => stubs.push(stub),
-        }
+        stubs.push(stub);
     }
     let stubs = stubs.join("\n\n");
-    let handed = handed.join("\n\n");
 
     let mut listed = String::new();
     for added in servers {
@@ -218,12 +216,8 @@ pub(crate) fn system(
 | Work that can go on in the background | `agent(task, name=\"...\")` | It runs while you continue |
 | The task asks for agents | `agent([part1, part2, ...])` once the parts are clear | Each part is done by an agent |
 
-- Without `name`, `agent()` waits for the answer. A single task that fails raises `RuntimeError`; a list of tasks returns the answers in order, with a `RuntimeError` in place of each task that failed.
-- With `name`, `agent()` returns a handle at once. If it is still running when you answer, the task stays open until it ends, and an `{DONE}:` message tells you when.
-
-```python
-{handed}
-```{roles}"
+- A single task that fails raises `RuntimeError`; a list of tasks returns the answers in order, with a `RuntimeError` in place of each task that failed.
+- An agent started with `name` that is still running when you answer keeps the task open until it ends, and an `{DONE}:` message tells you when.{roles}"
         ),
         Place::Delegated(_) => String::new(),
     };
@@ -259,7 +253,7 @@ pub(crate) fn system(
                 places.push(place);
             }
             let places = places.join(", ");
-            format!("\n- Your code runs in a sandbox: writing outside {places}, the venv and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- `$TMPDIR` is removed when the session ends.\n- If a tool fails because it cannot write its cache, rerun it with the cache in `$TMPDIR`.")
+            format!("\n- Your code runs in a sandbox: writing outside {places}, the venv and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- `$TMPDIR` is removed when the session ends; if a tool fails because it cannot write its cache, rerun it with the cache there.")
         }
         None => String::new(),
     };
@@ -273,14 +267,18 @@ pub(crate) fn system(
         lines.push(line);
     }
     let mut kept = Vec::new();
+    let remembering = functions.iter().any(|function| function.name == "remember");
+    if remembering {
+        kept.push(REMEMBERING.to_owned());
+    }
     if !lines.is_empty() {
         let shown = lines.len();
         let heading = match memories.global > shown {
             true => format!(
-                "Kept for every folder, the newest {shown} of {} (`recall()` finds the rest):",
+                "Saved for every folder, the newest {shown} of {} (`recall()` finds the rest):",
                 memories.global
             ),
-            false => "Kept for every folder:".to_owned(),
+            false => "Saved for every folder:".to_owned(),
         };
         let lines = lines.join("\n");
         let listed = format!("{heading}\n{lines}");
@@ -292,7 +290,7 @@ pub(crate) fn system(
         count => Some(format!("{count} memories")),
     };
     if let Some(counted) = counted {
-        let here = format!("This folder has {counted} of its own from earlier sessions; before you start a task, search them with `recall()` for what it is about.");
+        let here = format!("This folder has {counted} of its own; before you start a task, search them with `recall()` for the task's key words.");
         kept.push(here);
     }
     let remembered = match kept.is_empty() {
@@ -301,12 +299,6 @@ pub(crate) fn system(
             let kept = kept.join("\n\n");
             format!("\n\n# Memories\n\n{kept}")
         }
-    };
-
-    let remembering = functions.iter().any(|function| function.name == "remember");
-    let rules = match remembering {
-        true => format!("{RULES}\n{REMEMBERING}"),
-        false => RULES.to_owned(),
     };
 
     let date = Utc::now().format("%Y-%m-%d");
@@ -325,7 +317,7 @@ Answer as soon as you have the result; if the task needs no code, answer immedia
 
 All calls share one Python session: variables, functions and imports persist across calls.
 
-A call returns what its code printed, plus the value of every top-level expression that is not `None` (strings verbatim, other values as `repr`). Output longer than {MAX_OBSERVATION_CHARS} characters is cut in the middle; the values in your variables are not affected. If the code fails, the result ends with `Error:` followed by the exception and the line that raised it.
+A call returns what its code printed, plus the value of every top-level expression that is not `None` (strings verbatim, other values as `repr`). Output longer than {MAX_OBSERVATION_CHARS} characters, or a single `print()` longer than {MAX_PRINT_CHARS}, is cut in the middle; the values in your variables are not affected. If the code fails, the result ends with `Error:` followed by the exception and the line that raised it.
 
 Write each call as a complete program:
 - Do as much as possible in one call with loops, conditions, the standard library and the functions below.
@@ -341,18 +333,18 @@ These need no import. Use them instead of writing your own, and create new files
 
 ```python
 {stubs}
-```{listed}{skills}{agents}
+```{listed}{skills}{agents}{remembered}
 
 # Environment
 
 - Your code runs on the user's computer ({OS}) in `{cwd}`; the files and programs a task mentions are there.
 - Python is CPython {PYTHON} in a venv kept for this folder: packages you install with `pip install` can be imported in this session right away.{sandbox}
 - Today is {date} (UTC).
-- Your answer goes to {reader}; no hidden tests or graders check your work.{remembered}
+- Your answer goes to {reader}; no hidden tests or graders check your work.
 
 # Rules
 
-{rules}{instructions}",
+{RULES}{instructions}",
     )
 }
 
@@ -879,13 +871,13 @@ mod tests {
 
         let built_in = "## Built-in\n\n```python\n\
                         ls(path) -> list[str]\n    # Sorted paths.\n    # The café/ folder ends with /.\n\n\
+                        agent(task) -> str\n    # A new agent does each task.\n\n\
+                        class Agent\n    # The handle.\n\n\
+                        Agent.get(name) -> Agent\n    # Its handle.\n\n\
                         help(request) -> None\n    # Prints the docs.\n```\n\n# Skills";
         assert!(text.contains(built_in), "{text}");
-        let handed = "```python\n\
-                      agent(task) -> str\n    # A new agent does each task.\n\n\
-                      class Agent\n    # The handle.\n\n\
-                      Agent.get(name) -> Agent\n    # Its handle.\n```\n\n# Environment";
-        assert!(text.contains(handed), "{text}");
+        let delegating = "`Agent done:` message tells you when.\n\n# Environment";
+        assert!(text.contains(delegating), "{text}");
         let place = format!(
             ") in `/home/zoë/work`; the files and programs a task mentions are there.\n\
              - Python is CPython {PYTHON} in a venv kept for this folder: packages you install with `pip install` can be imported in this session right away.\n\
@@ -945,13 +937,17 @@ mod tests {
 
         let functions = [remember];
         let text = system(&functions, &[], &brief, cwd, None, &main);
-        let section = "check your work.\n\n# Memories\n\n\
-                       Kept for every folder:\n\
-                       - [7] Writes résumés in French\n\
-                       - [3] Prefers tabs over spaces\n\n\
-                       This folder has 12 memories of its own from earlier sessions; \
-                       before you start a task, search them with `recall()` for what it is about.\n\n# Rules\n\n";
+        let section = "message tells you when.\n\n# Memories\n\n\
+                       | Situation | Call |\n|---|---|\n";
         assert!(text.contains(section), "{text}");
+        let saved = "Keep one fact per memory.\n\n\
+                     Saved for every folder:\n\
+                     - [7] Writes résumés in French\n\
+                     - [3] Prefers tabs over spaces\n\n\
+                     This folder has 12 memories of its own; \
+                     before you start a task, search them with `recall()` for the task's key words.\n\n# Environment\n\n";
+        assert!(text.contains(saved), "{text}");
+        assert!(text.ends_with("or is uncertain."), "{text}");
 
         let listed = Listed {
             newest,
@@ -963,17 +959,15 @@ mod tests {
             ..Brief::default()
         };
         let text = system(&functions, &[], &more, cwd, None, &main);
-        let heading = "# Memories\n\n\
-                       Kept for every folder, the newest 2 of 14 (`recall()` finds the rest):\n\
+        let heading = "Keep one fact per memory.\n\n\
+                       Saved for every folder, the newest 2 of 14 (`recall()` finds the rest):\n\
                        - [7] Writes résumés in French\n";
         assert!(text.contains(heading), "{text}");
-        let rules =
-            "or is uncertain.\n- Keep with `remember()` what the user asks you to remember, ";
-        assert!(text.contains(rules), "{text}");
-        assert!(
-            text.ends_with("- `forget()` a memory that turned out wrong."),
-            "{text}"
-        );
+
+        let empty = Brief::default();
+        let bare = system(&functions, &[], &empty, cwd, None, &main);
+        let table = "corrected fact |\n\nKeep one fact per memory.\n\n# Environment";
+        assert!(bare.contains(table), "{bare}");
 
         let listed = Listed {
             here: 1,
@@ -984,11 +978,11 @@ mod tests {
             ..Brief::default()
         };
         let helper = system(&[], &[], &counted, cwd, None, &Place::Delegated(None));
-        let section = "check your work.\n\n# Memories\n\n\
-                       This folder has 1 memory of its own from earlier sessions; \
-                       before you start a task, search them with `recall()` for what it is about.\n\n# Rules\n\n";
+        let section = "```\n\n# Memories\n\n\
+                       This folder has 1 memory of its own; \
+                       before you start a task, search them with `recall()` for the task's key words.\n\n# Environment\n\n";
         assert!(helper.contains(section), "{helper}");
-        assert!(!helper.contains("remember()"), "{helper}");
+        assert!(!helper.contains("remember("), "{helper}");
     }
 
     #[test]
