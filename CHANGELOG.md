@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.6.0 - 2026-11-01
 
 - `remember(text, project=True)`, `recall(query="")` and `forget(id)` keep
   memories across sessions in `~/.smol/memory.db`. A memory belongs to the
@@ -16,6 +16,20 @@ but their files stay in `~/.smol/history` untouched.
   the directory has, which `recall()` finds by whole words, Chinese ones too.
   Agents that `agent()` starts can only recall. SQLite and a Chinese
   dictionary make `libsmol` about 3 MB larger.
+- A thread stuck writing to a full pipe no longer hangs the end of a snippet,
+  which used to end with the worker killed and every variable lost. Pipes the
+  code opened are still flushed after each snippet, on threads the snippet
+  waits for only briefly.
+- `help("name")` describes a function, class or module the code defined under
+  a built-in's name instead of the built-in.
+- `model.toml` must give `api` as an `http://` or `https://` URL, which used
+  to show only when the first request failed.
+- A quoted value in a `SKILL.md` front matter followed by a comment no longer
+  keeps its quotes.
+- Code that contains ```` ``` ```` shows as one block in smol and in editors.
+- While MCP servers connect, smol no longer shows a new turn as thinking.
+- An agent that `agent()` starts is told its answer goes to the agent that
+  gave it the task.
 
 ## 0.5.1 - 2026-11-01
 

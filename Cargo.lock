@@ -1870,7 +1870,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libsmol"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent-client-protocol-schema",
  "base64 0.23.1",
@@ -1907,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "libsmol-reaper"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "libsmol-tui"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "libsmol-worker"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "libc",
  "libsmol",
