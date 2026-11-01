@@ -28,6 +28,7 @@ grep-searcher = "0.1"
 html5ever = "0.39"
 ignore = "0.4"
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
+jieba-rs = "0.11"
 reaper.workspace = true
 regex-syntax = "0.8"
 reqwest = { version = "0.13", features = ["json"] }
@@ -36,6 +37,7 @@ rmcp = { version = "3", features = [
     "transport-async-rw",
     "transport-streamable-http-client-reqwest",
 ] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 scraper = "0.27"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -91,10 +91,19 @@ impl fmt::Display for McpState {
         match self {
             McpState::Off => f.write_str("off"),
             McpState::Connecting => f.write_str("connecting"),
-            McpState::Connected { tools: 1 } => f.write_str("connected, 1 tool"),
-            McpState::Connected { tools } => write!(f, "connected, {tools} tools"),
+            McpState::Connected { tools } => {
+                let tools = tool_count(*tools);
+                write!(f, "connected, {tools}")
+            }
             McpState::Failed { error } => write!(f, "failed: {error}"),
         }
+    }
+}
+
+pub(crate) fn tool_count(tools: usize) -> String {
+    match tools {
+        1 => "1 tool".to_owned(),
+        tools => format!("{tools} tools"),
     }
 }
 

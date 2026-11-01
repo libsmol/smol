@@ -299,21 +299,27 @@ impl App {
 
     pub(crate) fn submit_text(&mut self, text: &str) {
         let Some(command) = Command::parse(text) else {
-            return self.send(text);
+            self.transcript.task(text);
+            self.begin();
+            self.session.prompt(text);
+            return;
         };
 
         // A queued command may run while a draft sits in the input box,
         // and then the list goes into the transcript
         let drafting = !self.draft().is_empty();
         let result = match &command {
-            Command::List(list) if drafting => self.session.list(*list),
+            Command::List(list) if drafting => {
+                let rows = self.session.rows(*list);
+                rows.map(|rows| listed(*list, rows))
+            }
             Command::List(List::Sessions) => return self.complete(RESUME_PREFIX),
             Command::List(List::Models) if models(&self.session.options).is_empty() => {
-                return self.info(List::Models.empty_text())
+                return self.info(empty_text(List::Models))
             }
             Command::List(List::Models) => return self.complete(MODEL_PREFIX),
             Command::List(List::Servers) if self.session.mcp.is_empty() => {
-                return self.info(List::Servers.empty_text())
+                return self.info(empty_text(List::Servers))
             }
             Command::List(List::Servers) => return self.complete(MCP_PREFIX),
             Command::Quit => {
@@ -326,7 +332,7 @@ impl App {
             Command::Mcp(on, name) => self.session.set_mcp(*on, name),
             Command::Shell(command) => {
                 self.begin();
-                return self.session.client.shell(&self.session.id, command);
+                return self.session.shell(command);
             }
             Command::Invalid(text) => return self.failure(text),
         };
@@ -357,12 +363,6 @@ impl App {
         if resume.is_some() {
             self.show_session();
         }
-    }
-
-    fn send(&mut self, task: &str) {
-        self.transcript.task(task);
-        self.begin();
-        self.session.prompt(task);
     }
 
     fn begin(&mut self) {
@@ -725,7 +725,7 @@ impl App {
         } else if self.session_rows.is_none() {
             let asked = self.session.rows(List::Sessions);
             match &asked {
-                Ok(rows) if rows.is_empty() => self.info(List::Sessions.empty_text()),
+                Ok(rows) if rows.is_empty() => self.info(empty_text(List::Sessions)),
                 Ok(_) => {}
                 Err(error) => {
                     let text = format!("{error:#}");
@@ -1070,7 +1070,7 @@ impl App {
     fn interrupt(&mut self) {
         if let Some(run) = &mut self.run {
             run.interrupting = true;
-            self.session.client.cancel(&self.session.id);
+            self.session.cancel();
         }
     }
 
@@ -1278,6 +1278,36 @@ fn hints(input: &str) -> Vec<&'static Hint> {
     found
 }
 
+fn empty_text(list: List) -> &'static str {
+    match list {
+        List::Sessions => "no other sessions",
+        List::Models => "no models",
+        List::Servers => "no MCP servers",
+    }
+}
+
+fn listed(list: List, rows: Vec<Pick>) -> String {
+    if rows.is_empty() {
+        return empty_text(list).to_owned();
+    }
+
+    let mut lines = Vec::new();
+    for row in rows {
+        let mut line = row.value;
+        if row.label != line {
+            line += &format!("  {}", row.label);
+        }
+        if !row.description.is_empty() {
+            line += &format!("  {}", row.description);
+        }
+        if row.current {
+            line += "  (current)";
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use crate::client::McpStatus;
@@ -1444,6 +1474,22 @@ mod tests {
         app.session.options.clear();
         app.submit_text(":model");
         assert_eq!(shown(&mut app), ["", "  no models"]);
+    }
+
+    #[test]
+    fn lists_formatted() {
+        let mut app = app();
+        let list = |app: &App, list: List| {
+            let rows = app.session.rows(list).expect("list");
+            listed(list, rows)
+        };
+
+        assert_eq!(list(&app, List::Models), "m1  (current)\nm2-café");
+        assert_eq!(list(&app, List::Sessions), "no other sessions");
+        assert_eq!(list(&app, List::Servers), "no MCP servers");
+
+        app.session.open(None).expect("open");
+        assert_eq!(list(&app, List::Sessions), "s1  old session");
     }
 
     #[test]

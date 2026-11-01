@@ -23,12 +23,13 @@ pub mod guest {
     pub use crate::prompt::{unserializable, DONE};
     pub use crate::tools::attach::{shown_path, viewed};
     pub use crate::tools::files::{grep, ls};
+    pub use crate::tools::memories::{MAX_MEMORY_CHARS, MAX_RECALLED};
     pub use crate::tools::web::fetch;
     pub use crate::tools::ToolError;
     pub use crate::utils::{block_on, Waiting};
     pub use crate::worker::{
-        AgentCall, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
-        WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, END,
+        FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall, WorkerNote,
+        AGENTS_ENV, CONTROL_ENV, COPIES_ENV, END,
     };
 }
 

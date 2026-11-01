@@ -596,7 +596,7 @@ mod tests {
             assert!(matches!(asked, Ok(None)), "{asked:?}");
             assert!(interrupt.cancelled(0));
 
-            // Replayed notifications come before the reply.
+            // Replayed notifications come before the reply
             // Opening may first make the venv tests share, which is slow on Windows
             let answered = loop {
                 let receiving = sent.recv();

@@ -2,11 +2,14 @@ use crate::acp::rpc::{Notice, Peer};
 use crate::acp::servers::McpPool;
 use crate::acp::translator::Translator;
 use crate::acp::{rfc3339, task_of, to_value, App, QUEUED};
-use crate::agent::{title_of, Agent, Asking, Event, Helpers, Nudging, Place, Queue, Sink, Task};
+use crate::agent::{
+    title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Sink, Task,
+};
 use crate::config::{self, Access, McpConfig, Models};
 use crate::history::{Lock, SessionMeta, Settings};
 use crate::memory::{AgentMemory, Exit, MemoryStep};
 use crate::spawn::{spawn_shell, Group};
+use crate::tools::memories::Memories;
 use crate::utils::Interrupt;
 use crate::worker::host::Worker;
 use crate::worker::python::Python;
@@ -58,7 +61,8 @@ pub(crate) struct Shell {
     pub(crate) turn: u64,
 }
 
-/// The session task reads the config and saved session and sends the reply itself
+/// `Router::open` reads model.toml and agent.toml, and the session task reads the rest
+/// and sends the reply itself
 pub(crate) struct Opening {
     pub(crate) id: Value,
     pub(crate) session: String,
@@ -158,6 +162,9 @@ async fn start(opening: Opening) -> Result<Session> {
     if let Some(previous) = previous {
         previous.await.ok();
     }
+    if inbox.is_closed() {
+        return Err(unopened(inbox, peer, session));
+    }
 
     // Read the saved session only after locking because another process
     // saves its last step before releasing the lock
@@ -198,6 +205,7 @@ async fn start(opening: Opening) -> Result<Session> {
         let notice = problem.to_string();
         notices.push(notice);
     }
+    let memories = Memories::new(&app.config, &cwd);
 
     let mut settings = Settings {
         cwd: cwd.clone(),
@@ -228,6 +236,9 @@ async fn start(opening: Opening) -> Result<Session> {
     // The sandbox grants the runtime by the folders that exist when it is made
     let python = Python::install(&app.config, &cwd).await;
     let python = python.map_err(Error::Python)?;
+    if inbox.is_closed() {
+        return Err(unopened(inbox, peer, meta.id));
+    }
     let sandbox = Sandbox::new(&cwd, &copies, &app.config, &skills, &access, python);
     let sandbox = sandbox.map_err(Error::Python)?;
     let sandbox = Arc::new(sandbox);
@@ -237,7 +248,15 @@ async fn start(opening: Opening) -> Result<Session> {
         true => Delegation::On,
         false => Delegation::Roles,
     };
-    let worker = Worker::new(&interrupt, Arc::clone(&sandbox), &[], delegation, ran).await?;
+    let starting = Worker::new(
+        &interrupt,
+        Arc::clone(&sandbox),
+        memories.clone(),
+        &[],
+        delegation,
+        ran,
+    );
+    let worker = starting.await?;
 
     let response = match loading {
         true => {
@@ -274,14 +293,18 @@ async fn start(opening: Opening) -> Result<Session> {
         session: meta.id.clone(),
         enqueued,
     };
-    let agent = Agent {
-        model: Arc::from(built),
+    let brief = Brief {
         instructions,
         skills,
+    };
+    let agent = Agent {
+        model: Arc::from(built),
+        brief,
         cwd,
         copies,
         interrupt: interrupt.clone(),
         sandbox,
+        memories,
         place: Place::Main {
             roles,
             team: Arc::default(),
@@ -591,6 +614,22 @@ impl Queue for ClientQueue {
     fn enqueued(&self) -> Nudging<'_> {
         Box::pin(self.enqueued.notified())
     }
+}
+
+/// A session closed while opening still answers what was queued, as `Session::run` does after close
+fn unopened(mut inbox: UnboundedReceiver<Message>, peer: &Peer, session: String) -> Error {
+    while let Ok(message) = inbox.try_recv() {
+        match message {
+            Message::Prompt(Prompt { id, .. }) | Message::Shell(Shell { id, .. }) => {
+                finish(peer, &id, StopReason::Cancelled);
+            }
+            Message::Option(id, _) => {
+                let error = Error::SessionNotFound(session.clone());
+                peer.respond(&id, Err(error));
+            }
+        }
+    }
+    Error::SessionNotFound(session)
 }
 
 fn finish(peer: &Peer, id: &Value, reason: StopReason) {
@@ -949,6 +988,41 @@ mod tests {
         }
         let refused = format!("session: {session}: not found");
         assert_eq!(answers, ["cancelled", "cancelled", refused.as_str()]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn closed_while_opening() {
+        let dir = temp_dir("closed-opening");
+        let memory = one_task("Take a look at the café");
+        let settings = Settings::default();
+        saved(&stored(&dir), &memory, "s1", &settings);
+
+        let running = async {
+            let mut connection = Connection::open(&dir, "http://127.0.0.1:1/v1", "");
+            let load = json!({"sessionId": "s1", "cwd": CWD, "mcpServers": []});
+            let text = json!([{"type": "text", "text": "Make a naïve menu"}]);
+            let prompt = json!({"sessionId": "s1", "prompt": text});
+            let queued = [(100, "session/load", load), (101, "session/prompt", prompt)];
+            for (id, method, params) in queued {
+                let request =
+                    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+                connection.send(request);
+            }
+            let close = json!({"sessionId": "s1"});
+            connection.request("session/close", close).await;
+            connection.close().await
+        };
+        let seen = block_on(running);
+
+        let answer = |id: u64| seen.iter().find(|message| message["id"] == id);
+        let loaded = answer(100).expect("load");
+        assert_eq!(
+            loaded["error"]["message"], "session: s1: not found",
+            "{loaded}"
+        );
+        let prompted = answer(101).expect("prompt");
+        assert_eq!(prompted["result"]["stopReason"], "cancelled", "{prompted}");
         fs::remove_dir_all(&dir).ok();
     }
 

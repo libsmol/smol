@@ -405,11 +405,9 @@ fn venv_for(store: &Path, _: &Path, runtime: &str) -> PathBuf {
     store.join(VENVS).join(runtime).join("venv")
 }
 
-/// The folder's name and a hash of the whole path, both without `.` parts,
-/// a trailing separator or, on Windows, case
+/// The folder's name and a hash of the whole path, both as `folded` spells them
 fn venv_name(cwd: &Path) -> String {
-    let cwd: PathBuf = cwd.components().collect();
-    let cwd = PathBuf::from(folded(&cwd));
+    let cwd = PathBuf::from(folded(cwd));
     let digest = Sha256::digest(cwd.as_os_str().as_encoded_bytes());
     let hash = hex(&digest);
     let named = cwd.file_name().unwrap_or_default().to_string_lossy();

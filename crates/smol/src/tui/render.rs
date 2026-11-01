@@ -425,7 +425,8 @@ impl Render {
             let room = self.width.saturating_sub(taken);
             // What it is doing takes at most half the row and the title fits in the rest
             let status = status(helper, room / 2);
-            let left = room.saturating_sub(spans_width(&status) + " · ".width());
+            let used = spans_width(&status) + " · ".width();
+            let left = room.saturating_sub(used);
             let title = clipped(&helper.title, left);
 
             let mut spans = vec![

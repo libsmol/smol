@@ -3,6 +3,7 @@ use crate::model::Media;
 use crate::prompt::{self, NO_SERVER};
 use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
 use crate::tools::mcp::Server;
+use crate::tools::memories::Memories;
 use crate::utils::{new_id, Interrupt, Reply};
 use crate::worker::python;
 use crate::worker::sandbox::Sandbox;
@@ -80,6 +81,7 @@ pub(crate) struct Worker {
     live: Option<Live>,
     /// Shared with the workers of agents the code starts
     sandbox: Arc<Sandbox>,
+    memories: Memories,
     interrupt: Interrupt,
     delegation: Delegation,
     functions: Vec<Function>,
@@ -137,12 +139,14 @@ impl Worker {
     pub(crate) async fn new(
         interrupt: &Interrupt,
         sandbox: Arc<Sandbox>,
+        memories: Memories,
         servers: &[&Added],
         delegation: Delegation,
         restarted: bool,
     ) -> Result<Self> {
         let mut worker = Self {
             sandbox,
+            memories,
             interrupt: interrupt.clone(),
             delegation,
             functions: Vec::new(),
@@ -430,6 +434,14 @@ impl Worker {
                     let calling = delegate(call);
                     (calling, !asked)
                 }
+                WorkerCall::Memory(call) => {
+                    let memories = self.memories.clone();
+                    let calling: Calling = Box::pin(async move {
+                        let reply = memories.answer(call).await;
+                        Called::from(reply)
+                    });
+                    (calling, true)
+                }
             };
             let task = live.calls.spawn(async move { (number, calling.await) });
             if cancelable {
@@ -597,12 +609,13 @@ async fn start_error(group: Group, mut pieces: Receiver<Piece>, mut output: Clip
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::agent::tests::main_place;
-    use crate::agent::MAX_PARALLEL_AGENTS;
+    use crate::agent::{Brief, MAX_PARALLEL_AGENTS};
     use crate::memory::CallError;
     use crate::prompt::{self, system};
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
     use crate::tools::mcp::tests::{fake, started};
     use crate::tools::mcp::Server;
+    use crate::tools::memories::{Listed, Memories};
     use crate::utils::{block_on, new_id, Interrupt};
     use crate::worker::host::{Added, Called, Calling, Delegating, Evaluated, Worker, STOP_WAIT};
     use crate::worker::sandbox::tests::opened;
@@ -683,8 +696,20 @@ pub(crate) mod tests {
         let dir = temp_dir("session");
         let copies = dir.join("copies");
         let sandbox = opened(&cwd, &copies);
+        // As for the agents that agent() starts
+        let memories = match delegation {
+            Delegation::Off => Memories::new(&dir, &cwd).read_only(),
+            _ => Memories::new(&dir, &cwd),
+        };
         let restarted = false;
-        let building = Worker::new(&interrupt, Arc::new(sandbox), &[], delegation, restarted);
+        let building = Worker::new(
+            &interrupt,
+            Arc::new(sandbox),
+            memories,
+            &[],
+            delegation,
+            restarted,
+        );
         let worker = block_on(building).expect("worker");
         let value = Tried {
             worker,
@@ -1300,6 +1325,55 @@ pub(crate) mod tests {
         let output = worker.eval("import pickle\npickle.loads(pickle.dumps(square))(3)");
         assert_eq!(output.error, None);
         assert_eq!(output.logs, "9\n");
+    }
+
+    #[test]
+    fn memories_kept() {
+        let mut worker = fresh();
+        let code = "a = remember('Deploys the café site on Fridays')\n\
+             b = remember('Prefers naïve tests', project=False)\n\
+             [recall('fridays') == [(a, 'Deploys the café site on Fridays')], len(recall()), forget(a), recall('fridays')]";
+        let output = worker.eval(code);
+
+        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.logs, "[True, 2, None, []]\n");
+    }
+
+    #[test]
+    fn memory_errors() {
+        let mut worker = fresh();
+        let code = "def tried(act):\n    try:\n        act()\n    except (TypeError, ValueError) as error:\n        return f'{type(error).__name__}: {error}'\n\
+             [tried(lambda: remember('é' * 301)), tried(lambda: remember(' ')), tried(lambda: forget(999)),\n \
+              tried(lambda: forget('7')), tried(lambda: remember(5))]";
+        let output = worker.eval(code);
+
+        let expected = "['ValueError: remember: 301 characters, over the 300-character limit', \
+                        'ValueError: remember: text is empty', 'ValueError: forget: no such memory', \
+                        'TypeError: forget: id must be int, not str', 'TypeError: remember: text must be str, not int']\n";
+        assert_eq!(output.logs, expected);
+    }
+
+    /// Agents that agent() started only recall, even when their code asks the agent directly
+    #[test]
+    fn memories_nested() {
+        let dir = temp_dir("nested");
+        fs::create_dir_all(&dir).expect("dir");
+        let mut worker = build(Interrupt::default(), dir.clone(), Delegation::Off);
+        let names: Vec<String> = worker.functions().iter().map(|f| f.name.clone()).collect();
+        let code = "ask = recall.__globals__['_ask']\n\
+             try:\n    ask('remember', {'text': 'Uses tabs', 'project': True})\n\
+             except ValueError as error:\n    print(error)\n\
+             recall('tabs')";
+        let output = worker.eval(code);
+        fs::remove_dir_all(&dir).ok();
+
+        assert!(names.contains(&"recall".to_owned()), "{names:?}");
+        assert!(!names.contains(&"remember".to_owned()), "{names:?}");
+        assert!(!names.contains(&"forget".to_owned()), "{names:?}");
+        assert_eq!(
+            output.logs,
+            "not available to agents started by agent()\n[]\n"
+        );
     }
 
     #[test]
@@ -2025,7 +2099,9 @@ pub(crate) mod tests {
         let servers: Vec<&Added> = worker.servers.iter().collect();
         let cwd = Path::new("/work");
         let main = main_place(Vec::new());
-        let text = system(&[], &servers, &[], cwd, None, &[], &main);
+        let empty = Brief::default();
+        let none = Listed::default();
+        let text = system(&[], &servers, &empty, &none, cwd, None, &main);
         let listed = "\n\n## MCP `news_web`\n\nSearches the web and the news\n\nRead-only\n\n\
                       ```python\nnews_web.echo_text(the_text: str = None) -> str\n```\n\n\
                       ## MCP `notes`\n\n\
@@ -2195,6 +2271,36 @@ pub(crate) mod tests {
 
         assert_eq!(written, "still open");
         assert_eq!(closed, "False\n");
+    }
+
+    /// A thread blocked writing to a pipe would hold up its flush after the snippet
+    #[test]
+    fn pipes_not_flushed() {
+        let (mut worker, dir) = workspace("pipes");
+        let code = "import os\n\
+             _, end = os.pipe()\n\
+             pipe = open(end, 'wb')\n\
+             kept = open('café.txt', 'w')\n\
+             files = open.__globals__['_OPEN_FILES']\n\
+             [pipe in files, kept in files]";
+        let output = worker.eval(code);
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(output.logs, "[False, True]\n");
+    }
+
+    /// A function the code defined is looked up before a builtin of the same name
+    #[test]
+    fn help_prefers_code() {
+        let mut worker = fresh();
+        let code = "def fetch(url):\n    '''Reads the naïve cache.'''\n\nhelp('fetch')";
+        let output = worker.eval(code);
+
+        assert!(
+            output.logs.contains("Reads the naïve cache."),
+            "{}",
+            output.logs
+        );
     }
 
     #[test]

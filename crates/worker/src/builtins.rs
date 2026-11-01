@@ -1,7 +1,7 @@
 use crate::{json_of, python_of, request, send};
 use libsmol::guest::{
-    block_on, fetch, grep, ls, shown_path, unserializable, viewed, AgentCall, Message, ToolError,
-    WorkerCall, WorkerNote,
+    block_on, fetch, grep, ls, shown_path, unserializable, viewed, Message, ToolError, WorkerCall,
+    WorkerNote,
 };
 use pyo3::exceptions::{PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -38,7 +38,7 @@ pub(crate) fn builtins(
         ("_grep", wrap_pyfunction!(search, py)?),
         ("_fetch", wrap_pyfunction!(get, py)?),
         ("_call", wrap_pyfunction!(call_tool, py)?),
-        ("_agent", wrap_pyfunction!(delegate, py)?),
+        ("_ask", wrap_pyfunction!(ask, py)?),
         ("_view", wrap_pyfunction!(view, py)?),
     ])
 }
@@ -105,16 +105,17 @@ fn call_tool<'py>(
     asked(py, call)
 }
 
+/// The calls of `agent()`, its handles and the memory functions, by the method the agent reads
 #[pyfunction]
-fn delegate<'py>(
+fn ask<'py>(
     py: Python<'py>,
     method: String,
     params: Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let params = json_of(&params)?;
     let call = json!({ "method": method, "params": params });
-    let call: AgentCall = serde_json::from_value(call).map_err(value_error)?;
-    asked(py, WorkerCall::Agent(call))
+    let call: WorkerCall = serde_json::from_value(call).map_err(value_error)?;
+    asked(py, call)
 }
 
 #[pyfunction]

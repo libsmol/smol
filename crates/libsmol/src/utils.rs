@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::future;
 use std::future::Future;
 use std::hash::{BuildHasher, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::mpsc;
@@ -156,14 +156,16 @@ pub(crate) fn new_id() -> String {
     format!("{stamp:x}-{random:08x}")
 }
 
-/// One spelling of a directory, since on Windows a typed one may differ in case from the saved one
+/// One spelling of a directory, without `.` parts or a trailing separator,
+/// and lowercase on Windows since a typed one may differ in case from the saved one
 pub(crate) fn folded(path: &Path) -> OsString {
+    let path: PathBuf = path.components().collect();
     match cfg!(windows) {
         true => {
             let text = path.to_string_lossy();
             OsString::from(text.to_lowercase())
         }
-        false => path.as_os_str().to_owned(),
+        false => path.into_os_string(),
     }
 }
 

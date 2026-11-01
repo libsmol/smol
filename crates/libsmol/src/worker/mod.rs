@@ -85,6 +85,20 @@ pub enum WorkerCall {
     },
     #[serde(untagged)]
     Agent(AgentCall),
+    #[serde(untagged)]
+    Memory(MemoryCall),
+}
+
+/// A call to `remember()`, `recall()` or `forget()`
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params", rename_all = "snake_case")]
+pub enum MemoryCall {
+    /// Answered with the new memory's id
+    Remember { text: String, project: bool },
+    /// Answered with `[[id, text], ...]`
+    Recall { query: String },
+    /// Answered with null
+    Forget { id: i64 },
 }
 
 /// A call to `agent()` or to a handle it returned, where a handle is `{"id", "name", "task", "role"}`

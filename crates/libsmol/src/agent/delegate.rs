@@ -193,10 +193,17 @@ impl Agent {
                 watched.show(false);
 
                 let sandbox = Arc::clone(&self.sandbox);
+                let memories = self.memories.read_only();
                 let installed: Vec<&Added> = servers.iter().collect();
                 let restarted = false;
-                let starting =
-                    Worker::new(&self.interrupt, sandbox, &installed, Delegation::Off, restarted);
+                let starting = Worker::new(
+                    &self.interrupt,
+                    sandbox,
+                    memories,
+                    &installed,
+                    Delegation::Off,
+                    restarted,
+                );
                 match starting.await {
                     Ok(mut worker) => {
                         let task = Task {

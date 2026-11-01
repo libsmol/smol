@@ -1,4 +1,4 @@
-use crate::client::{McpState, McpStatus};
+use crate::client::{tool_count, McpState, McpStatus};
 use crate::tui::app::App;
 use crate::tui::render::wrap_ranges;
 use crate::tui::{
@@ -174,16 +174,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         }
 
         if !app.session.mcp.is_empty() {
-            let section = heading("mcp");
+            let section = Span::styled("MCP", HEADING);
+            let section = Line::from(section);
             lines.extend([Line::default(), section]);
         }
         for server in &app.session.mcp {
             let (dot, state) = match &server.state {
                 McpState::Off => (theme::COMMENT, Span::styled("off", DIM)),
                 McpState::Connecting => (theme::ORANGE, Span::styled("connecting", DIM)),
-                McpState::Connected { tools: 1 } => (theme::GREEN, Span::styled("1 tool", DIM)),
                 McpState::Connected { tools } => {
-                    let tools = format!("{tools} tools");
+                    let tools = tool_count(*tools);
                     (theme::GREEN, Span::styled(tools, DIM))
                 }
                 McpState::Failed { .. } => (theme::RED, Span::styled("failed", RED)),
@@ -646,12 +646,6 @@ fn panel() -> Block<'static> {
         .border_type(BorderType::Rounded)
         .border_style(BORDER)
         .padding(Padding::horizontal(1))
-}
-
-fn heading(text: &str) -> Line<'static> {
-    let text = text.to_uppercase();
-    let span = Span::styled(text, HEADING);
-    Line::from(span)
 }
 
 fn gauge(ratio: Option<f64>, width: usize) -> Line<'static> {

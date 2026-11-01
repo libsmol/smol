@@ -24,16 +24,6 @@ pub(crate) enum List {
     Servers,
 }
 
-impl List {
-    pub(crate) fn empty_text(self) -> &'static str {
-        match self {
-            List::Sessions => "no other sessions",
-            List::Models => "no models",
-            List::Servers => "no MCP servers",
-        }
-    }
-}
-
 pub(crate) enum Output {
     Update(Box<SessionUpdate>),
     Notice(Notice),
@@ -183,29 +173,6 @@ impl Session {
         Ok(rows)
     }
 
-    pub(crate) fn list(&self, list: List) -> Result<String> {
-        let rows = self.rows(list)?;
-        if rows.is_empty() {
-            return Ok(list.empty_text().to_owned());
-        }
-
-        let mut lines = Vec::new();
-        for row in rows {
-            let mut line = row.value;
-            if row.label != line {
-                line += &format!("  {}", row.label);
-            }
-            if !row.description.is_empty() {
-                line += &format!("  {}", row.description);
-            }
-            if row.current {
-                line += "  (current)";
-            }
-            lines.push(line);
-        }
-        Ok(lines.join("\n"))
-    }
-
     pub(crate) fn model(&self) -> String {
         let named = || self.client.agent.name.clone();
         model_of(&self.options).unwrap_or_else(named)
@@ -261,6 +228,14 @@ impl Session {
 
     pub(crate) fn enqueued(&self) {
         self.client.enqueued(&self.id);
+    }
+
+    pub(crate) fn shell(&self, command: &str) {
+        self.client.shell(&self.id, command);
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.client.cancel(&self.id);
     }
 
     pub(crate) fn blocks(&self, text: &str) -> Vec<ContentBlock> {
@@ -611,20 +586,6 @@ mod tests {
         let unsaved =
             "session s1: the last save failed; `smol --resume s1` restores the last saved state";
         assert_eq!(session.parting().as_deref(), Some(unsaved));
-    }
-
-    #[test]
-    fn lists_formatted() {
-        let agent = fake();
-        let mut session = Session::start(&agent, None, None).expect("start");
-        let list = |session: &Session, list: List| session.list(list).expect("list");
-
-        assert_eq!(list(&session, List::Models), "m1  (current)\nm2-café");
-        assert_eq!(list(&session, List::Sessions), "no other sessions");
-        assert_eq!(list(&session, List::Servers), "no MCP servers");
-
-        session.open(None).expect("open");
-        assert_eq!(list(&session, List::Sessions), "s1  old session");
     }
 
     #[test]

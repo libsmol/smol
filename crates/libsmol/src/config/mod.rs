@@ -117,7 +117,7 @@ pub(crate) fn models(dir: &Path) -> Result<Models> {
             return Err(Error::Unconfigured(message));
         }
         Err(e) => {
-            let reason = cause(&e);
+            let reason = unreadable(&e);
             return Err(invalid(reason));
         }
     };
@@ -135,6 +135,12 @@ pub(crate) fn models(dir: &Path) -> Result<Models> {
             }
         };
 
+        if let Some(api) = &provider.api {
+            if let Err(problem) = parse_url(api) {
+                let problem = format!("[model.{name}]: api: {problem}");
+                return Err(invalid(problem));
+            }
+        }
         if provider.models.is_empty() {
             let problem = format!("[model.{name}]: no models");
             return Err(invalid(problem));
@@ -240,8 +246,8 @@ pub(crate) fn instructions(dir: &Path, project: &Path) -> (Vec<String>, Vec<Erro
             Err(e) => {
                 let invalid = invalid(&path);
                 let reason = unreadable(&e);
-                let error = invalid(reason);
-                skipped.push(error);
+                let problem = format!("{reason}, skipped");
+                skipped.push(invalid(problem));
                 continue;
             }
         };
@@ -292,8 +298,8 @@ pub(crate) fn skills(dir: &Path, project: &Path) -> (Vec<Skill>, Vec<Error>) {
             Err(e) => {
                 let invalid = invalid(&root);
                 let reason = unreadable(&e);
-                let error = invalid(reason);
-                skipped.push(error);
+                let problem = format!("{reason}, skipped");
+                skipped.push(invalid(problem));
                 continue;
             }
         };
@@ -310,8 +316,8 @@ pub(crate) fn skills(dir: &Path, project: &Path) -> (Vec<Skill>, Vec<Error>) {
                 Ok(text) => text,
                 Err(e) => {
                     let reason = unreadable(&e);
-                    let error = invalid(reason);
-                    skipped.push(error);
+                    let problem = format!("{reason}, skipped");
+                    skipped.push(invalid(problem));
                     continue;
                 }
             };
@@ -374,7 +380,8 @@ pub(crate) fn roles(dir: &Path, project: &Path, models: &Models) -> (Vec<Role>, 
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => {
                 let reason = unreadable(&e);
-                skipped.push(invalid(reason));
+                let problem = format!("{reason}, skipped");
+                skipped.push(invalid(problem));
                 continue;
             }
         };
@@ -476,17 +483,47 @@ fn scalar(parts: &[&str]) -> String {
         return joined;
     }
 
-    if let Some(quoted) = joined
-        .strip_prefix('"')
-        .and_then(|text| text.strip_suffix('"'))
-    {
-        return quoted.replace("\\\"", "\"").replace("\\\\", "\\");
+    // A quoted value ends at its closing quote, after which a comment may follow
+    if let Some(rest) = joined.strip_prefix('"') {
+        let mut escaped = false;
+        let mut end = None;
+        for (at, c) in rest.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' => escaped = true,
+                '"' => {
+                    end = Some(at);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(end) = end {
+            let quoted = &rest[..end];
+            return quoted.replace("\\\"", "\"").replace("\\\\", "\\");
+        }
     }
-    if let Some(quoted) = joined
-        .strip_prefix('\'')
-        .and_then(|text| text.strip_suffix('\''))
-    {
-        return quoted.replace("''", "'");
+    if let Some(rest) = joined.strip_prefix('\'') {
+        let mut chars = rest.char_indices().peekable();
+        let mut end = None;
+        while let Some((at, c)) = chars.next() {
+            if c != '\'' {
+                continue;
+            }
+            // Two quotes stand for one inside the value
+            if chars.next_if(|(_, next)| *next == '\'').is_some() {
+                continue;
+            }
+            end = Some(at);
+            break;
+        }
+        if let Some(end) = end {
+            let quoted = &rest[..end];
+            return quoted.replace("''", "'");
+        }
     }
     // In an unquoted value whatever follows # is a comment
     let (plain, _) = joined.split_once(" #").unwrap_or((&joined, ""));
@@ -494,11 +531,10 @@ fn scalar(parts: &[&str]) -> String {
 }
 
 fn unreadable(e: &io::Error) -> String {
-    let reason = match e.kind() {
+    match e.kind() {
         io::ErrorKind::InvalidData => "not UTF-8 text".to_owned(),
         _ => cause(e),
-    };
-    format!("{reason}, skipped")
+    }
 }
 
 #[derive(Deserialize)]
@@ -596,7 +632,7 @@ pub(crate) fn agent(dir: &Path) -> Result<(Vec<McpConfig>, Access)> {
             return Ok((Vec::new(), Access::default()));
         }
         Err(e) => {
-            let reason = cause(&e);
+            let reason = unreadable(&e);
             return Err(invalid(reason));
         }
     };
@@ -734,8 +770,8 @@ fn parsed<T: DeserializeOwned>(text: &str) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        agent, instructions, models, roles, save_model, skills, Access, McpConfig, McpKind, Skill,
-        MODEL_EXAMPLE,
+        agent, front_matter, instructions, models, roles, save_model, scalar, skills, Access,
+        McpConfig, McpKind, Skill, MODEL_EXAMPLE,
     };
     use crate::model::{MediaKind, ModelSpec};
     use crate::tests::temp_dir;
@@ -813,6 +849,14 @@ models = [{ id = "m3" }]
                 "[model.jalapeño]: m: context below 1024",
             ),
             (
+                "[model.\"café\"]\ntype = \"openai-completions\"\napi = \"api.café.com/v1\"\nmodels = [{ id = \"m\" }]\n",
+                "[model.café]: api: relative URL without a base",
+            ),
+            (
+                "[model.\"café\"]\ntype = \"openai-completions\"\napi = \"ftp://café.com/v1\"\nmodels = [{ id = \"m\" }]\n",
+                "[model.café]: api: expected http:// or https://",
+            ),
+            (
                 "[model.kimi]\ntype = \"openai-completions\"\nmodels = [{ id = \"k3\" }]\n\n[model.kimi]\n",
                 "line 5: kimi: duplicate key",
             ),
@@ -828,6 +872,12 @@ models = [{ id = "m3" }]
             assert_eq!(error, format!("config: {shown}: {problem}"));
             fs::remove_dir_all(&dir).ok();
         }
+
+        let (dir, shown) = written("");
+        fs::write(dir.join("model.toml"), b"\xff\xfe").expect("write");
+        let error = models(&dir).err().expect("error").to_string();
+        assert_eq!(error, format!("config: {shown}: not UTF-8 text"));
+        fs::remove_dir_all(&dir).ok();
 
         let (dir, shown) = written("");
         fs::remove_file(dir.join("model.toml")).expect("remove");
@@ -1005,6 +1055,35 @@ models = [{ id = "m3" }]
         let skipped: Vec<String> = skipped.iter().map(ToString::to_string).collect();
         assert_eq!(skipped, [problem]);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn front_matter_parsed() {
+        let cases: [(&[&str], &str); 7] = [
+            (&[r#""The café # menu" # comment"#], "The café # menu"),
+            (&[r#""Say \"naïve\" \\ twice""#], r#"Say "naïve" \ twice"#),
+            (&["'It''s # résumé' # comment"], "It's # résumé"),
+            (&["\"Unclosed # comment"], "\"Unclosed"),
+            (&["Plain café # comment"], "Plain café"),
+            (&[">", "Read the", "# résumé"], "Read the # résumé"),
+            (&["Read the", "", "naïve notes"], "Read the naïve notes"),
+        ];
+        for (parts, expected) in cases {
+            assert_eq!(scalar(parts), expected, "{parts:?}");
+        }
+
+        let text = "---\nname: café\ndescription: Plain\n  continued\n...\nname: late\n";
+        let fields = front_matter(text).expect("front matter");
+        let pairs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [("description", "Plain continued"), ("name", "café")]
+        );
+        assert_eq!(front_matter("name: café\n---\n"), None);
+        assert_eq!(front_matter("---\nname: café\n"), None);
     }
 
     #[test]

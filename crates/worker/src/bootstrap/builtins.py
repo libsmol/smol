@@ -4,6 +4,7 @@ import io as _io
 import os as _os
 import pickle as _pickle
 import re as _re
+import stat as _stat
 import sys as _sys
 import types as _types
 import weakref as _weakref
@@ -42,7 +43,10 @@ _MAX_PRINT_CHARS = 8192
 
 def _open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
     opened = _REAL_OPEN(file, mode, buffering, encoding, errors, newline, closefd, opener)
-    _OPEN_FILES.add(opened)
+    # Flushing a pipe waits for a thread blocked writing to it, which no interrupt wakes
+    found = _os.fstat(opened.fileno())
+    if _stat.S_ISREG(found.st_mode):
+        _OPEN_FILES.add(opened)
     return opened
 
 def _print(*args, sep=" ", end="\n", file=None, flush=False, limit=_MAX_PRINT_CHARS):
@@ -94,7 +98,7 @@ def _builtin(function, header=None):
     builtin.__qualname__ = function.__qualname__
     builtin.__signature__ = signature
     # The agent sets these values too, so docs name them in braces
-    builtin.__doc__ = function.__doc__.format(agents=_MAX_AGENTS, done=_DONE)
+    builtin.__doc__ = function.__doc__.format(agents=_MAX_AGENTS, done=_DONE, chars=_MAX_MEMORY_CHARS, recalled=_MAX_RECALLED)
     builtin._smol_header = header
     return builtin
 
@@ -207,11 +211,39 @@ def view(path: str | _os.PathLike) -> None:
     absolute = _os.path.abspath(path)
     _view(path, absolute)
 
-def _delegated(function, method, params):
+def _asked(function, method, params):
     try:
-        return _agent(method, params)
+        return _ask(method, params)
     except (TypeError, ValueError) as exc:
         raise type(exc)(f"{function}: {exc}") from None
+
+@_builtin
+def remember(text: str, project: bool = True) -> int:
+    """Saves text as a memory of this folder, or of every folder with project=False, and returns its id.
+
+    Saves text of at most {chars} characters as a memory and returns its id. With project=True only sessions in this folder see it; with project=False every session sees it, and later turns list the newest such memories under Memories. Keep one fact per memory; to change one, forget() it and remember() the new text."""
+    text = _str("remember", "text", text)
+    project = bool(project)
+    return _asked("remember", "remember", {"text": text, "project": project})
+
+@_builtin
+def recall(query: str = "") -> list[tuple[int, str]]:
+    """(id, text) of the memories that best match the words of query, or the newest without any.
+
+    Searches the memories of this folder and of every folder for any word of query and returns up to {recalled} as (id, text), best matches first; a query without words returns the newest."""
+    query = _str("recall", "query", query)
+    found = _asked("recall", "recall", {"query": query})
+    return [(id, text) for id, text in found]
+
+@_builtin
+def forget(id: int) -> None:
+    """Deletes the memory with this id.
+
+    Deletes a memory of this folder or of every folder by the id that remember() and recall() give."""
+    if isinstance(id, bool) or not isinstance(id, int):
+        kind = type(id).__name__
+        raise TypeError(f"forget: id must be int, not {kind}")
+    _asked("forget", "forget", {"id": id})
 
 def _handed(function, result):
     error = result.get("error")
@@ -253,7 +285,7 @@ class Agent:
 
         Returns the handle of the agent last started with this name in this session, also after Python restarts, or None if there is none."""
         name = _str("Agent.get", "name", name)
-        found = _delegated("Agent.get", "find", {"name": name})
+        found = _asked("Agent.get", "find", {"name": name})
         if found is None:
             return None
         return cls(**found)
@@ -274,7 +306,7 @@ class Agent:
                 raise ValueError(f"Agent.wait: timeout must be 0 or more, not {timeout}")
             # JSON has no infinity, and waiting that long is waiting until it ends
             timeout = None if timeout == float("inf") else float(timeout)
-        result = _delegated("Agent.wait", "wait", {"id": self._id, "timeout": timeout})
+        result = _asked("Agent.wait", "wait", {"id": self._id, "timeout": timeout})
         if result is None:
             return None
         answer = _handed("Agent.wait", result)
@@ -286,13 +318,13 @@ class Agent:
         """What it is doing now and the end of what it is writing or printing, or how it ended.
 
         Returns how long it has run and what it is doing now, followed by the last lines it is writing or printing; once it has ended, returns how it ended."""
-        return _delegated("Agent.status", "status", {"id": self._id})
+        return _asked("Agent.status", "status", {"id": self._id})
 
     def stop(self) -> None:
         """Stops it and returns once it has stopped.
 
         Stops the agent and returns once it has stopped; no "{done}:" message is sent for it."""
-        _delegated("Agent.stop", "stop", {"id": self._id})
+        _asked("Agent.stop", "stop", {"id": self._id})
 
 # Wrapped once the class exists, which their annotations name
 for _method in [Agent.get, Agent.wait, Agent.status, Agent.stop]:
@@ -307,7 +339,7 @@ def agent(task: str | list[str], role: str | list[str] | None = None, *, name: s
     - Without name: returns its answer, or raises RuntimeError if the agent fails. A list of tasks runs up to {agents} agents at a time and returns their answers in order, with the exception in place of each task that failed.
     - With name: the agent runs in the background and agent() returns its Agent handle at once. A list of tasks takes one name per task and returns a list of handles. A name cannot be given again while its agent is running.
 
-    The agent has its own Python session and the same files, built-in functions, MCP servers, skills and instructions as you, but not your variables or this conversation, so the task must state everything it needs. Agents started this way cannot call agent()."""
+    The agent has its own Python session and the same files, built-in functions, MCP servers, skills and instructions as you, but not your variables or this conversation, so the task must state everything it needs. Agents started this way cannot call agent(), remember() or forget()."""
     single = isinstance(task, str)
     tasks = _texts("agent", "task", task)
     if not tasks or not all(item.strip() for item in tasks):
@@ -316,7 +348,7 @@ def agent(task: str | list[str], role: str | list[str] | None = None, *, name: s
 
     if name is None:
         asked = [{"task": task, "role": role, "name": None} for task, role in zip(tasks, roles)]
-        results = _delegated("agent", "ask", {"agents": asked})
+        results = _asked("agent", "ask", {"agents": asked})
         answers = [_handed("agent", result) for result in results]
         if not single:
             return answers
@@ -331,7 +363,7 @@ def agent(task: str | list[str], role: str | list[str] | None = None, *, name: s
         if item in names[:at]:
             raise ValueError(f"agent: name: {item}: given twice")
     asked = [{"task": task, "role": role, "name": name} for task, role, name in zip(tasks, roles, names)]
-    handles = _delegated("agent", "start", {"agents": asked})
+    handles = _asked("agent", "start", {"agents": asked})
     handles = [Agent(**handle) for handle in handles]
     return handles[0] if single else handles
 
@@ -356,10 +388,13 @@ def help(request: object) -> None:
         builtins = vars(_builtins)
         head, *rest = name.split(".")
         try:
-            if head in builtins:
+            own = _STATE.get(head)
+            documented = callable(own) or isinstance(own, _types.ModuleType)
+            # The code's functions, classes and modules hide builtins of the same name, and its other values don't
+            if head in _STATE and (documented or head not in builtins):
+                target = own
+            elif head in builtins:
                 target = builtins[head]
-            elif head in _STATE:
-                target = _STATE[head]
             else:
                 target = importlib.import_module(head)
             for i, part in enumerate(rest):
@@ -409,10 +444,11 @@ def help(request: object) -> None:
     text = "\n".join(parts)
     print(text, limit=None)
 
-_BUILTINS = [edit, ls, grep, fetch, view, help]
-# Workers of agents that agent() started have none of it
+# _AGENTS is empty in the workers of agents that agent() starts, which only recall memories
+_MEMORY = [remember, recall, forget] if _AGENTS else [recall]
+_BUILTINS = [edit, ls, grep, fetch, view, *_MEMORY, help]
 if _AGENTS:
-    _BUILTINS[5:5] = [agent, Agent, Agent.get, Agent.wait, Agent.status, Agent.stop]
+    _BUILTINS[-1:-1] = [agent, Agent, Agent.get, Agent.wait, Agent.status, Agent.stop]
 _FUNCTIONS = []
 for _function in _BUILTINS:
     _name = _function.__qualname__

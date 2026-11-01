@@ -9,9 +9,6 @@ import tokenize as _tokenize
 import types as _types
 import unicodedata as _unicodedata
 
-def _text(value):
-    return value if isinstance(value, str) else repr(value)
-
 _DEFINITIONS = (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)
 _SCOPES = (*_DEFINITIONS, _ast.Lambda, _ast.ListComp, _ast.SetComp, _ast.DictComp, _ast.GeneratorExp)
 
@@ -207,7 +204,7 @@ def _run(code):
         for block in blocks:
             value = eval(block, _STATE)
             if value is not None:
-                text = _text(value)
+                text = value if isinstance(value, str) else repr(value)
                 print(text, limit=None)
 
     except BaseException as exc:

@@ -221,8 +221,10 @@ impl Transcript {
     }
 
     pub(crate) fn unstarted(&self) -> bool {
-        let asked = matches!(self.held[..], [Entry::Task(_)]);
-        asked && self.live.is_none()
+        let asked = matches!(self.held.first(), Some(Entry::Task(_)));
+        let step = |entry: &Entry| matches!(entry, Entry::Step(_));
+        let stepped = self.held.iter().any(step);
+        asked && !stepped && self.live.is_none()
     }
 
     pub(crate) fn stepping(&self) -> bool {
@@ -579,7 +581,7 @@ impl Transcript {
 
         // A notice arriving after a step ends doesn't belong to the next one,
         // and counting it there would displace the answer
-        let asked = matches!(self.held.last(), Some(Entry::Task(_)));
+        let asked = matches!(self.held.last(), Some(Entry::Task(_))) || self.unstarted();
         if self.live.is_none() && !asked && !notice.step {
             return self.push(Entry::Failure(text));
         }
@@ -1181,11 +1183,17 @@ fn contents(content: &[ToolCallContent]) -> (Vec<String>, Vec<Attachment>) {
     (texts, attachments)
 }
 
-/// The closing ``` may not have arrived yet
+/// The closing fence may not have arrived yet
 fn fenced(text: &str) -> Option<(&str, &str)> {
-    let rest = text.strip_prefix("```")?;
+    let rest = text.trim_start_matches('`');
+    let ticks = text.len() - rest.len();
+    if ticks < 3 {
+        return None;
+    }
+
+    let fence = &text[..ticks];
     let (language, code) = rest.split_once('\n').unwrap_or((rest, ""));
-    let code = code.trim_end().strip_suffix("```").unwrap_or(code);
+    let code = code.trim_end().strip_suffix(fence).unwrap_or(code);
     Some((language.trim(), code.trim_matches('\n')))
 }
 
@@ -1554,6 +1562,35 @@ mod tests {
     }
 
     #[test]
+    fn unstarted_after_info() {
+        let mut transcript = Transcript::default();
+        transcript.task("Search the café menus");
+        let connected = "mcp: web: connected, 2 tools".to_owned();
+        transcript.push(Entry::Info(connected));
+        assert!(transcript.unstarted());
+
+        transcript.notice(&told("Retrying"));
+        assert!(!transcript.unstarted());
+        transcript.update(&message("Found three"));
+        end_step(&mut transcript, 10, 1);
+        assert!(!transcript.unstarted());
+        transcript.finish_turn(Outcome::Answered);
+
+        let expected = [
+            "",
+            "❯ Search the café menus",
+            "",
+            "  mcp: web: connected, 2 tools",
+            "",
+            "  ✗ Retrying",
+            "",
+            "◆ Found three",
+            "  0.2s · ⇡10 ⇣1 · 2 t/s",
+        ];
+        assert_eq!(rows(&mut transcript), expected);
+    }
+
+    #[test]
     fn step_notice_kept() {
         let mut transcript = Transcript::default();
         transcript.task("Count the lines");
@@ -1748,6 +1785,13 @@ mod tests {
             Some(("python", "print('café')"))
         );
         assert_eq!(fenced("No code block"), None);
+
+        let quoted = "```python\nfence = '```'\nprint(fence)\n```";
+        let code = "fence = '```'\nprint(fence)";
+        assert_eq!(fenced(quoted), Some(("python", code)));
+        let nested = "````python\nnote = '''\n```\ncafé\n```\n'''\n````";
+        let code = "note = '''\n```\ncafé\n```\n'''";
+        assert_eq!(fenced(nested), Some(("python", code)));
     }
 
     #[test]

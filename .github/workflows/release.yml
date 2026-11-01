@@ -112,7 +112,7 @@ jobs:
             *windows*) 7z a "$name.zip" "$name" ;;
             *) tar -czf "$name.tar.gz" "$name" ;;
           esac
-          rm -r "$name"
+          rm -r "${name:?}"
 
       - uses: actions/upload-artifact@v4
         with:

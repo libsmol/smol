@@ -7,6 +7,16 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- `remember(text, project=True)`, `recall(query="")` and `forget(id)` keep
+  memories across sessions in `~/.smol/memory.db`. A memory belongs to the
+  working directory, or with `project=False` to every directory; each turn
+  the system prompt lists the newest of the latter and says how many the
+  directory has, which `recall()` finds by whole words, Chinese ones too.
+  Agents that `agent()` starts can only recall. SQLite and a Chinese
+  dictionary make `libsmol` about 3 MB larger.
+
 ## 0.5.1 - 2026-11-01
 
 - The runtime and the worker module in `~/.smol/runtime` are no longer named

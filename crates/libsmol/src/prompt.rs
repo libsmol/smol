@@ -1,10 +1,11 @@
-use crate::agent::{Place, Status};
-use crate::config::{Role, Skill};
+use crate::agent::{Brief, Place, Status};
+use crate::config::Role;
 use crate::memory::{
     exit_code, AgentStep, Call, CallError, Ending, Exit, MemoryStep, ShellStep, StepError,
     TaskStep, MAX_OBSERVATION_CHARS,
 };
 use crate::model::{Media, Part};
+use crate::tools::memories::{Listed, MAX_MEMORY_CHARS};
 use crate::utils::truncated;
 use crate::worker::host::Added;
 use crate::worker::python::PYTHON;
@@ -22,6 +23,9 @@ const UPDATE: &str = "Task update";
 const RULES: &str = "- Never make up data or functions; check unfamiliar ones with `help()` first.
 - Do the task instead of describing it.
 - Report only results you obtained, and state what failed or is uncertain.";
+/// Only for agents whose worker offers `remember()`
+const REMEMBERING: &str = "- Keep with `remember()` what the user asks you to remember, their preferences and corrections (with `project=False` when they hold in every folder), and facts about this folder you had to work out; not what its files already say.
+- `forget()` a memory that turned out wrong.";
 
 const SHOWN: &str = " Text you write in a reply that runs code is shown to the user.";
 const UPDATES: &str =
@@ -87,6 +91,14 @@ pub(crate) fn done(agents: &[String]) -> String {
     format!("{DONE}:\n{names}")
 }
 
+/// Errors of `remember()` and `forget()` go unlabeled too, as the worker labels them with the function
+pub(crate) const NO_MEMORY: &str = "no such memory";
+pub(crate) const EMPTY_MEMORY: &str = "text is empty";
+
+pub(crate) fn long_memory(count: usize) -> String {
+    format!("{count} characters, over the {MAX_MEMORY_CHARS}-character limit")
+}
+
 /// None leaves view() out of the prompt
 pub(crate) fn view_summary(image: bool, video: bool) -> Option<&'static str> {
     match (image, video) {
@@ -102,10 +114,10 @@ pub(crate) fn view_summary(image: bool, video: bool) -> Option<&'static str> {
 pub(crate) fn system(
     functions: &[Function],
     servers: &[&Added],
-    skills: &[Skill],
+    brief: &Brief,
+    memories: &Listed,
     cwd: &Path,
     writable: Option<&[PathBuf]>,
-    instructions: &[String],
     place: &Place,
 ) -> String {
     let mut stubs = Vec::new();
@@ -148,7 +160,7 @@ pub(crate) fn system(
     }
 
     let mut entries = Vec::new();
-    for skill in skills {
+    for skill in &brief.skills {
         let name = &skill.name;
         let description = &skill.description;
         let path = skill.path.display();
@@ -163,9 +175,15 @@ pub(crate) fn system(
         }
     };
 
-    let (shown, markdown, note, roles) = match place {
-        Place::Main { roles, .. } => (SHOWN, " in Markdown", UPDATES, roles.as_slice()),
-        Place::Delegated(_) => ("", "", HANDED_BACK, &[][..]),
+    let (shown, markdown, note, reader, roles) = match place {
+        Place::Main { roles, .. } => (SHOWN, " in Markdown", UPDATES, "the user", roles.as_slice()),
+        Place::Delegated(_) => (
+            "",
+            "",
+            HANDED_BACK,
+            "the agent that assigned this task",
+            &[][..],
+        ),
     };
     let mut entries = Vec::new();
     for role in roles {
@@ -211,7 +229,7 @@ pub(crate) fn system(
     };
 
     let mut files = Vec::new();
-    for text in instructions {
+    for text in &brief.instructions {
         let file = format!("<instructions>\n{text}\n</instructions>");
         files.push(file);
     }
@@ -237,6 +255,50 @@ pub(crate) fn system(
         }
         None => String::new(),
     };
+
+    let mut lines = Vec::new();
+    for (id, text) in &memories.newest {
+        // A memory may hold line breaks, which would end its item
+        let words: Vec<&str> = text.lines().collect();
+        let line = format!("- [{id}] {}", words.join(" "));
+        lines.push(line);
+    }
+    let mut kept = Vec::new();
+    if !lines.is_empty() {
+        let shown = lines.len();
+        let heading = match memories.global > shown {
+            true => format!(
+                "Kept for every folder, the newest {shown} of {} (`recall()` finds the rest):",
+                memories.global
+            ),
+            false => "Kept for every folder:".to_owned(),
+        };
+        let lines = lines.join("\n");
+        let listed = format!("{heading}\n{lines}");
+        kept.push(listed);
+    }
+    let counted = match memories.here {
+        0 => None,
+        1 => Some("1 memory".to_owned()),
+        count => Some(format!("{count} memories")),
+    };
+    if let Some(counted) = counted {
+        let here = format!("This folder has {counted} of its own from earlier sessions; before you start a task, search them with `recall()` for what it is about.");
+        kept.push(here);
+    }
+    let remembered = match kept.is_empty() {
+        true => String::new(),
+        false => {
+            let kept = kept.join("\n\n");
+            format!("\n\n# Memories\n\n{kept}")
+        }
+    };
+    let remembering = functions.iter().any(|function| function.name == "remember");
+    let rules = match remembering {
+        true => format!("{RULES}\n{REMEMBERING}"),
+        false => RULES.to_owned(),
+    };
+
     let date = Utc::now().format("%Y-%m-%d");
     format!(
         "You complete tasks by running Python code with the `{TOOL}` tool.
@@ -276,11 +338,11 @@ These need no import. Use them instead of writing your own, and create new files
 - Your code runs on the user's computer ({OS}) in `{cwd}`; the files and programs a task mentions are there.
 - Python is CPython {PYTHON} in a venv kept for this folder: packages you install with `pip install` can be imported in this session right away.{sandbox}
 - Today is {date} (UTC).
-- Your answer goes to the user; no hidden tests or graders check your work.
+- Your answer goes to {reader}; no hidden tests or graders check your work.{remembered}
 
 # Rules
 
-{RULES}{instructions}",
+{rules}{instructions}",
     )
 }
 
@@ -357,7 +419,7 @@ const CUT: &str = "Your last reply was discarded: it hit the output length limit
 const NO_CODE: &str = "not run: no Python code in the code argument";
 pub(crate) const STOPPED: &str = "interrupted by the user";
 const UNRUN: &str = "interrupted by the user before the code ran";
-const SKIPPED: &str = "not run: an earlier call failed";
+pub(crate) const SKIPPED: &str = "not run: an earlier call failed";
 const UNREPLIED: &str = "The user interrupted you before you replied.";
 
 /// A step with calls reports this in their replies instead
@@ -597,7 +659,7 @@ Each entry starts with a label:
 - `[Code]`: Python code it ran
 - `[Observation]`: what the code printed
 - `[Error]`: what failed
-- `[Attached ...]`: a file attached to a task
+- `[Attached ...]`: a file attached to a task, or an image or video that the code viewed or a function returned
 - `[Shell]`: a command the user ran
 - `[Agent done]`: agents started in the background that ended
 
@@ -741,7 +803,7 @@ pub(crate) fn summary(transcript: &str, previous: Option<&str>, trailing: bool) 
 #[cfg(test)]
 mod tests {
     use crate::agent::tests::main_place;
-    use crate::agent::Place;
+    use crate::agent::{Brief, Place};
     use crate::config::{Role, Skill};
     use crate::memory::{
         AgentStep, Call, CallError, CodeResult, Exit, MemoryStep, ShellStep, StepError,
@@ -751,18 +813,24 @@ mod tests {
     use crate::prompt::{
         call_error, error, media_tag, shell, system, transcript, unseen, view_summary,
     };
+    use crate::tools::memories::Listed;
     use crate::worker::python::PYTHON;
     use crate::worker::Function;
     use std::path::{Path, PathBuf};
 
     #[test]
     fn system_sections() {
-        let instructions = ["Reply in French".to_owned(), "Indent with tabs".to_owned()];
-        let skills = [Skill {
+        let instructions = vec!["Reply in French".to_owned(), "Indent with tabs".to_owned()];
+        let skills = vec![Skill {
             name: "weekly".to_owned(),
             description: "Write the weekly report".to_owned(),
             path: PathBuf::from("/home/zoë/.smol/skills/weekly/SKILL.md"),
         }];
+        let brief = Brief {
+            instructions,
+            skills,
+        };
+        let none = Listed::default();
         let cwd = Path::new("/home/zoë/work");
 
         let function = |name: &str, header: &str, summary: &str| Function {
@@ -783,7 +851,7 @@ mod tests {
         ];
 
         let main = main_place(Vec::new());
-        let text = system(&functions, &[], &skills, cwd, None, &instructions, &main);
+        let text = system(&functions, &[], &brief, &none, cwd, None, &main);
         let built_in = "## Built-in\n\n```python\n\
                         ls(path) -> list[str]\n    # Sorted paths.\n    # The café/ folder ends with /.\n\n\
                         help(request) -> None\n    # Prints the docs.\n```\n\n# Skills";
@@ -809,17 +877,87 @@ mod tests {
                      <instructions>\nIndent with tabs\n</instructions>";
         assert!(text.ends_with(files), "{text}");
 
-        let plain = system(&[], &[], &[], cwd, Some(&[]), &[], &main);
+        let empty = Brief::default();
+        let plain = system(&[], &[], &empty, &none, cwd, Some(&[]), &main);
         assert!(!plain.contains("<instructions"), "{plain}");
         assert!(!plain.contains("# Skills"), "{plain}");
         assert!(!plain.contains("# Roles"), "{plain}");
+        assert!(!plain.contains("# Memories"), "{plain}");
+        assert!(!plain.contains("remember()"), "{plain}");
         let sandbox = "right away.\n- Your code runs in a sandbox: writing outside `/home/zoë/work`, the venv and `$TMPDIR`, ";
         assert!(plain.contains(sandbox), "{plain}");
         let registry = [PathBuf::from("/home/zoë/.cargo/registry")];
-        let allowed = system(&[], &[], &[], cwd, Some(&registry), &[], &main);
+        let allowed = system(&[], &[], &empty, &none, cwd, Some(&registry), &main);
         let sandbox =
             "writing outside `/home/zoë/work`, `/home/zoë/.cargo/registry`, the venv and `$TMPDIR`, ";
         assert!(allowed.contains(sandbox), "{allowed}");
+    }
+
+    #[test]
+    fn memories_shown() {
+        let cwd = Path::new("/home/zoë/work");
+        let main = main_place(Vec::new());
+        let remember = Function {
+            name: "remember".to_owned(),
+            header: "remember(text) -> int".to_owned(),
+            summary: "Saves text.".to_owned(),
+        };
+        let newest = vec![
+            (7, "Writes résumés in French".to_owned()),
+            (3, "Prefers tabs\nover spaces".to_owned()),
+        ];
+        let memories = Listed {
+            newest: newest.clone(),
+            global: 2,
+            here: 12,
+        };
+        let brief = Brief::default();
+
+        let functions = [remember];
+        let text = system(&functions, &[], &brief, &memories, cwd, None, &main);
+        let section = "check your work.\n\n# Memories\n\n\
+                       Kept for every folder:\n\
+                       - [7] Writes résumés in French\n\
+                       - [3] Prefers tabs over spaces\n\n\
+                       This folder has 12 memories of its own from earlier sessions; \
+                       before you start a task, search them with `recall()` for what it is about.\n\n# Rules\n\n";
+        assert!(text.contains(section), "{text}");
+        let more = Listed {
+            newest,
+            global: 14,
+            here: 0,
+        };
+        let text = system(&functions, &[], &brief, &more, cwd, None, &main);
+        let heading = "# Memories\n\n\
+                       Kept for every folder, the newest 2 of 14 (`recall()` finds the rest):\n\
+                       - [7] Writes résumés in French\n";
+        assert!(text.contains(heading), "{text}");
+        let rules =
+            "or is uncertain.\n- Keep with `remember()` what the user asks you to remember, ";
+        assert!(text.contains(rules), "{text}");
+        assert!(
+            text.ends_with("- `forget()` a memory that turned out wrong."),
+            "{text}"
+        );
+
+        let memories = Listed {
+            here: 1,
+            ..Listed::default()
+        };
+        let helper = system(
+            &[],
+            &[],
+            &brief,
+            &memories,
+            cwd,
+            None,
+            &Place::Delegated(None),
+        );
+        let section = "check your work.\n\n# Memories\n\n\
+                       This folder has 1 memory of its own from earlier sessions; \
+                       before you start a task, search them with `recall()` for what it is about.\n\n# Rules\n\n";
+        assert!(helper.contains(section), "{helper}");
+        assert!(!helper.contains("remember()"), "{helper}");
     }
 
     #[test]
@@ -834,7 +972,9 @@ mod tests {
         let cwd = Path::new("/home/zoë/work");
 
         let place = main_place(roles);
-        let main = system(&[], &[], &[], cwd, None, &[], &place);
+        let empty = Brief::default();
+        let none = Listed::default();
+        let main = system(&[], &[], &empty, &none, cwd, None, &place);
         let listed = "\n\n## Roles\n\n\
                       To give a task to an agent in one of these roles, call `agent(task, role=\"reviewer\")`. \
                       For a list of tasks, `role` is one role for all of them or a list with one role per task.\n\n\
@@ -842,14 +982,17 @@ mod tests {
                       - `tester`: Writes naïve tests\n\n# Environment\n\n";
         assert!(main.contains(listed), "{main}");
         assert!(!main.contains("# Role\n"), "{main}");
+        assert!(main.contains("- Your answer goes to the user;"), "{main}");
 
         let played = Place::Delegated(Some(reviewer));
-        let helper = system(&[], &[], &[], cwd, None, &[], &played);
+        let helper = system(&[], &[], &empty, &none, cwd, None, &played);
         let own = "include everything the task asks for.\n\n# Role\n\n\
                    Your role is `reviewer`: Reviews the café's code\n\n# Running code";
         assert!(helper.contains(own), "{helper}");
         assert!(!helper.contains("# Roles"), "{helper}");
-        let plain = system(&[], &[], &[], cwd, None, &[], &Place::Delegated(None));
+        let reader = "- Your answer goes to the agent that assigned this task;";
+        assert!(helper.contains(reader), "{helper}");
+        let plain = system(&[], &[], &empty, &none, cwd, None, &Place::Delegated(None));
         assert!(!plain.contains("# Role"), "{plain}");
     }
 

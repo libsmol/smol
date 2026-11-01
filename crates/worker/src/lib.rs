@@ -1,7 +1,8 @@
 use crate::builtins::{builtins, value_error};
 use libsmol::guest::{
     block_on, FromWorker, Function, HostCall, HostNote, Message, ToWorker, ToolError, Waiting,
-    WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, DONE, END, MAX_PARALLEL_AGENTS,
+    WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, DONE, END, MAX_MEMORY_CHARS,
+    MAX_PARALLEL_AGENTS, MAX_RECALLED,
 };
 use pyo3::exceptions::PyRuntimeError;
 #[cfg(windows)]
@@ -94,6 +95,8 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     }
     globals.set_item("_AGENTS", agents)?;
     globals.set_item("_MAX_AGENTS", MAX_PARALLEL_AGENTS)?;
+    globals.set_item("_MAX_RECALLED", MAX_RECALLED)?;
+    globals.set_item("_MAX_MEMORY_CHARS", MAX_MEMORY_CHARS)?;
     globals.set_item("_DONE", DONE)?;
 
     let builtin = py.import("builtins")?;

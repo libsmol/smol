@@ -5,6 +5,7 @@ use std::io;
 pub(crate) mod attach;
 pub(crate) mod files;
 pub(crate) mod mcp;
+pub(crate) mod memories;
 pub(crate) mod web;
 
 #[derive(Debug, thiserror::Error)]

@@ -9,6 +9,7 @@ use crate::model::{
 };
 use crate::prompt;
 use crate::tools::attach::{attach, Mention};
+use crate::tools::memories::{Listed, Memories};
 use crate::utils::Interrupt;
 use crate::worker::host::{Added, Worker};
 use crate::worker::sandbox::Sandbox;
@@ -194,14 +195,21 @@ pub(crate) struct Task {
 #[derive(Clone)]
 pub(crate) struct Agent {
     pub(crate) model: Arc<dyn Model>,
-    pub(crate) instructions: Vec<String>,
-    pub(crate) skills: Vec<Skill>,
+    pub(crate) brief: Brief,
     pub(crate) cwd: PathBuf,
     pub(crate) copies: PathBuf,
     pub(crate) interrupt: Interrupt,
     /// Every worker of the session uses it
     pub(crate) sandbox: Arc<Sandbox>,
+    pub(crate) memories: Memories,
     pub(crate) place: Place,
+}
+
+/// What the session read when it opened, which the system prompt shows
+#[derive(Clone, Default)]
+pub(crate) struct Brief {
+    pub(crate) instructions: Vec<String>,
+    pub(crate) skills: Vec<Skill>,
 }
 
 #[derive(Clone)]
@@ -266,13 +274,21 @@ impl Agent {
             }
             functions.push(function);
         }
+        // Read for each run, since a memory forgotten in an earlier one must leave the prompt
+        let listed = match self.memories.listed().await {
+            Ok(listed) => listed,
+            Err(problem) => {
+                warn!("memory: listing failed, {problem}");
+                Listed::default()
+            }
+        };
         let system = prompt::system(
             &functions,
             servers,
-            &self.skills,
+            &self.brief,
+            &listed,
             &self.cwd,
             self.sandbox.writable(),
-            &self.instructions,
             &self.place,
         );
 
@@ -603,8 +619,8 @@ pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::agent::{
-        title_of, Agent, Asking, Event, Helpers, Nudging, Place, Queue, Sink, Streamed, Task, Turn,
-        Unseen, RETRY_WAIT,
+        title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Sink, Streamed,
+        Task, Turn, Unseen, RETRY_WAIT,
     };
     use crate::config::Role;
     use crate::history::MAX_TITLE_CHARS;
@@ -616,6 +632,7 @@ pub(crate) mod tests {
     use crate::prompt::RESTARTED;
     use crate::tests::{content, temp_dir, write_file, Temp};
     use crate::tools::attach::tests::mentioned;
+    use crate::tools::memories::Memories;
     use crate::utils::{block_on, Interrupt};
     use crate::worker::host::tests::no_agents;
     use crate::worker::host::Worker;
@@ -890,7 +907,15 @@ pub(crate) mod tests {
             false => Delegation::Roles,
         };
         let restarted = false;
-        let starting = Worker::new(&interrupt, Arc::clone(&sandbox), &[], delegation, restarted);
+        let memories = Memories::new(&dir, &cwd);
+        let starting = Worker::new(
+            &interrupt,
+            Arc::clone(&sandbox),
+            memories.clone(),
+            &[],
+            delegation,
+            restarted,
+        );
         let worker = block_on(starting).expect("worker");
 
         let queue = Arc::new(Pending::default());
@@ -901,12 +926,12 @@ pub(crate) mod tests {
         };
         let agent = Agent {
             model: Arc::new(model),
-            instructions: Vec::new(),
-            skills: Vec::new(),
+            brief: Brief::default(),
             cwd,
             copies,
             interrupt,
             sandbox,
+            memories,
             place,
         };
         let probe = Probe {

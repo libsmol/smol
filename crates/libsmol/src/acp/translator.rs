@@ -5,7 +5,7 @@ use crate::memory::{
     estimate, text_bytes, AgentMemory, AgentStep, Call, CallError, Ending, Exit, Helper,
     MemoryStep, ShellStep, StepError, SummaryStep, TaskStep, Usage,
 };
-use crate::prompt::{STOPPED, STOPPED_BY_CODE, TOOL, UNFINISHED};
+use crate::prompt::{SKIPPED, STOPPED, STOPPED_BY_CODE, TOOL, UNFINISHED};
 use agent_client_protocol_schema::v1::{
     ContentBlock, ContentChunk, MessageId, Meta, ResourceLink, SessionUpdate, ToolCall,
     ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
@@ -22,7 +22,6 @@ const ESTIMATE_EVERY: Duration = Duration::from_secs(1);
 const MAX_TASK_CHARS: usize = 80;
 const COMPACTING: &str = "Compact context";
 const RESTARTED: &str = "python: restarted, earlier variables are gone";
-const SKIPPED: &str = "skipped: an earlier call failed";
 
 pub(crate) struct Translator {
     session: String,
@@ -161,8 +160,7 @@ impl Translator {
     }
 
     pub(crate) fn shell(&mut self, command: &str) {
-        self.ids += 1;
-        let id = format!("call_{}", self.ids);
+        let id = self.next_id();
         let marked = (SHELL.to_owned(), json!(true));
         let meta = Meta::from_iter([marked]);
         let started = ToolCall::new(id.clone(), command)
@@ -309,8 +307,7 @@ impl Translator {
                 SessionUpdate::ToolCallUpdate(update)
             }
             None => {
-                self.ids += 1;
-                let id = format!("call_{}", self.ids);
+                let id = self.next_id();
                 let started = ToolCall::new(id.clone(), title)
                     .kind(ToolKind::Execute)
                     .status(ToolCallStatus::Pending)
@@ -337,8 +334,7 @@ impl Translator {
             Some(CallError::NoTool(name)) => (name.as_str(), ToolKind::Other),
             _ => (TOOL, ToolKind::Execute),
         };
-        self.ids += 1;
-        let id = format!("call_{}", self.ids);
+        let id = self.next_id();
         let head = head("", call.arguments.as_deref());
         let started = ToolCall::new(id.clone(), title)
             .kind(kind)
@@ -351,6 +347,11 @@ impl Translator {
         };
         self.calls.push(opened);
         self.update(SessionUpdate::ToolCall(started));
+    }
+
+    fn next_id(&mut self) -> String {
+        self.ids += 1;
+        format!("call_{}", self.ids)
     }
 
     fn opened(&self, index: usize) -> Option<&Opened> {
@@ -502,8 +503,7 @@ impl Translator {
     }
 
     fn think(&mut self, title: &str) {
-        self.ids += 1;
-        let id = format!("call_{}", self.ids);
+        let id = self.next_id();
         let started = ToolCall::new(id.clone(), title)
             .kind(ToolKind::Think)
             .status(ToolCallStatus::InProgress);
@@ -674,9 +674,12 @@ fn agent_title(task: &str, cwd: &Path) -> String {
     format!("agent: {title}")
 }
 
+/// A fence longer than every run of backticks in the code keeps the code in one block
 fn fenced(code: &str) -> ToolCallContent {
     let code = code.trim_matches('\n');
-    let text = format!("```python\n{code}\n```");
+    let longest = code.split(|c| c != '`').map(str::len).max();
+    let fence = "`".repeat(longest.unwrap_or(0).max(2) + 1);
+    let text = format!("{fence}python\n{code}\n{fence}");
     ToolCallContent::from(text)
 }
 
@@ -1029,7 +1032,7 @@ mod tests {
         assert_eq!(closed["toolCallId"], "call_2");
         assert_eq!(closed["status"], "failed");
         let reason = &closed["content"][1]["content"]["text"];
-        assert_eq!(reason, "skipped: an earlier call failed");
+        assert_eq!(reason, "not run: an earlier call failed");
         assert_eq!(usage["sessionUpdate"], "usage_update");
     }
 
@@ -1144,6 +1147,18 @@ mod tests {
         let shown = &completed["content"][0]["content"]["text"];
         assert_eq!(shown, "```python\nprint('seven')\n```");
         assert!(completed.get("rawInput").is_none(), "{completed}");
+    }
+
+    #[test]
+    fn fences_outrun_backticks() {
+        let text = |code: &str| {
+            let content = fenced(code);
+            let content = serde_json::to_value(content).expect("json");
+            content["content"]["text"].clone()
+        };
+        assert_eq!(text("print('café')\n"), "```python\nprint('café')\n```");
+        let quoted = "s = '```naïve````'";
+        assert_eq!(text(quoted), format!("`````python\n{quoted}\n`````"));
     }
 
     #[test]

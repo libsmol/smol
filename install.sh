@@ -31,7 +31,7 @@ esac
 
 command -v curl >/dev/null || fail "curl: not found"
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "${tmp:?}"' EXIT
 
 printf 'downloading %s\n' "$base/$asset"
 curl -fsSL "$base/$asset" -o "$tmp/$asset" || fail "$asset: download failed"

@@ -33,7 +33,13 @@ pub(crate) fn wave(column: usize) -> Color {
     let seconds = START.elapsed().as_secs_f32();
     let phase = seconds / 4.0 - column as f32 / 32.0;
     let t = (1.0 - (phase * TAU).cos()) / 2.0;
-    mix(PURPLE, PINK, t)
+
+    let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (PURPLE, PINK) else {
+        return PURPLE;
+    };
+    let channel = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    let (r, g, b) = (channel(r1, r2), channel(g1, g2), channel(b1, b2));
+    Color::Rgb(r, g, b)
 }
 
 pub(crate) fn shimmer(text: &str, base: Style, glow: Color, started: Instant) -> Spans {
@@ -50,16 +56,6 @@ pub(crate) fn shimmer(text: &str, base: Style, glow: Color, started: Instant) ->
         spans.push((c.to_string(), style));
     }
     spans
-}
-
-fn mix(from: Color, to: Color, t: f32) -> Color {
-    let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (from, to) else {
-        return from;
-    };
-
-    let channel = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
-    let (r, g, b) = (channel(r1, r2), channel(g1, g2), channel(b1, b2));
-    Color::Rgb(r, g, b)
 }
 
 pub(crate) fn downgrade(buffer: &mut Buffer) {
