@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.6.2 - 2026-11-02
 
 - The system prompt gives `remember()`'s 300-character limit and says that
   `recall()` returns up to 10 memories matching any word of the query, which
