@@ -6,8 +6,14 @@ use ratatui::crossterm::event::{self, Event};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::style::{Modifier, Style};
+#[cfg(unix)]
+use signal_hook::consts::SIGTERM;
+#[cfg(unix)]
+use signal_hook::{flag, low_level};
 use std::env;
 use std::io::stdout;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -143,9 +149,18 @@ pub(crate) fn run(
     let program = env::var("TERM_PROGRAM").unwrap_or_default();
     let truecolor = term != "linux" && program != "Apple_Terminal";
 
+    // A polite kill still leaves the terminal as it was
+    // The shutdown is registered first, so only a second SIGTERM ends smol at once
+    let terminated = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        flag::register_conditional_shutdown(SIGTERM, 1, Arc::clone(&terminated)).ok();
+        flag::register(SIGTERM, Arc::clone(&terminated)).ok();
+    }
+
     let mut screen = Screen::enter()?;
     let mut listened = Instant::now();
-    while !app.quit {
+    while !app.quit && !terminated.load(Ordering::Relaxed) {
         if app.take_dirty() {
             execute!(stdout(), BeginSynchronizedUpdate)?;
             screen.terminal.draw(|frame| {
@@ -190,6 +205,13 @@ pub(crate) fn run(
     drop(screen);
     if let Some(line) = app.session.parting() {
         println!("{line}");
+    }
+
+    // libsmol gets to save first, then the signal ends smol as it would have
+    drop(app);
+    #[cfg(unix)]
+    if terminated.load(Ordering::Relaxed) {
+        low_level::emulate_default_handler(SIGTERM).ok();
     }
 
     Ok(())

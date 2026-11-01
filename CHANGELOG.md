@@ -13,6 +13,76 @@ but their files stay in `~/.smol/history` untouched.
   only and says that `help()` gives their types, which takes what tavily adds
   to the prompt from about 1800 to 1200 characters; `help()` on a server or a
   function still shows the full signatures.
+- Code that replaced `sys.stdout` with its own stream on fd 1, such as
+  `io.TextIOWrapper(open(sys.stdout.fileno(), "wb", 0))`, closed fd 1 once
+  the next snippet put the original stream back, and the next file the code
+  opened got every later print and program output, while each snippet
+  waited 2 more seconds to end. The output now stays with the code.
+- Output that happens to hold the bytes that mark the end of a snippet, such
+  as `libsmol` printed with `cat`, no longer moves output into the next
+  snippet.
+- A thread the code started no longer waits forever on a call to an MCP
+  function, `agent()` or a memory function that was still running when the
+  snippet ended or that it made while an MCP server was being added; the call
+  raises an error instead.
+- An interrupt no longer kills Python and loses its variables when the code
+  had already stopped but its output was still arriving.
+- When Python exits while the model writes the next code, for example from a
+  thread that called `os._exit`, that code is reported as not run instead of
+  as the code that ended Python.
+- Editors get the code the model writes when it first appears and then at
+  most every 100 ms instead of on every token. Each update carries all of the
+  code, so long code used to send hundreds of megabytes and could stall every
+  session.
+- With `max_tokens` set in `model.toml`, compaction starts early enough to
+  leave room for it, and summary requests leave room for it too. A server
+  that refuses a request whose input and `max_tokens` together pass the
+  context no longer fails every turn once a session grows; the larger
+  `max_tokens`, the earlier compaction starts.
+- On Linux the code can list `/`, the home folder and any other folder that
+  holds a hidden path, where `ls`, `os.listdir` and `git status` failed with
+  a permission error. Folders below that are hidden can be listed too, but
+  what they hold still can't be read.
+- On Linux a symbolic link in a writable folder that holds a hidden path, such
+  as a link in the home folder when it is the working directory, no longer
+  makes the place it leads to writable.
+- `~/.config/git/credentials`, `~/.pgpass`, `~/.vault-token` and
+  `~/.terraform.d/credentials.tfrc.json` are hidden from the code too.
+- A client that opens a session with a relative `cwd` gets an error, as ACP
+  requires an absolute one; such a session used to look for instructions,
+  skills and the venv in the wrong place.
+- `recall()` with a NUL in the query finds memories instead of failing with
+  "unterminated string", and other control characters separate words.
+- An MCP function whose tool declares no output schema returns a `str`, as
+  its signature says, even when the server also sends structured content;
+  it used to return a dict and drop the text, including notes on images
+  that weren't kept.
+- `libsmol setup` writes `model.toml` aside and renames it into place, so a
+  write that fails halfway leaves the old file instead of an empty one.
+- When a model error ends a turn, agents still running in the background end
+  as "stopped before it answered" instead of "interrupted by the user".
+- Copies of images and videos larger than their limit are no longer read,
+  and the name of a missing tool the model called is cut to 64 characters,
+  in the reply to the model and where it is saved and shown.
+- Output and command results drop the payload of DCS, SOS, PM and APC
+  sequences, such as kitty and sixel images, and an ESC right before another
+  sequence no longer leaves that sequence's bytes in the text.
+- An MCP server named like a function that agents `agent()` starts don't
+  have, such as `agent` or `remember`, works under the same name in those
+  agents, where it used to raise `NameError`.
+- When output redrawn with `\r`, such as a progress bar, is so long that its
+  middle is dropped, the note on the dropped characters stands where they
+  were instead of in the middle of a line.
+- An attached or viewed image or video is held to the limit of what it is
+  rather than of its extension, so a 15 MB PNG named `.mov` is refused and a
+  15 MB MP4 named `.png` is taken as a video. A file with a media extension
+  that holds no image or video is held to the 1 MB limit of other files.
+- Requests a client sent for a session that then fails to open, such as one
+  open in another process, get answers instead of none.
+- smol restores the terminal when it is killed with SIGTERM, ends a scrollbar
+  drag let go over the completions, ends a frame left unfinished by an error
+  before restoring the terminal, and keeps emoji and accents whole in the
+  shimmer of a running agent's status.
 
 ## 0.6.0 - 2026-11-01
 

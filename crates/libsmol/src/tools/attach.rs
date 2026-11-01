@@ -18,8 +18,13 @@ const MAX_IMAGE_BYTES: u64 = match cfg!(test) {
     false => 10 << 20,
 };
 const MAX_VIDEO_BYTES: u64 = match cfg!(test) {
-    true => 64,
+    true => 128,
     false => 20 << 20,
+};
+/// What the content turns out to be decides its limit, so a media extension gets the larger one first
+const MAX_MEDIA_BYTES: u64 = match MAX_IMAGE_BYTES > MAX_VIDEO_BYTES {
+    true => MAX_IMAGE_BYTES,
+    false => MAX_VIDEO_BYTES,
 };
 
 /// Extension, kind and mime type
@@ -82,7 +87,7 @@ pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment
 
     let mut shown = shown_path(path, cwd);
     let kind = kind_of(path);
-    let limit = kind.map_or(MAX_ATTACH_BYTES, media_limit);
+    let limit = kind.map_or(MAX_ATTACH_BYTES, |_| MAX_MEDIA_BYTES);
     let mut lines = None;
     let mut media = None;
     let content = match fs::metadata(path) {
@@ -110,8 +115,11 @@ pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment
             Err(e) => ToolError::os("read", &shown, e).to_string(),
             Ok(data) => {
                 let found = sniffed(&data);
-                // A media extension on content that is not media is read as a plain file
+                let size = data.len() as u64;
                 match kind.and(found) {
+                    Some((_, actual, _)) if size > media_limit(actual) => oversized(actual, size),
+                    // A media extension on content that is not media is read as a plain file
+                    None if size > MAX_ATTACH_BYTES => prompt::too_large(size),
                     Some(found) => match copied(copies, &data, found, false) {
                         Ok(copy) => {
                             media = Some(copy);
@@ -164,7 +172,7 @@ pub fn viewed(path: &Path, copies: &Path) -> Result<Media, ToolError> {
         let irregular = prompt::failure("read", &shown, prompt::IRREGULAR);
         return Err(ToolError::Failed(irregular));
     }
-    if meta.len() > media_limit(kind) {
+    if meta.len() > MAX_MEDIA_BYTES {
         let refused = oversized(kind, meta.len());
         let refused = prompt::failure("view", &shown, &refused);
         return Err(ToolError::Failed(refused));
@@ -175,6 +183,13 @@ pub fn viewed(path: &Path, copies: &Path) -> Result<Media, ToolError> {
         let refused = unviewable(&shown);
         return Err(ToolError::Failed(refused));
     };
+    let (_, actual, _) = found;
+    let size = data.len() as u64;
+    if size > media_limit(actual) {
+        let refused = oversized(actual, size);
+        let refused = prompt::failure("view", &shown, &refused);
+        return Err(ToolError::Failed(refused));
+    }
     // Copying now keeps later writes to the file from changing what this step viewed
     let copy = copied(copies, &data, found, false);
     copy.map_err(|e| ToolError::os("copy", &shown, e))
@@ -217,14 +232,14 @@ fn copied(copies: &Path, data: &[u8], found: MediaType, from_call: bool) -> io::
 }
 
 /// The code can write to the copies folder, so whatever stands in for a copy there is only read
-/// when it is a plain file
-pub(crate) fn read_copy(path: &Path) -> io::Result<Vec<u8>> {
+/// when it is a plain file no larger than a copy of its kind can be
+pub(crate) fn read_copy(path: &Path, kind: MediaKind) -> io::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
     // Opening a pipe would block until something writes to it
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let mut file = options.open(path)?;
+    let file = options.open(path)?;
     let meta = file.metadata()?;
 
     // A hard link reaches a file the code may not read where it is
@@ -232,12 +247,17 @@ pub(crate) fn read_copy(path: &Path) -> io::Result<Vec<u8>> {
     let linked = meta.nlink() > 1;
     #[cfg(not(unix))]
     let linked = false;
-    if !meta.is_file() || linked {
+    let limit = media_limit(kind);
+    if !meta.is_file() || linked || meta.len() > limit {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
 
+    // It may grow while it is read
     let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    file.take(limit + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > limit {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
     Ok(data)
 }
 
@@ -443,7 +463,8 @@ pub(crate) mod tests {
         let png = [b"\x89PNG\r\n\x1a\n".as_slice(), "pixels".as_bytes()].concat();
         write_file(&dir.join("screenshot.PNG"), &png);
         write_file(&dir.join("clip.mp4"), b"\0\0\0\x18ftypisom");
-        write_file(&dir.join("large.jpg"), &[0; 65]);
+        let jpeg = [b"\xff\xd8\xff".as_slice(), &[0; 62]].concat();
+        write_file(&dir.join("large.jpg"), &jpeg);
         write_file(&dir.join("renamed.jpg"), &png);
         write_file(&dir.join("fake.png"), "not an image".as_bytes());
 
@@ -497,6 +518,33 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// The limit is the one of what the content is, not of what its extension names
+    #[test]
+    fn limits_by_content() {
+        let dir = temp_dir("limits");
+        let copies = dir.join("copies");
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.resize(100, b'p');
+        let mut mp4 = b"\0\0\0\x18ftypisom".to_vec();
+        mp4.resize(100, b'v');
+        write_file(&dir.join("café.mov"), &png);
+        write_file(&dir.join("naïve.png"), &mp4);
+
+        let image = attach_path(&dir.join("café.mov"), &dir, &copies);
+        let refused = "100 bytes, over the 64-byte limit for an attached image";
+        assert_eq!((image.media, image.content.as_str()), (None, refused));
+        let video = attach_path(&dir.join("naïve.png"), &dir, &copies);
+        assert_eq!(video.media.map(|media| media.kind), Some(MediaKind::Video));
+
+        let viewed_image = viewed(&dir.join("café.mov"), &copies).expect_err("image");
+        let shown = slashed(&dir.join("café.mov"));
+        let expected = format!("view: {shown}: {refused}");
+        assert_eq!(viewed_image.to_string(), expected);
+        let viewed_video = viewed(&dir.join("naïve.png"), &copies).expect("video");
+        assert_eq!(viewed_video.kind, MediaKind::Video);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// Links and pipes the code put in the copies folder are not read through
     #[cfg(unix)]
     #[test]
@@ -506,6 +554,8 @@ pub(crate) mod tests {
         let secret = dir.join("secret/naïve.png");
         write_file(&secret, b"\x89PNG secret");
         write_file(&copies.join("café.png"), b"\x89PNG copy");
+        let big = [b'x'; MAX_IMAGE_BYTES as usize + 1];
+        write_file(&copies.join("big.png"), &big);
         symlink(&secret, copies.join("linked.png")).expect("link");
         fs::hard_link(&secret, copies.join("hard.png")).expect("link");
         let pipe = copies.join("pipe.png");
@@ -514,15 +564,17 @@ pub(crate) mod tests {
         let made = unsafe { libc::mkfifo(named.as_ptr(), 0o600) };
         assert_eq!(made, 0);
 
-        let read = |name: &str| read_copy(&copies.join(name)).ok();
+        let read = |name: &str| read_copy(&copies.join(name), MediaKind::Image).ok();
         let found = [
             read("café.png"),
+            read("big.png"),
             read("linked.png"),
             read("hard.png"),
             read("pipe.png"),
         ];
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(found, [Some(b"\x89PNG copy".to_vec()), None, None, None]);
+        let copy = Some(b"\x89PNG copy".to_vec());
+        assert_eq!(found, [copy, None, None, None, None]);
     }
 }

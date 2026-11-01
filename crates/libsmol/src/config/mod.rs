@@ -6,12 +6,10 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
-#[cfg(unix)]
-use std::fs::Permissions;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{self, Path, PathBuf};
 use std::sync::Arc;
 use toml::Value;
@@ -207,19 +205,27 @@ pub(crate) fn save_model(
     };
     fs::create_dir_all(dir).map_err(unwritable)?;
 
+    // Written aside and renamed over the file a link leads to, so a write that fails halfway leaves the old one
+    let target = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let written = target.with_extension("toml.new");
+    // A stale one would keep its own mode
+    fs::remove_file(&written).ok();
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     // The file holds the key in plain text
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(&path).map_err(unwritable)?;
-    // The mode only applies to a new file
-    #[cfg(unix)]
-    {
-        let private = Permissions::from_mode(0o600);
-        file.set_permissions(private).map_err(unwritable)?;
+    let writing = || -> io::Result<()> {
+        let mut file = options.open(&written)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    };
+    if let Err(e) = writing() {
+        // It holds part of the key
+        fs::remove_file(&written).ok();
+        return Err(unwritable(e));
     }
-    file.write_all(text.as_bytes()).map_err(unwritable)?;
+    fs::rename(&written, &target).map_err(unwritable)?;
 
     Ok(())
 }
@@ -789,7 +795,7 @@ mod tests {
     #[cfg(unix)]
     use std::fs::Permissions;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     fn written(text: &str) -> (PathBuf, String) {
@@ -939,6 +945,20 @@ models = [{ id = "m3" }]
         let read = models(&dir).expect("load");
         let built = read.make("local-1/qwen3:32b").expect("make");
         assert_eq!(built.context_window(), None);
+
+        // A link a dotfile manager made stays, and the file it leads to is rewritten
+        #[cfg(unix)]
+        {
+            let real = dir.join("dotfiles/model.toml");
+            fs::create_dir_all(dir.join("dotfiles")).expect("dir");
+            fs::rename(&path, &real).expect("move");
+            symlink(&real, &path).expect("link");
+            save_model(&dir, "local-1", api, "", &spec).expect("save");
+            let linked = fs::symlink_metadata(&path).expect("link").file_type();
+            assert!(linked.is_symlink());
+            assert_eq!(fs::read_to_string(&real).expect("read"), expected);
+            assert!(!dir.join("dotfiles/model.toml.new").exists());
+        }
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -128,22 +128,42 @@ impl Interrupt {
 }
 
 pub(crate) fn truncated(text: &str, max: usize) -> String {
-    truncated_with(text, max, 0)
-}
-
-/// `cut` counts characters already dropped from the middle
-pub(crate) fn truncated_with(text: &str, max: usize, cut: usize) -> String {
     let count = text.chars().count();
-    if count <= max && cut == 0 {
+    if count <= max {
         return text.to_owned();
     }
 
-    let max = max.min(count);
     let kept = max / 2;
     let head: String = text.chars().take(max - kept).collect();
     let tail: String = text.chars().skip(count - kept).collect();
-    let cut = count - max + cut;
-    let marker = prompt::cut(cut);
+    let marker = prompt::cut(count - max);
+
+    format!("{head}\n{marker}\n{tail}")
+}
+
+/// `head` and `tail` with `cut` characters already dropped between them, kept to `max` characters
+/// and marked once where text is missing
+pub(crate) fn seamed(head: &str, tail: &str, cut: usize, max: usize) -> String {
+    if cut == 0 {
+        let text = format!("{head}{tail}");
+        return truncated(&text, max);
+    }
+
+    // Each side keeps up to half, and a side shorter than that leaves the rest to the other
+    let heads = head.chars().count();
+    let tails = tail.chars().count();
+    let max = max.min(heads + tails);
+    let half = max / 2;
+    let tail_kept = match heads < max - half {
+        true => tails.min(max - heads),
+        false => tails.min(half),
+    };
+    let head_kept = heads.min(max - tail_kept);
+
+    let head: String = head.chars().take(head_kept).collect();
+    let tail: String = tail.chars().skip(tails - tail_kept).collect();
+    let dropped = heads - head_kept + cut + tails - tail_kept;
+    let marker = prompt::cut(dropped);
 
     format!("{head}\n{marker}\n{tail}")
 }

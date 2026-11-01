@@ -4,6 +4,7 @@ use ratatui::style::{Color, Style};
 use std::f32::consts::TAU;
 use std::sync::LazyLock;
 use std::time::Instant;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) const BG: Color = Color::Rgb(0x28, 0x2A, 0x36);
 pub(crate) const BAND: Color = Color::Rgb(0x34, 0x37, 0x46);
@@ -42,18 +43,20 @@ pub(crate) fn wave(column: usize) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// One span per grapheme, as ratatui drops a span of a zero-width character such as a joiner
 pub(crate) fn shimmer(text: &str, base: Style, glow: Color, started: Instant) -> Spans {
-    let count = text.chars().count();
+    let graphemes: Vec<&str> = text.graphemes(true).collect();
+    let count = graphemes.len();
     let at = (started.elapsed().as_millis() / 70) as usize % (count + 8);
 
     let mut spans = Vec::new();
-    for (index, c) in text.chars().enumerate() {
+    for (index, grapheme) in graphemes.into_iter().enumerate() {
         let style = match index.abs_diff(at) {
             0 => base.fg(FG),
             1 => base.fg(glow),
             _ => base,
         };
-        spans.push((c.to_string(), style));
+        spans.push((grapheme.to_owned(), style));
     }
     spans
 }
@@ -123,5 +126,28 @@ mod tests {
         for (index, color) in downgraded.iter().enumerate() {
             assert!(!downgraded[..index].contains(color), "{downgraded:?}");
         }
+    }
+
+    #[test]
+    fn shimmer_whole_graphemes() {
+        let text = "café 👨‍💻 nai\u{308}ve";
+        let spans = shimmer(text, Style::new(), PINK, Instant::now());
+        let pieces: Vec<&str> = spans.iter().map(|(piece, _)| piece.as_str()).collect();
+
+        let expected = [
+            "c",
+            "a",
+            "f",
+            "é",
+            " ",
+            "👨‍💻",
+            " ",
+            "n",
+            "a",
+            "i\u{308}",
+            "v",
+            "e",
+        ];
+        assert_eq!(pieces, expected);
     }
 }

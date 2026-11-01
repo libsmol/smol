@@ -109,12 +109,19 @@ def _flushed(opened):
 
 def _run(code):
     global _SHOWN, _STDOUT, _STDERR
-    # Streams the code closed are reopened on fds that are still open
+    # Streams the previous snippet swapped in are not kept
+    _sys.stdout, _sys.stderr = _STDOUT, _STDERR
+    # Dropping one the code made on fd 1 or 2 closed that fd, which the next file opened would take
+    for fd in (1, 2):
+        try:
+            _os.fstat(fd)
+        except OSError:
+            _os.dup2(_OUTPUT, fd)
+    # Streams the code closed are reopened on the fds
     if _STDOUT.closed or _STDERR.closed:
         _STDOUT, _STDERR = _stream(1), _stream(2)
         _sys.__stdout__, _sys.__stderr__ = _STDOUT, _STDERR
-    # Streams the previous snippet swapped in are not kept
-    _sys.stdout, _sys.stderr = _STDOUT, _STDERR
+        _sys.stdout, _sys.stderr = _STDOUT, _STDERR
     _SHOWN = _STDOUT
 
     # Packages installed since, like editable ones, add their paths as site would after a restart
@@ -260,7 +267,7 @@ def _run(code):
     finally:
         _SHOWN = None
 
-        # A pipe flushes on a thread END waits for only briefly, since a writer blocked on it holds its lock
+        # A pipe flushes on a thread the end marker waits for only briefly, since a writer blocked on it holds its lock
         started = []
         for opened in list(_PIPES):
             flusher = _FLUSHERS.get(opened)

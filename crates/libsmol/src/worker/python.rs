@@ -327,7 +327,7 @@ pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
                 let reason = cause(&e);
                 format!("{shown}: {reason}")
             };
-            let (mut group, mut pieces) = Group::start(repairing).map_err(failed)?;
+            let (mut group, mut pieces) = Group::start(repairing, None).map_err(failed)?;
 
             let mut output = Clip::new(KEPT_BYTES);
             // Read while it runs, since a full pipe would stall it

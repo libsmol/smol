@@ -252,7 +252,13 @@ pub(crate) async fn connect(
     let description = server.description.clone().unwrap_or_default();
 
     let mut tools = Vec::new();
+    // As in mcp.py, only a tool with a non-empty output schema returns a dict
+    let mut typed = HashSet::new();
     for tool in &listed {
+        let declared = tool.output_schema.as_ref();
+        if declared.is_some_and(|schema| !schema.is_empty()) {
+            typed.insert(tool.name.to_string());
+        }
         let tool = serde_json::to_value(tool).expect("serialize");
         tools.push(tool);
     }
@@ -267,6 +273,7 @@ pub(crate) async fn connect(
     let call = move |function: String, arguments: Map<String, Value>, label: String| -> Calling {
         let connection = Arc::clone(&connection);
         let copies = copies.clone();
+        let structured = typed.contains(&function);
         Box::pin(async move {
             let mut media = Vec::new();
             let calling = async {
@@ -349,9 +356,14 @@ pub(crate) async fn connect(
                     return Err(message);
                 }
 
-                match result.structured_content {
-                    Some(structured) => Ok(structured),
-                    None => {
+                // Other tools are declared `-> str`, so their structured content stands in only for missing text
+                match (structured, result.structured_content) {
+                    (true, Some(content)) => Ok(content),
+                    (false, Some(content)) if texts.is_empty() => {
+                        let text = content.to_string();
+                        Ok(Value::String(text))
+                    }
+                    _ => {
                         let text = texts.join("\n");
                         Ok(Value::String(text))
                     }
@@ -508,8 +520,26 @@ pub(crate) mod tests {
             "mixed",
             "exit",
             "cancelled",
+            "stats",
+            "counts",
+            "bare",
         ];
         assert_eq!(names, expected);
+    }
+
+    /// Structured content is a dict only for a tool whose output schema says so, as its signature does
+    #[test]
+    fn structured_typed() {
+        let server = fake();
+        let called = |tool: &str| {
+            let label = format!("fake.{tool}");
+            let calling = (server.call)(tool.to_owned(), Map::new(), label);
+            block_on(calling).result
+        };
+
+        assert_eq!(called("stats"), Ok(json!({"count": 3})));
+        assert_eq!(called("counts"), Ok(json!("3 cafés counted")));
+        assert_eq!(called("bare"), Ok(json!("{\"count\":3}")));
     }
 
     #[test]

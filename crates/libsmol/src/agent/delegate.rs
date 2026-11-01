@@ -7,7 +7,7 @@ use crate::prompt;
 use crate::spawn::SHOWN_EVERY;
 use crate::utils::{Interrupt, Reply};
 use crate::worker::host::{Added, Called, Calling, Worker};
-use crate::worker::{AgentCall, Delegation};
+use crate::worker::AgentCall;
 use serde_json::{json, Value};
 use std::future::{self, Future};
 use std::mem;
@@ -89,7 +89,7 @@ impl Agent {
                     let mut members = team.members.lock().expect("members");
                     let running = members.get_mut(id).filter(|member| member.helper.running());
                     if let Some(member) = running {
-                        member.stopped = true;
+                        member.stopped = Some(Ending::Stopped {});
                         member.stop.cancel(u64::MAX);
                     }
                     drop(members);
@@ -196,9 +196,10 @@ impl Agent {
 
                 let sandbox = Arc::clone(&self.sandbox);
                 let installed: Vec<&Added> = servers.iter().collect();
+                let delegation = self.place.delegation();
                 let restarted = false;
                 let starting =
-                    Worker::new(&self.interrupt, sandbox, &installed, Delegation::Off, restarted);
+                    Worker::new(&self.interrupt, sandbox, &installed, delegation, restarted);
                 match starting.await {
                     Ok(mut worker) => {
                         let task = Task {
@@ -353,8 +354,8 @@ struct Member {
     status: Arc<Mutex<Status>>,
     /// Stops it alone
     stop: Interrupt,
-    /// `stop()` was called for it
-    stopped: bool,
+    /// How it ends when `stop` rather than the user stopped it
+    stopped: Option<Ending>,
     /// The code got its result or stopped it, so it is not announced
     taken: bool,
     /// The turn has saved its final record
@@ -423,9 +424,10 @@ impl Team {
 
                 let mut members = team.members.lock().expect("members");
                 let member = &mut members[id];
-                // Its own interrupt can't tell `stop()` from the turn ending
-                if member.stopped && helper.end == (Ending::Interrupted {}) {
-                    helper.end = Ending::Stopped {};
+                // Its own interrupt can't tell the user from `stop()` or the turn ending
+                let interrupted = helper.end == (Ending::Interrupted {});
+                if let Some(end) = member.stopped.clone().filter(|_| interrupted) {
+                    helper.end = end;
                 }
                 member.helper = helper;
                 drop(members);
@@ -437,7 +439,7 @@ impl Team {
                 helper: record,
                 status,
                 stop,
-                stopped: false,
+                stopped: None,
                 taken: false,
                 filed: false,
                 abort,
@@ -568,9 +570,13 @@ impl Turn<'_> {
     /// aborting those that take longer than `HELPERS_WAIT`
     pub(crate) async fn stopped(&mut self) {
         if let Some(team) = self.agent.place.team() {
+            let user = self.agent.interrupt.triggered();
             {
-                let members = team.members.lock().expect("members");
-                for member in members.iter().filter(|member| member.helper.running()) {
+                let mut members = team.members.lock().expect("members");
+                for member in members.iter_mut().filter(|member| member.helper.running()) {
+                    if !user && member.stopped.is_none() {
+                        member.stopped = Some(Ending::Unfinished {});
+                    }
                     member.stop.cancel(u64::MAX);
                 }
             }
@@ -718,7 +724,8 @@ mod tests {
     use crate::memory::tests::metered;
     use crate::memory::{AgentMemory, AgentStep, Call, Ending, Helper, MemoryStep};
     use crate::model::{
-        ChatMessage, Finish, Finished, Generating, Model, Purpose, StreamDelta, TokenUsage,
+        ChatMessage, Finish, Finished, Generating, Model, ModelError, Purpose, StreamDelta,
+        TokenUsage,
     };
     use crate::tests::{cancel_soon, content};
     use crate::tools::mcp::tests::fake;
@@ -1007,6 +1014,8 @@ mod tests {
                     time::sleep(Duration::from_secs_f64(seconds)).await;
                 }
                 match code {
+                    // Stands for a request the server refuses
+                    Some("refused") => return Err(ModelError::new("http 400: bad request")),
                     Some(code) => {
                         on_delta(StreamDelta::CallCode(code));
                         on_delta(StreamDelta::CallEnd(Ok(())));
@@ -1206,6 +1215,23 @@ mod tests {
         assert_eq!(
             ends(ran(&memory, 1)),
             [(Some("slow"), &Ending::Interrupted {})]
+        );
+    }
+
+    /// An agent still running when a model error ends the turn ends unfinished,
+    /// as the user didn't interrupt it
+    #[test]
+    fn failed_turn_unfinished() {
+        let codes = vec!["agent('Wait after 30', name='slow')", "refused"];
+        let model = Background(codes, Requests::default());
+        let mut agent = scripted(model, Box::new(|_| {}));
+
+        let mut memory = AgentMemory::default();
+        let failed = agent.turn(&mut memory, "Wait for it").expect_err("refused");
+        assert!(failed.to_string().contains("bad request"), "{failed}");
+        assert_eq!(
+            ends(ran(&memory, 1)),
+            [(Some("slow"), &Ending::Unfinished {})]
         );
     }
 

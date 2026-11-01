@@ -270,15 +270,18 @@ programs it starts:
 
 - can write only in the working directory, in its venv, in a temporary folder
   of their own (`TMPDIR`) and in the session's copies of viewed images;
-- can read everything else except these credential locations, which they can
-  neither read nor list: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`,
-  `~/.docker`, `~/.config/gcloud`, `~/.config/gh`, `~/.netrc`,
-  `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials.toml`,
-  `~/.cargo/credentials`, `~/.password-store`, `~/.local/share/keyrings`,
-  `~/Library/Keychains`, `~/.smol`, `~/.claude`, `~/.claude.json`, `~/.codex`,
-  and the configuration directory when `SMOL_CONFIG_DIR` moves it; of the
-  configuration directory they still see the runtime, the worker module, the
-  skills, the venv and the copies of viewed images;
+- can read everything else except these credential locations, which they
+  can't read, though on Linux they can list the names of what these folders
+  hold: `~/.ssh`, `~/.gnupg`, `~/.aws`,
+  `~/.azure`, `~/.kube`, `~/.docker`, `~/.config/gcloud`, `~/.config/gh`,
+  `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.npmrc`,
+  `~/.pypirc`, `~/.cargo/credentials.toml`, `~/.cargo/credentials`,
+  `~/.pgpass`, `~/.vault-token`, `~/.terraform.d/credentials.tfrc.json`,
+  `~/.password-store`, `~/.local/share/keyrings`, `~/Library/Keychains`,
+  `~/.smol`, `~/.claude`, `~/.claude.json`, `~/.codex`, and the configuration
+  directory when `SMOL_CONFIG_DIR` moves it; of the configuration directory
+  they still see the runtime, the worker module, the skills, the venv and the
+  copies of viewed images;
 - get only `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `LANG`, `LC_ALL`,
   `LC_CTYPE`, `TERM` and `TZ` from your environment, with the venv's `python`
   and `pip` first on `PATH` and `VIRTUAL_ENV` naming it;
@@ -309,11 +312,13 @@ code starts go through it.
 
 Paths are absolute or start with `~`. Where rules overlap, the deeper path
 wins: with `~/.cargo` in `write`, `~/.cargo/credentials.toml` stays hidden.
-On Linux a folder that holds a hidden path is opened entry by entry, so files
-created or replaced directly in it after the session opens can't be read, and
-when the working directory is your home folder, new files go into its
-subfolders. On macOS the folders above a hidden path can't be renamed or
-removed.
+On Linux a folder that holds a hidden path is opened entry by entry: it can be
+listed, but files created or replaced directly in it after the session opens
+can't be read, and no new files can be made directly in it, so when the
+working directory is your home folder or holds a hidden path, new files go
+into its subfolders. On macOS the folders above a hidden path can't be renamed
+or removed, and hiding `~/Library/Keychains` hides the keychain files but not
+the system service that hands their items to the programs each item trusts.
 
 On Windows, and on Linux kernels without Landlock, files are not isolated; the
 environment is still cut down, on Windows to the system variables programs

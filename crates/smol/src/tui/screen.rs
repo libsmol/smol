@@ -7,7 +7,9 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::style::Print;
-use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::crossterm::terminal::{
+    self, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::Terminal;
 use std::cell::Cell;
 use std::io::{self, stdout, Stdout};
@@ -83,6 +85,8 @@ fn restore() {
     execute!(stdout(), PopKeyboardEnhancementFlags).ok();
     execute!(
         stdout(),
+        // A frame that failed halfway leaves the terminal holding back what follows
+        EndSynchronizedUpdate,
         Print(OWN_COLORS),
         SetCursorStyle::DefaultUserShape,
         DisableBracketedPaste,

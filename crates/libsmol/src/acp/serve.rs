@@ -376,6 +376,12 @@ impl Router {
     }
 
     fn open(&mut self, id: &Value, session: String, cwd: PathBuf, loading: bool) -> Result<()> {
+        if !cwd.is_absolute() {
+            let shown = cwd.display();
+            let message = format!("acp: invalid params: cwd: {shown}: not an absolute path");
+            return Err(Error::InvalidParams(message));
+        }
+
         // An unreadable config must not close the open session with the same id
         let models = config::models(&self.app.config);
         let agent = config::agent(&self.app.config);
@@ -408,12 +414,11 @@ impl Router {
             app: Arc::clone(&self.app),
             interrupt: interrupt.clone(),
             enqueued: Arc::clone(&enqueued),
-            inbox,
         };
 
         // Error level keeps the id on log lines even when only warn is enabled
         let span = error_span!("", id = %session);
-        let running = session::open(opening).instrument(span.clone());
+        let running = session::open(opening, inbox).instrument(span.clone());
         let task = task::spawn(running);
 
         let handle = Handle {
@@ -556,11 +561,24 @@ mod tests {
         });
         assert_eq!(answered["authMethods"], json!([setup]));
 
-        let opening = json!({"cwd": "/", "mcpServers": []});
+        let opening = json!({"cwd": dir, "mcpServers": []});
         let refused = router.request(&json!(3), "session/new", opening);
         let refused = refused.expect_err("unconfigured");
         assert!(matches!(refused, Error::Unconfigured(_)), "{refused:?}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn relative_cwd_refused() {
+        let dir = temp_dir("relative");
+        let (mut router, _sent) = router(&dir);
+        let opening = json!({"cwd": "café", "mcpServers": []});
+        let refused = router.request(&json!(1), "session/new", opening);
+        let refused = refused.expect_err("relative");
+
+        let expected = "acp: invalid params: cwd: café: not an absolute path";
+        assert_eq!(refused.to_string(), expected);
+        assert!(router.sessions.is_empty());
     }
 
     #[test]
@@ -594,7 +612,7 @@ mod tests {
             };
             router.sessions.insert("s1".to_owned(), opened);
 
-            let params = json!({"sessionId": "s1", "cwd": "/", "mcpServers": []});
+            let params = json!({"sessionId": "s1", "cwd": dir, "mcpServers": []});
             let asked = router.request(&json!(1), "session/load", params);
             assert!(matches!(asked, Ok(None)), "{asked:?}");
             assert!(interrupt.cancelled(0));
@@ -626,6 +644,55 @@ mod tests {
 
         assert!(answered.get("result").is_some(), "{answered}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What was queued behind an open that fails is still answered
+    #[test]
+    fn failed_open_drained() {
+        let dir = temp_dir("failed-open");
+        let (mut router, mut sent) = router(&dir);
+        let model = "[model.mock]\ntype = \"openai-completions\"\napi = \"http://127.0.0.1:1/v1\"\nmodels = [{ id = \"m1\" }]\n";
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("model.toml"), model).expect("model.toml");
+        let held = router.app.store.lock("s1").expect("lock");
+
+        let answering = async {
+            let params = json!({"sessionId": "s1", "cwd": dir, "mcpServers": []});
+            router
+                .request(&json!(1), "session/load", params)
+                .expect("load");
+            let text = json!({"type": "text", "text": "Count the cafés"});
+            let params = json!({"sessionId": "s1", "prompt": [text]});
+            router
+                .request(&json!(2), "session/prompt", params)
+                .expect("prompt");
+
+            let mut answers = Vec::new();
+            while answers.len() < 2 {
+                let receiving = sent.recv();
+                let waiting = time::timeout(Duration::from_secs(10), receiving);
+                let line = waiting
+                    .await
+                    .expect("answered")
+                    .expect("open")
+                    .expect("line");
+                let message: Value = serde_json::from_str(&line).expect("json");
+                if message.get("id").is_some() {
+                    answers.push(message);
+                }
+            }
+            answers
+        };
+        let answers = block_on(answering);
+        drop(held);
+        fs::remove_dir_all(&dir).ok();
+
+        // Queued requests are answered first, as when the session is closed while opening
+        let ids: Vec<&Value> = answers.iter().map(|answer| &answer["id"]).collect();
+        assert_eq!(ids, [&json!(2), &json!(1)]);
+        assert_eq!(answers[0]["result"]["stopReason"], "cancelled");
+        let refused = answers[1]["error"]["message"].as_str().unwrap_or_default();
+        assert!(refused.contains("open in another process"), "{answers:?}");
     }
 
     #[test]

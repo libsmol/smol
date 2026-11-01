@@ -568,6 +568,12 @@ pub(crate) fn exited(end: Option<&Exit>) -> String {
     }
 }
 
+/// For a worker that went away while the model wrote the code
+pub(crate) fn lost(end: Option<&Exit>) -> String {
+    let exited = exited(end);
+    format!("{exited} before the code ran")
+}
+
 /// `said` is the output or error from before the worker came up
 pub(crate) fn unstarted(said: &str) -> String {
     match said {
@@ -579,6 +585,9 @@ pub(crate) fn unstarted(said: &str) -> String {
 /// Errors from MCP functions, which the Python side prefixes with `server.function:`
 pub(crate) const NO_SERVER: &str = "server disconnected";
 pub(crate) const SILENT_ERROR: &str = "the tool reported an error without a message";
+/// For calls from threads the code started, which keep running after it
+pub(crate) const LEFT_BEHIND: &str = "stopped when the code that was running ended";
+pub(crate) const ADDING_SERVER: &str = "not run while an MCP server was being added";
 
 pub(crate) fn unshown(what: &str, mime: &str, size: usize) -> String {
     format!("[{what}: {mime}, {size} bytes, not shown]")

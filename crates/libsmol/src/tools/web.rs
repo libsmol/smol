@@ -59,8 +59,7 @@ pub async fn fetch(url: &str) -> Result<String, ToolError> {
         let moved = matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308);
         let location = response.headers().get(LOCATION);
         let location = location.and_then(|value| value.to_str().ok());
-        let next = location.and_then(|location| base.join(location).ok());
-        let next = next.filter(|next| matches!(next.scheme(), "http" | "https"));
+        let next = location.and_then(|location| web_url(&base, location));
         if let Some(next) = next.filter(|_| moved) {
             hops += 1;
             target = next.into();
@@ -259,9 +258,15 @@ fn refresh(page: &Html, base: &Url) -> Option<Url> {
         return None;
     }
 
-    let next = base.join(link).ok()?;
-    let web = matches!(next.scheme(), "http" | "https");
-    (web && next != *base).then_some(next)
+    let next = web_url(base, link)?;
+    (next != *base).then_some(next)
+}
+
+/// `link` read against `base`, when it leads to a web page
+fn web_url(base: &Url, link: &str) -> Option<Url> {
+    let url = base.join(link).ok()?;
+    let web = matches!(url.scheme(), "http" | "https");
+    web.then_some(url)
 }
 
 fn markdown(page: &Html, base: &Url) -> String {
@@ -345,12 +350,10 @@ impl Markdown<'_> {
             },
             "a" => {
                 let href = el.attr("href").filter(|href| !href.starts_with('#'));
-                let url = href.and_then(|href| self.base.join(href).ok());
+                let url = href.and_then(|href| web_url(self.base, href));
                 match url {
-                    Some(url) if matches!(url.scheme(), "http" | "https") => {
-                        ("[".into(), format!("]({url})"))
-                    }
-                    _ => Default::default(),
+                    Some(url) => ("[".into(), format!("]({url})")),
+                    None => Default::default(),
                 }
             }
             _ => Default::default(),

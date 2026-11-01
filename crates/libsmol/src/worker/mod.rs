@@ -13,7 +13,12 @@ pub const COPIES_ENV: &str = "SMOL_COPIES";
 /// Holds `on`, or `roles` when `agent()` takes a role, and is unset for workers without `agent()`
 pub const AGENTS_ENV: &str = "SMOL_AGENTS";
 
-pub const END: &[u8] = b"\x02smol\x03end\n";
+/// The marker the worker writes after each snippet's output,
+/// made from the token because the output may hold any fixed marker
+pub fn end_marker(token: &str) -> Vec<u8> {
+    let marker = format!("\x02{token}\x03end\n");
+    marker.into_bytes()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
@@ -60,8 +65,10 @@ pub enum HostCall {
     Run {
         code: String,
     },
+    /// `name` is the one the session's first worker chose, which the worker picks itself when None
     AddServer {
         source: String,
+        name: Option<String>,
         description: String,
         tools: Vec<Value>,
     },

@@ -28,8 +28,8 @@ pub mod guest {
     pub use crate::tools::ToolError;
     pub use crate::utils::{block_on, Waiting};
     pub use crate::worker::{
-        FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall, WorkerNote,
-        AGENTS_ENV, CONTROL_ENV, COPIES_ENV, END,
+        end_marker, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
+        WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV,
     };
 }
 

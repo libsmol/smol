@@ -29,7 +29,7 @@ const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 
 const ARGUMENT: &str = "code";
 /// Servers only accept tool names of letters, digits, `_` and `-` up to this length
-const MAX_NAME_CHARS: usize = 64;
+pub(crate) const MAX_NAME_CHARS: usize = 64;
 
 pub(crate) const DEFAULT_API: &str = "https://api.openai.com/v1";
 const LIST_WAIT: Duration = Duration::from_secs(30);
@@ -227,6 +227,11 @@ pub(crate) trait Model: Send + Sync {
         None
     }
 
+    /// Sent with every request, and servers may refuse one whose input and this together pass the window
+    fn max_tokens(&self) -> Option<u64> {
+        None
+    }
+
     fn takes(&self, _kind: MediaKind) -> bool {
         false
     }
@@ -312,7 +317,7 @@ impl OpenAIModel {
                 };
 
                 let accepted = self.takes(media.kind);
-                let read = accepted.then(|| read_copy(&media.file));
+                let read = accepted.then(|| read_copy(&media.file, media.kind));
                 let bytes = match read {
                     Some(Ok(bytes)) => bytes,
                     Some(Err(_)) => {
@@ -565,6 +570,10 @@ impl Model for OpenAIModel {
 
     fn context_window(&self) -> Option<u64> {
         self.window
+    }
+
+    fn max_tokens(&self) -> Option<u64> {
+        self.max_tokens
     }
 
     fn takes(&self, kind: MediaKind) -> bool {

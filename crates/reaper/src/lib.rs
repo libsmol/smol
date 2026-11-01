@@ -98,23 +98,27 @@ pub fn terminal_view(text: &str) -> String {
     }
 
     let mut kept = String::new();
-    let mut chars = text.chars();
+    let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\x1b' {
             kept.push(c);
             continue;
         }
-        match chars.next() {
+        // An ESC that starts no sequence is dropped, and an ESC right after it may start one
+        let Some(next) = chars.next_if(|&next| next != '\x1b') else {
+            continue;
+        };
+        match next {
             // CSI runs to its final byte
-            Some('[') => {
+            '[' => {
                 for c in chars.by_ref() {
                     if ('@'..='~').contains(&c) {
                         break;
                     }
                 }
             }
-            // OSC runs to BEL or ESC \
-            Some(']') => loop {
+            // OSC and the strings of DCS, SOS, PM and APC run to BEL or ESC \
+            ']' | 'P' | 'X' | '^' | '_' => loop {
                 match chars.next() {
                     Some('\x07') | None => break,
                     Some('\x1b') => {
@@ -125,16 +129,15 @@ pub fn terminal_view(text: &str) -> String {
                 }
             },
             // Intermediate bytes are followed by one final byte
-            Some(' '..='/') => {
+            ' '..='/' => {
                 for c in chars.by_ref() {
                     if ('0'..='~').contains(&c) {
                         break;
                     }
                 }
             }
-            Some('0'..='~') | None => {}
-            // An ESC that starts no sequence is dropped on its own
-            Some(c) => kept.push(c),
+            '0'..='~' => {}
+            other => kept.push(other),
         }
     }
 
@@ -298,6 +301,12 @@ mod tests {
             ),
             ("\rstart\r\r", "start"),
             ("plain\ntwo lines", "plain\ntwo lines"),
+            (
+                "\x1b_Gf=100;iVBORw0KGgo=\x1b\\café \x1bPq#0;2;0;0;0~-\x1b\\naïve",
+                "café naïve",
+            ),
+            ("\x1b^private\x07\x1bXstring\x1b\\résumé", "résumé"),
+            ("\x1b\x1b[31mred\x1b\x1b\x1b[0m 🐍", "red 🐍"),
         ];
 
         for (text, expected) in cases {

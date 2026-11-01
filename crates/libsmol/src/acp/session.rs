@@ -14,7 +14,6 @@ use crate::utils::Interrupt;
 use crate::worker::host::Worker;
 use crate::worker::python::Python;
 use crate::worker::sandbox::Sandbox;
-use crate::worker::Delegation;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     ContentBlock, LoadSessionResponse, NewSessionResponse, PromptResponse, SessionConfigOption,
@@ -77,8 +76,6 @@ pub(crate) struct Opening {
     pub(crate) app: Arc<App>,
     pub(crate) interrupt: Interrupt,
     pub(crate) enqueued: Arc<Notify>,
-    /// Only `Router` holds the sender, and dropping it closes the session
-    pub(crate) inbox: UnboundedReceiver<Message>,
 }
 
 #[derive(Deserialize)]
@@ -87,7 +84,6 @@ struct Queued {
 }
 
 struct Session {
-    inbox: UnboundedReceiver<Message>,
     interrupt: Interrupt,
     memory: AgentMemory,
     models: Models,
@@ -130,19 +126,25 @@ impl Unsaved {
     }
 }
 
-pub(crate) async fn open(opening: Opening) {
+/// Only `Router` holds the sender of `inbox`, and dropping it closes the session
+pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>) {
     let id = opening.id.clone();
+    let session = opening.session.clone();
     let app = Arc::clone(&opening.app);
-    match start(opening).await {
-        Ok(session) => session.run().await,
+    let started = start(opening, &inbox).await;
+    match started {
+        Ok(opened) => opened.run(inbox).await,
         Err(error) => {
             error!("session: open failed, {error}");
+            // Closed first, so a request that comes in meanwhile is refused instead of lost
+            inbox.close();
+            drain(&mut inbox, &app.peer, &session);
             app.peer.respond(&id, Err(error));
         }
     }
 }
 
-async fn start(opening: Opening) -> Result<Session> {
+async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<Session> {
     let Opening {
         id,
         session,
@@ -155,7 +157,6 @@ async fn start(opening: Opening) -> Result<Session> {
         app,
         interrupt,
         enqueued,
-        inbox,
     } = opening;
     let peer = &app.peer;
 
@@ -163,7 +164,7 @@ async fn start(opening: Opening) -> Result<Session> {
         previous.await.ok();
     }
     if inbox.is_closed() {
-        return Err(unopened(inbox, peer, session));
+        return Err(Error::SessionNotFound(session));
     }
 
     // Read the saved session only after locking because another process
@@ -244,18 +245,26 @@ async fn start(opening: Opening) -> Result<Session> {
     let python = Python::install(&app.config, &cwd).await;
     let python = python.map_err(Error::Python)?;
     if inbox.is_closed() {
-        return Err(unopened(inbox, peer, meta.id));
+        return Err(Error::SessionNotFound(meta.id));
     }
     let sandbox = Sandbox::new(&cwd, &copies, &app.config, &skills, &access, python);
     let sandbox = sandbox.map_err(Error::Python)?;
     let sandbox = Arc::new(sandbox);
 
+    let queue = ClientQueue {
+        peer: Arc::clone(&app.peer),
+        session: meta.id.clone(),
+        enqueued,
+    };
+    let place = Place::Main {
+        roles,
+        team: Arc::default(),
+        queue: Arc::new(queue),
+    };
+
     // No restart notice again when no code has run since the last restart
     let ran = memory.ran_code();
-    let delegation = match roles.is_empty() {
-        true => Delegation::On,
-        false => Delegation::Roles,
-    };
+    let delegation = place.delegation();
     let starting = Worker::new(&interrupt, Arc::clone(&sandbox), &[], delegation, ran);
     let worker = starting.await?;
 
@@ -289,11 +298,6 @@ async fn start(opening: Opening) -> Result<Session> {
     let pool = McpPool::new(servers, &meta.settings, &copies, peer, meta.id.clone());
     pool.report();
 
-    let queue = ClientQueue {
-        peer: Arc::clone(&app.peer),
-        session: meta.id.clone(),
-        enqueued,
-    };
     let brief = Brief {
         instructions,
         skills,
@@ -307,11 +311,7 @@ async fn start(opening: Opening) -> Result<Session> {
         interrupt: interrupt.clone(),
         sandbox,
         memories,
-        place: Place::Main {
-            roles,
-            team: Arc::default(),
-            queue: Arc::new(queue),
-        },
+        place,
     };
     let keeper = Keeper {
         meta,
@@ -322,7 +322,6 @@ async fn start(opening: Opening) -> Result<Session> {
     };
 
     Ok(Session {
-        inbox,
         interrupt,
         memory,
         models,
@@ -336,7 +335,7 @@ async fn start(opening: Opening) -> Result<Session> {
 }
 
 impl Session {
-    async fn run(mut self) {
+    async fn run(mut self, mut inbox: UnboundedReceiver<Message>) {
         loop {
             let titling = &mut self.keeper.titling;
             let titled = async {
@@ -359,23 +358,23 @@ impl Session {
                     }
                     continue;
                 }
-                message = self.inbox.recv() => message,
+                message = inbox.recv() => message,
             };
             let Some(message) = message else {
                 break;
             };
 
-            // Messages still queued after close must not run,
-            // and prompts and commands are answered as cancelled by turn
-            let closed = self.inbox.is_closed();
+            // Messages still queued after close must not run
+            if inbox.is_closed() {
+                let peer = &self.keeper.app.peer;
+                let session = &self.keeper.meta.id;
+                refused(message, peer, session);
+                drain(&mut inbox, peer, session);
+                break;
+            }
             match message {
                 Message::Prompt(prompt) => self.prompt(prompt).await,
                 Message::Shell(shell) => self.shell(shell).await,
-                Message::Option(id, _) if closed => {
-                    let session = self.keeper.meta.id.clone();
-                    let error = Error::SessionNotFound(session);
-                    self.keeper.app.peer.respond(&id, Err(error));
-                }
                 Message::Option(id, option) => {
                     let result = self.option(option);
                     self.keeper.app.peer.respond(&id, result);
@@ -394,12 +393,7 @@ impl Session {
     }
 
     async fn prompt(&mut self, prompt: Prompt) {
-        // Skip prompts still queued after close, but record one the user interrupted
-        // before it started and end it as interrupted
-        if self.interrupt.cancelled(prompt.turn) && self.inbox.is_closed() {
-            let peer = &self.keeper.app.peer;
-            return finish(peer, &prompt.id, StopReason::Cancelled);
-        }
+        // One the user interrupted before it started is still recorded and ends as interrupted
         self.interrupt.begin(prompt.turn);
 
         // Requests stay in the channel while MCP servers connect,
@@ -618,20 +612,24 @@ impl Queue for ClientQueue {
     }
 }
 
-/// A session closed while opening still answers what was queued, as `Session::run` does after close
-fn unopened(mut inbox: UnboundedReceiver<Message>, peer: &Peer, session: String) -> Error {
-    while let Ok(message) = inbox.try_recv() {
-        match message {
-            Message::Prompt(Prompt { id, .. }) | Message::Shell(Shell { id, .. }) => {
-                finish(peer, &id, StopReason::Cancelled);
-            }
-            Message::Option(id, _) => {
-                let error = Error::SessionNotFound(session.clone());
-                peer.respond(&id, Err(error));
-            }
+/// Answers a message without running it, a prompt or command as cancelled
+fn refused(message: Message, peer: &Peer, session: &str) {
+    match message {
+        Message::Prompt(Prompt { id, .. }) | Message::Shell(Shell { id, .. }) => {
+            finish(peer, &id, StopReason::Cancelled);
+        }
+        Message::Option(id, _) => {
+            let error = Error::SessionNotFound(session.to_owned());
+            peer.respond(&id, Err(error));
         }
     }
-    Error::SessionNotFound(session)
+}
+
+/// Answers what is still queued once the session is closed or failed to open
+fn drain(inbox: &mut UnboundedReceiver<Message>, peer: &Peer, session: &str) {
+    while let Ok(message) = inbox.try_recv() {
+        refused(message, peer, session);
+    }
 }
 
 fn finish(peer: &Peer, id: &Value, reason: StopReason) {
@@ -1211,7 +1209,7 @@ mod tests {
         assert_eq!(statuses.first(), Some(&first), "{statuses:?}");
         let last = json!([
             {"name": "down", "state": "failed", "error": "…"},
-            {"name": "fake", "state": "connected", "tools": 7},
+            {"name": "fake", "state": "connected", "tools": 10},
             {"name": "off", "state": "off"},
         ]);
         assert_eq!(statuses.last(), Some(&last), "{statuses:?}");

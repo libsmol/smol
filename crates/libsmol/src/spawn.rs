@@ -1,6 +1,5 @@
 use crate::memory::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
-use crate::utils::{truncated_with, Interrupt};
-use crate::worker::END;
+use crate::utils::{seamed, Interrupt};
 #[cfg(windows)]
 use encoding_rs::Encoding;
 use reaper::{cause, terminal_view, Mark};
@@ -78,8 +77,11 @@ impl Group {
         Ok(Self { group, ended })
     }
 
-    /// Replaces the command's stdout and stderr with one pipe
-    pub(crate) fn start(mut command: Command) -> io::Result<(Self, Receiver<Piece>)> {
+    /// Replaces the command's stdout and stderr with one pipe, whose output ends a piece at each `end`
+    pub(crate) fn start(
+        mut command: Command,
+        end: Option<Vec<u8>>,
+    ) -> io::Result<(Self, Receiver<Piece>)> {
         // Reading stdout and stderr separately would scramble the order of interleaved writes
         let (mut output, writer) = io::pipe()?;
         let copied = writer.try_clone()?;
@@ -99,8 +101,14 @@ impl Group {
             let mut held = Vec::new();
             while let Ok(count @ 1..) = output.read(&mut buffer) {
                 held.extend_from_slice(&buffer[..count]);
-                while let Some(at) = held.windows(END.len()).position(|window| window == END) {
-                    let rest = held.split_off(at + END.len());
+                let Some(end) = &end else {
+                    let read = mem::take(&mut held);
+                    pieces.blocking_send(Piece::Output(read)).ok();
+                    continue;
+                };
+
+                while let Some(at) = held.windows(end.len()).position(|window| window == end) {
+                    let rest = held.split_off(at + end.len());
                     held.truncate(at);
                     let before = mem::replace(&mut held, rest);
                     pieces.blocking_send(Piece::Output(before)).ok();
@@ -108,9 +116,9 @@ impl Group {
                 }
 
                 // The marker may span two reads, so a tail that starts it waits for the next one
-                let partial = (1..END.len())
+                let partial = (1..end.len())
                     .rev()
-                    .find(|size| held.ends_with(&END[..*size]));
+                    .find(|size| held.ends_with(&end[..*size]));
                 let at = held.len() - partial.unwrap_or(0);
                 let rest = held.split_off(at);
                 let before = mem::replace(&mut held, rest);
@@ -144,7 +152,7 @@ impl Group {
 
 pub(crate) enum Piece {
     Output(Vec<u8>),
-    /// The END marker the worker writes after each snippet
+    /// The marker the worker writes after each snippet
     End,
 }
 
@@ -199,7 +207,7 @@ impl Clip {
         self.dropped += over;
     }
 
-    /// The kept text and the number of characters dropped from the middle
+    /// The kept text as the program wrote it, and the number of characters dropped from the middle
     pub(crate) fn text(&self) -> (String, usize) {
         let mut bytes = self.head.clone();
         bytes.extend(&self.tail);
@@ -207,10 +215,33 @@ impl Clip {
         (text, self.cut)
     }
 
+    /// The kept text without terminal sequences and redrawn frames, and where its tail starts,
+    /// with head and tail cleaned apart once the middle is dropped as a sequence may span the seam
+    pub(crate) fn cleaned(&self) -> (String, usize) {
+        if self.cut == 0 {
+            let (text, _) = self.text();
+            let text = terminal_view(&text);
+            let seam = text.len();
+            return (text, seam);
+        }
+
+        let head = decoded(&self.head);
+        let head = terminal_view(&head);
+        let tail: Vec<u8> = self.tail.iter().copied().collect();
+        let tail = decoded(&tail);
+        let tail = terminal_view(&tail);
+        let seam = head.len();
+        (head + &tail, seam)
+    }
+
+    pub(crate) fn cut(&self) -> usize {
+        self.cut
+    }
+
     pub(crate) fn shown(&self, max: usize) -> String {
-        let (text, cut) = self.text();
-        let text = terminal_view(&text);
-        truncated_with(&text, max, cut)
+        let (text, seam) = self.cleaned();
+        let (head, tail) = text.split_at(seam);
+        seamed(head, tail, self.cut, max)
     }
 
     /// Returns text only when more output arrived since the last call
@@ -311,7 +342,7 @@ pub(crate) async fn spawn_shell(
     // Otherwise a spawned CPython uses GBK on the pipes and fails on characters outside it
     #[cfg(windows)]
     process.env("PYTHONUTF8", "1");
-    let (mut group, mut pieces) = match Group::start(process) {
+    let (mut group, mut pieces) = match Group::start(process, None) {
         Ok(started) => started,
         Err(e) => {
             step.end = Exit::Unstarted(cause(&e));
@@ -368,7 +399,7 @@ mod tests {
     use crate::memory::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
     use crate::spawn::{spawn_shell, Clip};
     use crate::tests::temp_dir;
-    use crate::utils::{block_on, truncated, truncated_with, Interrupt};
+    use crate::utils::{block_on, truncated, Interrupt};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -389,11 +420,26 @@ mod tests {
             for chunk in text.as_bytes().chunks(4097) {
                 clip.push(chunk);
             }
-            let (kept, cut) = clip.text();
-            let clipped = truncated_with(&kept, MAX_OBSERVATION_CHARS, cut);
+            let clipped = clip.shown(MAX_OBSERVATION_CHARS);
             let expected = truncated(&text, MAX_OBSERVATION_CHARS);
             assert_eq!(clipped, expected, "{size}");
         }
+    }
+
+    /// Progress redrawn with \r shrinks when cleaned, and the marker stays where the middle was dropped
+    #[test]
+    fn redraws_seam_marked() {
+        let mut written = "head line one, two!\n".to_owned();
+        for frame in 1..=50 {
+            written.push_str(&format!("\rframe {frame:02}"));
+        }
+        written.push_str("\rlast\n");
+        let mut clip = Clip::new(20);
+        clip.push(written.as_bytes());
+
+        let expected = "head line one, two!\n\n[436 characters cut]\nlast\n";
+        assert_eq!(clip.shown(1000), expected);
+        assert_eq!(clip.shown(10), "head \n[451 characters cut]\nlast\n");
     }
 
     /// A character split across two chunks is completed by the next one

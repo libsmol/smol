@@ -87,13 +87,15 @@ def _unique(name, used):
 # Only stdlib names count because a sys.path lookup would vary with the working directory
 _MODULES = frozenset(_sys.builtin_module_names) | _sys.stdlib_module_names
 
-def _server(source, description, tools):
+def _server(source, name, description, tools):
     builtins = vars(_builtins)
-    name = _identifier(source)
-    builtin = name in builtins and not isinstance(builtins[name], _Server)
-    # A single import would shadow a server named like a module
-    if name in _MODULES or builtin:
-        name += "_mcp"
+    # Workers after the first get the name it chose, which their own builtins might not lead to
+    if name is None:
+        name = _identifier(source)
+        builtin = name in builtins and not isinstance(builtins[name], _Server)
+        # A single import would shadow a server named like a module
+        if name in _MODULES or builtin:
+            name += "_mcp"
     taken = builtins.get(name)
     if isinstance(taken, _Server) and taken._source != source:
         return {"name": name, "server": taken._source}

@@ -13,7 +13,7 @@ use crate::tools::memories::{Listed, Memories};
 use crate::utils::Interrupt;
 use crate::worker::host::{Added, Called, Calling, Serving, Worker};
 use crate::worker::sandbox::Sandbox;
-use crate::worker::{AgentCall, Service};
+use crate::worker::{AgentCall, Delegation, Service};
 use crate::{Error, Result};
 use std::fs;
 use std::future::Future;
@@ -242,6 +242,15 @@ impl Place {
         match self {
             Place::Main { team, .. } => Some(team),
             Place::Delegated(_) => None,
+        }
+    }
+
+    /// Which `agent()` its worker offers
+    pub(crate) fn delegation(&self) -> Delegation {
+        match self {
+            Place::Main { roles, .. } if roles.is_empty() => Delegation::On,
+            Place::Main { .. } => Delegation::Roles,
+            Place::Delegated(_) => Delegation::Off,
         }
     }
 }

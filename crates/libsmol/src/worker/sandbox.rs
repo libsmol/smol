@@ -55,6 +55,10 @@ const CREDENTIALS: &[&str] = &[
     ".pypirc",
     ".cargo/credentials.toml",
     ".cargo/credentials",
+    ".config/git/credentials",
+    ".pgpass",
+    ".vault-token",
+    ".terraform.d/credentials.tfrc.json",
     ".password-store",
     ".local/share/keyrings",
     "Library/Keychains",
@@ -105,6 +109,16 @@ type Isolation = OwnedFd;
 type Isolation = String;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 type Isolation = Infallible;
+
+/// What a Landlock rule lets the code do with a path and all below it
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Grant {
+    /// For a folder that holds a hidden path, which lets the code list the hidden folders too
+    List,
+    Read,
+    Write,
+}
 
 /// What a session's worker and the programs it starts can see, kept across restarts
 pub(crate) struct Sandbox {
@@ -316,7 +330,11 @@ fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation
         .collect();
     let mut allowed = Vec::new();
     for (path, write) in granted {
-        spread(path, *write, &hidden, &mut allowed);
+        let grant = match write {
+            true => Grant::Write,
+            false => Grant::Read,
+        };
+        spread(path, grant, &hidden, &mut allowed);
     }
 
     // A kernel drops the rights and scopes it doesn't know, and the rest still holds
@@ -325,13 +343,14 @@ fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation
     // Connecting to a Unix socket is a write right, so only writable folders allow it
     let read = AccessFs::from_read(abi);
     let mut rules = Vec::new();
-    for (path, write) in allowed {
+    for (path, grant) in allowed {
         let Ok(fd) = PathFd::new(&path) else {
             continue;
         };
-        let mut access = match write {
-            true => all,
-            false => read,
+        let mut access = match grant {
+            Grant::Write => all,
+            Grant::Read => read,
+            Grant::List => AccessFs::ReadDir.into(),
         };
         // The kernel refuses a rule on a file that names rights only folders have
         if !path.is_dir() {
@@ -384,38 +403,28 @@ fn landlock_abi() -> libc::c_long {
 }
 
 /// Landlock can't take back access below a granted folder,
-/// so a folder holding a hidden path is granted entry by entry
+/// so a folder holding a hidden path is granted entry by entry and may only be listed
 #[cfg(target_os = "linux")]
-fn spread(path: &Path, write: bool, hidden: &[PathBuf], allowed: &mut Vec<(PathBuf, bool)>) {
+fn spread(path: &Path, grant: Grant, hidden: &[PathBuf], allowed: &mut Vec<(PathBuf, Grant)>) {
     if hidden.iter().any(|spot| spot == path) {
         return;
     }
     let holds = hidden.iter().any(|spot| spot.starts_with(path));
     if !holds {
-        allowed.push((path.to_owned(), write));
+        allowed.push((path.to_owned(), grant));
         return;
     }
 
+    allowed.push((path.to_owned(), Grant::List));
     let Ok(entries) = fs::read_dir(path) else {
         return;
     };
     for entry in entries.flatten() {
-        let inner = entry.path();
+        // A rule on a link would grant where it leads, which `/` already lets the code read
         let linked = entry.file_type().is_ok_and(|kind| kind.is_symlink());
         if !linked {
-            spread(&inner, write, hidden, allowed);
-            continue;
-        }
-
-        // A rule on a link grants where it leads
-        let Ok(real) = fs::canonicalize(&inner) else {
-            continue;
-        };
-        let near = hidden
-            .iter()
-            .any(|spot| real.starts_with(spot) || spot.starts_with(&real));
-        if !near {
-            allowed.push((real, write));
+            let inner = entry.path();
+            spread(&inner, grant, hidden, allowed);
         }
     }
 }
@@ -530,7 +539,7 @@ pub(crate) mod tests {
     use crate::worker::host::Worker;
     use crate::worker::python::tests::installed;
     #[cfg(target_os = "linux")]
-    use crate::worker::sandbox::{landlock_abi, spread};
+    use crate::worker::sandbox::{landlock_abi, spread, Grant};
     use crate::worker::sandbox::{
         profile, sweep, Sandbox, LOCK, PASSED_ENV, PIP_CACHE_ENV, TEMP_PREFIX, VENV_ENV,
     };
@@ -539,7 +548,7 @@ pub(crate) mod tests {
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::os::linux::net::SocketAddrExt;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     #[cfg(target_os = "linux")]
     use std::os::unix::net::SocketAddr;
@@ -602,22 +611,22 @@ pub(crate) mod tests {
         symlink(home.join(".config"), home.join("settings")).expect("link");
         symlink(&outside, home.join("data")).expect("link");
         let home = fs::canonicalize(&home).expect("real");
-        let outside = fs::canonicalize(&outside).expect("real");
         let hidden = [home.join(".ssh"), home.join(".config/gh")];
 
         let mut allowed = Vec::new();
-        spread(&home, false, &hidden, &mut allowed);
-        spread(&home.join("café"), true, &hidden, &mut allowed);
-        spread(&home.join(".ssh"), true, &hidden, &mut allowed);
+        spread(&home, Grant::Read, &hidden, &mut allowed);
+        spread(&home.join("café"), Grant::Write, &hidden, &mut allowed);
+        spread(&home.join(".ssh"), Grant::Write, &hidden, &mut allowed);
         allowed.sort();
         fs::remove_dir_all(&dir).ok();
 
         let expected = [
-            (home.join(".config/git"), false),
-            (home.join(".gitconfig"), false),
-            (home.join("café"), false),
-            (home.join("café"), true),
-            (outside, false),
+            (home.clone(), Grant::List),
+            (home.join(".config"), Grant::List),
+            (home.join(".config/git"), Grant::Read),
+            (home.join(".gitconfig"), Grant::Read),
+            (home.join("café"), Grant::Read),
+            (home.join("café"), Grant::Write),
         ];
         assert_eq!(allowed, expected);
     }
@@ -673,19 +682,21 @@ pub(crate) mod tests {
         let code = "import os, subprocess, sys, tempfile\n\
             def tried(act):\n    try:\n        act()\n        return 'ok'\n    except PermissionError:\n        return 'denied'\n\
             key = '../secret/id_rsa'\n\
+            def linked():\n    try:\n        os.link(key, 'k')\n    except OSError:\n        return 'denied'\n    return tried(lambda: open('k').read())\n\
             [tried(lambda: open('../notes.md').read()), tried(lambda: open(key).read()),\n\
              tried(lambda: open('résumé.txt', 'w').write('x')), tried(lambda: tempfile.TemporaryFile().write(b'x')),\n\
              tried(lambda: open('../naïve.txt', 'w').write('x')), tried(lambda: open('../config/x', 'w').write('x')),\n\
              tried(lambda: open('../shared/x', 'w').write('x')),\n\
              tried(lambda: os.rename(os.getcwd(), '../moved')), tried(lambda: os.rename(sys.prefix, sys.prefix + '-moved')),\n\
+             tried(lambda: os.listdir('..')), tried(lambda: os.listdir('/')), linked(),\n\
              subprocess.run(['cat', key], capture_output=True).returncode]";
         let logs = evaluated(sandbox, code);
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(
-            logs,
-            "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 'ok', 'denied', 'denied', 1]\n"
-        );
+        let expected =
+            "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 'ok', 'denied', 'denied', \
+                        'ok', 'ok', 'denied', 1]\n";
+        assert_eq!(logs, expected);
     }
 
     /// Renaming a folder above a hidden one doesn't uncover it
@@ -718,6 +729,44 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(logs, "['denied', 'denied']\n");
+    }
+
+    /// A link in a writable folder that holds a hidden path doesn't make where it leads writable
+    #[cfg(unix)]
+    #[test]
+    fn links_not_granted() {
+        let dir = temp_dir("linked");
+        let cwd = dir.join("café");
+        write_file(&cwd.join(".env"), b"key");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&outside).expect("dir");
+        symlink(&outside, cwd.join("data")).expect("link");
+        let access = Access {
+            hidden: vec![cwd.join(".env")],
+            ..Access::default()
+        };
+        let config = dir.join("config");
+        let copies = config.join("copies");
+        let python = installed(&config, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, python);
+        let sandbox = sandbox.expect("sandbox");
+        #[cfg(target_os = "macos")]
+        assert!(sandbox.enforced());
+        if !sandbox.enforced() {
+            fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        let code = "import os\n\
+            def tried(act):\n    try:\n        return act()\n    except PermissionError:\n        return 'denied'\n\
+            [tried(lambda: open('data/naïve.txt', 'w').write('x')), tried(lambda: open('.env').read()),\n \
+             tried(lambda: sorted(os.listdir('.')))]";
+        let logs = evaluated(sandbox, code);
+        let written = outside.join("naïve.txt").exists();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(logs, "['denied', 'denied', ['.env', 'data']]\n");
+        assert!(!written);
     }
 
     /// Sockets and signals reach outside the sandbox only on kernels that can't stop them,

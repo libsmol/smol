@@ -253,10 +253,12 @@ fn terms(text: &str) -> String {
 
 /// An FTS5 query for any word of `query`, each quoted to keep FTS5 syntax out
 fn matched(query: &str) -> String {
+    // FTS5 reads the query as a C string, which a NUL inside a quoted word would end
+    let separates = |c: char| c.is_whitespace() || c.is_control();
     let mut words = Vec::new();
     for (chinese, part) in parts(query) {
         if !chinese {
-            words.extend(part.split_whitespace());
+            words.extend(part.split(separates));
             continue;
         }
         let tokens = JIEBA.cut(part, false);
@@ -345,6 +347,8 @@ mod tests {
         let syntax = "\"say\" OR \"\"\"hi\"\"\" OR \"AND\" OR \"NEAR(a\"";
         assert_eq!(matched("say \"hi\" AND * NEAR(a"), syntax);
         assert_eq!(matched("。！ ? "), "");
+        let controls = "\"café\" OR \"naïve\" OR \"résumé\"";
+        assert_eq!(matched("café\0naïve\u{1b}résumé"), controls);
     }
 
     #[test]
@@ -380,6 +384,7 @@ mod tests {
         assert_eq!(found("共和国"), [ids[2]]);
         assert_eq!(found("CAFE"), [ids[3]]);
         assert_eq!(found("nautilus"), [ids[4]]);
+        assert_eq!(found("corner\0nine"), [ids[3]]);
         assert_eq!(found("pnpm 依赖 检查")[0], ids[0]);
         assert_eq!(found("中文"), [shared]);
         let newest = [shared, ids[4], ids[3], ids[2], ids[1], ids[0]];

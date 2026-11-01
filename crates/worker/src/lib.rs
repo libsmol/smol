@@ -1,10 +1,10 @@
 use crate::builtins::{builtins, value_error};
 use libsmol::guest::{
-    block_on, FromWorker, Function, HostCall, HostNote, Message, ToWorker, ToolError, Waiting,
-    WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, DONE, END, MAX_MEMORY_CHARS,
+    block_on, end_marker, FromWorker, Function, HostCall, HostNote, Message, ToWorker, ToolError,
+    Waiting, WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, DONE, MAX_MEMORY_CHARS,
     MAX_PARALLEL_AGENTS, MAX_RECALLED, NO_AGENT, NO_MEMORY, SURROGATE,
 };
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
 #[cfg(windows)]
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -50,11 +50,18 @@ fn _smol(module: &Bound<'_, PyModule>) -> PyResult<()> {
 /// Runs on the main thread, where Python raises `KeyboardInterrupt`, until the agent hangs up
 #[pyfunction]
 fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
-    let environ = py.import("os")?.getattr("environ")?;
+    let os = py.import("os")?;
+    let environ = os.getattr("environ")?;
     // Programs the code starts would inherit these, and they must go before any thread starts
     let control: String = taken(&environ, CONTROL_ENV)?.extract()?;
     let copies: OsString = taken(&environ, COPIES_ENV)?.extract()?;
     let agents: String = taken(&environ, AGENTS_ENV)?.extract()?;
+
+    // Taken before any code can close fd 1
+    // Python's os makes it because a Windows fd belongs to the C runtime that opened it
+    let output: i32 = os.call_method1("dup", (1,))?.extract()?;
+    // Bound now, as the code may replace what `os` holds
+    let write = os.getattr("write")?;
 
     // Python leaves SIGINT ignored when libsmol was started with it ignored, and no interrupt would land
     let signal = py.import("signal")?;
@@ -89,12 +96,14 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     stream.write_all(greeting.as_bytes()).map_err(failed)?;
     let reading = stream.try_clone().map_err(failed)?;
     CONTROL.set(Mutex::new(stream)).ok();
+    let marker = end_marker(token);
 
     let globals = PyDict::new(py);
     let copies = PathBuf::from(copies);
     for (name, function) in builtins(py, copies, cwd)? {
         globals.set_item(name, function)?;
     }
+    globals.set_item("_OUTPUT", output)?;
     globals.set_item("_AGENTS", agents)?;
     globals.set_item("_MAX_AGENTS", MAX_PARALLEL_AGENTS)?;
     globals.set_item("_MAX_RECALLED", MAX_RECALLED)?;
@@ -138,7 +147,7 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
             summary,
         });
     }
-    ended();
+    ended(&write, output, &marker);
     let ready = WorkerNote::Ready { functions };
     send(&Message::Note(ready));
 
@@ -171,7 +180,7 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
                 let ran = ran.and_then(|result| json_of(&result));
 
                 // The output is all written and reading this tells the agent it is complete
-                ended();
+                ended(&write, output, &marker);
                 // The agent takes an error reply to `Run` to mean the worker is gone
                 let result = match ran {
                     Ok(result) => result,
@@ -185,12 +194,13 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
 
             HostCall::AddServer {
                 source,
+                name,
                 description,
                 tools,
             } => {
                 let tools = Value::Array(tools);
                 let installed = python_of(py, &tools)
-                    .and_then(|tools| server.call1((source, description, tools)))
+                    .and_then(|tools| server.call1((source, name, description, tools)))
                     .and_then(|installed| json_of(&installed));
                 installed.map_err(|error| shown(py, &error))
             }
@@ -277,14 +287,20 @@ fn interrupt() {
     unsafe { ffi::PyErr_SetInterruptEx(2) };
 }
 
-/// Marks the end of the output on the pipe the code also writes to
-fn ended() {
+/// Marks the end of the output on `output`, the worker's own copy of the pipe the code writes to
+fn ended(write: &Bound<'_, PyAny>, output: i32, marker: &[u8]) {
     // C extensions print through C's stdio, which holds what goes to a pipe until flushed
     // SAFETY: A null stream flushes every open one
     unsafe { libc::fflush(ptr::null_mut()) };
-    let mut stdout = io::stdout();
-    stdout.write_all(END).ok();
-    stdout.flush().ok();
+    // An interrupt the snippet didn't take is raised here once
+    // A pipe takes a write this small whole or not at all
+    let py = write.py();
+    loop {
+        match write.call1((output, marker)) {
+            Err(error) if error.is_instance_of::<PyKeyboardInterrupt>(py) => continue,
+            _ => break,
+        }
+    }
 }
 
 fn send(message: &FromWorker) {

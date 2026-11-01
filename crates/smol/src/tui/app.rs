@@ -521,6 +521,14 @@ impl App {
                 let on_bar = self.scrollbar.contains(position);
 
                 match mouse.kind {
+                    // A drag of the scrollbar ends wherever the button is let go
+                    MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
+                        self.drag_to(mouse.row);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) if self.dragging => {
+                        self.dragging = false;
+                    }
+
                     MouseEventKind::ScrollUp if on_choices => self.highlight.select_previous(),
                     MouseEventKind::ScrollDown if on_choices => self.highlight.select_next(),
                     _ if on_choices => {}
@@ -532,12 +540,6 @@ impl App {
                         self.dragging = true;
                         self.selection = None;
                         self.drag_to(mouse.row);
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
-                        self.drag_to(mouse.row);
-                    }
-                    MouseEventKind::Up(MouseButton::Left) if self.dragging => {
-                        self.dragging = false;
                     }
 
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -1565,6 +1567,23 @@ mod tests {
             mouse(&mut app, kind, 3, 1);
         }
         assert_eq!((app.pressed, app.selection), (None, None));
+    }
+
+    /// A drag of the scrollbar let go over the completions still ends
+    #[test]
+    fn drag_released_anywhere() {
+        let mut app = app();
+        fill(&mut app, 15);
+        draw(&mut app, 60, 20);
+        let bar = app.scrollbar;
+        let left = MouseButton::Left;
+        mouse(&mut app, MouseEventKind::Down(left), bar.left(), bar.top());
+        assert!(app.dragging);
+
+        app.choices_area = Rect::new(0, 0, 10, 5);
+        mouse(&mut app, MouseEventKind::Drag(left), 2, 2);
+        mouse(&mut app, MouseEventKind::Up(left), 2, 2);
+        assert!(!app.dragging);
     }
 
     #[test]

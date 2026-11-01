@@ -14,6 +14,7 @@ const MAX_RESERVE_TOKENS: u64 = 16_384;
 const MAX_RECENT_SHARE: f64 = 0.15;
 /// The rest is left for the summary
 const MAX_TRANSCRIPT_SHARE: f64 = 0.7;
+const MIN_TRANSCRIPT_SHARE: f64 = 0.25;
 const MIN_OBSERVATION_CHARS: usize = 1024;
 
 impl Turn<'_> {
@@ -30,7 +31,11 @@ impl Turn<'_> {
         let takes = |kind| model.takes(kind);
         let used = self.memory.tokens(&self.system, &takes, Some(window));
         let reserve = (window as f64 * RESERVE_SHARE) as u64;
-        let reserve = reserve.min(MAX_RESERVE_TOKENS);
+        // Servers may refuse a request whose input and output limit together pass the window,
+        // and a reserve over half the window would have every step compact
+        let output = model.max_tokens();
+        let limit = output.unwrap_or(0);
+        let reserve = reserve.min(MAX_RESERVE_TOKENS).max(limit).min(window / 2);
         let interrupted = self.agent.interrupt.triggered();
         if !added || interrupted || used < window - reserve {
             return Ok(());
@@ -92,15 +97,30 @@ impl Turn<'_> {
             return Ok(());
         }
 
-        // If it does not fit, chunk it oldest first with the previous summary
+        self.sink.event(Event::Compact);
+        let interrupt = &self.agent.interrupt;
+        let started = Instant::now();
+        let mut previous = visible.summary.map(|summary| summary.summary.clone());
+        let mut usage = Usage::default();
+        // If it does not fit, chunk it oldest first with the summary so far
         // and cut only a step too big alone
-        let budget = (window as f64 * MAX_TRANSCRIPT_SHARE) as u64;
-        let mut transcripts = Vec::new();
         let mut start = 0;
         while start < older.len() {
+            // The request also holds the output limit, the prompt and the summary so far,
+            // and a smaller budget would make every step a chunk of its own
+            let mut budget = (window as f64 * MAX_TRANSCRIPT_SHARE) as u64;
+            if let Some(output) = output {
+                let asked = prompt::summary("", previous.as_deref(), true);
+                let fixed = text_bytes(SUMMARIZER) + text_bytes(&asked);
+                let fixed = estimate(fixed);
+                let room = window.saturating_sub(output + fixed);
+                let least = (window as f64 * MIN_TRANSCRIPT_SHARE) as u64;
+                budget = budget.min(room).max(least);
+            }
+
             // Steps up to `end` fit and steps up to `over` do not
             let mut end = start + 1;
-            let mut text = squeezed(&older[start..end], window);
+            let mut transcript = squeezed(&older[start..end], budget);
             let mut over = older.len() + 1;
             while over - end > 1 {
                 let middle = (end + over) / 2;
@@ -108,24 +128,15 @@ impl Turn<'_> {
                 let size = text_bytes(&longer);
                 if estimate(size) <= budget {
                     end = middle;
-                    text = longer;
+                    transcript = longer;
                 } else {
                     over = middle;
                 }
             }
-            transcripts.push(text);
             start = end;
-        }
 
-        self.sink.event(Event::Compact);
-        let interrupt = &self.agent.interrupt;
-        let started = Instant::now();
-        let mut previous = visible.summary.map(|summary| summary.summary.clone());
-        let mut usage = Usage::default();
-        let last = transcripts.len() - 1;
-        for (index, transcript) in transcripts.iter().enumerate() {
-            let trailing = kept > 0 && index == last;
-            let asked = prompt::summary(transcript, previous.as_deref(), trailing);
+            let trailing = kept > 0 && end == older.len();
+            let asked = prompt::summary(&transcript, previous.as_deref(), trailing);
             // A fresh request, as continuing the conversation makes the model keep doing the task
             let request = [
                 ChatMessage::System(SUMMARIZER.to_owned()),
@@ -181,9 +192,7 @@ impl Turn<'_> {
 }
 
 /// Always returns a transcript however long, cutting observations first and then the middle
-fn squeezed(steps: &[&MemoryStep], window: u64) -> String {
-    let budget = (window as f64 * MAX_TRANSCRIPT_SHARE) as u64;
-
+fn squeezed(steps: &[&MemoryStep], budget: u64) -> String {
     // Stored observations are already cut and a second cut would lose their count,
     // so try them as they are
     let mut max = usize::MAX;
@@ -200,7 +209,7 @@ fn squeezed(steps: &[&MemoryStep], window: u64) -> String {
     };
 
     // Tokens become characters at the text's average rate,
-    // and the window's spare 30% covers a denser head or tail
+    // so a denser head or tail may pass the budget a little
     let size = text_bytes(&text);
     let tokens = estimate(size).max(1);
     let chars = text.chars().count() as u64;
@@ -214,12 +223,63 @@ mod tests {
     use crate::agent::tests::{called, recorded, reply, Run, Script};
     use crate::memory::tests::{asked, coded, metered, replied};
     use crate::memory::{AgentMemory, AgentStep, Attachment, Exit, ShellStep, TaskStep};
-    use crate::model::{Finish, ModelError, TokenUsage};
+    use crate::model::{Finish, Generating, MediaKind, Model, ModelError, StreamDelta, TokenUsage};
     use crate::tests::content;
     use std::sync::{Arc, Mutex};
 
     fn agent(window: Option<u64>, replies: Vec<Result<Script, ModelError>>) -> Run {
         recorded(replies, window, SUMMARIZER, Box::new(|_| {}))
+    }
+
+    /// Answers as `inner` does, with an output limit
+    struct Limited {
+        inner: Arc<dyn Model>,
+        max_tokens: u64,
+    }
+
+    impl Model for Limited {
+        fn generate<'a>(
+            &'a self,
+            conversation: &'a [ChatMessage],
+            purpose: Purpose,
+            on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
+        ) -> Generating<'a> {
+            self.inner.generate(conversation, purpose, on_delta)
+        }
+
+        fn context_window(&self) -> Option<u64> {
+            self.inner.context_window()
+        }
+
+        fn max_tokens(&self) -> Option<u64> {
+            Some(self.max_tokens)
+        }
+
+        fn takes(&self, kind: MediaKind) -> bool {
+            self.inner.takes(kind)
+        }
+    }
+
+    fn limited(run: &mut Run, max_tokens: u64) {
+        let inner = Arc::clone(&run.agent.agent.model);
+        run.agent.agent.model = Arc::new(Limited { inner, max_tokens });
+    }
+
+    /// A long output and a last step that measured `tokens`
+    fn filled(tokens: u64) -> AgentMemory {
+        let task = asked("Tidy the logs");
+        let printed = "log ".repeat(150_000);
+        let read = coded("print(log)", Some(printed));
+        let counted = AgentStep {
+            usage: metered(tokens, 0),
+            ..replied("The log is 600,000 characters long.")
+        };
+        let steps = vec![
+            MemoryStep::Task(task),
+            MemoryStep::Action(Box::new(read)),
+            MemoryStep::Action(Box::new(counted)),
+        ];
+        AgentMemory { steps }
     }
 
     fn watched(
@@ -335,21 +395,6 @@ mod tests {
     #[test]
     fn reserve_capped() {
         let window = 1 << 20;
-        let filled = |tokens: u64| {
-            let task = asked("Tidy the logs");
-            let printed = "log ".repeat(150_000);
-            let read = coded("print(log)", Some(printed));
-            let counted = AgentStep {
-                usage: metered(tokens, 0),
-                ..replied("The log is 600,000 characters long.")
-            };
-            let steps = vec![
-                MemoryStep::Task(task),
-                MemoryStep::Action(Box::new(read)),
-                MemoryStep::Action(Box::new(counted)),
-            ];
-            AgentMemory { steps }
-        };
         let mut run = agent(Some(window), vec![Ok(reply("Summary"))]);
         let limit = window - MAX_RESERVE_TOKENS;
 
@@ -360,6 +405,70 @@ mod tests {
         let mut full = filled(limit);
         run.agent.compact(&mut full).expect("compact");
         assert!(summarized(&full));
+    }
+
+    /// The reserve holds the output limit, up to half the window
+    #[test]
+    fn reserve_fits_output() {
+        for (max_tokens, limit) in [(20_000, 44_000), (50_000, 32_000)] {
+            let mut run = agent(Some(64_000), vec![Ok(reply("Summary"))]);
+            limited(&mut run, max_tokens);
+
+            let mut below = filled(limit - 1);
+            run.agent.compact(&mut below).expect("compact");
+            assert!(!summarized(&below), "{max_tokens}");
+
+            let mut full = filled(limit);
+            run.agent.compact(&mut full).expect("compact");
+            assert!(summarized(&full), "{max_tokens}");
+        }
+    }
+
+    /// Every summary request leaves the output limit free in the window,
+    /// also a later chunk that carries the long summary of those before it
+    #[test]
+    fn summary_fits_output() {
+        let window = 16_000;
+        let max_tokens = 4000;
+        let long = reply(&"brief ".repeat(750));
+        let mut run = agent(
+            Some(window),
+            vec![Ok(long.clone()), Ok(long.clone()), Ok(long)],
+        );
+        limited(&mut run, max_tokens);
+        let earlier = SummaryStep {
+            summary: "brief ".repeat(10),
+            kept: 1,
+            ..SummaryStep::default()
+        };
+        let mut steps = vec![
+            MemoryStep::Task(asked("Print the parts")),
+            MemoryStep::Summary(earlier),
+        ];
+        // Each part is about a thousand tokens and fits a chunk whole
+        for _ in 0..30 {
+            let printed = "naïve café ".repeat(250);
+            let ran = coded("print(part)", Some(printed));
+            steps.push(MemoryStep::Action(Box::new(ran)));
+        }
+        let answered = AgentStep {
+            usage: metered(13_000, 10),
+            ..replied("Printed them")
+        };
+        steps.push(MemoryStep::Action(Box::new(answered)));
+        let mut memory = AgentMemory { steps };
+        run.agent.compact(&mut memory).expect("compact");
+
+        assert!(matches!(memory.steps.last(), Some(MemoryStep::Summary(_))));
+        let requests = run.requests.lock().expect("requests");
+        assert!(requests.len() > 1, "{}", requests.len());
+        for request in requests.iter() {
+            let sent: usize = request
+                .iter()
+                .map(|message| text_bytes(&content(message)))
+                .sum();
+            assert!(estimate(sent) + max_tokens <= window, "{sent}");
+        }
     }
 
     #[test]

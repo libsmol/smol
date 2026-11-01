@@ -1930,6 +1930,7 @@ dependencies = [
  "ratatui-textarea",
  "serde",
  "serde_json",
+ "signal-hook",
  "textwrap",
  "unicode-segmentation",
  "unicode-width",

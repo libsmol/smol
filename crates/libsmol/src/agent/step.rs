@@ -3,9 +3,10 @@ use crate::agent::{generate, retry, Event, Streamed, Turn, MAX_RETRIES};
 use crate::memory::{
     estimate, text_bytes, AgentStep, Call, CallError, CodeResult, StepError, MAX_OBSERVATION_CHARS,
 };
-use crate::model::{ChatMessage, Finish, Part, Purpose, StreamDelta, Unread};
+use crate::model::{ChatMessage, Finish, Part, Purpose, StreamDelta, Unread, MAX_NAME_CHARS};
 use crate::prompt::{self, TOOL};
-use crate::utils::{truncated, truncated_with};
+use crate::spawn::SHOWN_EVERY;
+use crate::utils::{seamed, truncated};
 use std::mem;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -88,6 +89,8 @@ impl Turn<'_> {
                 &mut on_delta,
             );
             let generated = generating.await;
+            // However the stream ended, the code it left unshown still shows
+            reply.show_code(&mut shown);
             step.reasoning = reply.reasoning;
             step.usage.duration = started.elapsed().as_secs_f64();
 
@@ -185,8 +188,11 @@ impl Turn<'_> {
 
                     let quiet = error.is_none() && output.media.is_empty();
                     let printed = if !logs.is_empty() {
-                        let shown =
-                            truncated_with(logs, MAX_OBSERVATION_CHARS - ending, output.cut);
+                        // Trimming may have taken the whole tail
+                        let seam = output.seam.min(logs.len());
+                        let (head, tail) = logs.split_at(seam);
+                        let budget = MAX_OBSERVATION_CHARS - ending;
+                        let shown = seamed(head, tail, output.cut, budget);
                         Some(shown)
                     } else if quiet {
                         Some(prompt::NO_OUTPUT.to_owned())
@@ -237,6 +243,9 @@ struct Reply {
     looped: usize,
     /// Bytes already scanned in the code being received
     checked: usize,
+    /// Bytes already shown of the code being received, and when they last were
+    shown: usize,
+    shown_at: Option<Instant>,
 }
 
 impl Reply {
@@ -250,26 +259,19 @@ impl Reply {
             self.calls.push(call);
             self.open = true;
             self.checked = 0;
+            self.shown = 0;
+            self.shown_at = None;
         }
 
         let index = self.calls.len() - 1;
-        let written = &mut self.calls[index].code;
-        let earlier = written.trim().is_empty();
-        written.push_str(code);
-        // A blank call is hidden live as it is on replay, since saved code is trimmed
-        let shown = match (earlier, written.trim().is_empty()) {
-            (_, true) => None,
-            (true, false) => Some(written.as_str()),
-            (false, false) => Some(code),
-        };
-        if let Some(added) = shown {
-            let streamed = Streamed {
-                added,
-                whole: written,
-            };
-            on_event(Event::Code(index, streamed));
+        self.calls[index].code.push_str(code);
+        // An event carries all the code and comes at most every `SHOWN_EVERY` after the first
+        let due = self.shown_at.is_none_or(|at| at.elapsed() >= SHOWN_EVERY);
+        if due {
+            self.show_code(on_event);
         }
 
+        let written = &self.calls[index].code;
         while let Some(end) = written[self.checked..].find('\n') {
             let line = written[self.checked..self.checked + end].trim();
             if line.starts_with("</") && line.ends_with('>') {
@@ -281,8 +283,30 @@ impl Reply {
         }
     }
 
+    /// Shows the code that arrived for the open call since it was last shown
+    fn show_code(&mut self, on_event: &mut dyn FnMut(Event)) {
+        if !self.open {
+            return;
+        }
+        let index = self.calls.len() - 1;
+        let written = &self.calls[index].code;
+        // A blank call is hidden live as it is on replay, since saved code is trimmed
+        if self.shown == written.len() || written.trim().is_empty() {
+            return;
+        }
+
+        let streamed = Streamed {
+            added: &written[self.shown..],
+            whole: written,
+        };
+        on_event(Event::Code(index, streamed));
+        self.shown = written.len();
+        self.shown_at = Some(Instant::now());
+    }
+
     /// A call with no readable code never runs and keeps its raw arguments for display
     fn end_call(&mut self, ended: Result<(), Unread>, on_event: &mut dyn FnMut(Event)) {
+        self.show_code(on_event);
         // Close an unreadable call even after it streamed code, or the next call writes into it
         let opened = mem::replace(&mut self.open, false);
         if !opened {
@@ -301,7 +325,11 @@ impl Reply {
         let call = &mut self.calls[index];
         let error = match unread.name == TOOL {
             true => CallError::NoCode,
-            false => CallError::NoTool(unread.name.to_owned()),
+            // Its reply names it, cut as the name sent back to the server is
+            false => {
+                let name = unread.name.chars().take(MAX_NAME_CHARS).collect();
+                CallError::NoTool(name)
+            }
         };
         call.error = Some(error);
         call.arguments = Some(unread.arguments.to_owned());
@@ -699,6 +727,37 @@ mod tests {
         assert_eq!(events, shown);
     }
 
+    /// Code shows when it first appears, then at most every `SHOWN_EVERY`, and in full once its call ends
+    #[test]
+    fn code_shown_throttled() {
+        let mut shown = Vec::new();
+        let mut collect = |event: Event| {
+            if let Event::Code(index, code) = event {
+                shown.push((index, code.added.to_owned(), code.whole.to_owned()));
+            }
+        };
+        let lines: Vec<String> = (0..200).map(|i| format!("print('café {i}')\n")).collect();
+        let mut reply = Reply::default();
+        for line in &lines {
+            reply.push_code(line, &mut collect);
+        }
+        reply.end_call(Ok(()), &mut collect);
+        reply.push_code("print('naïve')", &mut collect);
+        reply.push_code("\nprint('résumé')", &mut collect);
+        reply.show_code(&mut collect);
+
+        let code = lines.concat();
+        let rest = lines[1..].concat();
+        let both = "print('naïve')\nprint('résumé')".to_owned();
+        let expected = [
+            (0, lines[0].clone(), lines[0].clone()),
+            (0, rest, code),
+            (1, "print('naïve')".to_owned(), "print('naïve')".to_owned()),
+            (1, "\nprint('résumé')".to_owned(), both),
+        ];
+        assert_eq!(shown, expected);
+    }
+
     /// A cutoff right as the second call starts leaves the fully received first call incomplete too
     #[test]
     fn cut_after_call() {
@@ -967,6 +1026,22 @@ mod tests {
         };
         assert_eq!(shown, [(0, call.clone())]);
         assert_eq!(reply.calls, [call]);
+    }
+
+    /// A long name of a missing tool is cut before the reply repeats it
+    #[test]
+    fn tool_name_cut() {
+        let mut ignore = |_: Event| {};
+        let mut reply = Reply::default();
+        let name = "café".repeat(100);
+        let unread = Unread {
+            name: &name,
+            arguments: "{}",
+        };
+        reply.end_call(Err(unread), &mut ignore);
+
+        let cut = "café".repeat(16);
+        assert_eq!(reply.calls[0].error, Some(CallError::NoTool(cut)));
     }
 
     #[test]

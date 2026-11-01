@@ -53,7 +53,25 @@ TOOLS = [
         "description": "Counts the cancellations received",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "stats",
+        "description": "Answers with structured content its output schema declares",
+        "inputSchema": {"type": "object", "properties": {}},
+        "outputSchema": {"type": "object", "properties": {"count": {"type": "integer"}}},
+    },
+    {
+        "name": "counts",
+        "description": "Answers with structured content and text, without an output schema",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "bare",
+        "description": "Answers with structured content alone, without an output schema",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
+
+COUNTED = {"count": 3}
 
 CANCELLED = []
 
@@ -125,6 +143,11 @@ def handle(msg):
             sys.exit(0)
         elif name == "cancelled":
             result(msg_id, {"content": [{"type": "text", "text": str(len(CANCELLED))}]})
+        elif name in ("stats", "counts"):
+            text = [{"type": "text", "text": "3 cafés counted"}]
+            result(msg_id, {"content": text, "structuredContent": COUNTED})
+        elif name == "bare":
+            result(msg_id, {"content": [], "structuredContent": COUNTED})
         else:
             send({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "unknown tool"}})
 

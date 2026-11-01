@@ -1,17 +1,17 @@
 use crate::memory::{CallError, MAX_OBSERVATION_CHARS};
 use crate::model::Media;
-use crate::prompt::{self, NO_SERVER};
+use crate::prompt::{self, ADDING_SERVER, LEFT_BEHIND, NO_SERVER};
 use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
 use crate::tools::mcp::Server;
 use crate::utils::{new_id, Interrupt, Reply};
 use crate::worker::python;
 use crate::worker::sandbox::Sandbox;
 use crate::worker::{
-    AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message, Service, ToWorker,
-    WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV,
+    end_marker, AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message, Service,
+    ToWorker, WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV,
 };
 use crate::{Error, Result};
-use reaper::{cause, terminal_view};
+use reaper::cause;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::{self, Future};
@@ -33,7 +33,7 @@ use tokio::time::{self, Instant};
 const STOP_WAIT: Duration = Duration::from_secs(3);
 /// Code that swallows exceptions may have caught the previous interrupt
 const CANCEL_EVERY: Duration = Duration::from_millis(500);
-/// Code that closes stdout never lets the END marker through
+/// Code that closes the worker's own copy of the pipe never lets the end marker through
 const OUTPUT_WAIT: Duration = Duration::from_secs(2);
 const START_WAIT: Duration = Duration::from_secs(30);
 
@@ -60,6 +60,8 @@ pub(crate) struct Evaluated {
     pub(crate) logs: String,
     /// Characters dropped from the middle of `logs`
     pub(crate) cut: usize,
+    /// Where the part of `logs` after the dropped middle starts
+    pub(crate) seam: usize,
     pub(crate) error: Option<CallError>,
     pub(crate) media: Vec<(String, Media)>,
     /// The code actually run after stray tags were stripped
@@ -94,10 +96,16 @@ struct Live {
     pieces: Receiver<Piece>,
     next_id: u64,
     calls: JoinSet<(u64, Called)>,
-    /// Calls a cancel stops, which leaves out the agents the code waits for so they keep their records
-    running: HashMap<u64, AbortHandle>,
+    /// Every call not yet answered, which a thread the code started may still wait for
+    running: HashMap<u64, Running>,
     output: Clip,
     media: Vec<(String, Media)>,
+}
+
+struct Running {
+    abort: AbortHandle,
+    /// False for the agents the code waits for, which a cancel leaves running so they keep their records
+    cancelable: bool,
 }
 
 enum Event {
@@ -202,7 +210,8 @@ impl Worker {
         if let Some(agents) = agents {
             command.env(AGENTS_ENV, agents);
         }
-        let (mut group, pieces) = Group::start(command).map_err(failed)?;
+        let marker = end_marker(&token);
+        let (mut group, pieces) = Group::start(command, Some(marker)).map_err(failed)?;
 
         let accepting = async {
             let (stream, _) = listener.accept().await?;
@@ -248,7 +257,7 @@ impl Worker {
             media: Vec::new(),
         };
 
-        // Startup output runs up to the END marker and doesn't belong to the first snippet
+        // Startup output runs up to the end marker and doesn't belong to the first snippet
         let deadline = Instant::now() + START_WAIT;
         let mut ready = None;
         let mut ended = false;
@@ -278,7 +287,7 @@ impl Worker {
         };
 
         for added in servers {
-            live.install(&added.server).await?;
+            live.install(&added.server, Some(&added.name)).await?;
         }
         self.functions = functions;
         self.live = Some(live);
@@ -291,7 +300,7 @@ impl Worker {
         self.reap();
         self.connect(servers).await.map_err(Error::Python)?;
         let live = self.live.as_mut().expect("connected");
-        let installed = live.install(&server).await.map_err(Error::Python)?;
+        let installed = live.install(&server, None).await.map_err(Error::Python)?;
 
         let name = installed.name;
         if let Some(other) = installed.server {
@@ -329,6 +338,15 @@ impl Worker {
             let error = prompt::python(&reason);
             CallError::Execution(error)
         };
+
+        // A worker lost while the model wrote the code never ran it
+        if let Some(live) = self.live.as_mut().filter(|live| live.group.ended()) {
+            let end = live.group.exited().await;
+            self.reap();
+            let reason = prompt::lost(end.as_ref());
+            return Err(failed(reason));
+        }
+
         let connected = select! {
             biased;
             connected = self.connect(servers) => connected.map_err(failed),
@@ -337,9 +355,7 @@ impl Worker {
         connected?;
 
         let live = self.live.as_mut().expect("connected");
-        // Calls still running from the previous snippet don't belong to this one
-        live.calls.abort_all();
-        live.running.clear();
+        // Views that arrived while a server was being added don't belong to this snippet
         live.media.clear();
         live.output = Clip::new(KEPT_BYTES);
 
@@ -371,7 +387,10 @@ impl Worker {
                     cancel_at += CANCEL_EVERY;
                     continue;
                 }
-                () = time::sleep_until(stop_at), if stopping.is_some() => break Outcome::Stuck,
+                // Once the reply is in, the code has stopped and only its output is still on the way
+                () = time::sleep_until(stop_at), if stopping.is_some() && ran.is_none() => {
+                    break Outcome::Stuck;
+                }
                 () = time::sleep_until(drain_at), if draining.is_some() => {
                     let ran = ran.take().expect("replied");
                     break Outcome::Replied(ran);
@@ -435,19 +454,28 @@ impl Worker {
                     (calling, !asked)
                 }
             };
-            let task = live.calls.spawn(async move { (number, calling.await) });
-            if cancelable {
-                live.running.insert(number, task);
-            }
+            let abort = live.calls.spawn(async move { (number, calling.await) });
+            let running = Running { abort, cancelable };
+            live.running.insert(number, running);
         };
 
-        // Calls the snippet left behind get no reply, and agents among them close their views here
-        for (_, task) in live.running.drain() {
-            task.abort();
-        }
+        // Calls the snippet left behind end with it, and agents among them close their views here
         // On an interrupt the agents the code waits for stop by themselves and keep their records
-        if !interrupt.triggered() {
-            live.calls.abort_all();
+        let interrupted = interrupt.triggered();
+        // Calls that finished meanwhile still answer with their result
+        while let Some(joined) = live.calls.try_join_next() {
+            if let Ok((number, called)) = joined {
+                live.answer(number, called);
+            }
+        }
+        let left = mem::take(&mut live.running);
+        for (number, running) in left {
+            if running.cancelable || !interrupted {
+                running.abort.abort();
+            }
+            let refused = Err(LEFT_BEHIND.to_owned());
+            let reply = Message::reply(number, refused);
+            live.deliver(&reply);
         }
         while live.calls.join_next().await.is_some() {}
 
@@ -465,12 +493,13 @@ impl Worker {
             outcome => outcome,
         };
 
-        let (logs, cut) = live.output.text();
-        let logs = terminal_view(&logs);
+        let (logs, seam) = live.output.cleaned();
+        let cut = live.output.cut();
         let media = mem::take(&mut live.media);
         let mut output = Evaluated {
             logs,
             cut,
+            seam,
             media,
             ..Evaluated::default()
         };
@@ -512,6 +541,13 @@ impl Live {
         self.deliver(&Message::Note(note));
     }
 
+    fn answer(&mut self, id: u64, called: Called) {
+        self.running.remove(&id);
+        self.media.extend(called.media);
+        let reply = Message::reply(id, called.result);
+        self.deliver(&reply);
+    }
+
     fn deliver(&self, message: &ToWorker) {
         let mut line = serde_json::to_string(message).expect("serialize");
         line.push('\n');
@@ -542,8 +578,9 @@ impl Live {
                             return Event::Ready(functions);
                         }
                         Message::Note(WorkerNote::Cancel { id }) => {
-                            if let Some(call) = self.running.remove(&id) {
-                                call.abort();
+                            let running = self.running.get(&id);
+                            if let Some(running) = running.filter(|running| running.cancelable) {
+                                running.abort.abort();
                             }
                         }
                         // The code can write to this connection too, so only a name in the copies folder is taken
@@ -558,32 +595,34 @@ impl Live {
                     }
                 }
                 Some(joined) = self.calls.join_next() => {
-                    let Ok((id, called)) = joined else {
-                        continue;
-                    };
-                    self.running.remove(&id);
-                    self.media.extend(called.media);
-                    let reply = Message::reply(id, called.result);
-                    self.deliver(&reply);
+                    if let Ok((id, called)) = joined {
+                        self.answer(id, called);
+                    }
                 }
             }
         }
     }
 
-    async fn install(&mut self, server: &Server) -> Result<Installed, String> {
+    async fn install(&mut self, server: &Server, name: Option<&str>) -> Result<Installed, String> {
         let call = HostCall::AddServer {
             source: server.name.clone(),
+            name: name.map(str::to_owned),
             description: server.description.clone(),
             tools: server.tools.clone(),
         };
         let id = self.send(call);
 
-        // No code is running, so the worker makes no host calls now
         let installed = loop {
             match self.next().await {
                 Event::Answer(number, reply) if number == id => break reply?,
                 Event::Gone(reason) => return Err(reason),
-                Event::Answer(..) | Event::Call(..) | Event::Ready(_) | Event::End => {}
+                // A thread the code started waits for every call it makes
+                Event::Call(number, _) => {
+                    let refused = Err(ADDING_SERVER.to_owned());
+                    let reply = Message::reply(number, refused);
+                    self.deliver(&reply);
+                }
+                Event::Answer(..) | Event::Ready(_) | Event::End => {}
             }
         };
         serde_json::from_value(installed).map_err(|e| e.to_string())
@@ -845,6 +884,29 @@ pub(crate) mod tests {
         assert!(worker.restarted());
         let output = worker.eval("notes.echo_text('x')");
         assert_eq!(output.logs, "noted\n");
+    }
+
+    /// A worker lost while the model writes the next code is reported without running it
+    #[test]
+    fn lost_before_run() {
+        let mut worker = fresh();
+        let output =
+            worker.eval("import os, threading\nthreading.Timer(0.2, os._exit, [3]).start()");
+        assert_eq!(output.error, None);
+        let waiting = async { time::sleep(Duration::from_secs(1)).await };
+        block_on(waiting);
+
+        let mut ignore = |_: &str| {};
+        let mut none = unserved;
+        let evaluating = worker.evaluate("print('café')", &[], &mut ignore, &mut none);
+        let lost = block_on(evaluating).err();
+        let message = lost.map(|error| error.to_string());
+        let expected = "Python exited with code 3 before the code ran";
+        assert_eq!(message.as_deref(), Some(expected));
+        assert!(worker.restarted());
+
+        let output = worker.eval("print('naïve')");
+        assert_eq!(output.logs, "naïve\n");
     }
 
     /// The code runs on the main thread, whose stack takes deep recursion that a raised limit allows
@@ -1527,6 +1589,43 @@ pub(crate) mod tests {
         assert_eq!(output.logs, "next\noriginal\n2\n");
     }
 
+    /// Dropping a stream made on fd 1 closes the fd, which a file opened next would take
+    #[test]
+    fn stdout_fd_restored() {
+        let (mut worker, dir) = workspace("fd");
+        let code = "import io, sys\n\
+             sys.stdout = io.TextIOWrapper(open(sys.stdout.fileno(), 'wb', 0), write_through=True)\n\
+             print('café')";
+        let output = worker.eval(code);
+        assert_eq!(output.logs, "café\n");
+
+        let code = "import subprocess\n\
+             notes = open('notes.txt', 'w')\n\
+             print('naïve')\n\
+             _ = subprocess.run([sys.executable, '-c', 'print(\"résumé\")'])\n\
+             notes.close()";
+        let output = worker.eval(code);
+        let notes = fs::read_to_string(dir.join("notes.txt")).expect("notes");
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(output.error, None);
+        assert_eq!(output.logs, "naïve\nrésumé\n");
+        assert_eq!(notes, "");
+    }
+
+    /// Output holding a fixed marker of its own doesn't end the snippet
+    #[test]
+    fn marker_text_kept() {
+        let mut worker = fresh();
+        let code = "import sys\nsys.stdout.flush()\n\
+             _ = sys.stdout.buffer.write(b'\\x02smol\\x03end\\n')\nprint('café')";
+        let output = worker.eval(code);
+        assert_eq!(output.logs, "\u{2}smol\u{3}end\ncafé\n");
+
+        let next = worker.eval("print('naïve')");
+        assert_eq!(next.logs, "naïve\n");
+    }
+
     #[test]
     fn output_captured() {
         let code = "import pprint, sys, warnings\npprint.pprint({'a': 1})\nsys.stdout.write('raw\\n')\nprint('café', 'naïve', sep='-', end='!')\nprint('résumé')\nwarnings.warn('careful')\nprint('dunder', file=sys.__stdout__)";
@@ -1649,6 +1748,29 @@ pub(crate) mod tests {
         assert!(listed.starts_with(titled), "{listed}");
     }
 
+    /// A worker without `agent()` keeps the name the first worker chose for a server named like it
+    #[test]
+    fn server_name_kept() {
+        let mut worker = fresh();
+        let named = server("agent", |_, _| json!("café"));
+        let added = worker.add(&named).expect("add server");
+        assert_eq!(added, "agent_mcp");
+
+        let servers: Vec<&Added> = worker.servers.iter().collect();
+        let sandbox = Arc::clone(&worker.sandbox);
+        let interrupt = Interrupt::default();
+        let starting = Worker::new(&interrupt, sandbox, &servers, Delegation::Off, false);
+        let mut helper = block_on(starting).expect("worker");
+        let mut ignore = |_: &str| {};
+        let mut none = unserved;
+        let code = "agent_mcp.echo_text('x')";
+        let evaluating = helper.evaluate(code, &servers, &mut ignore, &mut none);
+        let output = block_on(evaluating).expect("evaluate");
+
+        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.logs, "café\n");
+    }
+
     #[test]
     fn server_names_clash() {
         let mut worker = fresh();
@@ -1759,6 +1881,59 @@ pub(crate) mod tests {
             failed.starts_with("ValueError: fake.fail: boom"),
             "{failed}"
         );
+    }
+
+    /// A thread the code started gets a reply to a call the snippet's end stopped
+    #[test]
+    fn left_calls_answered() {
+        let mut worker = fresh();
+        let mut slow = server("slow", |_, _| json!("late"));
+        slow.call = Arc::new(|_: String, _: Map<String, Value>, _: String| -> Calling {
+            Box::pin(async {
+                time::sleep(Duration::from_secs(30)).await;
+                Called::from(Ok(json!("late")))
+            })
+        });
+        worker.add(&slow).expect("add server");
+
+        let code = "import threading, time\n\
+             replies = []\n\
+             def call():\n    try:\n        replies.append(slow.echo_text('café'))\n    \
+                 except Exception as error:\n        replies.append(str(error))\n\
+             caller = threading.Thread(target=call)\ncaller.start()\ntime.sleep(0.5)";
+        let output = worker.eval(code);
+        assert_eq!(output.error, None);
+
+        let output = worker.eval("caller.join(5)\n[caller.is_alive(), replies]");
+        let expected =
+            "[False, ['slow.echo_text: stopped when the code that was running ended']]\n";
+        assert_eq!(output.logs, expected);
+    }
+
+    /// A thread the code started gets a reply to a call made while a server is being added
+    #[test]
+    fn calls_during_install() {
+        let mut worker = fresh();
+        let notes = server("notes", |_, _| json!("noted"));
+        worker.add(&notes).expect("add server");
+
+        let code = "import threading, time\n\
+             replies = []\nstop = False\n\
+             def poll():\n    while not stop:\n        try:\n            replies.append(notes.echo_text('café'))\n        \
+                 except Exception as error:\n            replies.append(str(error))\n\
+             poller = threading.Thread(target=poll)\npoller.start()\ntime.sleep(0.2)";
+        let output = worker.eval(code);
+        assert_eq!(output.error, None);
+        // The poller's next call waits on the connection until the agent reads it
+        let waiting = async { time::sleep(Duration::from_millis(200)).await };
+        block_on(waiting);
+        let more = server("more", |_, _| json!("more"));
+        worker.add(&more).expect("add server");
+
+        let code = "stop = True\npoller.join(5)\n\
+             [poller.is_alive(), 'notes.echo_text: not run while an MCP server was being added' in replies]";
+        let output = worker.eval(code);
+        assert_eq!(output.logs, "[False, True]\n");
     }
 
     #[test]
