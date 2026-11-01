@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.6.1 - 2026-11-01
 
 - The system prompt lists the optional parameters of MCP functions by name
   only and says that `help()` gives their types, which takes what tavily adds
@@ -28,8 +28,8 @@ but their files stay in `~/.smol/history` untouched.
 - An interrupt no longer kills Python and loses its variables when the code
   had already stopped but its output was still arriving.
 - When Python exits while the model writes the next code, for example from a
-  thread that called `os._exit`, that code is reported as not run instead of
-  as the code that ended Python.
+  thread that called `os._exit`, that code is reported as not run, with what
+  Python printed last, instead of as the code that ended Python.
 - Editors get the code the model writes when it first appears and then at
   most every 100 ms instead of on every token. Each update carries all of the
   code, so long code used to send hundreds of megabytes and could stall every
