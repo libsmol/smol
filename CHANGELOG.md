@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.5.1 - 2026-11-01
 
 - The runtime and the worker module in `~/.smol/runtime` are no longer named
   after the machine's target, so a configuration directory serves one
