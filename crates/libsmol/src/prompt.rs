@@ -34,7 +34,7 @@ const HANDED_BACK: &str = "Only your answer is returned to the agent that assign
 /// Errors of `agent()` and its handles go unlabeled, as the worker labels them with the function
 /// the code called
 pub(crate) const NESTED: &str = "not available to agents started by agent()";
-pub(crate) const NO_AGENT: &str = "no such agent";
+pub const NO_AGENT: &str = "no such agent";
 /// Also what the user sees for an agent that is aborted before it ends
 pub(crate) const UNFINISHED: &str = "stopped before it answered";
 pub(crate) const STOPPED_BY_CODE: &str = "stopped by stop()";
@@ -92,7 +92,7 @@ pub(crate) fn done(agents: &[String]) -> String {
 }
 
 /// Errors of `remember()` and `forget()` go unlabeled too, as the worker labels them with the function
-pub(crate) const NO_MEMORY: &str = "no such memory";
+pub const NO_MEMORY: &str = "no such memory";
 pub(crate) const EMPTY_MEMORY: &str = "text is empty";
 
 pub(crate) fn long_memory(count: usize) -> String {
@@ -597,6 +597,8 @@ pub(crate) fn undecoded(size: u64) -> String {
 pub fn unserializable(key: &str, kind: &str) -> String {
     format!("{key}: {kind} is not JSON-serializable")
 }
+
+pub const SURROGATE: &str = "a str holds a lone surrogate, which isn't valid Unicode";
 
 pub(crate) fn failure(label: &str, object: &str, reason: &str) -> String {
     format!("{label}: {object}: {reason}")

@@ -2,7 +2,7 @@ use crate::builtins::{builtins, value_error};
 use libsmol::guest::{
     block_on, FromWorker, Function, HostCall, HostNote, Message, ToWorker, ToolError, Waiting,
     WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, DONE, END, MAX_MEMORY_CHARS,
-    MAX_PARALLEL_AGENTS, MAX_RECALLED,
+    MAX_PARALLEL_AGENTS, MAX_RECALLED, NO_AGENT, NO_MEMORY, SURROGATE,
 };
 use pyo3::exceptions::PyRuntimeError;
 #[cfg(windows)]
@@ -98,6 +98,8 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     globals.set_item("_MAX_RECALLED", MAX_RECALLED)?;
     globals.set_item("_MAX_MEMORY_CHARS", MAX_MEMORY_CHARS)?;
     globals.set_item("_DONE", DONE)?;
+    globals.set_item("_NO_AGENT", NO_AGENT)?;
+    globals.set_item("_NO_MEMORY", NO_MEMORY)?;
 
     let builtin = py.import("builtins")?;
     let compile = builtin.getattr("compile")?;
@@ -324,8 +326,12 @@ fn shown(py: Python<'_>, error: &PyErr) -> String {
 fn json_of(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     let py = value.py();
     let dumps = py.import("json")?.getattr("dumps")?;
-    let strict = [("allow_nan", false)].into_py_dict(py)?;
-    let text: String = dumps.call((value,), Some(&strict))?.extract()?;
+    let strict = [("allow_nan", false), ("ensure_ascii", false)].into_py_dict(py)?;
+    let dumped = dumps.call((value,), Some(&strict))?;
+    // Only lone surrogates keep a str from becoming UTF-8
+    let Ok(text) = dumped.extract::<String>() else {
+        return Err(value_error(SURROGATE));
+    };
     serde_json::from_str(&text).map_err(value_error)
 }
 

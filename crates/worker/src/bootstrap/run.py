@@ -5,6 +5,8 @@ import re as _re
 import site as _site
 import sys as _sys
 import textwrap as _textwrap
+import threading as _threading
+import time as _time
 import tokenize as _tokenize
 import types as _types
 import unicodedata as _unicodedata
@@ -94,6 +96,16 @@ def _pths():
 
 # The ones site processed at start
 _PTHS = _pths()
+
+_FLUSH_WAIT = 0.1
+# The thread flushing each pipe, which a later snippet doesn't start again while it waits
+_FLUSHERS = _weakref.WeakKeyDictionary()
+
+def _flushed(opened):
+    try:
+        opened.flush()
+    except Exception:
+        pass
 
 def _run(code):
     global _SHOWN, _STDOUT, _STDERR
@@ -244,6 +256,16 @@ def _run(code):
 
     finally:
         _SHOWN = None
+        # A pipe flushes on a thread END waits for only briefly, since a writer blocked on it holds its lock
+        started = []
+        for opened in list(_PIPES):
+            flusher = _FLUSHERS.get(opened)
+            if opened.closed or (flusher is not None and flusher.is_alive()):
+                continue
+            flusher = _threading.Thread(target=_flushed, args=(opened,), daemon=True)
+            flusher.start()
+            _FLUSHERS[opened] = flusher
+            started.append(flusher)
         # Flush without closing because variables still hold them
         for opened in [*_OPEN_FILES, _sys.stdout, _sys.stderr, _STDOUT, _STDERR]:
             try:
@@ -251,6 +273,10 @@ def _run(code):
                     opened.flush()
             except Exception:
                 pass
+        deadline = _time.monotonic() + _FLUSH_WAIT
+        for flusher in started:
+            left = deadline - _time.monotonic()
+            flusher.join(max(left, 0))
 
     # An interrupt may land here and then no source is attached
     try:

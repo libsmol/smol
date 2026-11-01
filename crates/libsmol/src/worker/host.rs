@@ -1344,12 +1344,29 @@ pub(crate) mod tests {
         let mut worker = fresh();
         let code = "def tried(act):\n    try:\n        act()\n    except (TypeError, ValueError) as error:\n        return f'{type(error).__name__}: {error}'\n\
              [tried(lambda: remember('é' * 301)), tried(lambda: remember(' ')), tried(lambda: forget(999)),\n \
-              tried(lambda: forget('7')), tried(lambda: remember(5))]";
+              tried(lambda: forget('7')), tried(lambda: remember(5)), tried(lambda: forget(2**70)),\n \
+              tried(lambda: remember('caf\\udce9'))]";
         let output = worker.eval(code);
 
         let expected = "['ValueError: remember: 301 characters, over the 300-character limit', \
                         'ValueError: remember: text is empty', 'ValueError: forget: no such memory', \
-                        'TypeError: forget: id must be int, not str', 'TypeError: remember: text must be str, not int']\n";
+                        'TypeError: forget: id must be int, not str', 'TypeError: remember: text must be str, not int', \
+                        'ValueError: forget: no such memory', \
+                        \"ValueError: remember: a str holds a lone surrogate, which isn't valid Unicode\"]\n";
+        assert_eq!(output.logs, expected);
+    }
+
+    #[test]
+    fn handles_checked() {
+        let mut worker = fresh();
+        let code = "def tried(make):\n    try:\n        make()\n    except (TypeError, ValueError) as error:\n        return f'{type(error).__name__}: {error}'\n\
+             [tried(lambda: Agent('7', 'café', 'Count', None)), tried(lambda: Agent(-1, 'café', 'Count', None)),\n \
+              tried(lambda: Agent(2**64, 'café', 'Count', None))]";
+        let output = worker.eval(code);
+
+        let expected =
+            "['TypeError: Agent: id must be int, not str', 'ValueError: Agent: no such agent', \
+                        'ValueError: Agent: no such agent']\n";
         assert_eq!(output.logs, expected);
     }
 
@@ -2273,20 +2290,34 @@ pub(crate) mod tests {
         assert_eq!(closed, "False\n");
     }
 
-    /// A thread blocked writing to a pipe would hold up its flush after the snippet
+    /// A pipe is flushed after each snippet, and one a thread is stuck writing to doesn't hold the snippet up
     #[test]
-    fn pipes_not_flushed() {
-        let (mut worker, dir) = workspace("pipes");
-        let code = "import os\n\
-             _, end = os.pipe()\n\
-             pipe = open(end, 'wb')\n\
-             kept = open('café.txt', 'w')\n\
-             files = open.__globals__['_OPEN_FILES']\n\
-             [pipe in files, kept in files]";
+    fn pipes_flushed() {
+        let mut worker = fresh();
+        let code = "import os, threading, time\n\
+             reader, writer = os.pipe()\n\
+             os.set_blocking(reader, False)\n\
+             pipe = open(writer, 'wb')\n\
+             pipe.write('café'.encode())\n\
+             unread, full = os.pipe()\n\
+             stuck = open(full, 'wb')\n\
+             threading.Thread(target=stuck.write, args=(b'x' * 1_000_000,), daemon=True).start()\n\
+             time.sleep(0.3)";
         let output = worker.eval(code);
-        fs::remove_dir_all(&dir).ok();
+        assert_eq!(output.error, None, "{}", output.logs);
 
-        assert_eq!(output.logs, "[False, True]\n");
+        let output = worker.eval("os.read(reader, 100).decode()");
+        assert_eq!(output.logs, "café\n");
+
+        // Each flush ends once its pipe drains
+        let code = "drained = 0\n\
+             while drained < 1_000_000:\n    drained += len(os.read(unread, 65536))\n\
+             flushers = list(open.__globals__['_FLUSHERS'].values())\n\
+             deadline = time.monotonic() + 5\n\
+             while any(flusher.is_alive() for flusher in flushers) and time.monotonic() < deadline:\n    time.sleep(0.01)\n\
+             [len(flushers), any(flusher.is_alive() for flusher in flushers)]";
+        let output = worker.eval(code);
+        assert_eq!(output.logs, "[2, False]\n");
     }
 
     /// A function the code defined is looked up before a builtin of the same name

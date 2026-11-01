@@ -20,7 +20,7 @@ pub use crate::config::setup::{run as setup, SETUP_ARG};
 #[doc(hidden)]
 pub mod guest {
     pub use crate::agent::MAX_PARALLEL_AGENTS;
-    pub use crate::prompt::{unserializable, DONE};
+    pub use crate::prompt::{unserializable, DONE, NO_AGENT, NO_MEMORY, SURROGATE};
     pub use crate::tools::attach::{shown_path, viewed};
     pub use crate::tools::files::{grep, ls};
     pub use crate::tools::memories::{MAX_MEMORY_CHARS, MAX_RECALLED};

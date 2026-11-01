@@ -29,6 +29,8 @@ _REAL_OPEN = _io.open
 _REAL_PRINT = print
 # Flushed after each snippet, which lets other programs read files left open
 _OPEN_FILES = _weakref.WeakSet()
+# Written pipes and devices, whose flush can wait for good on a writer blocked on them
+_PIPES = _weakref.WeakSet()
 
 def _stream(fd):
     buffered = _REAL_OPEN(fd, "wb", closefd=False)
@@ -43,10 +45,11 @@ _MAX_PRINT_CHARS = 8192
 
 def _open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
     opened = _REAL_OPEN(file, mode, buffering, encoding, errors, newline, closefd, opener)
-    # Flushing a pipe waits for a thread blocked writing to it, which no interrupt wakes
     found = _os.fstat(opened.fileno())
     if _stat.S_ISREG(found.st_mode):
         _OPEN_FILES.add(opened)
+    elif opened.writable():
+        _PIPES.add(opened)
     return opened
 
 def _print(*args, sep=" ", end="\n", file=None, flush=False, limit=_MAX_PRINT_CHARS):
@@ -243,6 +246,9 @@ def forget(id: int) -> None:
     if isinstance(id, bool) or not isinstance(id, int):
         kind = type(id).__name__
         raise TypeError(f"forget: id must be int, not {kind}")
+    # The agent keeps ids in 64 bits, so a larger one names no memory
+    if not -2**63 <= id < 2**63:
+        raise ValueError(f"forget: {_NO_MEMORY}")
     _asked("forget", "forget", {"id": id})
 
 def _handed(function, result):
@@ -272,6 +278,12 @@ class Agent:
     _smol_header = "class Agent"
 
     def __init__(self, id, name, task, role):
+        if isinstance(id, bool) or not isinstance(id, int):
+            kind = type(id).__name__
+            raise TypeError(f"Agent: id must be int, not {kind}")
+        # The agent numbers agents from 0 in 64 bits, so another id names none
+        if not 0 <= id < 2**64:
+            raise ValueError(f"Agent: {_NO_AGENT}")
         self._id = id
         self.name = name
         self.task = task
