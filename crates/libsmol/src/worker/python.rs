@@ -1,6 +1,6 @@
 use crate::memory::Exit;
 use crate::spawn::{drain, Clip, Group, Piece, KEPT_BYTES};
-use crate::utils::{http_cause, http_client, new_id};
+use crate::utils::{folded, http_cause, http_client, new_id};
 use crate::worker::sandbox::Sandbox;
 use flate2::read::GzDecoder;
 use reaper::{cause, tilde};
@@ -57,7 +57,8 @@ const STORE: &str = "runtime";
 const VENVS: &str = "venvs";
 /// Held by an install or a repair in the store
 const STORE_LOCK: &str = "lock";
-const MAX_NAME_CHARS: usize = 48;
+/// Without long paths Windows refuses paths over 260 characters, and packages nest deep in a venv
+const MAX_NAME_CHARS: usize = 16;
 const DOWNLOAD_WAIT: Duration = Duration::from_secs(30);
 /// How long a runtime, a module or the venv of a directory that is gone stays unused before it is removed
 const MIN_IDLE: Duration = Duration::from_hours(7 * 24);
@@ -405,10 +406,11 @@ fn venv_for(store: &Path, _: &Path, runtime: &str) -> PathBuf {
     store.join(VENVS).join(runtime).join("venv")
 }
 
-/// The folder's name, kept short for the path's sake, and a hash of the whole path,
-/// written alike however the client spells it
+/// The folder's name and a hash of the whole path, both without `.` parts,
+/// a trailing separator or, on Windows, case
 fn venv_name(cwd: &Path) -> String {
     let cwd: PathBuf = cwd.components().collect();
+    let cwd = PathBuf::from(folded(&cwd));
     let digest = Sha256::digest(cwd.as_os_str().as_encoded_bytes());
     let hash = hex(&digest);
     let named = cwd.file_name().unwrap_or_default().to_string_lossy();
@@ -824,7 +826,7 @@ pub(crate) mod tests {
         let long = "🐍".repeat(100);
         let path = Path::new("/home").join(&long);
         let name = venv_name(&path);
-        assert_eq!(name.chars().count(), 48 + 1 + 16, "{name}");
+        assert_eq!(name.chars().count(), 16 + 1 + 16, "{name}");
         assert_ne!(
             venv_name(Path::new("/a/work")),
             venv_name(Path::new("/b/work"))
@@ -832,6 +834,11 @@ pub(crate) mod tests {
         assert_eq!(
             venv_name(Path::new("/a/./work/")),
             venv_name(Path::new("/a/work"))
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            venv_name(Path::new(r"C:\Users\Zoë\Café")),
+            venv_name(Path::new(r"c:\users\zoë\CAFÉ"))
         );
     }
 }

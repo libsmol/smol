@@ -289,6 +289,10 @@ write = ["~/.cargo/registry", "~/.npm"]   # more places the code may write
 read = ["~/work/secrets"]                 # more places the code can't read or write
 ```
 
+Behind a proxy, add the variables you set for it, such as `HTTPS_PROXY`,
+`HTTP_PROXY` and `NO_PROXY`, to `env`, so that pip and the other programs the
+code starts go through it.
+
 Paths are absolute or start with `~`. Where rules overlap, the deeper path
 wins: with `~/.cargo` in `write`, `~/.cargo/credentials.toml` stays hidden.
 On Linux a folder that holds a hidden path is opened entry by entry, so files
@@ -405,7 +409,9 @@ the default is `warn,libsmol=info`, `SMOL_LOG=warn` keeps only problems,
   the venv for a week. To start over, delete it while no session in that
   directory is open. `VIRTUAL_ENV` names it, so tools such as uv or poetry
   install into it too, and a venv the code makes for itself is based on the
-  runtime, which a later smol may replace.
+  runtime, which a later smol may replace. On Windows a package with deeply
+  nested files may fail to install unless long paths are turned on
+  (`LongPathsEnabled` in the registry).
 - **Interrupting** stops code in place, and the session keeps its variables.
   Code blocked where an interrupt cannot reach it (for example `os.system`, a
   long call inside a C extension, or most blocking calls on Windows) gets 3

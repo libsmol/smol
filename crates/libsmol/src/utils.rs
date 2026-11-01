@@ -5,10 +5,12 @@ use serde_json::Value;
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::error::Error;
+use std::ffi::OsString;
 #[cfg(test)]
 use std::future;
 use std::future::Future;
 use std::hash::{BuildHasher, Hasher};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::mpsc;
@@ -152,6 +154,17 @@ pub(crate) fn new_id() -> String {
     let random = RandomState::new().build_hasher().finish() as u32;
 
     format!("{stamp:x}-{random:08x}")
+}
+
+/// One spelling of a directory, since on Windows a typed one may differ in case from the saved one
+pub(crate) fn folded(path: &Path) -> OsString {
+    match cfg!(windows) {
+        true => {
+            let text = path.to_string_lossy();
+            OsString::from(text.to_lowercase())
+        }
+        false => path.as_os_str().to_owned(),
+    }
 }
 
 pub(crate) fn excerpt(text: &str) -> String {

@@ -4,7 +4,7 @@ use crate::acp::{rfc3339, task_of, to_value, App, ENQUEUED, QUEUED, SHELL};
 use crate::config;
 use crate::config::setup::SETUP_ARG;
 use crate::history::HistoryStore;
-use crate::utils::{block_on, new_id, Interrupt};
+use crate::utils::{block_on, folded, new_id, Interrupt};
 use crate::worker::sandbox;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
@@ -25,7 +25,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, BufRead};
 use std::panic::{self, PanicHookInfo};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::thread;
@@ -307,15 +307,6 @@ impl Router {
             }
             m if m == names.session_list => {
                 let request: ListSessionsRequest = parsed(params)?;
-                // On Windows a typed directory may differ in case from the saved one
-                let folded = |path: &Path| {
-                    let text = path.to_string_lossy();
-                    match cfg!(windows) {
-                        true => text.to_lowercase(),
-                        false => text.into_owned(),
-                    }
-                };
-
                 let wanted = request.cwd.as_deref().map(folded);
                 let mut sessions = Vec::new();
                 for meta in self.app.store.list()? {
