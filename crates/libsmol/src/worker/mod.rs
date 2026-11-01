@@ -85,8 +85,14 @@ pub enum WorkerCall {
         called: String,
     },
     #[serde(untagged)]
+    Service(Service),
+}
+
+/// What the agent answers itself rather than the worker
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Service {
     Agent(AgentCall),
-    #[serde(untagged)]
     Memory(MemoryCall),
 }
 

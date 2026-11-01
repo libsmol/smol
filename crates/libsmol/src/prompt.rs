@@ -5,7 +5,7 @@ use crate::memory::{
     TaskStep, MAX_OBSERVATION_CHARS,
 };
 use crate::model::{Media, Part};
-use crate::tools::memories::{Listed, MAX_MEMORY_CHARS};
+use crate::tools::memories::MAX_MEMORY_CHARS;
 use crate::utils::truncated;
 use crate::worker::host::Added;
 use crate::worker::python::PYTHON;
@@ -116,7 +116,6 @@ pub(crate) fn system(
     functions: &[Function],
     servers: &[&Added],
     brief: &Brief,
-    memories: &Listed,
     cwd: &Path,
     writable: Option<&[PathBuf]>,
     place: &Place,
@@ -259,6 +258,7 @@ pub(crate) fn system(
         None => String::new(),
     };
 
+    let memories = &brief.listed;
     let mut lines = Vec::new();
     for (id, text) in &memories.newest {
         // A memory may hold line breaks, which would end its item
@@ -835,8 +835,8 @@ mod tests {
         let brief = Brief {
             instructions,
             skills,
+            listed: Listed::default(),
         };
-        let none = Listed::default();
         let cwd = Path::new("/home/zoë/work");
 
         let function = |name: &str, header: &str, summary: &str| Function {
@@ -857,7 +857,7 @@ mod tests {
         ];
 
         let main = main_place(Vec::new());
-        let text = system(&functions, &[], &brief, &none, cwd, None, &main);
+        let text = system(&functions, &[], &brief, cwd, None, &main);
 
         let built_in = "## Built-in\n\n```python\n\
                         ls(path) -> list[str]\n    # Sorted paths.\n    # The café/ folder ends with /.\n\n\
@@ -885,7 +885,7 @@ mod tests {
         assert!(text.ends_with(files), "{text}");
 
         let empty = Brief::default();
-        let plain = system(&[], &[], &empty, &none, cwd, Some(&[]), &main);
+        let plain = system(&[], &[], &empty, cwd, Some(&[]), &main);
         assert!(!plain.contains("<instructions"), "{plain}");
         assert!(!plain.contains("# Skills"), "{plain}");
         assert!(!plain.contains("# Roles"), "{plain}");
@@ -895,7 +895,7 @@ mod tests {
         assert!(plain.contains(sandbox), "{plain}");
 
         let registry = [PathBuf::from("/home/zoë/.cargo/registry")];
-        let allowed = system(&[], &[], &empty, &none, cwd, Some(&registry), &main);
+        let allowed = system(&[], &[], &empty, cwd, Some(&registry), &main);
         let sandbox =
             "writing outside `/home/zoë/work`, `/home/zoë/.cargo/registry`, the venv and `$TMPDIR`, ";
         assert!(allowed.contains(sandbox), "{allowed}");
@@ -914,15 +914,18 @@ mod tests {
             (7, "Writes résumés in French".to_owned()),
             (3, "Prefers tabs\nover spaces".to_owned()),
         ];
-        let memories = Listed {
+        let listed = Listed {
             newest: newest.clone(),
             global: 2,
             here: 12,
         };
-        let brief = Brief::default();
+        let brief = Brief {
+            listed,
+            ..Brief::default()
+        };
 
         let functions = [remember];
-        let text = system(&functions, &[], &brief, &memories, cwd, None, &main);
+        let text = system(&functions, &[], &brief, cwd, None, &main);
         let section = "check your work.\n\n# Memories\n\n\
                        Kept for every folder:\n\
                        - [7] Writes résumés in French\n\
@@ -931,12 +934,16 @@ mod tests {
                        before you start a task, search them with `recall()` for what it is about.\n\n# Rules\n\n";
         assert!(text.contains(section), "{text}");
 
-        let more = Listed {
+        let listed = Listed {
             newest,
             global: 14,
             here: 0,
         };
-        let text = system(&functions, &[], &brief, &more, cwd, None, &main);
+        let more = Brief {
+            listed,
+            ..Brief::default()
+        };
+        let text = system(&functions, &[], &more, cwd, None, &main);
         let heading = "# Memories\n\n\
                        Kept for every folder, the newest 2 of 14 (`recall()` finds the rest):\n\
                        - [7] Writes résumés in French\n";
@@ -949,19 +956,15 @@ mod tests {
             "{text}"
         );
 
-        let memories = Listed {
+        let listed = Listed {
             here: 1,
             ..Listed::default()
         };
-        let helper = system(
-            &[],
-            &[],
-            &brief,
-            &memories,
-            cwd,
-            None,
-            &Place::Delegated(None),
-        );
+        let counted = Brief {
+            listed,
+            ..Brief::default()
+        };
+        let helper = system(&[], &[], &counted, cwd, None, &Place::Delegated(None));
         let section = "check your work.\n\n# Memories\n\n\
                        This folder has 1 memory of its own from earlier sessions; \
                        before you start a task, search them with `recall()` for what it is about.\n\n# Rules\n\n";
@@ -982,8 +985,7 @@ mod tests {
 
         let place = main_place(roles);
         let empty = Brief::default();
-        let none = Listed::default();
-        let main = system(&[], &[], &empty, &none, cwd, None, &place);
+        let main = system(&[], &[], &empty, cwd, None, &place);
         let listed = "\n\n## Roles\n\n\
                       To give a task to an agent in one of these roles, call `agent(task, role=\"reviewer\")`. \
                       For a list of tasks, `role` is one role for all of them or a list with one role per task.\n\n\
@@ -994,14 +996,14 @@ mod tests {
         assert!(main.contains("- Your answer goes to the user;"), "{main}");
 
         let played = Place::Delegated(Some(reviewer));
-        let helper = system(&[], &[], &empty, &none, cwd, None, &played);
+        let helper = system(&[], &[], &empty, cwd, None, &played);
         let own = "include everything the task asks for.\n\n# Role\n\n\
                    Your role is `reviewer`: Reviews the café's code\n\n# Running code";
         assert!(helper.contains(own), "{helper}");
         assert!(!helper.contains("# Roles"), "{helper}");
         let reader = "- Your answer goes to the agent that assigned this task;";
         assert!(helper.contains(reader), "{helper}");
-        let plain = system(&[], &[], &empty, &none, cwd, None, &Place::Delegated(None));
+        let plain = system(&[], &[], &empty, cwd, None, &Place::Delegated(None));
         assert!(!plain.contains("# Role"), "{plain}");
     }
 

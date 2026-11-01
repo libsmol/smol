@@ -525,9 +525,8 @@ pub(crate) fn sweep() {
 pub(crate) mod tests {
     use crate::config::Access;
     use crate::tests::{temp_dir, write_file};
-    use crate::tools::memories::Memories;
     use crate::utils::{block_on, new_id, Interrupt};
-    use crate::worker::host::tests::no_agents;
+    use crate::worker::host::tests::unserved;
     use crate::worker::host::Worker;
     use crate::worker::python::tests::installed;
     #[cfg(target_os = "linux")]
@@ -625,13 +624,10 @@ pub(crate) mod tests {
 
     fn evaluated(sandbox: Sandbox, code: &str) -> String {
         let interrupt = Interrupt::default();
-        let config = sandbox.copies.parent().expect("config");
-        let memories = Memories::new(config, &sandbox.cwd);
         let restarted = false;
         let starting = Worker::new(
             &interrupt,
             Arc::new(sandbox),
-            memories,
             &[],
             Delegation::Off,
             restarted,
@@ -639,7 +635,7 @@ pub(crate) mod tests {
         let mut worker = block_on(starting).expect("worker");
 
         let mut ignore = |_: &str| {};
-        let mut none = no_agents;
+        let mut none = unserved;
         let evaluating = worker.evaluate(code, &[], &mut ignore, &mut none);
         let output = block_on(evaluating).expect("evaluate");
         assert_eq!(output.error, None, "{}", output.logs);

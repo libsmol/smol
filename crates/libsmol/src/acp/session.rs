@@ -9,7 +9,7 @@ use crate::config::{self, Access, McpConfig, Models};
 use crate::history::{Lock, SessionMeta, Settings};
 use crate::memory::{AgentMemory, Exit, MemoryStep};
 use crate::spawn::{spawn_shell, Group};
-use crate::tools::memories::Memories;
+use crate::tools::memories::{Listed, Memories};
 use crate::utils::Interrupt;
 use crate::worker::host::Worker;
 use crate::worker::python::Python;
@@ -206,6 +206,13 @@ async fn start(opening: Opening) -> Result<Session> {
         notices.push(notice);
     }
     let memories = Memories::new(&app.config, &cwd);
+    let listed = match memories.listed().await {
+        Ok(listed) => listed,
+        Err(problem) => {
+            notices.push(problem);
+            Listed::default()
+        }
+    };
 
     let mut settings = Settings {
         cwd: cwd.clone(),
@@ -249,14 +256,7 @@ async fn start(opening: Opening) -> Result<Session> {
         true => Delegation::On,
         false => Delegation::Roles,
     };
-    let starting = Worker::new(
-        &interrupt,
-        Arc::clone(&sandbox),
-        memories.clone(),
-        &[],
-        delegation,
-        ran,
-    );
+    let starting = Worker::new(&interrupt, Arc::clone(&sandbox), &[], delegation, ran);
     let worker = starting.await?;
 
     let response = match loading {
@@ -297,6 +297,7 @@ async fn start(opening: Opening) -> Result<Session> {
     let brief = Brief {
         instructions,
         skills,
+        listed,
     };
     let agent = Agent {
         model: Arc::from(built),

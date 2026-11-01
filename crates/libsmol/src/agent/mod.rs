@@ -11,8 +11,9 @@ use crate::prompt;
 use crate::tools::attach::{attach, Mention};
 use crate::tools::memories::{Listed, Memories};
 use crate::utils::Interrupt;
-use crate::worker::host::{Added, Worker};
+use crate::worker::host::{Added, Called, Calling, Serving, Worker};
 use crate::worker::sandbox::Sandbox;
+use crate::worker::{AgentCall, Service};
 use crate::{Error, Result};
 use std::fs;
 use std::future::Future;
@@ -29,7 +30,7 @@ mod compact;
 mod delegate;
 mod step;
 
-use crate::agent::delegate::Team;
+use crate::agent::delegate::{Records, Team};
 
 pub use crate::agent::delegate::MAX_PARALLEL_AGENTS;
 
@@ -210,7 +211,10 @@ pub(crate) struct Agent {
 pub(crate) struct Brief {
     pub(crate) instructions: Vec<String>,
     pub(crate) skills: Vec<Skill>,
+    pub(crate) listed: Listed,
 }
+
+pub(crate) type Delegating<'a> = dyn FnMut(AgentCall) -> Calling + Send + 'a;
 
 #[derive(Clone)]
 pub(crate) enum Place {
@@ -275,19 +279,10 @@ impl Agent {
             functions.push(function);
         }
 
-        // Read for each run, since a memory forgotten in an earlier one must leave the prompt
-        let listed = match self.memories.listed().await {
-            Ok(listed) => listed,
-            Err(problem) => {
-                warn!("memory: listing failed, {problem}");
-                Listed::default()
-            }
-        };
         let system = prompt::system(
             &functions,
             servers,
             &self.brief,
-            &listed,
             &self.cwd,
             self.sandbox.writable(),
             &self.place,
@@ -308,6 +303,22 @@ impl Agent {
         ran
     }
 
+    /// Answers what the code of one call asks of the agent,
+    /// and keeps the record of each agent it starts in `records`
+    pub(crate) fn serving<'a>(
+        &'a self,
+        servers: &'a [&'a Added],
+        views: Box<dyn Helpers>,
+        records: &Records,
+    ) -> Box<Serving<'a>> {
+        let mut delegate = self.delegate(servers, views, records);
+        // Agents that agent() starts only recall
+        let writable = matches!(self.place, Place::Main { .. });
+        let serving =
+            move |service: Service| serve(service, &mut *delegate, &self.memories, writable);
+        Box::new(serving)
+    }
+
     /// Reading files and copying images and videos stays off the async runtime
     async fn attached(&self, task: Task) -> TaskStep {
         let cwd = self.cwd.clone();
@@ -324,6 +335,25 @@ impl Agent {
         TaskStep {
             text: task.text,
             files,
+        }
+    }
+}
+
+/// Hands calls to `agent()` and its handles to `delegate` and answers the memory functions
+pub(crate) fn serve(
+    service: Service,
+    delegate: &mut Delegating<'_>,
+    memories: &Memories,
+    writable: bool,
+) -> Calling {
+    match service {
+        Service::Agent(call) => delegate(call),
+        Service::Memory(call) => {
+            let memories = memories.clone();
+            Box::pin(async move {
+                let reply = memories.answer(call, writable).await;
+                Called::from(reply)
+            })
         }
     }
 }
@@ -622,8 +652,8 @@ pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::agent::{
-        title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Sink, Streamed,
-        Task, Turn, Unseen, RETRY_WAIT,
+        title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Records, Sink,
+        Streamed, Task, Turn, Unseen, RETRY_WAIT,
     };
     use crate::config::Role;
     use crate::history::MAX_TITLE_CHARS;
@@ -632,16 +662,17 @@ pub(crate) mod tests {
         ChatMessage, Finish, Finished, Generating, MediaKind, Model, ModelError, Purpose,
         StreamDelta, TokenUsage, Unread,
     };
-    use crate::prompt::RESTARTED;
+    use crate::prompt::{NESTED, RESTARTED};
     use crate::tests::{content, temp_dir, write_file, Temp};
     use crate::tools::attach::tests::mentioned;
     use crate::tools::memories::Memories;
     use crate::utils::{block_on, Interrupt};
-    use crate::worker::host::tests::no_agents;
+    use crate::worker::host::tests::unserved;
     use crate::worker::host::Worker;
     use crate::worker::sandbox::tests::opened;
-    use crate::worker::Delegation;
+    use crate::worker::{Delegation, MemoryCall, Service};
     use crate::Result;
+    use serde_json::json;
     use std::collections::VecDeque;
     use std::fs;
     use std::future;
@@ -910,16 +941,9 @@ pub(crate) mod tests {
             false => Delegation::Roles,
         };
         let restarted = false;
-        let memories = Memories::new(&dir, &cwd);
-        let starting = Worker::new(
-            &interrupt,
-            Arc::clone(&sandbox),
-            memories.clone(),
-            &[],
-            delegation,
-            restarted,
-        );
+        let starting = Worker::new(&interrupt, Arc::clone(&sandbox), &[], delegation, restarted);
         let worker = block_on(starting).expect("worker");
+        let memories = Memories::new(&dir, &cwd);
 
         let queue = Arc::new(Pending::default());
         let place = Place::Main {
@@ -1114,7 +1138,7 @@ pub(crate) mod tests {
         let replies = vec![Ok(called("print('reading the orders again')"))];
         let mut run = recorded(replies, None, "", Box::new(|_| {}));
         let mut ignore = |_: &str| {};
-        let mut none = no_agents;
+        let mut none = unserved;
         let code = "import os\nos._exit(1)";
         let exiting = run.agent.worker.evaluate(code, &[], &mut ignore, &mut none);
         block_on(exiting).expect("evaluate");
@@ -1135,5 +1159,36 @@ pub(crate) mod tests {
             "reading the orders again",
         ];
         assert_eq!(second, expected);
+    }
+
+    /// Agents that agent() starts only recall, whatever their code asks the agent
+    #[test]
+    fn helpers_only_recall() {
+        let tested = scripted(ScriptedModel::new(Vec::new()), Box::new(|_| {}));
+        let helper = Agent {
+            place: Place::Delegated(None),
+            ..tested.agent.clone()
+        };
+        let asked = |agent: &Agent, call: MemoryCall| {
+            let records = Records::default();
+            let mut serving = agent.serving(&[], Box::new(Unseen), &records);
+            let calling = serving(Service::Memory(call));
+            block_on(calling).result
+        };
+        let remember = || MemoryCall::Remember {
+            text: "Uses tabs in the café".to_owned(),
+            project: true,
+        };
+
+        let refused = asked(&helper, remember());
+        let saved = asked(&tested.agent, remember());
+        let recall = MemoryCall::Recall {
+            query: "tabs".to_owned(),
+        };
+        let found = asked(&helper, recall);
+
+        assert_eq!(refused, Err(NESTED.to_owned()));
+        let id = saved.expect("remember");
+        assert_eq!(found, Ok(json!([[id, "Uses tabs in the café"]])));
     }
 }

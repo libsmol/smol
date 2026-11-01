@@ -11,9 +11,9 @@ but their files stay in `~/.smol/history` untouched.
 
 - `remember(text, project=True)`, `recall(query="")` and `forget(id)` keep
   memories across sessions in `~/.smol/memory.db`. A memory belongs to the
-  working directory, or with `project=False` to every directory; each turn
-  the system prompt lists the newest of the latter and says how many the
-  directory has, which `recall()` finds by whole words, Chinese ones too.
+  working directory, or with `project=False` to every directory; a session's
+  system prompt lists the newest of the latter when it opens and says how many
+  the directory has, which `recall()` finds by whole words, Chinese ones too.
   Agents that `agent()` starts can only recall. SQLite and a Chinese
   dictionary make `libsmol` about 3 MB larger.
 

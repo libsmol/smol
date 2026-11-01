@@ -206,10 +206,10 @@ MCP tools appear as Python objects named after their server, for example
 `github.search_issues(query="...")`.
 
 Memories outlast sessions in `~/.smol/memory.db`, which the code reaches only
-through these functions. Each turn the system prompt lists the 10 newest
-memories kept for every folder and says how many the session's folder has,
-which the model finds with `recall()`; words are matched whole, Chinese ones
-too.
+through these functions. When a session opens, its system prompt lists the
+10 newest memories kept for every folder and says how many the session's
+folder has, which the model finds with `recall()`; words are matched whole,
+Chinese ones too.
 Agents that `agent()` starts can only recall. To look at them, run
 `sqlite3 ~/.smol/memory.db "select id, text from memories"`; deleting the file
 forgets everything.

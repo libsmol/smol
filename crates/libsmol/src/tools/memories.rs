@@ -41,8 +41,6 @@ pub(crate) struct Memories {
     db: PathBuf,
     /// The working directory as `folded` spells it
     folder: Vec<u8>,
-    /// False for the workers of agents that `agent()` starts, which only recall
-    writable: bool,
 }
 
 /// What the system prompt shows of them
@@ -62,26 +60,18 @@ impl Memories {
         Self {
             db: config.join(DB),
             folder: folder.as_encoded_bytes().to_vec(),
-            writable: true,
         }
     }
 
-    pub(crate) fn read_only(&self) -> Self {
-        Self {
-            writable: false,
-            ..self.clone()
-        }
-    }
-
-    /// Replies as `MemoryCall` documents
-    pub(crate) async fn answer(&self, call: MemoryCall) -> Reply {
+    /// Replies as `MemoryCall` documents, and only to recalls unless `writable`
+    pub(crate) async fn answer(&self, call: MemoryCall, writable: bool) -> Reply {
         match call {
             MemoryCall::Recall { query } => {
                 let found = self.recall(&query).await?;
                 Ok(json!(found))
             }
-            // The worker leaves out what a read-only one can't call, but the code can still ask
-            _ if !self.writable => Err(NESTED.to_owned()),
+            // The worker leaves out what it can't call, but the code can still ask
+            _ if !writable => Err(NESTED.to_owned()),
             MemoryCall::Remember { text, project } => {
                 let id = self.remember(&text, project).await?;
                 Ok(Value::from(id))
@@ -486,19 +476,18 @@ mod tests {
     fn read_only_recalls() {
         let dir = temp_dir("read-only");
         let here = opened(&dir, "/home/zoë/café");
-        let reading = here.read_only();
         let answering = async {
             let remember = MemoryCall::Remember {
                 text: "Prefers naïve tests".to_owned(),
                 project: true,
             };
-            let saved = here.answer(remember).await.expect("remember");
+            let saved = here.answer(remember, true).await.expect("remember");
             let forget = MemoryCall::Forget { id: 1 };
-            let refused = reading.answer(forget).await;
+            let refused = here.answer(forget, false).await;
             let recall = MemoryCall::Recall {
                 query: String::new(),
             };
-            let found = reading.answer(recall).await;
+            let found = here.answer(recall, false).await;
             (saved, refused, found)
         };
         let (saved, refused, found) = block_on(answering);

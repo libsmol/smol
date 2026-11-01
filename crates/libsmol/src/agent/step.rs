@@ -152,12 +152,12 @@ impl Turn<'_> {
 
             let views = self.sink.helpers(index);
             let records = Records::default();
-            let mut delegate = self.agent.delegate(self.servers, views, &records);
+            let mut serving = self.agent.serving(self.servers, views, &records);
             let code = &call.code;
             let mut shown = |output: &str| self.sink.event(Event::Output(index, call, output));
             let evaluating = self
                 .worker
-                .evaluate(code, self.servers, &mut shown, &mut *delegate);
+                .evaluate(code, self.servers, &mut shown, &mut *serving);
             let evaluated = evaluating.await;
             step.usage.duration += started.elapsed().as_secs_f64();
             // Every call that could still change them has ended with the code

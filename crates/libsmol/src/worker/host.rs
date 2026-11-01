@@ -3,13 +3,12 @@ use crate::model::Media;
 use crate::prompt::{self, NO_SERVER};
 use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
 use crate::tools::mcp::Server;
-use crate::tools::memories::Memories;
 use crate::utils::{new_id, Interrupt, Reply};
 use crate::worker::python;
 use crate::worker::sandbox::Sandbox;
 use crate::worker::{
-    AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
-    WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV,
+    AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message, Service, ToWorker,
+    WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV,
 };
 use crate::{Error, Result};
 use reaper::{cause, terminal_view};
@@ -39,7 +38,7 @@ const OUTPUT_WAIT: Duration = Duration::from_secs(2);
 const START_WAIT: Duration = Duration::from_secs(30);
 
 pub(crate) type Calling = Pin<Box<dyn Future<Output = Called> + Send>>;
-pub(crate) type Delegating<'a> = dyn FnMut(AgentCall) -> Calling + Send + 'a;
+pub(crate) type Serving<'a> = dyn FnMut(Service) -> Calling + Send + 'a;
 
 /// The result of work done for the worker, with the images and videos it produced
 pub(crate) struct Called {
@@ -81,7 +80,6 @@ pub(crate) struct Worker {
     live: Option<Live>,
     /// Shared with the workers of agents the code starts
     sandbox: Arc<Sandbox>,
-    memories: Memories,
     interrupt: Interrupt,
     delegation: Delegation,
     functions: Vec<Function>,
@@ -139,14 +137,12 @@ impl Worker {
     pub(crate) async fn new(
         interrupt: &Interrupt,
         sandbox: Arc<Sandbox>,
-        memories: Memories,
         servers: &[&Added],
         delegation: Delegation,
         restarted: bool,
     ) -> Result<Self> {
         let mut worker = Self {
             sandbox,
-            memories,
             interrupt: interrupt.clone(),
             delegation,
             functions: Vec::new(),
@@ -319,14 +315,14 @@ impl Worker {
         }
     }
 
-    /// `shown` gets the clipped output so far now and then,
-    /// and stopping before the code is sent returns Err
+    /// `shown` gets the clipped output so far now and then, `serve` answers what the code asks
+    /// of the agent, and stopping before the code is sent returns Err
     pub(crate) async fn evaluate(
         &mut self,
         code: &str,
         servers: &[&Added],
         shown: &mut (dyn FnMut(&str) + Send),
-        delegate: &mut Delegating<'_>,
+        serve: &mut Serving<'_>,
     ) -> Result<Evaluated, CallError> {
         let interrupt = self.interrupt.clone();
         let failed = |reason: String| {
@@ -433,18 +429,10 @@ impl Worker {
                     };
                     (calling, true)
                 }
-                WorkerCall::Agent(call) => {
-                    let asked = matches!(call, AgentCall::Ask { .. });
-                    let calling = delegate(call);
+                WorkerCall::Service(service) => {
+                    let asked = matches!(service, Service::Agent(AgentCall::Ask { .. }));
+                    let calling = serve(service);
                     (calling, !asked)
-                }
-                WorkerCall::Memory(call) => {
-                    let memories = self.memories.clone();
-                    let calling: Calling = Box::pin(async move {
-                        let reply = memories.answer(call).await;
-                        Called::from(reply)
-                    });
-                    (calling, true)
                 }
             };
             let task = live.calls.spawn(async move { (number, calling.await) });
@@ -614,17 +602,17 @@ async fn start_error(group: Group, mut pieces: Receiver<Piece>, mut output: Clip
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::agent::tests::main_place;
-    use crate::agent::{Brief, MAX_PARALLEL_AGENTS};
+    use crate::agent::{serve, Brief, Delegating, MAX_PARALLEL_AGENTS};
     use crate::memory::CallError;
     use crate::prompt::{self, system};
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
     use crate::tools::mcp::tests::{fake, started};
     use crate::tools::mcp::Server;
-    use crate::tools::memories::{Listed, Memories};
+    use crate::tools::memories::Memories;
     use crate::utils::{block_on, new_id, Interrupt};
-    use crate::worker::host::{Added, Called, Calling, Delegating, Evaluated, Worker, STOP_WAIT};
+    use crate::worker::host::{Added, Called, Calling, Evaluated, Worker, STOP_WAIT};
     use crate::worker::sandbox::tests::opened;
-    use crate::worker::{AgentCall, Delegation};
+    use crate::worker::{AgentCall, Delegation, Service};
     use serde_json::{json, Map, Value};
     use std::env;
     use std::fs;
@@ -639,16 +627,18 @@ pub(crate) mod tests {
     use std::time::{Duration, Instant};
     use tokio::time;
 
-    /// Keeps track of installed servers in place of the MCP pool
+    /// Keeps track of installed servers in place of the MCP pool, and answers as the agent would
     struct Tried {
         worker: Worker,
         servers: Vec<Added>,
         delegate: Box<Delegating<'static>>,
+        memories: Memories,
+        writable: bool,
     }
 
-    /// For code that never calls `agent()`
-    pub(crate) fn no_agents(call: AgentCall) -> Calling {
-        panic!("{call:?}");
+    /// For code that asks the agent for nothing
+    pub(crate) fn unserved(service: Service) -> Calling {
+        panic!("{service:?}");
     }
 
     impl Deref for Tried {
@@ -670,7 +660,12 @@ pub(crate) mod tests {
             let mut ignore = |_: &str| {};
             let servers: Vec<&Added> = self.servers.iter().collect();
             let delegate = &mut *self.delegate;
-            let evaluating = self.worker.evaluate(code, &servers, &mut ignore, delegate);
+            let memories = &self.memories;
+            let writable = self.writable;
+            let mut serving = |service: Service| serve(service, delegate, memories, writable);
+            let evaluating = self
+                .worker
+                .evaluate(code, &servers, &mut ignore, &mut serving);
             block_on(evaluating).expect("evaluate")
         }
 
@@ -701,26 +696,18 @@ pub(crate) mod tests {
         let dir = temp_dir("session");
         let copies = dir.join("copies");
         let sandbox = opened(&cwd, &copies);
-        // As for the agents that agent() starts
-        let memories = match delegation {
-            Delegation::Off => Memories::new(&dir, &cwd).read_only(),
-            _ => Memories::new(&dir, &cwd),
-        };
         let restarted = false;
-        let building = Worker::new(
-            &interrupt,
-            Arc::new(sandbox),
-            memories,
-            &[],
-            delegation,
-            restarted,
-        );
+        let building = Worker::new(&interrupt, Arc::new(sandbox), &[], delegation, restarted);
         let worker = block_on(building).expect("worker");
 
+        let no_agents = |call: AgentCall| -> Calling { panic!("{call:?}") };
         let value = Tried {
             worker,
             servers: Vec::new(),
             delegate: Box::new(no_agents),
+            memories: Memories::new(&dir, &cwd),
+            // Agents that agent() starts only recall
+            writable: delegation != Delegation::Off,
         };
         Temp { value, dir }
     }
@@ -824,7 +811,7 @@ pub(crate) mod tests {
         worker.live = None;
         interrupt.cancel(0);
         let mut ignore = |_: &str| {};
-        let mut none = no_agents;
+        let mut none = unserved;
         let evaluating = worker.evaluate("print('skipped')", &[], &mut ignore, &mut none);
         let stopped = block_on(evaluating);
         assert_eq!(stopped.err(), Some(CallError::Interrupted));
@@ -1074,7 +1061,7 @@ pub(crate) mod tests {
         let mut seen = Vec::new();
         let mut shown = |text: &str| seen.push(text.to_owned());
         let code = "import time\nprint('\\x1b[1mfirst line\\x1b[0m', flush=True)\ntime.sleep(0.5)\nprint('second line')";
-        let mut none = no_agents;
+        let mut none = unserved;
         let evaluating = worker.evaluate(code, &[], &mut shown, &mut none);
         let output = block_on(evaluating).expect("evaluate");
 
@@ -2129,8 +2116,7 @@ pub(crate) mod tests {
         let cwd = Path::new("/work");
         let main = main_place(Vec::new());
         let empty = Brief::default();
-        let none = Listed::default();
-        let text = system(&[], &servers, &empty, &none, cwd, None, &main);
+        let text = system(&[], &servers, &empty, cwd, None, &main);
 
         let listed = "\n\n## MCP `news_web`\n\nSearches the web and the news\n\nRead-only\n\n\
                       ```python\nnews_web.echo_text(the_text: str = None) -> str\n```\n\n\

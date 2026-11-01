@@ -226,7 +226,7 @@ def _asked(function, method, params):
 def remember(text: str, project: bool = True) -> int:
     """Saves text as a memory of this folder, or of every folder with project=False, and returns its id.
 
-    Saves text of at most {chars} characters as a memory and returns its id. With project=True only sessions in this folder see it; with project=False every session sees it, and later turns list the newest such memories under Memories. Keep one fact per memory; to change one, forget() it and remember() the new text."""
+    Saves text of at most {chars} characters as a memory and returns its id. With project=True only sessions in this folder see it; with project=False every session sees it, and later sessions list the newest such memories under Memories. Keep one fact per memory; to change one, forget() it and remember() the new text."""
     text = _str("remember", "text", text)
     project = bool(project)
     return _asked("remember", "remember", {"text": text, "project": project})

@@ -1,11 +1,12 @@
 use crate::agent::{
-    logged_tokens, Agent, Event, HelperView, Helpers, Place, Sink, Status, Task, Turn, Unseen,
+    logged_tokens, Agent, Delegating, Event, HelperView, Helpers, Place, Sink, Status, Task, Turn,
+    Unseen,
 };
 use crate::memory::{AgentMemory, Ending, Helper};
 use crate::prompt;
 use crate::spawn::SHOWN_EVERY;
 use crate::utils::{Interrupt, Reply};
-use crate::worker::host::{Added, Called, Calling, Delegating, Worker};
+use crate::worker::host::{Added, Called, Calling, Worker};
 use crate::worker::{AgentCall, Delegation};
 use serde_json::{json, Value};
 use std::future::{self, Future};
@@ -194,17 +195,10 @@ impl Agent {
                 watched.show(false);
 
                 let sandbox = Arc::clone(&self.sandbox);
-                let memories = self.memories.read_only();
                 let installed: Vec<&Added> = servers.iter().collect();
                 let restarted = false;
-                let starting = Worker::new(
-                    &self.interrupt,
-                    sandbox,
-                    memories,
-                    &installed,
-                    Delegation::Off,
-                    restarted,
-                );
+                let starting =
+                    Worker::new(&self.interrupt, sandbox, &installed, Delegation::Off, restarted);
                 match starting.await {
                     Ok(mut worker) => {
                         let task = Task {
