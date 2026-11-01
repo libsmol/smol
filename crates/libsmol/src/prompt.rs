@@ -568,10 +568,13 @@ pub(crate) fn exited(end: Option<&Exit>) -> String {
     }
 }
 
-/// For a worker that went away while the model wrote the code
-pub(crate) fn lost(end: Option<&Exit>) -> String {
+/// For a worker that went away while the model wrote the code, with what it printed after the last snippet
+pub(crate) fn lost(end: Option<&Exit>, said: &str) -> String {
     let exited = exited(end);
-    format!("{exited} before the code ran")
+    match said {
+        "" => format!("{exited} before the code ran"),
+        said => format!("{exited} before the code ran, after printing:\n{said}"),
+    }
 }
 
 /// `said` is the output or error from before the worker came up

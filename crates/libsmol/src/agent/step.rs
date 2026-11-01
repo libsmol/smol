@@ -288,6 +288,7 @@ impl Reply {
         if !self.open {
             return;
         }
+
         let index = self.calls.len() - 1;
         let written = &self.calls[index].code;
         // A blank call is hidden live as it is on replay, since saved code is trimmed

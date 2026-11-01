@@ -31,11 +31,14 @@ impl Turn<'_> {
         let takes = |kind| model.takes(kind);
         let used = self.memory.tokens(&self.system, &takes, Some(window));
         let reserve = (window as f64 * RESERVE_SHARE) as u64;
+        let reserve = reserve.min(MAX_RESERVE_TOKENS);
         // Servers may refuse a request whose input and output limit together pass the window,
-        // and a reserve over half the window would have every step compact
+        // and past half of what the system prompt leaves, every step would compact again
         let output = model.max_tokens();
-        let limit = output.unwrap_or(0);
-        let reserve = reserve.min(MAX_RESERVE_TOKENS).max(limit).min(window / 2);
+        let system = text_bytes(&self.system);
+        let left = window.saturating_sub(estimate(system));
+        let limit = output.unwrap_or(0).min(left / 2);
+        let reserve = reserve.max(limit);
         let interrupted = self.agent.interrupt.triggered();
         if !added || interrupted || used < window - reserve {
             return Ok(());
@@ -422,6 +425,27 @@ mod tests {
             run.agent.compact(&mut full).expect("compact");
             assert!(summarized(&full), "{max_tokens}");
         }
+    }
+
+    /// A long system prompt lowers the reserve, which would otherwise have every step compact
+    #[test]
+    fn reserve_under_system() {
+        let mut run = agent(Some(32_000), vec![Ok(reply("Summary"))]);
+        limited(&mut run, 16_000);
+        // About 12000 tokens, which leaves a reserve of 10000
+        let system = "Rules for the café ".repeat(1800);
+
+        let mut below = filled(21_999);
+        run.agent
+            .compact_under(&mut below, &system)
+            .expect("compact");
+        assert!(!summarized(&below));
+
+        let mut full = filled(22_000);
+        run.agent
+            .compact_under(&mut full, &system)
+            .expect("compact");
+        assert!(summarized(&full));
     }
 
     /// Every summary request leaves the output limit free in the window,

@@ -292,7 +292,7 @@ fn ended(write: &Bound<'_, PyAny>, output: i32, marker: &[u8]) {
     // C extensions print through C's stdio, which holds what goes to a pipe until flushed
     // SAFETY: A null stream flushes every open one
     unsafe { libc::fflush(ptr::null_mut()) };
-    // An interrupt the snippet didn't take is raised here once
+    // A SIGINT that lands while the write waits on a full pipe raises here
     // A pipe takes a write this small whole or not at all
     let py = write.py();
     loop {

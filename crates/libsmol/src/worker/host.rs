@@ -342,8 +342,13 @@ impl Worker {
         // A worker lost while the model wrote the code never ran it
         if let Some(live) = self.live.as_mut().filter(|live| live.group.ended()) {
             let end = live.group.exited().await;
+            // Programs it left would keep the pipe open
+            live.group.kill();
+            let mut said = Clip::new(KEPT_BYTES);
+            drain(&mut live.pieces, &mut said).await;
+            let said = said.shown(MAX_OBSERVATION_CHARS / 2);
             self.reap();
-            let reason = prompt::lost(end.as_ref());
+            let reason = prompt::lost(end.as_ref(), said.trim());
             return Err(failed(reason));
         }
 
@@ -890,8 +895,10 @@ pub(crate) mod tests {
     #[test]
     fn lost_before_run() {
         let mut worker = fresh();
-        let output =
-            worker.eval("import os, threading\nthreading.Timer(0.2, os._exit, [3]).start()");
+        let code = "import os, threading\n\
+             def leave():\n    print('café closed', flush=True)\n    os._exit(3)\n\
+             threading.Timer(0.2, leave).start()";
+        let output = worker.eval(code);
         assert_eq!(output.error, None);
         let waiting = async { time::sleep(Duration::from_secs(1)).await };
         block_on(waiting);
@@ -901,7 +908,8 @@ pub(crate) mod tests {
         let evaluating = worker.evaluate("print('café')", &[], &mut ignore, &mut none);
         let lost = block_on(evaluating).err();
         let message = lost.map(|error| error.to_string());
-        let expected = "Python exited with code 3 before the code ran";
+        let expected =
+            "Python exited with code 3 before the code ran, after printing:\ncafé closed";
         assert_eq!(message.as_deref(), Some(expected));
         assert!(worker.restarted());
 

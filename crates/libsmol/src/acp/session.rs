@@ -136,9 +136,9 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
         Ok(opened) => opened.run(inbox).await,
         Err(error) => {
             error!("session: open failed, {error}");
-            // Closed first, so a request that comes in meanwhile is refused instead of lost
+            // A request that came in after the queue was answered would be lost
             inbox.close();
-            drain(&mut inbox, &app.peer, &session);
+            refuse_queued(&mut inbox, &app.peer, &session);
             app.peer.respond(&id, Err(error));
         }
     }
@@ -369,7 +369,7 @@ impl Session {
                 let peer = &self.keeper.app.peer;
                 let session = &self.keeper.meta.id;
                 refused(message, peer, session);
-                drain(&mut inbox, peer, session);
+                refuse_queued(&mut inbox, peer, session);
                 break;
             }
             match message {
@@ -626,7 +626,7 @@ fn refused(message: Message, peer: &Peer, session: &str) {
 }
 
 /// Answers what is still queued once the session is closed or failed to open
-fn drain(inbox: &mut UnboundedReceiver<Message>, peer: &Peer, session: &str) {
+fn refuse_queued(inbox: &mut UnboundedReceiver<Message>, peer: &Peer, session: &str) {
     while let Ok(message) = inbox.try_recv() {
         refused(message, peer, session);
     }

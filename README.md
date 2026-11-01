@@ -316,7 +316,9 @@ On Linux a folder that holds a hidden path is opened entry by entry: it can be
 listed, but files created or replaced directly in it after the session opens
 can't be read, and no new files can be made directly in it, so when the
 working directory is your home folder or holds a hidden path, new files go
-into its subfolders. On macOS the folders above a hidden path can't be renamed
+into its subfolders. `~/.config/git` is such a folder once
+`~/.config/git/credentials` exists, so a git config rewritten there during a
+session can't be read until the next one. On macOS the folders above a hidden path can't be renamed
 or removed, and hiding `~/Library/Keychains` hides the keychain files but not
 the system service that hands their items to the programs each item trusts.
 

@@ -907,12 +907,20 @@ pub(crate) mod tests {
 
         /// Compacts only, with an empty system prompt
         pub(crate) fn compact(&mut self, memory: &mut AgentMemory) -> Result<()> {
+            self.compact_under(memory, "")
+        }
+
+        pub(crate) fn compact_under(
+            &mut self,
+            memory: &mut AgentMemory,
+            system: &str,
+        ) -> Result<()> {
             let mut turn = Turn {
                 agent: &self.agent,
                 worker: &mut self.worker,
                 servers: &[],
                 memory,
-                system: String::new(),
+                system: system.to_owned(),
                 sink: &mut self.probe,
             };
             let compacting = turn.compact();

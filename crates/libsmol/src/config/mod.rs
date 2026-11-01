@@ -205,8 +205,9 @@ pub(crate) fn save_model(
     };
     fs::create_dir_all(dir).map_err(unwritable)?;
 
-    // Written aside and renamed over the file a link leads to, so a write that fails halfway leaves the old one
+    // Renaming over a link would leave a plain file where the link was
     let target = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    // A write straight into it that failed halfway would leave no models
     let written = target.with_extension("toml.new");
     // A stale one would keep its own mode
     fs::remove_file(&written).ok();
@@ -215,12 +216,12 @@ pub(crate) fn save_model(
     // The file holds the key in plain text
     #[cfg(unix)]
     options.mode(0o600);
-    let writing = || -> io::Result<()> {
-        let mut file = options.open(&written)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()
-    };
-    if let Err(e) = writing() {
+    let mut file = options.open(&written).map_err(unwritable)?;
+    let saved = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = saved {
         // It holds part of the key
         fs::remove_file(&written).ok();
         return Err(unwritable(e));

@@ -149,8 +149,7 @@ pub(crate) fn run(
     let program = env::var("TERM_PROGRAM").unwrap_or_default();
     let truecolor = term != "linux" && program != "Apple_Terminal";
 
-    // A polite kill still leaves the terminal as it was
-    // The shutdown is registered first, so only a second SIGTERM ends smol at once
+    // Registered before the flag, the shutdown ends smol only on a second SIGTERM
     let terminated = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     {
