@@ -58,12 +58,9 @@ pub fn guard() {
     drop(writer);
 
     // It has to survive a kill of the parent's group or a terminal hangup to clean up
-    // SAFETY: Only changes this process's own group, name, signal dispositions and descriptors
+    // SAFETY: Only changes this process's own group, signal dispositions and descriptors
     unsafe {
         libc::setpgid(0, 0);
-        // With the parent's name it would also die when the parent is killed by name
-        #[cfg(target_os = "linux")]
-        libc::prctl(libc::PR_SET_NAME, c"smol-reaper".as_ptr());
         for signal in [libc::SIGINT, libc::SIGHUP, libc::SIGTERM, libc::SIGQUIT] {
             libc::signal(signal, libc::SIG_IGN);
         }
