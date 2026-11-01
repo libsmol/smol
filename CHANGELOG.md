@@ -36,6 +36,11 @@ but their files stay in `~/.smol/history` untouched.
   folder and can be written, and that installed packages import at once, and
   no longer tells the model to install a skill's packages in a venv in
   `$TMPDIR`.
+- On macOS, code could read a hidden path with a folder between it and a place
+  the code can write, such as `~/.config/gh` in a session opened in `~` or a
+  deeper path in `[deny] read`, by renaming that folder, since Seatbelt rules
+  go by path. The folders above a hidden path can no longer be renamed or
+  removed.
 
 ## 0.4.4 - 2026-10-31
 

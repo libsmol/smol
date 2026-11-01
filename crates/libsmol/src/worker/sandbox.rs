@@ -9,6 +9,8 @@ use landlock::{
     ABI,
 };
 use reaper::{cause, tilde};
+#[cfg(any(target_os = "macos", test))]
+use std::collections::BTreeSet;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::convert::Infallible;
 use std::env;
@@ -479,10 +481,10 @@ fn isolated(_: &[(PathBuf, bool)], _: &[PathBuf]) -> Option<Isolation> {
 }
 
 /// Seatbelt takes the last rule that matches, so deeper paths come later
-/// and a hidden path comes after a granted one of the same depth
+/// and a hidden path or a folder above one comes after a granted one of the same depth
 #[cfg(any(target_os = "macos", test))]
 fn profile(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> String {
-    let mut rules = Vec::new();
+    let mut rules: Vec<(&Path, &str, &str)> = Vec::new();
     for (path, write) in granted {
         let rule = match write {
             true => "allow file-read* file-write* network-outbound",
@@ -501,6 +503,14 @@ fn profile(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> String {
             "deny file-read* file-write* network-outbound",
             "subpath",
         ));
+    }
+    // A rule follows the path, so a folder above a hidden one must stay where it is
+    let mut above = BTreeSet::new();
+    for path in hidden {
+        above.extend(path.ancestors().skip(1));
+    }
+    for path in above {
+        rules.push((path, "deny file-write-unlink file-write-create", "literal"));
     }
     rules.sort_by_key(|(path, _, _)| path.components().count());
 
@@ -602,11 +612,17 @@ pub(crate) mod tests {
         let expected = "(version 1)\n(allow default)\n(deny file-write*)\n\
             (deny network-outbound (subpath \"/\"))\n\
             (allow file-read* (subpath \"/\"))\n\
+            (deny file-write-unlink file-write-create (literal \"/\"))\n\
+            (deny file-write-unlink file-write-create (literal \"/Users\"))\n\
+            (deny file-write-unlink file-write-create (literal \"/Users/zoë\"))\n\
             (allow file-read* file-write* network-outbound (subpath \"/Users/zoë/café\"))\n\
             (deny file-write-unlink file-write-create (literal \"/Users/zoë/café\"))\n\
             (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.ssh\"))\n\
             (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.smol\"))\n\
+            (deny file-write-unlink file-write-create (literal \"/Users/zoë/a\"))\n\
+            (deny file-write-unlink file-write-create (literal \"/Users/zoë/a/b\"))\n\
             (allow file-read* (subpath \"/Users/zoë/.smol/skills/pdf\"))\n\
+            (deny file-write-unlink file-write-create (literal \"/Users/zoë/a/b/c\"))\n\
             (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/a/b/c/we\\\"ird\\\\name\"))\n\
             (allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n\
             (deny signal (target others))\n";
