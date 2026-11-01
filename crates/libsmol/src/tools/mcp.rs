@@ -100,6 +100,7 @@ impl Drop for Unanswered {
         let Some(id) = self.id.take() else {
             return;
         };
+
         let params = CancelledNotificationParam::new(Some(id), None);
         let cancelled = CancelledNotification::new(params);
         let cancelled = ClientNotification::CancelledNotification(cancelled);
@@ -446,12 +447,14 @@ pub(crate) mod tests {
     pub(crate) fn fake() -> Server {
         let copies = temp_dir("copies");
         let (server, link) = started(copies);
+
         // Dropping the link would disconnect
         let kept = async {
             let ending = link.ended();
             task::spawn(ending);
         };
         block_on(kept);
+
         server
     }
 
@@ -512,6 +515,7 @@ pub(crate) mod tests {
     #[test]
     fn cancel_sent() {
         let server = fake();
+
         // An answered call sends no cancel
         let label = "fake.cancelled".to_owned();
         let counting = (server.call)("cancelled".to_owned(), Map::new(), label);
@@ -526,6 +530,7 @@ pub(crate) mod tests {
         let limit = Duration::from_millis(200);
         let dropped = async move { time::timeout(limit, waiting).await.is_err() };
         assert!(block_on(dropped));
+
         // Let the task sending the cancel run first
         let settling = async { time::sleep(Duration::from_millis(100)).await };
         block_on(settling);
@@ -560,6 +565,7 @@ pub(crate) mod tests {
         let label = "fake.mixed".to_owned();
         let calling = (server.call)("mixed".to_owned(), Map::new(), label);
         let called = block_on(calling);
+
         let [(label, _)] = &called.media[..] else {
             panic!("{:?}", called.media);
         };
@@ -568,6 +574,7 @@ pub(crate) mod tests {
         let expected = "Intro\nembedded content\n[resource link: file:///big.bin]";
         let result = called.result.expect("call");
         assert_eq!(result, Value::String(expected.to_owned()));
+
         let entries = fs::read_dir(&copies).expect("copies");
         let names: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
         let [copy] = &names[..] else {
@@ -601,6 +608,7 @@ pub(crate) mod tests {
             (failed, said)
         };
         let (failed, said) = block_on(running);
+
         assert_eq!(failed, "server disconnected");
         assert_eq!(said.ok().as_deref(), Some("written at exit"));
     }

@@ -20,6 +20,7 @@ impl Turn<'_> {
         let window = model.context_window();
         let takes = |kind| model.takes(kind);
         let mut conversation = self.memory.conversation(&self.system, &takes, window);
+
         // Saved sessions store only the file names of copies
         let copies = &self.agent.copies;
         for message in &mut conversation {
@@ -160,7 +161,9 @@ impl Turn<'_> {
             let evaluated = evaluating.await;
             step.usage.duration += started.elapsed().as_secs_f64();
             // Every call that could still change them has ended with the code
-            let agents = mem::take(&mut *records.lock().expect("records"));
+            let mut recorded = records.lock().expect("records");
+            let agents = mem::take(&mut *recorded);
+            drop(recorded);
 
             let call = &mut step.calls[index];
             match evaluated {
@@ -248,6 +251,7 @@ impl Reply {
             self.open = true;
             self.checked = 0;
         }
+
         let index = self.calls.len() - 1;
         let written = &mut self.calls[index].code;
         let earlier = written.trim().is_empty();
@@ -370,7 +374,6 @@ mod tests {
     fn interrupted(memory: &AgentMemory) -> &AgentStep {
         let step = only(memory);
         assert_eq!(step.error, Some(StepError::Interrupted));
-
         step
     }
 
@@ -629,6 +632,7 @@ mod tests {
 
         let mut memory = AgentMemory::default();
         agent.turn(&mut memory, "task").expect("run");
+
         let steps = actions(&memory);
         let mut outputs = Vec::new();
         let mut measured = Vec::new();
@@ -918,6 +922,7 @@ mod tests {
 
         let mut memory = AgentMemory::default();
         agent.turn(&mut memory, "task").expect("run");
+
         let step = actions(&memory)[0];
         assert_eq!(step.text, "Running it first.");
         assert_eq!(codes(step), ["print('naïve')"]);

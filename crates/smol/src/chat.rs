@@ -15,6 +15,7 @@ use url::Url;
 /// No file name or path is longer than these
 const MAX_NAME_BYTES: usize = 255;
 const MAX_PATH_BYTES: usize = 4096;
+
 const MAX_PROBES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +204,7 @@ impl Session {
         for server in self.mcp.iter_mut().filter(|server| server.name == name) {
             server.state = state.clone();
         }
+
         Ok(format!("mcp: {name}: {state}"))
     }
 
@@ -409,6 +411,7 @@ fn mentions(text: &str, exists: impl Fn(&str) -> bool) -> Vec<String> {
                     }
                     ends.push(end);
                 }
+
                 let ended = |end: &usize| !continues(&after[*end..]);
                 let ends = ends.into_iter().rev().filter(ended);
                 ends.map(|end| &after[..end]).find(|path| exists(path))
@@ -536,11 +539,13 @@ mod tests {
         let off = status("s1", McpState::Off);
         session.receive(off);
         session.set_mcp(true, "web").expect("switch");
+
         let titled = SessionInfoUpdate::new().title("Snake game".to_owned());
         let titled = info("s1", titled);
         session.receive(titled);
         assert_eq!(session.title, "Snake game");
         assert!(!session.saved);
+
         let stamped = SessionInfoUpdate::new().updated_at("2026-10-12T00:00:00Z".to_owned());
         let stamped = info("s1", stamped);
         session.receive(stamped);

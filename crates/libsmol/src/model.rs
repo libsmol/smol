@@ -26,9 +26,11 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_RETRIES: u32 = 3;
 /// Don't retry when the server asks for a longer wait
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
+
 const ARGUMENT: &str = "code";
 /// Servers only accept tool names of letters, digits, `_` and `-` up to this length
 const MAX_NAME_CHARS: usize = 64;
+
 pub(crate) const DEFAULT_API: &str = "https://api.openai.com/v1";
 const LIST_WAIT: Duration = Duration::from_secs(30);
 
@@ -1176,6 +1178,7 @@ pub(crate) mod tests {
         let api = format!("http://{address}/v1/");
         let listing = listed(&api, key);
         let result = block_on(listing);
+
         let request = server.join().expect("server");
         (result, request.to_lowercase())
     }
@@ -1717,6 +1720,7 @@ pub(crate) mod tests {
         ]}"#;
         let response = reply("200 OK", "application/json", body);
         let (listed, request) = listing(&response, "sk-test");
+
         let specs = listed.expect("listed");
         let found: Vec<(&str, Option<u64>)> = specs
             .iter()

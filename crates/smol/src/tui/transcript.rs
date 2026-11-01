@@ -245,6 +245,7 @@ impl Transcript {
             let blocking = |helper: &&Helper| helper.waiting() && helper.name.is_none();
             return step.helpers().filter(blocking).count();
         }
+
         // A message the turn took after the answer is what the model works on next
         let Some((Entry::Step(last), after)) = self.held.split_first() else {
             return 0;
@@ -366,6 +367,7 @@ impl Transcript {
                     }
                     helper.status = status;
                 }
+
                 // A preview follows the status, and the last update holds only the answer or error
                 if let Some(content) = &fields.content {
                     let (texts, _) = contents(content);
@@ -373,6 +375,7 @@ impl Transcript {
                     helper.text = texts.next().unwrap_or_default();
                     helper.preview = texts.collect();
                 }
+
                 let meta = call.meta.as_ref();
                 let get = |key: &str| meta.and_then(|meta| meta.get(key));
                 if get("interrupted").and_then(Value::as_bool) == Some(true) {
@@ -669,6 +672,7 @@ impl Transcript {
         if self.layout == (width, expanded) {
             return None;
         }
+
         // Rows past the cache are the part redrawn every time, counted from its start
         if row >= self.rows.len() {
             let offset = row - self.rows.len();
@@ -1024,6 +1028,7 @@ impl Step {
 
             SessionUpdate::ToolCall(call) => {
                 let id = call.tool_call_id.0.to_string();
+
                 // An agent the code started belongs under the call running that code
                 let meta = call.meta.as_ref();
                 let marked = meta.is_some_and(|meta| meta.contains_key(AGENT));
@@ -1597,6 +1602,7 @@ mod tests {
         let reply = message("Counting the first part");
         transcript.update(&reply);
         end_step(&mut transcript, 10, 1);
+
         // The second step is interrupted before any text, and a replayed turn has no stop reason
         let stopped = Notice {
             step: true,
@@ -1684,6 +1690,7 @@ mod tests {
         let stats = transcript.stats();
         assert_eq!((stats.context, stats.window), (Some(22), Some(200)));
         assert_eq!(stats.ratio(), None);
+
         end_step(&mut transcript, 30, 3);
         let stats = transcript.stats();
         assert_eq!((stats.steps, stats.ratio()), (3, Some(0.33)));
@@ -1722,6 +1729,7 @@ mod tests {
         let reply = message("Working on it");
         transcript.update(&reply);
         assert_eq!(transcript.rows(40, false).len(), rows + 4);
+
         // Changes made without an update aren't redrawn
         transcript.live = None;
         assert_eq!(transcript.rows(40, false).len(), rows + 4);
@@ -1889,6 +1897,7 @@ mod tests {
             let usage = UsageUpdate::new(0, 1000).meta(meta.as_object().cloned());
             transcript.update(&SessionUpdate::UsageUpdate(usage));
         };
+
         ended(&mut transcript);
         assert_eq!(transcript.awaited(), 0);
 
@@ -1923,6 +1932,7 @@ mod tests {
             let shown: Vec<String> = area.iter().map(|row| row.line.to_string()).collect();
             shown.iter().filter(|row| row.contains("menu ")).count()
         };
+
         let rows = transcript.rows(60, false);
         let second = rows
             .iter()

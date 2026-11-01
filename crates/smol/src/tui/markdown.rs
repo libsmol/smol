@@ -203,6 +203,7 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
                     let Some(link) = builder.links.pop() else {
                         continue;
                     };
+
                     let target = builder.target();
                     let text = joined(target);
                     if !link.bare && !text.ends_with(&link.url) {

@@ -248,6 +248,7 @@ mod tests {
         let dir = temp_dir("files");
         write_file(&dir.join("deep/résumé.txt"), "first\nsecond".as_bytes());
         write_file(&dir.join("a.txt"), b"");
+
         assert_eq!(listed(&dir, false), ["a.txt", "deep/"]);
 
         let expected = ["a.txt", "deep/", "deep/résumé.txt"];
@@ -282,6 +283,7 @@ mod tests {
             let made = unsafe { libc::mkfifo(named.as_ptr(), 0o600) };
             assert_eq!(made, 0);
         }
+
         let stopped = AtomicBool::new(true);
         assert!(ls(&dir, true, &stopped).expect("ls").is_empty());
 
@@ -318,6 +320,7 @@ mod tests {
         let late = [b"const Z: u8 = 0;\n".repeat(20_000), b"\0".to_vec()].concat();
         write("deep/late.log", &late);
         write("deep/crlf.txt", "déjà vu \r\nthe end:\r\n".as_bytes());
+
         let going = AtomicBool::new(false);
         let found = |pattern: &str, root: &Path, glob: Option<&str>| {
             let rows = grep(pattern, root, glob, &going).expect("grep");

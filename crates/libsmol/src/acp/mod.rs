@@ -137,7 +137,9 @@ mod tests {
             ContentBlock::ResourceLink(file),
             ContentBlock::ResourceLink(page),
         ];
+
         let task = task_of(&blocks);
+
         assert_eq!(task.text, "Summarize these\nhttps://example.com/café");
         let file = Mention::File {
             path,
@@ -168,6 +170,7 @@ mod tests {
         ];
 
         let task = task_of(&blocks);
+
         let file = |text: Option<&str>| Mention::File {
             path: path.clone(),
             lines: Some((10, 12)),
@@ -192,6 +195,7 @@ mod tests {
             ("café", None),
             ("L", None),
         ];
+
         for (fragment, range) in cases {
             assert_eq!(line_range(fragment), range, "{fragment}");
         }

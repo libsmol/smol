@@ -274,6 +274,7 @@ impl Agent {
             }
             functions.push(function);
         }
+
         // Read for each run, since a memory forgotten in an earlier one must leave the prompt
         let listed = match self.memories.listed().await {
             Ok(listed) => listed,
@@ -408,6 +409,7 @@ impl Turn<'_> {
                 if self.agent.interrupt.triggered() {
                     return Ok(None);
                 }
+
                 // Read before collecting, so an agent that ends in between is still collected
                 let team = self.agent.place.team();
                 let running = team.is_some_and(|team| team.running());
@@ -490,6 +492,7 @@ async fn retry(
         () = interrupt.wait() => {}
     }
     *tries += 1;
+
     true
 }
 
@@ -986,6 +989,7 @@ pub(crate) mod tests {
             let naming = title_of(model, task);
             block_on(naming)
         };
+
         let title = titled("  **“Snake game”**。\nAn extra line");
         assert_eq!(title.as_deref(), Some("Snake game"));
         let heading = titled("\n# .env file setup\n");

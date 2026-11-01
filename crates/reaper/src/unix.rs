@@ -87,6 +87,7 @@ pub fn guard() {
     }
     let prefix = instance();
     kill_marked(prefix);
+
     // SAFETY: Skips the exit handlers inherited from the parent
     unsafe { libc::_exit(0) }
 }
@@ -395,6 +396,7 @@ mod tests {
         let output = command.output().expect("run");
         let pid = String::from_utf8_lossy(&output.stdout);
         let pid: libc::pid_t = pid.trim().parse().expect("pid");
+
         // Where PID 1 doesn't reap orphans the killed process stays a zombie
         let alive = || {
             let path = format!("/proc/{pid}/stat");

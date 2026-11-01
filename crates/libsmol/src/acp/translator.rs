@@ -232,6 +232,7 @@ impl Translator {
             let chunk = chunk(reasoning);
             self.update(SessionUpdate::AgentThoughtChunk(chunk));
         }
+
         // Split the text where each call started to restore the live order
         let mut said = 0;
         for (index, call) in step.calls.iter().enumerate() {
@@ -616,6 +617,7 @@ impl HelperCall {
             Ending::Stopped {} => (ToolCallStatus::Failed, STOPPED_BY_CODE),
             Ending::Unfinished {} | Ending::Running {} => (ToolCallStatus::Failed, UNFINISHED),
         };
+
         let (usage, steps) = memory.spent();
         let mut meta = usage_meta(&usage);
         meta.insert("steps".to_owned(), steps.into());
@@ -742,6 +744,7 @@ mod tests {
         replaying.replay(&memory);
         let replayed = drained(&mut sent);
         assert_eq!(told, replayed);
+
         let notice = json!({
             "sessionId": "session-1",
             "text": "python: restarted, earlier variables are gone",
@@ -883,6 +886,7 @@ mod tests {
         let mut memory = AgentMemory::default();
         agent.turn(&mut memory, "Task").expect("run");
         let live = drained(&mut sent);
+
         let mut thoughts = Vec::new();
         for item in shown(&live) {
             if item["kind"] == "agent_thought_chunk" {
@@ -1046,6 +1050,7 @@ mod tests {
         let memory = AgentMemory {
             steps: vec![MemoryStep::Summary(summary)],
         };
+
         let updates = replayed(&memory);
         let [started, ended, usage] = &updates[..] else {
             panic!("{updates:?}");
@@ -1259,6 +1264,7 @@ mod tests {
                 MemoryStep::Update(asked("Add tests too")),
             ],
         };
+
         let updates = replayed(&memory);
         let [task, update] = &updates[..] else {
             panic!("{updates:?}");
@@ -1427,6 +1433,7 @@ mod tests {
         let started = stopping.helpers(0);
         let mut call = started.open(1, &stopped);
         call.close(&stopped);
+
         // One aborted before it closes still ends, and so does one replayed while running
         let running = Helper {
             task: "Spell naïve".to_owned(),

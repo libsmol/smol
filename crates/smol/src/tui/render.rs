@@ -115,6 +115,7 @@ const LAST_PINNED: Mark = Mark {
     rest: "      ",
     style: DIM,
 };
+
 const PULSE: [char; 5] = ['✢', '✳', '✶', '✻', '✽'];
 const PULSE_EVERY: Duration = Duration::from_millis(240);
 
@@ -265,6 +266,7 @@ impl Render {
                     if !call.helpers.is_empty() {
                         self.helpers(call);
                     }
+
                     let count = parts.attachments.len() + parts.outputs.len();
                     let mut drawn = 0;
                     let mut branch = || {
@@ -1000,6 +1002,7 @@ fn summary(helpers: &[&Helper], seconds: Option<u64>) -> String {
     if input + output > 0 {
         parts.push(in_out(input, output));
     }
+
     parts.join(" · ")
 }
 
@@ -1128,6 +1131,7 @@ mod tests {
         full.pinned(&[&running], 27);
         let rows = text(&full.rows);
         assert_eq!(rows.len(), 5, "{rows:?}");
+
         // The summary spins like the agents below it, and only ones still queued leave it waiting
         let tokens = in_out(1200, 300);
         let summary = format!(" agents · 1 running · 0s · {tokens}");
@@ -1138,6 +1142,7 @@ mod tests {
         queued.pinned(&[&waiting], 27);
         let rows_queued = text(&queued.rows);
         assert_eq!(rows_queued[1], "  ◌ agents · 1 queued");
+
         assert!(rows[2].starts_with("  ╰ "), "{rows:?}");
         assert!(
             rows[2].ends_with(" counter · cafés Count the cafés"),
@@ -1163,6 +1168,7 @@ mod tests {
             "{rows:?}"
         );
         assert!(compact.groups.is_empty(), "{:?}", compact.groups);
+
         // The branch of an agent at work takes its color
         let branch = &compact.rows[2].line.spans[0];
         assert_eq!(branch.content, "  ├ ");
@@ -1198,9 +1204,11 @@ mod tests {
             let end = render.rows.len() - 1;
             render.rows.drain(start..end).collect::<Vec<Row>>()
         };
+
         let folded = text(&titled(false));
         assert_eq!(folded.len(), MAX_TITLE_ROWS, "{folded:#?}");
         assert!(folded[1].ends_with('…'), "{folded:#?}");
+
         let expanded = titled(true);
         let rows = text(&expanded);
         assert_eq!(rows.len(), 3, "{rows:#?}");
@@ -1388,6 +1396,7 @@ mod tests {
         let mut render = Render::new(40, true);
         render.entry(&task);
         assert_eq!(render.rows.len(), 21);
+
         let short = asked(lines[..7].join("\n"));
         let mut render = Render::new(40, false);
         render.entry(&short);
@@ -1514,6 +1523,7 @@ mod tests {
         render.step(&step);
         let marks: Vec<usize> = render.rows[2..].iter().map(|row| row.mark_width).collect();
         assert_eq!(marks, [usize::MAX, usize::MAX]);
+
         let empty = Step::default();
         assert_eq!(rendered(&empty, 40, false), [""]);
     }

@@ -168,6 +168,7 @@ impl Agent {
     ) -> Helper {
         let started = Instant::now();
         let mut memory = AgentMemory::default();
+
         // One still waiting for a slot stops on an interrupt without starting a worker
         let answered = select! {
             biased;
@@ -460,6 +461,7 @@ impl Team {
                 .is_none_or(|member| !member.helper.running())
         };
         let waiting = self.until(ended);
+
         // The worker refuses negative timeouts, and one too large for a duration waits forever
         let limit = timeout.and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
         let finished = match limit {
@@ -551,6 +553,7 @@ impl Turn<'_> {
         let Place::Main { team, queue, .. } = &self.agent.place else {
             return Vec::new();
         };
+
         let unfiled = |members: &[Member]| members.iter().any(Member::unfiled);
         let ended = team.until(unfiled);
         let enqueued = queue.enqueued();
@@ -592,6 +595,7 @@ impl Turn<'_> {
                 team.until(settled).await;
             }
         }
+
         self.ended();
     }
 }
@@ -948,6 +952,7 @@ mod tests {
         };
         let calling = delegate(call);
         block_on(calling);
+
         let records = records.lock().expect("records");
         assert_eq!(records[0].end, Ending::Answer("5".to_owned()));
     }
@@ -1162,6 +1167,7 @@ mod tests {
 
         let mut memory = AgentMemory::default();
         agent.turn(&mut memory, "Split the work").expect("run");
+
         let call = ran(&memory, 1);
         let cafés = Ending::Answer("Answer: Count the cafés after 1".to_owned());
         let naïve = Ending::Answer("Answer: Spell naïve".to_owned());
@@ -1252,6 +1258,7 @@ mod tests {
         };
         watched.event(Event::Execute(0, &call));
         watched.event(Event::Output(0, &call, "3\n"));
+
         // A saved step shows the tokens so far, and one without any shows nothing new
         let counted = AgentStep {
             usage: metered(100, 20),

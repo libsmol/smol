@@ -21,6 +21,7 @@ const MAX_VIDEO_BYTES: u64 = match cfg!(test) {
     true => 64,
     false => 20 << 20,
 };
+
 /// Extension, kind and mime type
 type MediaType = (&'static str, MediaKind, &'static str);
 /// Extensions are lowercase and the first one listed for a mime type names the copies
@@ -373,6 +374,7 @@ pub(crate) mod tests {
         let resource = attach(&diagnostics, &dir, &copies);
         assert_eq!((resource.path.as_str(), resource.resource), (uri, true));
         assert_eq!(resource.content, "error: unused café");
+
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -485,6 +487,7 @@ pub(crate) mod tests {
         big.resize(65, 0);
         let refused_big = kept(&copies, &big);
         assert_eq!(refused_big, Some(Err(refused.to_owned())));
+
         // A file in the way keeps the copies directory from being created
         let blocked = dir.join("screenshot.PNG");
         let failed = kept(&blocked, &png).expect("known");

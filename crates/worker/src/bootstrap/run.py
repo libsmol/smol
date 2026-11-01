@@ -147,25 +147,28 @@ def _run(code):
             blocks = []
             source = exc.text
             column = max((exc.offset or 1) - 1, 0)
-            # Errors found only when compiling (like return outside a function) carry no source line,
-            # and their column counts UTF-8 bytes
+
+            # Errors found only when compiling, like return outside a function, carry no source line
             lines = code.split("\n")
             if source is None and exc.lineno and 0 < exc.lineno <= len(lines):
                 source = lines[exc.lineno - 1]
+                # Such an error counts its column in UTF-8 bytes
                 before = source.encode("utf-8", "surrogatepass")[:column]
                 column = len(before.decode("utf-8", "ignore"))
+
             source = (source or "").rstrip()
             padding = []
             for c in source[:column]:
-                # Wide characters take two terminal columns
-                # and tabs are copied to expand like the line above
+                # Tabs are copied to expand like the line above
                 if c == "\t":
                     padding.append(c)
+                # Wide characters take two terminal columns
                 elif _unicodedata.east_asian_width(c) in ("W", "F"):
                     padding.append("  ")
                 else:
                     padding.append(" ")
             caret = "".join(padding) + "^"
+
             # Like the error for null bytes, which belongs to no line
             if exc.lineno is None:
                 error = f"syntax error: {exc.msg}"
@@ -256,6 +259,7 @@ def _run(code):
 
     finally:
         _SHOWN = None
+
         # A pipe flushes on a thread END waits for only briefly, since a writer blocked on it holds its lock
         started = []
         for opened in list(_PIPES):
@@ -266,6 +270,7 @@ def _run(code):
             flusher.start()
             _FLUSHERS[opened] = flusher
             started.append(flusher)
+
         # Flush without closing because variables still hold them
         for opened in [*_OPEN_FILES, _sys.stdout, _sys.stderr, _STDOUT, _STDERR]:
             try:
@@ -273,6 +278,7 @@ def _run(code):
                     opened.flush()
             except Exception:
                 pass
+
         deadline = _time.monotonic() + _FLUSH_WAIT
         for flusher in started:
             left = deadline - _time.monotonic()
@@ -284,6 +290,7 @@ def _run(code):
             value = _STATE.get(name)
             if value is old:
                 continue
+
             # The full code for help() to print, from the first decorator on and with comments kept
             linenos = [part.lineno for part in [statement, *statement.decorator_list]]
             start = min(linenos)

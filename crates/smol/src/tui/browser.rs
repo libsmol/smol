@@ -59,5 +59,6 @@ pub(crate) fn open(target: impl AsRef<OsStr>) -> Result<(), String> {
     }
 
     thread::spawn(move || child.wait());
+
     Ok(())
 }

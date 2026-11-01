@@ -242,6 +242,7 @@ async fn start(opening: Opening) -> Result<Session> {
     let sandbox = Sandbox::new(&cwd, &copies, &app.config, &skills, &access, python);
     let sandbox = sandbox.map_err(Error::Python)?;
     let sandbox = Arc::new(sandbox);
+
     // No restart notice again when no code has run since the last restart
     let ran = memory.ran_code();
     let delegation = match roles.is_empty() {
@@ -661,6 +662,7 @@ fn options(
         let option = SessionConfigOption::boolean(id, label, on);
         options.push(option);
     }
+
     options
 }
 
@@ -741,6 +743,7 @@ mod tests {
                 length = value.trim().parse().unwrap_or(0);
             }
         }
+
         let mut body = vec![0; length];
         reader.read_exact(&mut body).ok();
         let body: Value = serde_json::from_slice(&body).unwrap_or_default();
@@ -847,6 +850,7 @@ mod tests {
                 .expect("ended")
                 .expect("joined")
                 .expect("served");
+
             let mut seen = self.seen;
             let rest = drained(&mut self.output);
             seen.extend(rest);
@@ -894,6 +898,7 @@ mod tests {
         let (meta, _) = stored(&dir).load(&session).expect("load");
         assert_eq!(meta.title, "Snake game");
         assert_eq!(meta.settings.name, "Snake game");
+
         // The client tells the user the session is saved only once it gets a save time
         let mut infos = Vec::new();
         for message in &seen {
@@ -1059,6 +1064,7 @@ mod tests {
         let answer = seen.iter().find(|message| message["id"] == 100);
         let stop = answer.map(|answer| &answer["result"]["stopReason"]);
         assert_eq!(stop, Some(&json!("cancelled")));
+
         let (_, memory) = stored(&dir).load(&session).expect("load");
         let mut kinds = Vec::new();
         for step in &memory.steps {
@@ -1267,6 +1273,7 @@ mod tests {
             (loaded, seen)
         };
         let (loaded, seen) = block_on(running);
+
         assert!(loaded["result"].is_object(), "{loaded}");
 
         let mut notices = Vec::new();
@@ -1321,6 +1328,7 @@ mod tests {
         let shown = tilde(&dir.join("roles.toml"));
         let skipped = format!("config: {shown}: [critic]: model: mock/gone: not in model.toml (models: mock/m1), skipped");
         assert_eq!(notices, [skipped]);
+
         let prompts = prompts.lock().expect("prompts");
         let prompt = &prompts[0];
         let header =

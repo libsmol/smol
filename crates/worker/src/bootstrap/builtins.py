@@ -12,6 +12,7 @@ from multiprocessing.reduction import ForkingPickler as _ForkingPickler
 
 _FILENAME = "<smolcode>"
 _BOOTSTRAP = (lambda: None).__code__.co_filename
+
 # pickle finds functions and classes defined in the code by module name
 _MAIN = _types.ModuleType("__main__")
 _sys.modules["__main__"] = _MAIN
@@ -162,6 +163,7 @@ def edit(path: str | _os.PathLike, old: str, new: str) -> None:
         crlf = "\n" in text and text.count("\r\n") == text.count("\n")
     if crlf:
         new = new.replace("\r\n", "\n").replace("\n", "\r\n")
+
     # Encoding must fail before the file is truncated
     edited = (text[:first.start()] + new + text[first.end():]).encode()
     with _REAL_OPEN(path, "wb") as file:
@@ -318,6 +320,7 @@ class Agent:
                 raise ValueError(f"Agent.wait: timeout must be 0 or more, not {timeout}")
             # JSON has no infinity, and waiting that long is waiting until it ends
             timeout = None if timeout == float("inf") else float(timeout)
+
         result = _asked("Agent.wait", "wait", {"id": self._id, "timeout": timeout})
         if result is None:
             return None
@@ -374,6 +377,7 @@ def agent(task: str | list[str], role: str | list[str] | None = None, *, name: s
     for at, item in enumerate(names):
         if item in names[:at]:
             raise ValueError(f"agent: name: {item}: given twice")
+
     asked = [{"task": task, "role": role, "name": name} for task, role, name in zip(tasks, roles, names)]
     handles = _asked("agent", "start", {"agents": asked})
     handles = [Agent(**handle) for handle in handles]
@@ -461,6 +465,7 @@ _MEMORY = [remember, recall, forget] if _AGENTS else [recall]
 _BUILTINS = [edit, ls, grep, fetch, view, *_MEMORY, help]
 if _AGENTS:
     _BUILTINS[-1:-1] = [agent, Agent, Agent.get, Agent.wait, Agent.status, Agent.stop]
+
 _FUNCTIONS = []
 for _function in _BUILTINS:
     _name = _function.__qualname__

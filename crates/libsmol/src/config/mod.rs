@@ -20,6 +20,7 @@ pub(crate) mod setup;
 
 /// Testing compaction shrinks the window a lot, so this only catches 0 and obvious typos
 pub(crate) const MIN_CONTEXT: u64 = 1024;
+
 /// Only the first one found in each directory is used
 const INSTRUCTION_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 const SKILL_FILE: &str = "SKILL.md";
@@ -258,6 +259,7 @@ pub(crate) fn instructions(dir: &Path, project: &Path) -> (Vec<String>, Vec<Erro
             found.push(text.to_owned());
         }
     }
+
     (found, skipped)
 }
 
@@ -311,6 +313,7 @@ pub(crate) fn skills(dir: &Path, project: &Path) -> (Vec<Skill>, Vec<Error>) {
             if !path.is_file() {
                 continue;
             }
+
             let invalid = invalid(&path);
             let text = match fs::read_to_string(&path) {
                 Ok(text) => text,
@@ -454,7 +457,8 @@ fn front_matter(text: &str) -> Option<BTreeMap<String, String>> {
         }
 
         if let Some((key, parts)) = current.take() {
-            fields.insert(key, scalar(&parts));
+            let value = scalar(&parts);
+            fields.insert(key, value);
         }
         if ended {
             return Some(fields);
@@ -464,6 +468,7 @@ fn front_matter(text: &str) -> Option<BTreeMap<String, String>> {
             current = Some((key, vec![value.trim()]));
         }
     }
+
     None
 }
 
@@ -525,6 +530,7 @@ fn scalar(parts: &[&str]) -> String {
             return quoted.replace("''", "'");
         }
     }
+
     // In an unquoted value whatever follows # is a comment
     let (plain, _) = joined.split_once(" #").unwrap_or((&joined, ""));
     plain.trim().to_owned()
@@ -903,6 +909,7 @@ models = [{ id = "m3" }]
         };
         let api = "http://127.0.0.1:1/v1";
         save_model(&dir, "über café.v2", api, tricky, &spec).expect("save");
+
         let read = models(&dir).expect("load");
         assert_eq!(read.names(), ["über café.v2/piñata-2"]);
         let built = read.make("über café.v2/piñata-2").expect("make");
@@ -920,6 +927,7 @@ models = [{ id = "m3" }]
             ..ModelSpec::default()
         };
         save_model(&dir, "local-1", api, "", &spec).expect("save");
+
         let text = fs::read_to_string(&path).expect("read");
         let expected = "[model.local-1]\ntype = \"openai-completions\"\napi = \"http://127.0.0.1:1/v1\"\napi_key = \"none\"\nmodels = [{ id = \"qwen3:32b\" }]\n";
         assert_eq!(text, expected);
@@ -974,6 +982,7 @@ models = [{ id = "m3" }]
             found.retain(|text| written.contains(&text.as_str()));
             found
         };
+
         assert_eq!(read(&global, &project), expected);
         assert_eq!(read(&global, &global), expected[..1]);
         assert_eq!(read(&project, &project), [expected[2], expected[1]]);
@@ -1041,6 +1050,7 @@ models = [{ id = "m3" }]
             ),
             skill("weekly", "Write the weekly report", &weekly),
         ];
+
         let (mut found, skipped) = skills(&global, &project);
         // Ignore anything above the temp directory
         found.retain(|skill| skill.path.starts_with(&dir));
@@ -1110,6 +1120,7 @@ models = [{ id = "m3" }]
         let broken = write(project.join(".smol"), "[résumé\n");
 
         let (found, skipped) = roles(&global, &project, &read);
+
         let mut listed = Vec::new();
         for role in &found {
             let window = role.model.as_ref().and_then(|model| model.context_window());
@@ -1148,6 +1159,7 @@ models = [{ id = "m3" }]
             [mcp.web]\ntype = \"http\"\nurl = \"http://127.0.0.1:1/mcp\"\nenabled = false\ndescription = \"Search the web\"\n";
         fs::write(dir.join("agent.toml"), text).expect("write");
         let (read, _) = agent(&dir).expect("servers");
+
         let http = McpKind::Http {
             url: "http://127.0.0.1:1/mcp".to_owned(),
             headers: BTreeMap::new(),
@@ -1221,6 +1233,7 @@ models = [{ id = "m3" }]
         );
         fs::write(dir.join("agent.toml"), text).expect("write");
         let (_, access) = agent(&dir).expect("access");
+
         let expected = Access {
             env: vec!["GITHUB_TOKEN".to_owned()],
             write: vec![home.join(".npm"), PathBuf::from(absolute)],

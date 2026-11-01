@@ -12,6 +12,7 @@ pub const CONTROL_ENV: &str = "SMOL_CONTROL";
 pub const COPIES_ENV: &str = "SMOL_COPIES";
 /// Holds `on`, or `roles` when `agent()` takes a role, and is unset for workers without `agent()`
 pub const AGENTS_ENV: &str = "SMOL_AGENTS";
+
 pub const END: &[u8] = b"\x02smol\x03end\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

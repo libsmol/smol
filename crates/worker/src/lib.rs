@@ -55,11 +55,13 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     let control: String = taken(&environ, CONTROL_ENV)?.extract()?;
     let copies: OsString = taken(&environ, COPIES_ENV)?.extract()?;
     let agents: String = taken(&environ, AGENTS_ENV)?.extract()?;
+
     // Python leaves SIGINT ignored when libsmol was started with it ignored, and no interrupt would land
     let signal = py.import("signal")?;
     let sigint = signal.getattr("SIGINT")?;
     let handler = signal.getattr("default_int_handler")?;
     signal.call_method1("signal", (sigint, handler))?;
+
     // Taken before site runs the venv's .pth files, which could change it
     let cwd = env::current_dir().unwrap_or_default();
 
@@ -146,6 +148,7 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
         let Some(message) = py.detach(|| block_on(receiving)) else {
             return Ok(());
         };
+
         // An interrupt that arrived after the previous snippet finished isn't for this one
         py.check_signals().ok();
         let (id, call) = match message {
@@ -217,6 +220,7 @@ fn repair(py: Python<'_>, python: OsString) -> PyResult<()> {
         py.import("subprocess")?.call_method1("run", (removing,))?;
         making.call1(([&venv],))?;
     }
+
     Ok(())
 }
 
@@ -253,8 +257,9 @@ fn listen(stream: TcpStream, queue: UnboundedSender<ToWorker>) {
             }
         }
     }
-    // The agent hung up, and the running code need not finish
-    // SAFETY: Ends the process at once, without running C extensions' cleanup under the code
+
+    // SAFETY: The agent hung up, so the process ends at once
+    // without waiting for the code or running C extensions' cleanup under it
     unsafe { libc::_exit(0) }
 }
 

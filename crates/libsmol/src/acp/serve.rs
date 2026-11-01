@@ -125,6 +125,7 @@ pub fn run() -> Result<()> {
 
     info!("agent: exited [pid={pid}]");
     reaper::kill_all();
+
     ended
 }
 
@@ -352,6 +353,7 @@ impl Router {
                     let closing = old.close();
                     self.closing.insert(session, closing);
                 }
+
                 let response = CloseSessionResponse::new();
                 Some(to_value(response))
             }
@@ -423,6 +425,7 @@ impl Router {
             task,
         };
         self.sessions.insert(session, handle);
+
         Ok(())
     }
 
@@ -640,6 +643,7 @@ mod tests {
         let params = json!({"cwd": r"c:\users\éloïse\PROJECT"});
         let listed = router.request(&json!(1), "session/list", params);
         let listed = listed.expect("list").expect("result");
+
         assert_eq!(
             listed["sessions"].as_array().map(Vec::len),
             Some(1),

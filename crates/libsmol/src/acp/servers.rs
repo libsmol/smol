@@ -95,6 +95,7 @@ impl McpPool {
                 pool.connect(index, None);
             }
         }
+
         pool
     }
 
@@ -144,6 +145,7 @@ impl McpPool {
             false => info!("mcp[{name}]: turned off"),
         }
         self.report();
+
         &self.servers[index].config
     }
 
@@ -171,6 +173,7 @@ impl McpPool {
                     }
                     Err(error) => Err(error),
                 };
+
                 let name = &self.servers[index].config.name;
                 let state = match added {
                     Ok(added) => {

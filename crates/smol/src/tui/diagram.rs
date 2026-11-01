@@ -37,6 +37,7 @@ pub(crate) fn page(code: &str) -> Result<PathBuf, String> {
         None => env::temp_dir(),
     };
     let path = dir.join(name);
+
     let html = format!(
         "<!doctype html>\n<meta charset=\"utf-8\">\n<title>diagram</title>\n<body style=\"margin: 16px; background: #fff\">\n{svg}\n</body>\n"
     );
@@ -45,6 +46,7 @@ pub(crate) fn page(code: &str) -> Result<PathBuf, String> {
         format!("diagram: {}: {reason}", path.display())
     };
     fs::write(&path, html).map_err(failed)?;
+
     Ok(path)
 }
 

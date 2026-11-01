@@ -184,6 +184,7 @@ impl Worker {
 
         let prepared = python::command(&self.sandbox).await;
         let mut command = prepared.map_err(|reason| prompt::unstarted(&reason))?;
+
         let failed = |e: io::Error| {
             let reason = cause(&e);
             prompt::unstarted(&reason)
@@ -192,6 +193,7 @@ impl Worker {
         let address = listener.local_addr().map_err(failed)?;
         let token = new_id();
         let control = format!("{address}/{token}");
+
         command
             .env(CONTROL_ENV, control)
             .env(COPIES_ENV, &self.sandbox.copies)
@@ -284,6 +286,7 @@ impl Worker {
         }
         self.functions = functions;
         self.live = Some(live);
+
         Ok(())
     }
 
@@ -343,6 +346,7 @@ impl Worker {
         live.running.clear();
         live.media.clear();
         live.output = Clip::new(KEPT_BYTES);
+
         let run = HostCall::Run {
             code: code.to_owned(),
         };
@@ -503,6 +507,7 @@ impl Worker {
                 output.error = Some(CallError::Interrupted);
             }
         }
+
         Ok(output)
     }
 }
@@ -711,6 +716,7 @@ pub(crate) mod tests {
             restarted,
         );
         let worker = block_on(building).expect("worker");
+
         let value = Tried {
             worker,
             servers: Vec::new(),
@@ -862,6 +868,7 @@ pub(crate) mod tests {
             try:\n    deep(10 ** 4)\nexcept RecursionError:\n    print('too deep')\n\
             sys.setrecursionlimit(10 ** 6)\nprint(deep(50000))";
         let output = run(code);
+
         assert_eq!(output.error, None);
         assert_eq!(output.logs, "too deep\n50000\n");
     }
@@ -1172,6 +1179,7 @@ pub(crate) mod tests {
             os.mkdir('subdir')\nos.chdir('subdir')\nview('../screenshot.png')";
         let output = worker.eval(code);
         assert_eq!(output.error, None);
+
         let mut seen = Vec::new();
         for (path, media) in &output.media {
             let copy = copies.join(&media.file);
@@ -1182,6 +1190,7 @@ pub(crate) mod tests {
         let first = ("screenshot.png", "first".to_owned());
         let second = ("screenshot.png", "second".to_owned());
         assert_eq!(seen, [first, second]);
+
         let next = worker.eval("1");
         assert!(next.media.is_empty());
         fs::remove_dir_all(&dir).ok();
@@ -1366,7 +1375,7 @@ pub(crate) mod tests {
 
         let expected =
             "['TypeError: Agent: id must be int, not str', 'ValueError: Agent: no such agent', \
-                        'ValueError: Agent: no such agent']\n";
+             'ValueError: Agent: no such agent']\n";
         assert_eq!(output.logs, expected);
     }
 
@@ -1560,6 +1569,7 @@ pub(crate) mod tests {
         );
 
         let output = run(&code);
+
         assert_eq!(output.logs, "[]\n");
     }
 
@@ -1949,7 +1959,7 @@ pub(crate) mod tests {
 
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut worker = build(Interrupt::default(), cwd, Delegation::Roles);
-        let roled ="agent(task: str | list[str], role: str | list[str] | None = None, *, name: str | list[str] | None = None) -> str | list[str | RuntimeError] | Agent | list[Agent]";
+        let roled = "agent(task: str | list[str], role: str | list[str] | None = None, *, name: str | list[str] | None = None) -> str | list[str | RuntimeError] | Agent | list[Agent]";
         assert_eq!(header(&worker), roled);
         worker.delegate = Box::new(answering);
         let code = "print(agent('café', role='critic'))\n\
@@ -2008,6 +2018,7 @@ pub(crate) mod tests {
             threading.Thread(target=agent, args=('Count the cafés',), daemon=True).start()\n\
             time.sleep(0.5)";
         let output = worker.eval(code);
+
         assert_eq!(output.error, None, "{}", output.logs);
         assert!(dropped.load(Ordering::SeqCst));
     }
@@ -2034,6 +2045,7 @@ pub(crate) mod tests {
 
         cancel_soon(&interrupt, 0);
         let output = worker.eval("agent('Read the café menu')");
+
         assert_eq!(output.error, Some(CallError::Interrupted));
         assert!(finished.load(Ordering::SeqCst));
     }
@@ -2119,6 +2131,7 @@ pub(crate) mod tests {
         let empty = Brief::default();
         let none = Listed::default();
         let text = system(&[], &servers, &empty, &none, cwd, None, &main);
+
         let listed = "\n\n## MCP `news_web`\n\nSearches the web and the news\n\nRead-only\n\n\
                       ```python\nnews_web.echo_text(the_text: str = None) -> str\n```\n\n\
                       ## MCP `notes`\n\n\
@@ -2502,6 +2515,7 @@ pub(crate) mod tests {
             print(subprocess.run(['echo', 'café'], capture_output=True, text=True).stdout, end='')\n\
             print('before', flush=True)\n_ = os.system('echo direct')\nprint('after')";
         let output = run(code);
+
         assert_eq!(output.error, None);
         assert_eq!(output.logs, "café\nbefore\ndirect\nafter\n");
     }

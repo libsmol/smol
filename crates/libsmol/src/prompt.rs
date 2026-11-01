@@ -31,6 +31,7 @@ const SHOWN: &str = " Text you write in a reply that runs code is shown to the u
 const UPDATES: &str =
     "A user message that starts with `Task update:` adds to or changes the current task.";
 const HANDED_BACK: &str = "Only your answer is returned to the agent that assigned this task, so include everything the task asks for.";
+
 /// Errors of `agent()` and its handles go unlabeled, as the worker labels them with the function
 /// the code called
 pub(crate) const NESTED: &str = "not available to agents started by agent()";
@@ -185,6 +186,7 @@ pub(crate) fn system(
             &[][..],
         ),
     };
+
     let mut entries = Vec::new();
     for role in roles {
         let entry = format!("- `{}`: {}", role.name, role.description);
@@ -220,6 +222,7 @@ pub(crate) fn system(
         ),
         Place::Delegated(_) => String::new(),
     };
+
     let role = match place.role() {
         Some(role) => format!(
             "\n\n# Role\n\nYour role is `{}`: {}",
@@ -293,6 +296,7 @@ pub(crate) fn system(
             format!("\n\n# Memories\n\n{kept}")
         }
     };
+
     let remembering = functions.iter().any(|function| function.name == "remember");
     let rules = match remembering {
         true => format!("{RULES}\n{REMEMBERING}"),
@@ -854,6 +858,7 @@ mod tests {
 
         let main = main_place(Vec::new());
         let text = system(&functions, &[], &brief, &none, cwd, None, &main);
+
         let built_in = "## Built-in\n\n```python\n\
                         ls(path) -> list[str]\n    # Sorted paths.\n    # The café/ folder ends with /.\n\n\
                         help(request) -> None\n    # Prints the docs.\n```\n\n# Skills";
@@ -888,6 +893,7 @@ mod tests {
         assert!(!plain.contains("remember()"), "{plain}");
         let sandbox = "right away.\n- Your code runs in a sandbox: writing outside `/home/zoë/work`, the venv and `$TMPDIR`, ";
         assert!(plain.contains(sandbox), "{plain}");
+
         let registry = [PathBuf::from("/home/zoë/.cargo/registry")];
         let allowed = system(&[], &[], &empty, &none, cwd, Some(&registry), &main);
         let sandbox =
@@ -924,6 +930,7 @@ mod tests {
                        This folder has 12 memories of its own from earlier sessions; \
                        before you start a task, search them with `recall()` for what it is about.\n\n# Rules\n\n";
         assert!(text.contains(section), "{text}");
+
         let more = Listed {
             newest,
             global: 14,
@@ -1039,6 +1046,7 @@ mod tests {
         let unrun = call_error(&step, &written);
         let expected = "Error:\ninterrupted by the user before the code ran";
         assert_eq!(unrun.as_deref(), Some(expected));
+
         let failed = AgentStep {
             error: None,
             ..step

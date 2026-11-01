@@ -13,11 +13,13 @@ use tracing::info;
 
 /// In the config directory, which the sandbox hides from the code
 const DB: &str = "memory.db";
+
 /// The worker puts it in the docs of `remember()`
 pub const MAX_MEMORY_CHARS: usize = 300;
 /// SQLite takes integers as `i64`, and the worker puts it in the docs of `recall()`
 pub const MAX_RECALLED: i64 = 10;
 const MAX_LISTED: i64 = 10;
+
 const BUSY_WAIT: Duration = Duration::from_secs(5);
 /// Made in one write transaction, since sessions of several libsmol may open a new database at once
 const SCHEMA: &str = "BEGIN IMMEDIATE;
@@ -100,6 +102,7 @@ impl Memories {
             )?;
             let rows = newest.query_map([MAX_LISTED], pair)?;
             let newest = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
             let (global, here): (i64, i64) = connection.query_row(
                 "SELECT count(*) FILTER (WHERE folder IS NULL), count(*) FILTER (WHERE folder = ?1) \
                  FROM memories",
@@ -376,6 +379,7 @@ mod tests {
             (ids, theirs.expect("remember"), shared.expect("remember"))
         };
         let (ids, theirs, shared) = block_on(saving);
+
         let found = |query: &str| {
             let recalling = here.recall(query);
             let recalled = block_on(recalling).expect("recall");

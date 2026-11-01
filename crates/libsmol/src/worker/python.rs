@@ -51,6 +51,7 @@ const BUILDS: [(&str, &str); 5] = [
     ),
 ];
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Holds the runtimes, the worker modules, the venvs and their locks in the config directory
 const STORE: &str = "runtime";
 /// Holds a folder of venvs for each runtime in the store
@@ -59,9 +60,11 @@ const VENVS: &str = "venvs";
 const STORE_LOCK: &str = "lock";
 /// Without long paths Windows refuses paths over 260 characters, and packages nest deep in a venv
 const MAX_NAME_CHARS: usize = 16;
+
 const DOWNLOAD_WAIT: Duration = Duration::from_secs(30);
 /// How long a runtime, a module or the venv of a directory that is gone stays unused before it is removed
 const MIN_IDLE: Duration = Duration::from_hours(7 * 24);
+
 #[cfg(unix)]
 const HOME_BIN: &str = "bin";
 #[cfg(windows)]
@@ -84,6 +87,7 @@ const PIP: &str = "pip.exe";
 const SITE: &str = "lib/python3.14/site-packages";
 #[cfg(windows)]
 const SITE: &str = "Lib/site-packages";
+
 /// Loads the worker module from `sys.argv[1]` whatever its file name,
 /// and calls the function named in `sys.argv[2]` with the venv's interpreter
 const LOADER: &str = "import sys
@@ -129,6 +133,7 @@ impl Runtime {
             format!("{shown}: {reason}")
         };
         fs::create_dir_all(&store).map_err(failed)?;
+
         // Taken before looking, which waits out a removal under way
         let home_held = held(&home, "").await?;
         let module_held = held(&module, "").await?;
@@ -157,6 +162,7 @@ impl Runtime {
         let _lock = locked(&store).await?;
         let builder = Client::builder().read_timeout(DOWNLOAD_WAIT);
         let client = http_client(builder)?;
+
         if !home.exists() {
             info!("python: downloading runtime [version={PYTHON}+{RELEASE}]");
             let name = format!("cpython-{PYTHON}+{RELEASE}-{target}-install_only_stripped.tar.gz");
@@ -208,6 +214,7 @@ impl Runtime {
                 let shown = module.display();
                 return Err(format!("{shown}: not built"));
             }
+
             info!("python: downloading worker module [version={VERSION}]");
             let base = format!("https://github.com/libsmol/smol/releases/download/v{VERSION}");
             let url = format!("{base}/SHA256SUMS");
@@ -267,6 +274,7 @@ impl Python {
             format!("{shown}: {reason}")
         };
         fs::create_dir_all(venvs).map_err(failed)?;
+
         // A working directory that isn't UTF-8 can't be named, and its venv stays
         let record = cwd.to_str().unwrap_or_default();
         let hold = held(&venv, record).await?;
@@ -320,6 +328,7 @@ pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
                 format!("{shown}: {reason}")
             };
             let (mut group, mut pieces) = Group::start(repairing).map_err(failed)?;
+
             let mut output = Clip::new(KEPT_BYTES);
             // Read while it runs, since a full pipe would stall it
             let exit = loop {
@@ -416,15 +425,15 @@ fn venv_name(cwd: &Path) -> String {
 }
 
 /// Removes the runtimes and modules no session used for `MIN_IDLE`, with each runtime's venvs,
-/// and what stopped installs left.
-/// Lock files stay, since another session may be about to lock the one it opened
+/// and what stopped installs left
 fn sweep_store(store: &Path, current: &[PathBuf], venvs: &Path) {
     let Ok(entries) = fs::read_dir(store) else {
         return;
     };
-    // Every install holds it, so a dot name found while it is free is what a stopped install left.
+
     // Held through the sweep, or an install that starts meanwhile would lose its folder
     let store_lock = File::options().write(true).open(store.join(STORE_LOCK));
+    // Every install holds it, so a dot name found while it is free is what a stopped install left
     let installing = match &store_lock {
         Ok(file) => file.try_lock().is_err(),
         Err(_) => true,
@@ -437,18 +446,20 @@ fn sweep_store(store: &Path, current: &[PathBuf], venvs: &Path) {
         let dotted = name.starts_with('.');
         // What a later version keeps here is not this one's to remove
         let known = runtime || dotted || name.starts_with("worker-");
+        // A lock file stays, since another session may be about to lock the one it opened
         if !known || current.contains(&path) || name.ends_with(".lock") {
             continue;
         }
+
         let locking = lock_of(&path);
+        // Kept locked until the removal is done
         let lock = File::options().write(true).open(locking);
-        // Kept locked until the removal is done.
-        // What no session ever held has none, like what an install that stopped left
         let used = match &lock {
             Ok(file) => match file.try_lock() {
                 Ok(()) => file.metadata(),
                 Err(_) => continue,
             },
+            // What no session ever held has none, like what an install that stopped left
             Err(e) if e.kind() == io::ErrorKind::NotFound => entry.metadata(),
             Err(_) => continue,
         };
@@ -486,12 +497,14 @@ fn sweep_venvs(venvs: &Path, own: &Path) {
         if lock == own || !locking {
             continue;
         }
+
         let recorded = fs::read_to_string(&lock).unwrap_or_default();
         // One that can't be looked up now is not gone
         let looked = Path::new(&recorded).try_exists();
         if recorded.is_empty() || !matches!(looked, Ok(false)) {
             continue;
         }
+
         let Ok(file) = File::open(&lock) else {
             continue;
         };

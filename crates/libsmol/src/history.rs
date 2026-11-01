@@ -134,6 +134,7 @@ impl HistoryStore {
                 _ => {}
             }
         }
+
         let name = &meta.settings.name;
         meta.title = match (name.is_empty(), tasked.or(typed)) {
             (false, _) => name.clone(),
@@ -435,6 +436,7 @@ pub(crate) mod tests {
             let refused = store.lock(id).expect_err("invalid").to_string();
             assert_eq!(refused, expected);
         }
+
         drop(held);
         assert_eq!(dir.join("s1.lock").exists(), cfg!(windows));
         let again = store.lock("s1").expect("relock");

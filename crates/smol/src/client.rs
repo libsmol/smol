@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 
 const EXITED: &str = "agent: exited";
+
 const QUEUED: &str = "_smol/queued";
 const ENQUEUED: &str = "_smol/enqueued";
 const NOTICE: &str = "_smol/notice";
@@ -42,10 +43,12 @@ pub(crate) const UPDATE: &str = "_smol/update";
 pub(crate) const SHELL: &str = "_smol/shell";
 /// Marks the tool calls of agents the code starts
 pub(crate) const AGENT: &str = "_smol/agent";
+
 const MAX_STDERR_LINES: usize = 20;
 const STDERR_WAIT: Duration = Duration::from_millis(200);
 /// The agent needs time to finish saving the cancelled turn
 const EXIT_WAIT: Duration = Duration::from_secs(5);
+
 const INVALID_PARAMS: i64 = -32602;
 const METHOD_NOT_FOUND: i64 = -32601;
 const AUTH_REQUIRED: i64 = -32000;
@@ -572,7 +575,6 @@ impl Client {
     pub(crate) fn prompt(&self, session: &str, blocks: Vec<ContentBlock>) {
         let session = session.to_owned();
         let request = PromptRequest::new(session, blocks);
-
         let method = AGENT_METHOD_NAMES.session_prompt;
         self.start_turn(method, request);
     }

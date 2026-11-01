@@ -197,6 +197,7 @@ fn resume(pid: u32) -> io::Result<()> {
         // SAFETY: Keeps reading the same snapshot
         more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
     }
+
     // SAFETY: The snapshot is no longer used
     unsafe { CloseHandle(snapshot) };
 

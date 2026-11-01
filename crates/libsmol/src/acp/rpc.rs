@@ -118,6 +118,7 @@ impl Peer {
             Notice::Unsaved => (None, false, true),
         };
         let retry_in = retry_in.map(|wait| wait.as_secs_f64());
+
         let params = json!({
             "sessionId": session,
             "text": text,

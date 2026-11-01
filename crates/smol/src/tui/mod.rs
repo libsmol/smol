@@ -27,6 +27,7 @@ mod ui;
 const POLL_EVERY: Duration = Duration::from_millis(30);
 /// Keys buffered after this long without reading events may have been typed during a stall
 const STALL_WAIT: Duration = Duration::from_millis(200);
+
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 pub(crate) const SPIN_EVERY: Duration = Duration::from_millis(80);
 
@@ -182,6 +183,7 @@ pub(crate) fn run(
                 }
             }
         }
+
         app.pump();
     }
 
@@ -189,6 +191,7 @@ pub(crate) fn run(
     if let Some(line) = app.session.parting() {
         println!("{line}");
     }
+
     Ok(())
 }
 

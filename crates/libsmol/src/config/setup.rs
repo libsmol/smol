@@ -159,6 +159,7 @@ pub fn run() -> Result<()> {
     config::save_model(&dir, &name, &api, &key, &spec)?;
     eprintln!("Wrote {shown}, edit it to add models or set max_tokens, effort, image and video");
     prepare(&dir);
+
     Ok(())
 }
 

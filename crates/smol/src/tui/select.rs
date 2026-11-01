@@ -75,6 +75,7 @@ impl Selection {
     /// A word split by a soft wrap (an empty joint) continues into the rows above and below
     pub(crate) fn word(rows: Rows, point: Point) -> Option<Self> {
         rows.get(point.row)?;
+
         let glued = |index| {
             rows.get(index)
                 .is_some_and(|row| row.joint.as_deref() == Some(""))

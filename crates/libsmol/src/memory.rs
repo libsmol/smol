@@ -416,6 +416,7 @@ impl AgentMemory {
                 attached.extend(media);
             }
         }
+
         // A batch at a time keeps the prompt cache matching until the next batch goes
         let dropped = attached.len().saturating_sub(KEPT_MEDIA) / KEPT_MEDIA * KEPT_MEDIA;
         for part in attached.into_iter().take(dropped) {

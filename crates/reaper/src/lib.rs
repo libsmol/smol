@@ -299,6 +299,7 @@ mod tests {
             ("\rstart\r\r", "start"),
             ("plain\ntwo lines", "plain\ntwo lines"),
         ];
+
         for (text, expected) in cases {
             assert_eq!(terminal_view(text), expected, "{text:?}");
         }

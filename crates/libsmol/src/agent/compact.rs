@@ -174,8 +174,8 @@ impl Turn<'_> {
         };
         summary.used = Some(used);
         self.sink.event(Event::CompactEnd(Ok(summary)));
-
         self.sink.saved(self.memory);
+
         Ok(())
     }
 }
@@ -183,6 +183,7 @@ impl Turn<'_> {
 /// Always returns a transcript however long, cutting observations first and then the middle
 fn squeezed(steps: &[&MemoryStep], window: u64) -> String {
     let budget = (window as f64 * MAX_TRANSCRIPT_SHARE) as u64;
+
     // Stored observations are already cut and a second cut would lose their count,
     // so try them as they are
     let mut max = usize::MAX;

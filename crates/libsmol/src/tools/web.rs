@@ -42,6 +42,7 @@ pub async fn fetch(url: &str) -> Result<String, ToolError> {
             return Err(ToolError::Failed(message));
         }
     };
+
     let mut target = url.to_owned();
     let mut hops = 0;
     loop {
@@ -49,6 +50,7 @@ pub async fn fetch(url: &str) -> Result<String, ToolError> {
             let message = prompt::failure("fetch", url, prompt::TOO_MANY_REDIRECTS);
             return Err(ToolError::Failed(message));
         }
+
         let sent = client.get(&target).send().await;
         let mut response = sent.map_err(|e| failed(url, e))?;
         let base = response.url().clone();
@@ -74,7 +76,6 @@ pub async fn fetch(url: &str) -> Result<String, ToolError> {
         let html = matches!(mime.as_str(), "" | "text/html" | "application/xhtml+xml");
 
         if !status.is_success() {
-            let code = status.as_u16();
             // An error body may stream forever and only its start is read
             let mut body = Vec::new();
             while body.len() < MAX_EXCERPT_BYTES {
@@ -95,6 +96,7 @@ pub async fn fetch(url: &str) -> Result<String, ToolError> {
             };
             let said = excerpt(&body);
 
+            let code = status.as_u16();
             let reason = prompt::http_status(code, &said);
             let message = prompt::failure("fetch", url, &reason);
             return Err(ToolError::Failed(message));

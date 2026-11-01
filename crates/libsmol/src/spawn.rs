@@ -219,6 +219,7 @@ impl Clip {
         if pushed == self.reported {
             return None;
         }
+
         self.reported = pushed;
         let text = self.shown(max);
         Some(text)
@@ -432,6 +433,7 @@ mod tests {
         let interrupt = Interrupt::default();
         let line = "echo café; echo naïve >&2; echo résumé; pwd; exit 3";
         let (ran, _) = shelled(&dir, line, &interrupt);
+
         assert_eq!(ran.end, Exit::Exited(3));
         // `pwd` prints the physical path, and the macOS temp directory sits behind a symlink
         let real = fs::canonicalize(&dir).expect("canonical");
@@ -455,6 +457,7 @@ mod tests {
         let interrupt = Interrupt::default();
         let line = "echo café& (echo naïve)1>&2& echo résumé& cd& exit /b 3";
         let (ran, _) = shelled(&dir, line, &interrupt);
+
         assert_eq!(ran.end, Exit::Exited(3));
         let expected = format!("café\nnaïve\nrésumé\n{}\n", dir.display());
         assert_eq!(ran.output, expected);
@@ -481,6 +484,7 @@ mod tests {
         let started = Instant::now();
         let running = spawn_shell(line, &cwd, &interrupt, &mut shown);
         let (ran, left) = block_on(running);
+
         assert_eq!(ran.end, Exit::Interrupted);
         assert_eq!(ran.output.trim(), "first\nlast");
         assert!(started.elapsed() < Duration::from_secs(15));

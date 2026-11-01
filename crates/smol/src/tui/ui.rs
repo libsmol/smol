@@ -18,8 +18,10 @@ const SIDEBAR_WIDTH: u16 = 32;
 const MIN_WIDE_SCREEN: u16 = 100;
 const MAX_INPUT_ROWS: usize = 10;
 const MAX_CHOICE_ROWS: usize = 10;
+
 const PINK: Style = Style::new().fg(theme::PINK);
 const GREEN: Style = Style::new().fg(theme::GREEN);
+
 const QUEUED: &str = " · queued";
 const LOGO: [&str; 2] = ["▄▀▀ ▄▀▄▀▄ ▄▀▄ █ ", "▄▄▀ █ █ █ ▀▄▀ █▄"];
 
@@ -77,6 +79,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             };
             usage += &format!(" · context {share}");
         }
+
         let working = app.transcript.helping();
         let mut agents = Vec::new();
         if working > 0 {
@@ -160,6 +163,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             context,
             bar,
         ];
+
         // The progress line already counts the agents at work, and both don't fit here
         let helped = stats.agent_input + stats.agent_output > 0;
         let working = app.transcript.helping();
@@ -1008,6 +1012,7 @@ mod tests {
             .status(ToolCallStatus::InProgress)
             .content(vec![code]);
         app.transcript.update(&SessionUpdate::ToolCall(running));
+
         let tasks = [
             "Review prices.py",
             "Review names.py",
@@ -1024,6 +1029,7 @@ mod tests {
                 .meta(meta.as_object().cloned());
             app.transcript.update(&SessionUpdate::ToolCall(opened));
         }
+
         let marked = json!({});
         let preview = "prices = load('prices.csv')\nprint(prices[:3])\nprint(total(prices))\nprint(sum(prices))\nprint('café', len(prices))";
         helper_update(
@@ -1068,6 +1074,7 @@ mod tests {
             "╰ agents · 1 running · 1 queued · 1 done · 1 failed · 1 interrupted · ⇡1.2k ⇣340";
         assert!(wide.contains(header), "{wide}");
         assert!(!wide.contains('✓'), "{wide}");
+
         // Only the conversation panel, without its borders or the sidebar
         let mut panel = Vec::new();
         for row in &rows {
@@ -1075,6 +1082,7 @@ mod tests {
             let inside = inside.strip_prefix('│').unwrap_or(inside);
             panel.push(inside.trim_end().to_owned());
         }
+
         // Ended agents keep a row, or two when they failed,
         // and a running one shows the end of its work above its status
         let group = [
@@ -1133,6 +1141,7 @@ mod tests {
             expanded[stats + 2].contains("✗ Review dates.py"),
             "{expanded:#?}"
         );
+
         let narrow = screen(&mut app, 80, 20);
         assert!(
             narrow[0].contains(" · agents 2 working · ⇡1.2k ⇣340 "),

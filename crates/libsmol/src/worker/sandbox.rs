@@ -31,12 +31,14 @@ use tracing::warn;
 const TEMP_PREFIX: &str = "smol-";
 /// The sandbox holds a lock on this file in its temporary folder while it lives
 const LOCK: &str = "lock";
+
 /// `LANDLOCK_CREATE_RULESET_VERSION`, which libc doesn't define
 #[cfg(target_os = "linux")]
 const LANDLOCK_VERSION: libc::c_uint = 1;
 /// Applies a profile and starts a program under it, by full path since `PATH` leads to the venv first
 #[cfg(target_os = "macos")]
 const SEATBELT: &str = "/usr/bin/sandbox-exec";
+
 /// Relative to the home folder
 const CREDENTIALS: &[&str] = &[
     ".ssh",
@@ -61,6 +63,7 @@ const CREDENTIALS: &[&str] = &[
     ".claude.json",
     ".codex",
 ];
+
 #[cfg(unix)]
 const PASSED_ENV: &[&str] = &[
     "HOME", "USER", "LOGNAME", "PATH", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
@@ -137,6 +140,7 @@ impl Sandbox {
             format!("{shown}: {reason}")
         };
         fs::create_dir_all(&scratch).map_err(|e| failed(&scratch, e))?;
+
         // Dropping it when a step below fails removes the temporary folder
         let mut sandbox = Self {
             cwd: cwd.to_owned(),
@@ -152,6 +156,7 @@ impl Sandbox {
         let lock = File::create(&path).map_err(|e| failed(&path, e))?;
         lock.lock().map_err(|e| failed(&path, e))?;
         sandbox.lock = Some(lock);
+
         // A Landlock rule holds on to the folder that exists when the rule is made.
         // An earlier session's code may have swapped one for a link, which the grant would follow
         let python = &sandbox.python;
@@ -206,6 +211,7 @@ impl Sandbox {
                 sandbox.writable.push(path.clone());
             }
         }
+
         // Links resolve before the kernel checks a path, so rules compare real paths
         let mut real = Vec::new();
         for (path, write) in granted {
@@ -236,6 +242,7 @@ impl Sandbox {
                 .env
                 .insert(0, (OsString::from(PIP_CACHE_ENV), cache));
         }
+
         Ok(sandbox)
     }
 
@@ -284,6 +291,7 @@ impl Sandbox {
                 });
             }
         }
+
         command
     }
 }
@@ -357,6 +365,7 @@ fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation
         (Some(_), Some(open)) => info!("sandbox: enforced (landlock), {open} open [abi={version}]"),
         (None, _) => info!("sandbox: not enforced, landlock unavailable"),
     }
+
     ruleset
 }
 
@@ -453,6 +462,7 @@ fn profile(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> String {
             "subpath",
         ));
     }
+
     // A rule follows the path, so a folder above a hidden one must stay where it is
     let mut above = BTreeSet::new();
     for path in hidden {
@@ -627,6 +637,7 @@ pub(crate) mod tests {
             restarted,
         );
         let mut worker = block_on(starting).expect("worker");
+
         let mut ignore = |_: &str| {};
         let mut none = no_agents;
         let evaluating = worker.evaluate(code, &[], &mut ignore, &mut none);

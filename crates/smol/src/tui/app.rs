@@ -21,13 +21,16 @@ use std::time::{Duration, Instant};
 const FLASH_WAIT: Duration = Duration::from_secs(2);
 const DOUBLE_CLICK_WAIT: Duration = Duration::from_millis(500);
 const ANIMATE_EVERY: Duration = Duration::from_millis(100);
+
 const RESUME_PREFIX: &str = ":resume ";
 const MODEL_PREFIX: &str = ":model ";
 const MCP_PREFIX: &str = ":mcp ";
 const SHELL_USAGE: &str = "!<command>";
+
 const MAX_UNFOLDED_LINES: usize = 5;
 /// On Windows, characters typed with AltGr carry Ctrl and Alt
 const ALTGR: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::ALT);
+
 /// Keeps typing @ responsive even in the home directory
 const MAX_PATHS: usize = 20_000;
 const MAX_MATCHES: usize = 200;
@@ -1004,6 +1007,7 @@ impl App {
         self.input = input_box(&text);
         self.input_top = 0;
         jump(&mut self.input, cursor);
+
         true
     }
 

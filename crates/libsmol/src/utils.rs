@@ -22,6 +22,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{oneshot, watch};
 
 const MAX_EXCERPT_CHARS: usize = 300;
+
 /// The read timeout starts when the request is sent,
 /// so only a shorter connect wait reports an unreachable host as a connect failure
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
