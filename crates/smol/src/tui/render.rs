@@ -1,5 +1,6 @@
 use crate::tui::highlight;
 use crate::tui::markdown::{self, Block, Text, LINK};
+use crate::tui::picture::{self, Source};
 use crate::tui::transcript::{Call, Entry, Group, Helper, Item, Retry, State, Step};
 use crate::tui::{
     clipped, in_out, joined, spinner, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG,
@@ -8,6 +9,7 @@ use pulldown_cmark::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
@@ -130,6 +132,8 @@ pub(crate) struct Row {
     pub(crate) fill: Option<Color>,
     /// What opens in the browser when these columns are clicked
     pub(crate) targets: Vec<(Range<usize>, Target)>,
+    /// A spinner drawn at this column when the row is, because cached rows are not drawn again
+    pub(crate) spin: Option<(usize, Instant)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,11 +141,15 @@ pub(crate) enum Target {
     Url(String),
     /// Mermaid source, drawn as a web page only when clicked
     Diagram(String),
+    /// Opened in the system's image viewer
+    Picture(Source),
 }
 
 pub(crate) struct Render {
     width: usize,
     expanded: bool,
+    /// Where relative image paths start
+    pub(crate) cwd: PathBuf,
     pub(crate) rows: Vec<Row>,
     pub(crate) groups: Vec<Group>,
 }
@@ -151,6 +159,7 @@ impl Render {
         Self {
             width: usize::from(width).max(8),
             expanded,
+            cwd: PathBuf::new(),
             rows: Vec::new(),
             groups: Vec::new(),
         }
@@ -284,6 +293,14 @@ impl Render {
                         let name = (attachment.name.clone(), Style::new());
                         let line = vec![kind, gap, name];
                         self.push_lines(mark, &[line]);
+
+                        // Images the code viewed show only when expanded, as there can be many,
+                        // and their name is already on the row above
+                        if self.expanded && attachment.kind == "image" {
+                            let bar = [Span::styled(mark.rest, mark.style)];
+                            let source = Source::of(&attachment.uri, &self.cwd);
+                            self.picture(&bar, &bar, source, "");
+                        }
                     }
                     for output in parts.outputs {
                         let mark = branch();
@@ -723,8 +740,73 @@ impl Render {
                         }
                     }
                 }
+
+                Block::Image {
+                    marker,
+                    indent,
+                    alt,
+                    url,
+                } => {
+                    let first = [Span::styled(lead, mark.style), Span::styled(marker, ACCENT)];
+                    let rest = [
+                        Span::styled(mark.rest, mark.style),
+                        Span::styled(indent, ACCENT),
+                    ];
+                    let source = Source::of(&url, &self.cwd);
+                    self.picture(&first, &rest, source, &alt);
+                }
             }
             lead = mark.rest;
+        }
+    }
+
+    /// The picture after `first` and then `rest`, or its alt text as when pictures weren't drawn,
+    /// behind a spinner while it loads
+    fn picture(
+        &mut self,
+        first: &[Span<'static>],
+        rest: &[Span<'static>],
+        source: Option<Source>,
+        alt: &str,
+    ) {
+        let width: usize = first.iter().map(Span::width).sum();
+        let state = source.as_ref().map(picture::state);
+        match (source, state) {
+            (Some(source), Some(picture::State::Ready(ready))) => {
+                let room = self.width.saturating_sub(width);
+                let lines = picture::drawn(&source, &ready, room);
+                for (index, cells) in lines.into_iter().enumerate() {
+                    let mut line = match index {
+                        0 => first.to_vec(),
+                        _ => rest.to_vec(),
+                    };
+                    line.extend(cells);
+                    let target = Target::Picture(source.clone());
+                    self.rows.push(Row {
+                        line: Line::from(line),
+                        mark_width: usize::MAX,
+                        targets: vec![(0..usize::MAX, target)],
+                        ..Row::default()
+                    });
+                }
+            }
+            (_, Some(picture::State::Loading(since))) => {
+                let mut spans = vec![(spinner(since).to_string(), DIM)];
+                if !alt.is_empty() {
+                    spans.push((format!(" {alt}"), DIM));
+                }
+                // Copying skips the spinner and the space after it
+                let start = self.rows.len();
+                self.push_rows(first, rest, width + 2, &spans, &[]);
+                if let Some(row) = self.rows.get_mut(start) {
+                    row.spin = Some((width, since));
+                }
+            }
+            _ if alt.is_empty() => {}
+            _ => {
+                let alt = [(alt.to_owned(), DIM)];
+                self.push_rows(first, rest, width, &alt, &[]);
+            }
         }
     }
 
@@ -1096,9 +1178,11 @@ fn last_sentence(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use crate::tui::render::*;
-    use crate::tui::tests::helper;
+    use crate::tui::tests::{helper, settled, written};
     use crate::tui::transcript::{Attachment, Call, Helper, Shell, StepStats, Totals};
     use agent_client_protocol_schema::v1::ToolCallStatus;
+    use std::fs;
+    use url::Url;
 
     fn call(content: &[&str], status: ToolCallStatus) -> Call {
         Call {
@@ -1462,6 +1546,7 @@ mod tests {
         failed.attachments = vec![Attachment {
             kind: "image".to_owned(),
             name: "screenshot.png".to_owned(),
+            uri: "file:///nowhere/copies/a1.png".to_owned(),
         }];
         let step = Step {
             items: vec![Item::Call(failed)],
@@ -1488,12 +1573,84 @@ mod tests {
                 attachments: vec![Attachment {
                     kind: "video".to_owned(),
                     name: "recording.mp4".to_owned(),
+                    uri: "file:///nowhere/copies/a2.mp4".to_owned(),
                 }],
                 ..alone
             })],
             ..Step::default()
         };
         assert_eq!(rendered(&alone, 40, false)[2], "  ╰ video recording.mp4");
+    }
+
+    /// A picture alone in an answer shows loading, then its cells, which open it when clicked
+    #[test]
+    fn pictures_drawn() {
+        let path = written("render", 16, 8);
+        let dir = path.parent().expect("dir").to_path_buf();
+        let answer = Item::Message {
+            text: "Here:\n\n![sales](café.png)\n\n![gone](naïve.png)".to_owned(),
+            answer: true,
+        };
+        let step = Step {
+            items: vec![answer],
+            ..Step::default()
+        };
+        let drawn = |expanded: bool, step: &Step| {
+            let mut render = Render::new(40, expanded);
+            render.cwd = dir.clone();
+            render.step(step);
+            render.rows
+        };
+
+        // A loading picture is its alt text behind a spinner, and only the spinner's column moves
+        let loading = drawn(false, &step);
+        let row = &loading[3];
+        let shown = row.line.to_string();
+        assert!(
+            shown.starts_with("  ") && shown.ends_with(" sales"),
+            "{row:?}"
+        );
+        assert_eq!(row.spin.map(|(column, _)| column), Some(2));
+        assert_eq!(row.mark_width, 4);
+
+        let source = Source::File(path.clone());
+        settled(&source);
+        let missing = Source::File(dir.join("naïve.png"));
+        settled(&missing);
+        let ready = drawn(false, &step);
+        let row = &ready[3];
+        assert_eq!(row.line.to_string(), "  ▀▀");
+        assert_eq!(row.mark_width, usize::MAX);
+        let target = Target::Picture(source.clone());
+        assert_eq!(row.targets, [(0..usize::MAX, target)]);
+        // One that can't show is its alt text, as before pictures were drawn
+        let last = ready.last().expect("row");
+        assert_eq!(last.line.to_string(), "  gone");
+        assert_eq!(last.spin, None);
+
+        // Images the code viewed show only when expanded
+        let uri = Url::from_file_path(&path).expect("url").to_string();
+        let mut viewed = call(
+            &["```python\nview('café.png')\n```"],
+            ToolCallStatus::Completed,
+        );
+        viewed.attachments = vec![Attachment {
+            kind: "image".to_owned(),
+            name: "café.png".to_owned(),
+            uri,
+        }];
+        let step = Step {
+            items: vec![Item::Call(viewed)],
+            ..Step::default()
+        };
+        let folded = text(&drawn(false, &step));
+        assert_eq!(
+            folded.last().map(String::as_str),
+            Some("  ╰ image café.png")
+        );
+        let expanded = text(&drawn(true, &step));
+        assert_eq!(expanded.last().map(String::as_str), Some("    ▀▀"));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -7,6 +7,24 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- smol shows an image that an answer puts on a line of its own, from a path or
+  a web address, in the conversation: through Kitty's graphics protocol in
+  Ghostty and kitty, and as colored half blocks in other terminals and inside
+  tmux, screen or Zellij. Its alt text shows behind a spinner while it loads, and alone as
+  before when it can't be shown. Clicking it opens the image in the system's
+  viewer. Images the code viewed show under their call when expanded.
+- `remember()` with the same text in the same scope, project or global,
+  returns the id of the memory already saved instead of saving another. A
+  batch of memories that failed halfway and ran again used to save its first
+  ones twice.
+- The system prompt asks to read large or many files in parts or to search
+  them with `grep()`, next to printing only what is needed.
+- The system prompt asks to put temporary files in `$TMPDIR`, which
+  `tempfile` uses. Code that wrote to `/tmp` directly failed with
+  `PermissionError` in about one deepseek run in ten.
+
 ## 0.6.3 - 2026-11-02
 
 - The system prompt says that packages installed into the venv can be

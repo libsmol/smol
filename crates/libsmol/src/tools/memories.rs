@@ -3,7 +3,7 @@ use crate::utils::{folded, Reply};
 use crate::worker::MemoryCall;
 use jieba_rs::Jieba;
 use reaper::{cause, tilde};
-use rusqlite::{params, Connection, Row, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -131,6 +131,18 @@ impl Memories {
             let terms = terms(&text);
             let mut connection = opened(&db)?;
             let saved = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // A batch retried after one item failed saved its first items twice
+            let kept = saved
+                .query_row(
+                    "SELECT id FROM memories WHERE text = ?1 AND folder IS ?2",
+                    params![text, folder],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = kept {
+                return Ok((id, false));
+            }
+
             saved.execute(
                 "INSERT INTO memories (text, folder) VALUES (?1, ?2)",
                 params![text, folder],
@@ -141,15 +153,18 @@ impl Memories {
                 params![id, terms],
             )?;
             saved.commit()?;
-            Ok(id)
+            Ok((id, true))
         };
-        let id = self.run(saving).await?;
+        let (id, fresh) = self.run(saving).await?;
 
         let scope = match project {
             true => "project",
             false => "global",
         };
-        info!("memory: saved [id={id}, scope={scope}]");
+        match fresh {
+            true => info!("memory: saved [id={id}, scope={scope}]"),
+            false => info!("memory: already saved [id={id}, scope={scope}]"),
+        }
         Ok(id)
     }
 
@@ -501,6 +516,30 @@ mod tests {
         assert_eq!(again, Err(NO_MEMORY.to_owned()));
         assert_eq!(left, [(theirs, "Uses tabs".to_owned())]);
         assert_eq!(searched, []);
+    }
+
+    #[test]
+    fn same_text_once() {
+        let dir = temp_dir("same-text");
+        let here = opened(&dir, "/home/zoë/café");
+        let there = opened(&dir, "/home/zoë/naïve");
+        let saving = async {
+            let text = "Prefers résumé over CV";
+            let first = here.remember(text, true).await.expect("remember");
+            let again = here.remember("  Prefers résumé over CV\n", true).await;
+            let global = here.remember(text, false).await.expect("remember");
+            let theirs = there.remember(text, true).await.expect("remember");
+            let found = here.recall("").await.expect("recall");
+            (first, again.expect("remember"), global, theirs, found)
+        };
+        let (first, again, global, theirs, found) = block_on(saving);
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(again, first);
+        assert_ne!(global, first);
+        assert_ne!(theirs, first);
+        assert_ne!(theirs, global);
+        assert_eq!(found.len(), 2, "{found:?}");
     }
 
     /// An id the code still holds never names a memory saved later

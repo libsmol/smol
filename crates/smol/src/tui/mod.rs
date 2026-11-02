@@ -23,6 +23,7 @@ mod browser;
 mod diagram;
 mod highlight;
 mod markdown;
+mod picture;
 mod render;
 mod screen;
 mod select;
@@ -160,6 +161,8 @@ pub(crate) fn run(
     let mut screen = Screen::enter()?;
     let mut listened = Instant::now();
     while !app.quit && !terminated.load(Ordering::Relaxed) {
+        // Images drawn last frame go out now, and their placeholders show them once they arrive
+        picture::send(&mut stdout())?;
         if app.take_dirty() {
             execute!(stdout(), BeginSynchronizedUpdate)?;
             screen.terminal.draw(|frame| {
@@ -201,6 +204,7 @@ pub(crate) fn run(
         app.pump();
     }
 
+    picture::forget(&mut stdout()).ok();
     drop(screen);
     if let Some(line) = app.session.parting() {
         println!("{line}");
@@ -219,11 +223,16 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use crate::tests::fake;
+    use crate::tui::picture::{state, Source, State};
     use crate::tui::transcript::{Entry, Helper};
     use crate::tui::*;
     use agent_client_protocol_schema::v1::ToolCallStatus;
+    use image::{ImageBuffer, Rgba, RgbaImage};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+    use std::{env, fs, process, thread};
 
     pub(crate) fn app() -> App {
         let agent = fake();
@@ -260,6 +269,32 @@ mod tests {
             tokens: None,
             totals: None,
         }
+    }
+
+    /// Pictures load on a thread of their own
+    pub(crate) fn settled(source: &Source) -> State {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = state(source);
+            if !matches!(state, State::Loading(_)) || Instant::now() > deadline {
+                return state;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A PNG `width` by `height` pixels, red above and blue below, in a folder of its own
+    pub(crate) fn written(name: &str, width: u32, height: u32) -> PathBuf {
+        let painted = |_: u32, y: u32| match y < height / 2 {
+            true => Rgba([255, 0, 0, 255]),
+            false => Rgba([0, 0, 255, 255]),
+        };
+        let pixels: RgbaImage = ImageBuffer::from_fn(width, height, painted);
+        let dir = env::temp_dir().join(format!("smol-picture-{name}-{}", process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("café.png");
+        pixels.save(&path).expect("save");
+        path
     }
 
     #[test]

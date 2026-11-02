@@ -252,7 +252,7 @@ pub(crate) fn system(
                 places.push(place);
             }
             let places = places.join(", ");
-            format!("\n- Your code runs in a sandbox: writing outside {places}, the venv and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- `$TMPDIR` is removed when the session ends; if a tool fails because it cannot write its cache, rerun it with the cache there.")
+            format!("\n- Your code runs in a sandbox: writing outside {places}, the venv and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- Put temporary files in `$TMPDIR`, which `tempfile` uses and which is removed when the session ends; if a tool fails because it cannot write its cache, rerun it with the cache there.")
         }
         None => String::new(),
     };
@@ -320,7 +320,7 @@ A call returns what its code printed, plus the value of every top-level expressi
 
 Write each call as a complete program:
 - Do as much as possible in one call with loops, conditions, the standard library and the functions below.
-- Print only what you need to see.
+- Print only what you need to see; read large or many files in parts, or search them with `grep()`.
 - Reuse the data, functions and imports the session already holds; reload data only if its source changed.
 - Put code you will run again in a function.
 

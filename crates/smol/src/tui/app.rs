@@ -4,7 +4,7 @@ use crate::tui::render::Target;
 use crate::tui::select::{self, Point, Selection};
 use crate::tui::transcript::{Entry, Outcome, Transcript};
 use crate::tui::ui::input_box;
-use crate::tui::{browser, diagram};
+use crate::tui::{browser, diagram, picture};
 use ignore::WalkBuilder;
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -267,6 +267,11 @@ impl App {
         let faded = flash.is_some_and(|(_, at)| at.elapsed() > FLASH_WAIT);
         if faded {
             self.flash = None;
+            self.dirty = true;
+        }
+        let loaded = picture::loaded();
+        if loaded != self.transcript.pictures {
+            self.transcript.pictures = loaded;
             self.dirty = true;
         }
 
@@ -598,6 +603,10 @@ impl App {
                                 Target::Diagram(code) => {
                                     let opened = diagram::open(&code);
                                     opened.map(|()| "opening the diagram in a browser".to_owned())
+                                }
+                                Target::Picture(source) => {
+                                    let opened = picture::open(&source);
+                                    opened.map(|()| "opening the image".to_owned())
                                 }
                             };
                             self.flash = Some((told, Instant::now()));

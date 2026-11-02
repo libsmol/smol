@@ -156,7 +156,10 @@ pub(crate) struct Transcript {
     held_rows: Vec<Row>,
     /// Anything that touches `held` or `live` must set this
     changed: bool,
-    layout: (u16, bool),
+    /// Width, expansion, and how many pictures had loaded
+    layout: (u16, bool, u64),
+    /// How many pictures had loaded when the frame began, which `anchor` and `rows` must agree on
+    pub(crate) pictures: u64,
     task_id: Option<String>,
     retry_at: Option<Instant>,
     /// Settled entries with agents at work, or whose agents ended after their rows were drawn
@@ -669,7 +672,7 @@ impl Transcript {
     /// Before a layout change, records which entry `row` belongs to and its offset there
     /// for `Rows::row_at` to find after relayout
     pub(crate) fn anchor(&self, row: usize, width: u16, expanded: bool) -> Option<(usize, usize)> {
-        if self.layout == (width, expanded) {
+        if self.layout == (width, expanded, self.pictures) {
             return None;
         }
 
@@ -684,9 +687,17 @@ impl Transcript {
         Some((entry, row - self.starts[entry]))
     }
 
+    fn render(&self, width: u16, expanded: bool) -> Render {
+        let mut render = Render::new(width, expanded);
+        render.cwd = self.cwd.clone();
+        render
+    }
+
     pub(crate) fn rows(&mut self, width: u16, expanded: bool) -> Rows<'_> {
-        if self.layout != (width, expanded) {
-            self.layout = (width, expanded);
+        // A picture that finished loading changes the height of its rows
+        let layout = (width, expanded, self.pictures);
+        if self.layout != layout {
+            self.layout = layout;
             self.rows.clear();
             self.starts.clear();
             self.groups.clear();
@@ -696,7 +707,7 @@ impl Transcript {
             self.changed = true;
         }
 
-        let mut render = Render::new(width, expanded);
+        let mut render = self.render(width, expanded);
         let rendered = self.starts.len();
         for (index, entry) in self.entries.iter().enumerate().skip(rendered) {
             let start = render.rows.len();
@@ -761,7 +772,7 @@ impl Transcript {
                 self.groups.remove(at);
                 continue;
             };
-            let mut drawn = Render::new(width, expanded);
+            let mut drawn = self.render(width, expanded);
             drawn.helpers(call);
 
             // The rows after these move by as many as they grew or shrank
@@ -954,6 +965,7 @@ pub(crate) struct Attachment {
     /// The MIME top-level type, or `file` when none was given
     pub(crate) kind: String,
     pub(crate) name: String,
+    pub(crate) uri: String,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1182,6 +1194,7 @@ fn contents(content: &[ToolCallContent]) -> (Vec<String>, Vec<Attachment>) {
         attachments.push(Attachment {
             kind: kind.to_owned(),
             name: link.name.clone(),
+            uri: link.uri.clone(),
         });
     }
 
@@ -2045,13 +2058,14 @@ mod tests {
         };
         assert_eq!(call.status, ToolCallStatus::Completed);
         assert_eq!(call.content, ["hello"]);
-        let attached = |kind: &str, name: &str| Attachment {
+        let attached = |kind: &str, name: &str, uri: &str| Attachment {
             kind: kind.to_owned(),
             name: name.to_owned(),
+            uri: uri.to_owned(),
         };
         let expected = [
-            attached("image", "screenshot.png"),
-            attached("file", "notes"),
+            attached("image", "screenshot.png", "file:///copies/a1.png"),
+            attached("file", "notes", "file:///copies/a2"),
         ];
         assert_eq!(call.attachments, expected);
     }

@@ -1,6 +1,11 @@
 use reaper::cause;
+use std::env;
 use std::ffi::OsStr;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 #[cfg(not(windows))]
@@ -10,6 +15,31 @@ use std::time::{Duration, Instant};
 const OPEN_WAIT: Duration = Duration::from_millis(500);
 #[cfg(not(windows))]
 const OPEN_EVERY: Duration = Duration::from_millis(20);
+
+/// /tmp is shared on Linux, while XDG_RUNTIME_DIR is private to the user and cleared at logout
+pub(crate) fn private_dir() -> PathBuf {
+    match env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => env::temp_dir(),
+    }
+}
+
+/// Makes the file anew, since where there is no private folder another user
+/// may have put a link or a file of their own under its name
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+    file.write_all(bytes)
+}
 
 pub(crate) fn open(target: impl AsRef<OsStr>) -> Result<(), String> {
     let program = if cfg!(target_os = "macos") {

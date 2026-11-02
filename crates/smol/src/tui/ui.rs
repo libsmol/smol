@@ -1,5 +1,6 @@
 use crate::client::{tool_count, McpState, McpStatus};
 use crate::tui::app::App;
+use crate::tui::picture;
 use crate::tui::render::wrap_ranges;
 use crate::tui::{
     clipped, fitted, in_out, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG,
@@ -295,7 +296,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let rows = app.transcript.rows(inner.width, app.expanded);
 
     app.scrollbar = Rect::default();
-    app.animating = rows.is_empty();
+    // The welcome logo moves, and so do the spinners of pictures loading
+    app.animating = rows.is_empty() || picture::loading();
     if rows.is_empty() {
         // Clicks and selections number rows from `bottom`,
         // so an empty conversation must not keep the previous one's
@@ -397,6 +399,17 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                 let band = Rect::new(inside.x, y, inside.width, 1);
                 let style = Style::new().bg(fill);
                 frame.buffer_mut().set_style(band, style);
+            }
+        }
+        let spins = rows.iter().map(|row| row.spin).skip(top).take(height);
+        for (y, spin) in (inner.y..).zip(spins) {
+            let Some((column, since)) = spin else {
+                continue;
+            };
+            let x = inner.x.saturating_add(column as u16);
+            if x < inner.right() {
+                let frame_char = spinner(since).to_string();
+                frame.buffer_mut()[(x, y)].set_symbol(&frame_char);
             }
         }
 

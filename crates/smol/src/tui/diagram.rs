@@ -2,8 +2,6 @@ use crate::tui::{browser, screen};
 use mmdflux::{render_diagram, OutputFormat, RenderConfig};
 use reaper::cause;
 use std::collections::hash_map::DefaultHasher;
-use std::env;
-use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::PathBuf;
@@ -31,12 +29,7 @@ pub(crate) fn page(code: &str) -> Result<PathBuf, String> {
     code.hash(&mut hasher);
     let hash = hasher.finish();
     let name = format!("smol-diagram-{hash:016x}.html");
-    // /tmp is shared on Linux, while XDG_RUNTIME_DIR is private to the user and cleared at logout
-    let dir = match env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => env::temp_dir(),
-    };
-    let path = dir.join(name);
+    let path = browser::private_dir().join(name);
 
     let html = format!(
         "<!doctype html>\n<meta charset=\"utf-8\">\n<title>diagram</title>\n<body style=\"margin: 16px; background: #fff\">\n{svg}\n</body>\n"
@@ -45,7 +38,7 @@ pub(crate) fn page(code: &str) -> Result<PathBuf, String> {
         let reason = cause(&e);
         format!("diagram: {}: {reason}", path.display())
     };
-    fs::write(&path, html).map_err(failed)?;
+    browser::write_private(&path, html.as_bytes()).map_err(failed)?;
 
     Ok(path)
 }
@@ -59,6 +52,8 @@ pub(crate) fn open(code: &str) -> Result<(), String> {
 mod tests {
     use crate::tui::diagram::{drawn, page};
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn drawn_and_paged() {
@@ -74,6 +69,11 @@ mod tests {
         let html = fs::read_to_string(&path).expect("read");
         assert!(html.contains("<svg") && html.contains("read 🐍"), "{html}");
         assert_eq!(page(code), Ok(path.clone()));
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&path).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
         fs::remove_file(&path).ok();
 
         let refused = page("graph TD\n    A[unclosed --> B");

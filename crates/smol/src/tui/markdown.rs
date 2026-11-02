@@ -45,6 +45,13 @@ pub(crate) enum Block {
         code: String,
         source: Vec<Text>,
     },
+    /// An image alone on its line, with its address as written
+    Image {
+        marker: String,
+        indent: String,
+        alt: String,
+        url: String,
+    },
 }
 
 pub(crate) fn blocks(text: &str) -> Vec<Block> {
@@ -115,7 +122,15 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
                         start,
                     });
                 }
-                Tag::Image { .. } => builder.styles.push(DIM),
+                Tag::Image { dest_url, .. } => {
+                    builder.styles.push(DIM);
+                    // An image inside a link or a table cell, or after one without alt text,
+                    // stays its alt text
+                    let starts = builder.line.is_empty() && builder.alone.is_none();
+                    let alone = starts && builder.links.is_empty() && builder.table.is_none();
+                    builder.image = alone.then(|| dest_url.into_string());
+                    builder.alone = None;
+                }
                 Tag::HtmlBlock => builder.gap(),
                 Tag::Table(aligns) => {
                     builder.gap();
@@ -195,8 +210,15 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
                     builder.flush();
                     builder.prefixes.pop();
                 }
-                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Image => {
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                     builder.styles.pop();
+                }
+                TagEnd::Image => {
+                    builder.styles.pop();
+                    if let Some(url) = builder.image.take() {
+                        let alt = joined(&builder.line);
+                        builder.alone = Some((url, alt));
+                    }
                 }
                 TagEnd::Link => {
                     builder.styles.pop();
@@ -281,6 +303,10 @@ struct Builder {
     links: Vec<Linking>,
     table: Option<Vec<Vec<Spans>>>,
     aligns: Vec<Alignment>,
+    /// The address of an image that started its line, until the image ends
+    image: Option<String>,
+    /// An ended image with nothing after it on its line so far, and its alt text
+    alone: Option<(String, String)>,
 }
 
 /// Opening a local file link from the model could run a program, so only web pages open
@@ -304,6 +330,9 @@ impl Builder {
     }
 
     fn push(&mut self, text: &str, style: Style) {
+        if self.image.is_none() {
+            self.alone = None;
+        }
         let text = widened(text);
         self.target().push((text, style));
     }
@@ -361,6 +390,18 @@ impl Builder {
     }
 
     fn flush(&mut self) {
+        // Its alt text may be empty, which leaves the line empty too
+        if let Some((url, alt)) = self.alone.take() {
+            self.line.clear();
+            let (marker, indent) = self.prefix();
+            self.blocks.push(Block::Image {
+                marker,
+                indent,
+                alt,
+                url,
+            });
+            return;
+        }
         if self.line.is_empty() {
             return;
         }
@@ -425,9 +466,33 @@ mod tests {
                         lines.push(lead.to_owned() + &line);
                     }
                 }
+                Block::Image {
+                    marker, alt, url, ..
+                } => lines.push(format!("{marker}![{alt}]({url})")),
             }
         }
         lines
+    }
+
+    #[test]
+    fn images_alone() {
+        let text = "Before\n\n![Monthly café sales](charts/café.png)\n\n- ![](a.png)\n\nInline ![x](y.png) and ![z](z.png) after\n\n![first](1.png)\n![second](2.png) ends\n\n[![badge](b.svg)](https://x.io)\n\n![](c.png)![](d.png)";
+        let expected = [
+            "Before",
+            "",
+            "![Monthly café sales](charts/café.png)",
+            "",
+            "• ![](a.png)",
+            "",
+            "Inline x and z after",
+            "",
+            "![first](1.png)",
+            "second ends",
+            "",
+            "badge (https://x.io)",
+            "",
+        ];
+        assert_eq!(lines(text), expected);
     }
 
     #[test]

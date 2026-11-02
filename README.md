@@ -166,6 +166,11 @@ Run `smol` in the directory you want to work in, then type a task.
   (`$SHELL`, or `cmd` on Windows). The model sees the command and its output
   with your next message.
 - Paths written as `@path` are attached to the message.
+- An image the answer puts on a line of its own, as `![label](chart.png)` or a
+  web address, shows in the conversation: sharp in Ghostty and kitty, in
+  colored blocks in other terminals and inside tmux, screen or Zellij. Clicking
+  it opens it in the system's image viewer. Images the code viewed show when
+  expanded.
 - `ctrl+o` expands long output, `ctrl+d` quits.
 
 | Command | What it does |
