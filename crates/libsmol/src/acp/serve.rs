@@ -515,7 +515,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
     use tokio::{task, time};
     use tracing::Span;
 
@@ -657,6 +657,22 @@ mod tests {
         let held = router.app.store.lock("s1").expect("lock");
 
         let answering = async {
+            // The open locks only after the old session ends, so the prompt is queued before the lock fails
+            let (release, released) = oneshot::channel::<()>();
+            let old = task::spawn(async move {
+                released.await.ok();
+            });
+            let (sender, _inbox) = mpsc::unbounded_channel();
+            let opened = Handle {
+                sender,
+                interrupt: Interrupt::default(),
+                enqueued: Arc::default(),
+                received: 0,
+                span: Span::none(),
+                task: old,
+            };
+            router.sessions.insert("s1".to_owned(), opened);
+
             let params = json!({"sessionId": "s1", "cwd": dir, "mcpServers": []});
             router
                 .request(&json!(1), "session/load", params)
@@ -666,6 +682,7 @@ mod tests {
             router
                 .request(&json!(2), "session/prompt", params)
                 .expect("prompt");
+            release.send(()).ok();
 
             let mut answers = Vec::new();
             while answers.len() < 2 {
