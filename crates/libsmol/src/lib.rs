@@ -65,6 +65,11 @@ pub enum Error {
     Python(String),
     #[error("history: {0}")]
     History(String),
+    /// Has no label because the memories write one into the text
+    #[error("{0}")]
+    Memory(String),
+    #[error("memory: {0}: not found")]
+    MemoryNotFound(i64),
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;

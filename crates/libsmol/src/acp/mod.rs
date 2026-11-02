@@ -29,6 +29,8 @@ const UPDATE: &str = "_smol/update";
 const SHELL: &str = "_smol/shell";
 /// Marks the tool calls that open agents the code starts, whose `rawInput` is what they were given
 const AGENT: &str = "_smol/agent";
+const MEMORIES: &str = "_smol/memories";
+const FORGET: &str = "_smol/forget";
 
 pub(crate) struct App {
     pub(crate) peer: Arc<Peer>,

@@ -7,6 +7,19 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- `:memory` lists the memories the session sees, the project's and then the
+  global ones, in a list that typing filters. `del` marks the selected one
+  in red and `enter` forgets it, while any other key keeps it, so a held
+  `del` can't forget several. A session's system prompt keeps what it
+  listed or counted when it opened, so a forgotten memory leaves it from
+  the next session. For ACP clients: `_smol/memories` lists them and
+  `_smol/forget` deletes one, both answered at once, even while a turn runs.
+- A highlighted choice too long for smol's popup list, such as a long memory
+  or session title, scrolls through its text after a pause, starting over
+  each time the highlight lands on it.
+
 ## 0.6.5 - 2026-11-02
 
 - A paste of more than five lines that starts with `!` shows in smol's input

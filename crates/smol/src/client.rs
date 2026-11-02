@@ -43,6 +43,8 @@ pub(crate) const UPDATE: &str = "_smol/update";
 pub(crate) const SHELL: &str = "_smol/shell";
 /// Marks the tool calls of agents the code starts
 pub(crate) const AGENT: &str = "_smol/agent";
+const MEMORIES: &str = "_smol/memories";
+const FORGET: &str = "_smol/forget";
 
 const MAX_STDERR_LINES: usize = 20;
 const STDERR_WAIT: Duration = Duration::from_millis(200);
@@ -131,6 +133,19 @@ impl fmt::Display for AuthRequired {
 }
 
 impl error::Error for AuthRequired {}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Memory {
+    pub(crate) id: i64,
+    pub(crate) text: String,
+    /// Kept for the working directory rather than for every directory
+    pub(crate) project: bool,
+}
+
+#[derive(Deserialize)]
+struct Memories {
+    memories: Vec<Memory>,
+}
 
 #[derive(Clone)]
 pub(crate) struct Pick {
@@ -570,6 +585,18 @@ impl Client {
         let request = ListSessionsRequest::new().cwd(cwd);
         let listed: ListSessionsResponse = self.connection.call(method, request)?;
         Ok(listed.sessions)
+    }
+
+    pub(crate) fn memories(&self, session: &str) -> Result<Vec<Memory>> {
+        let params = json!({ "sessionId": session });
+        let listed: Memories = self.connection.call(MEMORIES, params)?;
+        Ok(listed.memories)
+    }
+
+    pub(crate) fn forget(&self, session: &str, id: i64) -> Result<()> {
+        let params = json!({ "sessionId": session, "id": id });
+        let _: Value = self.connection.call(FORGET, params)?;
+        Ok(())
     }
 
     pub(crate) fn prompt(&self, session: &str, blocks: Vec<ContentBlock>) {

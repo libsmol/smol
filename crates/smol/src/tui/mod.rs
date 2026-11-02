@@ -175,7 +175,12 @@ pub(crate) fn run(
         }
 
         let stalled = listened.elapsed() > STALL_WAIT;
-        let ready = event::poll(POLL_EVERY)?;
+        let now = Instant::now();
+        let wait = match app.scroll_at {
+            Some(at) => at.saturating_duration_since(now).min(POLL_EVERY),
+            None => POLL_EVERY,
+        };
+        let ready = event::poll(wait)?;
         listened = Instant::now();
         if ready {
             let first = event::read()?;

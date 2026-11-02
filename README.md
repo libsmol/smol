@@ -36,7 +36,7 @@ A real run with DeepSeek on smol's own source:
   [Agent Client Protocol](https://agentclientprotocol.com), so Zed or any other
   ACP client can drive it; `smol` is just one such client. The few extras that
   ACP has no message for (`!` commands, queued updates, the agents `agent()`
-  starts) use `_smol/`
+  starts, listing and forgetting memories) use `_smol/`
   extensions, which other clients ignore as the protocol requires.
 
 > [!WARNING]
@@ -179,6 +179,7 @@ Run `smol` in the directory you want to work in, then type a task.
 | `:resume <session>` | Resume an earlier session. `:resume` lists them. |
 | `:model <name>` | Switch the model. `:model` lists them. |
 | `:mcp <on\|off> <server>` | Turn an MCP server on (again) or off. `:mcp` lists them. |
+| `:memory` | List the project's and the global memories; `del` then `enter` forgets the selected one. |
 | `:quit` | Quit. |
 
 `smol "<task>"` starts with a task, `smol --resume latest` resumes the last
@@ -215,9 +216,9 @@ through these functions. A project is the session's working directory. When
 a session opens, its system prompt lists the 10 newest global memories and
 says how many the project has, which the model finds with `recall()`; words
 are matched whole, Chinese ones too.
-Agents that `agent()` starts can only recall. To look at them, run
-`sqlite3 ~/.smol/memory.db "select id, text from memories"`; deleting the file
-forgets everything.
+Agents that `agent()` starts can only recall. In smol, `:memory` lists the
+memories a session sees, and `del` then `enter` forgets the selected one;
+deleting the file forgets everything.
 
 An agent started by `agent()` gets its own Python session and the same files,
 functions, skills, instructions and MCP servers, but not the variables or the

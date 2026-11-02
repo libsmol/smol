@@ -1,9 +1,10 @@
 use crate::acp::rpc::{Lines, Out, Peer};
 use crate::acp::session::{self, Message, Opening, Prompt, Shell};
-use crate::acp::{rfc3339, task_of, to_value, App, ENQUEUED, QUEUED, SHELL};
+use crate::acp::{rfc3339, task_of, to_value, App, ENQUEUED, FORGET, MEMORIES, QUEUED, SHELL};
 use crate::config;
 use crate::config::setup::SETUP_ARG;
 use crate::history::HistoryStore;
+use crate::tools::memories::{Kept, Memories};
 use crate::utils::{block_on, folded, new_id, Interrupt};
 use crate::worker::sandbox;
 use crate::{Error, Result};
@@ -18,11 +19,12 @@ use agent_client_protocol_schema::ProtocolVersion;
 use reaper::cause;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env::consts::OS;
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::io::{self, BufRead};
 use std::panic::{self, PanicHookInfo};
 use std::path::PathBuf;
@@ -192,7 +194,7 @@ pub(crate) async fn serve(mut input: Lines, app: Arc<App>) -> Result<()> {
                 }
             }
             None if method == ENQUEUED => {
-                let Ok(enqueued) = serde_json::from_value::<EnqueuedParams>(params) else {
+                let Ok(enqueued) = serde_json::from_value::<SessionParams>(params) else {
                     continue;
                 };
                 if let Some(session) = router.sessions.get(&enqueued.session_id) {
@@ -236,6 +238,7 @@ struct Handle {
     /// The session task is instrumented with it too, which puts the session id on every log line
     span: Span,
     task: JoinHandle<()>,
+    memories: Memories,
 }
 
 impl Handle {
@@ -255,12 +258,19 @@ struct ShellParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EnqueuedParams {
+struct SessionParams {
     session_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForgetParams {
+    session_id: String,
+    id: i64,
+}
+
 impl Router {
-    /// On None the session task sends the reply
+    /// On None another task sends the reply
     fn request(&mut self, id: &Value, method: &str, params: Value) -> Result<Option<Value>> {
         let names = &AGENT_METHOD_NAMES;
         let result = match method {
@@ -346,6 +356,38 @@ impl Router {
                 self.send(&session, Message::Option(id.clone(), request))?;
                 None
             }
+            MEMORIES => {
+                let request: SessionParams = parsed(params)?;
+                let handle = self.handle(&request.session_id)?;
+                let memories = handle.memories.clone();
+                let listing = async move {
+                    let seen = memories.seen().await;
+                    let seen = seen.map_err(Error::Memory)?;
+
+                    let mut listed = Vec::new();
+                    for Kept { id, text, project } in seen {
+                        let memory = json!({ "id": id, "text": text, "project": project });
+                        listed.push(memory);
+                    }
+                    Ok(json!({ "memories": listed }))
+                };
+                self.answer(id, handle, listing);
+                None
+            }
+            FORGET => {
+                let request: ForgetParams = parsed(params)?;
+                let handle = self.handle(&request.session_id)?;
+                let memories = handle.memories.clone();
+                let forgetting = async move {
+                    let forgotten = memories.forget(request.id).await;
+                    match forgotten.map_err(Error::Memory)? {
+                        true => Ok(json!({})),
+                        false => Err(Error::MemoryNotFound(request.id)),
+                    }
+                };
+                self.answer(id, handle, forgetting);
+                None
+            }
             m if m == names.session_close => {
                 let request: CloseSessionRequest = parsed(params)?;
                 let session = request.session_id.0.to_string();
@@ -402,6 +444,7 @@ impl Router {
 
         let interrupt = Interrupt::default();
         let enqueued = Arc::new(Notify::new());
+        let memories = Memories::new(&self.app.config, &cwd);
         let (sender, inbox) = mpsc::unbounded_channel();
         let opening = Opening {
             id: id.clone(),
@@ -415,6 +458,7 @@ impl Router {
             app: Arc::clone(&self.app),
             interrupt: interrupt.clone(),
             enqueued: Arc::clone(&enqueued),
+            memories: memories.clone(),
         };
 
         // Error level keeps the id on log lines even when only warn is enabled
@@ -429,6 +473,7 @@ impl Router {
             received: 0,
             span,
             task,
+            memories,
         };
         self.sessions.insert(session, handle);
 
@@ -443,11 +488,30 @@ impl Router {
         Ok(handle.received)
     }
 
+    fn handle(&self, session: &str) -> Result<&Handle> {
+        self.sessions.get(session).ok_or_else(|| unknown(session))
+    }
+
     fn send(&self, session: &str, message: Message) -> Result<()> {
-        let Some(handle) = self.sessions.get(session) else {
-            return Err(unknown(session));
-        };
+        let handle = self.handle(session)?;
         handle.sender.send(message).map_err(|_| unknown(session))
+    }
+
+    /// Runs on a task of its own because the session task takes requests only between turns
+    fn answer(
+        &self,
+        id: &Value,
+        handle: &Handle,
+        answering: impl Future<Output = Result<Value>> + Send + 'static,
+    ) {
+        let peer = Arc::clone(&self.app.peer);
+        let id = id.clone();
+        let replying = async move {
+            let result = answering.await;
+            peer.respond(&id, result);
+        };
+        let replying = replying.instrument(handle.span.clone());
+        task::spawn(replying);
     }
 }
 
@@ -506,6 +570,7 @@ mod tests {
     use crate::history::{HistoryStore, Settings};
     use crate::memory::tests::one_task;
     use crate::tests::temp_dir;
+    use crate::tools::memories::Memories;
     use crate::utils::{block_on, Interrupt};
     use crate::Error;
     use serde_json::{json, Value};
@@ -610,6 +675,7 @@ mod tests {
                 received: 0,
                 span: Span::none(),
                 task: old,
+                memories: Memories::new(&dir, &dir),
             };
             router.sessions.insert("s1".to_owned(), opened);
 
@@ -671,6 +737,7 @@ mod tests {
                 received: 0,
                 span: Span::none(),
                 task: old,
+                memories: Memories::new(&dir, &dir),
             };
             router.sessions.insert("s1".to_owned(), opened);
 

@@ -43,6 +43,15 @@ pub(crate) struct Memories {
     folder: Vec<u8>,
 }
 
+/// A memory the working directory sees
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Kept {
+    pub(crate) id: i64,
+    pub(crate) text: String,
+    /// Kept for the working directory rather than for every directory
+    pub(crate) project: bool,
+}
+
 /// What the system prompt shows of them
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct Listed {
@@ -76,11 +85,26 @@ impl Memories {
                 let id = self.remember(&text, project).await?;
                 Ok(Value::from(id))
             }
-            MemoryCall::Forget { id } => {
-                self.forget(id).await?;
-                Ok(Value::Null)
-            }
+            MemoryCall::Forget { id } => match self.forget(id).await? {
+                true => Ok(Value::Null),
+                false => Err(NO_MEMORY.to_owned()),
+            },
         }
+    }
+
+    /// The working directory's own memories and then the global ones, newest first in each
+    pub(crate) async fn seen(&self) -> Result<Vec<Kept>, String> {
+        let memories = self.clone();
+        let listing = move || {
+            let connection = opened(&memories.db)?;
+            let mut seen = connection.prepare(
+                "SELECT id, text, folder IS NOT NULL FROM memories WHERE folder = ?1 OR folder IS NULL \
+                 ORDER BY folder IS NULL, id DESC",
+            )?;
+            let rows = seen.query_map([&memories.folder], kept)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        };
+        self.run(listing).await
     }
 
     pub(crate) async fn listed(&self) -> Result<Listed, String> {
@@ -205,8 +229,8 @@ impl Memories {
         self.run(searching).await
     }
 
-    /// Only a memory the working directory sees
-    async fn forget(&self, id: i64) -> Result<(), String> {
+    /// Only a memory the working directory sees, and false when it sees none with that id
+    pub(crate) async fn forget(&self, id: i64) -> Result<bool, String> {
         let memories = self.clone();
         let forgetting = move || {
             let mut connection = opened(&memories.db)?;
@@ -224,11 +248,11 @@ impl Memories {
         };
         let deleted = self.run(forgetting).await?;
         if deleted == 0 {
-            return Err(NO_MEMORY.to_owned());
+            return Ok(false);
         }
 
         info!("memory: forgotten [id={id}]");
-        Ok(())
+        Ok(true)
     }
 
     /// SQLite blocks, and tokio runs every session on one thread
@@ -259,6 +283,14 @@ fn opened(db: &Path) -> rusqlite::Result<Connection> {
 
 fn pair(row: &Row<'_>) -> rusqlite::Result<(i64, String)> {
     Ok((row.get(0)?, row.get(1)?))
+}
+
+fn kept(row: &Row<'_>) -> rusqlite::Result<Kept> {
+    Ok(Kept {
+        id: row.get(0)?,
+        text: row.get(1)?,
+        project: row.get(2)?,
+    })
 }
 
 /// The words of a stored text separated by spaces, with Chinese cut for search, which also gives the shorter words inside long ones
@@ -335,7 +367,7 @@ fn parts(text: &str) -> Vec<(bool, &str)> {
 mod tests {
     use crate::prompt::{self, EMPTY_MEMORY, NESTED, NO_MEMORY};
     use crate::tests::temp_dir;
-    use crate::tools::memories::{matched, terms, Listed, Memories};
+    use crate::tools::memories::{matched, terms, Kept, Listed, Memories};
     use crate::utils::block_on;
     use crate::worker::MemoryCall;
     use serde_json::json;
@@ -504,18 +536,54 @@ mod tests {
             let refused = here.forget(theirs).await;
             let forgotten = [here.forget(own).await, here.forget(shared).await];
             let again = here.forget(own).await;
+            let answered = here.answer(MemoryCall::Forget { id: own }, true).await;
             let left = there.recall("").await.expect("recall");
             let searched = here.recall("Deploys").await.expect("recall");
-            (refused, forgotten, again, left, searched, theirs)
+            (refused, forgotten, again, answered, left, searched, theirs)
         };
-        let (refused, forgotten, again, left, searched, theirs) = block_on(forgetting);
+        let (refused, forgotten, again, answered, left, searched, theirs) = block_on(forgetting);
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(refused, Err(NO_MEMORY.to_owned()));
-        assert_eq!(forgotten, [Ok(()), Ok(())]);
-        assert_eq!(again, Err(NO_MEMORY.to_owned()));
+        assert_eq!(refused, Ok(false));
+        assert_eq!(forgotten, [Ok(true), Ok(true)]);
+        assert_eq!(again, Ok(false));
+        assert_eq!(answered, Err(NO_MEMORY.to_owned()));
         assert_eq!(left, [(theirs, "Uses tabs".to_owned())]);
         assert_eq!(searched, []);
+    }
+
+    #[test]
+    fn seen_scoped() {
+        let dir = temp_dir("seen");
+        let here = opened(&dir, "/home/zoë/café");
+        let there = opened(&dir, "/home/zoë/naïve");
+        let saving = async {
+            let shared = here.remember("Prefers résumé over CV", false).await;
+            let own = here.remember("Tests run with pytest", true).await;
+            there.remember("Builds with make", true).await.ok();
+            let newer = there.remember("Replies in French", false).await;
+            let seen = here.seen().await.expect("seen");
+            (
+                shared.expect("remember"),
+                own.expect("remember"),
+                newer.expect("remember"),
+                seen,
+            )
+        };
+        let (shared, own, newer, seen) = block_on(saving);
+        fs::remove_dir_all(&dir).ok();
+
+        let kept = |id: i64, text: &str, project: bool| Kept {
+            id,
+            text: text.to_owned(),
+            project,
+        };
+        let expected = [
+            kept(own, "Tests run with pytest", true),
+            kept(newer, "Replies in French", false),
+            kept(shared, "Prefers résumé over CV", false),
+        ];
+        assert_eq!(seen, expected);
     }
 
     #[test]

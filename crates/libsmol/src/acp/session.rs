@@ -76,6 +76,7 @@ pub(crate) struct Opening {
     pub(crate) app: Arc<App>,
     pub(crate) interrupt: Interrupt,
     pub(crate) enqueued: Arc<Notify>,
+    pub(crate) memories: Memories,
 }
 
 #[derive(Deserialize)]
@@ -157,6 +158,7 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
         app,
         interrupt,
         enqueued,
+        memories,
     } = opening;
     let peer = &app.peer;
 
@@ -206,7 +208,6 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
         let notice = problem.to_string();
         notices.push(notice);
     }
-    let memories = Memories::new(&app.config, &cwd);
     let listed = match memories.listed().await {
         Ok(listed) => listed,
         Err(problem) => {
@@ -687,8 +688,10 @@ mod tests {
     use crate::prompt::{NAMER, RESTARTED};
     use crate::tests::temp_dir;
     use crate::tools::mcp::tests::SCRIPT;
+    use crate::tools::memories::Memories;
     use crate::utils::block_on;
     use crate::worker::python::tests::interpreter;
+    use crate::worker::MemoryCall;
     use crate::Error;
     use reaper::tilde;
     use serde_json::{json, Value};
@@ -696,6 +699,7 @@ mod tests {
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -1246,6 +1250,65 @@ mod tests {
             "model: model2: not in model.toml (models: mock/m1)",
         ];
         assert_eq!(refused, expected);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The client sees and forgets only the memories the session's directory sees,
+    /// without waiting for the turn in progress
+    #[test]
+    fn memories_forgotten() {
+        let dir = temp_dir("memories");
+        let here = Memories::new(&dir, Path::new(CWD));
+        let elsewhere = Memories::new(&dir, Path::new("/home/zoë/naïve"));
+        let remember = |text: &str, project: bool| MemoryCall::Remember {
+            text: text.to_owned(),
+            project,
+        };
+        let released = Arc::new(AtomicBool::new(false));
+        let holding = Arc::clone(&released);
+        let api = model_server(move |body| {
+            while system_prompt(body) != NAMER && !holding.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok("Done.".to_owned())
+        });
+        let running = async {
+            let mut connection = Connection::open(&dir, &api, "");
+            let own = here.answer(remember("Tests run with pytest", true), true);
+            let own = own.await.expect("remember");
+            let shared = here.answer(remember("Prefers résumé over CV", false), true);
+            let shared = shared.await.expect("remember");
+            let theirs = elsewhere.answer(remember("Builds with make", true), true);
+            theirs.await.expect("remember");
+
+            let session = connection.new_session().await;
+            let text = json!([{"type": "text", "text": "Deploy the café"}]);
+            let params = json!({"sessionId": session, "prompt": text});
+            let prompt =
+                json!({"jsonrpc": "2.0", "id": 100, "method": "session/prompt", "params": params});
+            connection.send(prompt);
+            let params = json!({"sessionId": session});
+            let listed = connection.request("_smol/memories", params).await;
+            let forget = json!({"sessionId": session, "id": own});
+            let forgotten = connection.request("_smol/forget", forget.clone()).await;
+            let again = connection.request("_smol/forget", forget).await;
+            let ended = connection.seen.iter().any(|message| message["id"] == 100);
+            released.store(true, Ordering::Relaxed);
+            connection.close().await;
+            (own, shared, listed, forgotten, again, ended)
+        };
+        let (own, shared, listed, forgotten, again, ended) = block_on(running);
+
+        assert!(!ended);
+        let memories = json!([
+            {"id": own, "text": "Tests run with pytest", "project": true},
+            {"id": shared, "text": "Prefers résumé over CV", "project": false},
+        ]);
+        assert_eq!(listed["result"]["memories"], memories, "{listed}");
+        assert_eq!(forgotten["result"], json!({}), "{forgotten}");
+        let missing = format!("memory: {own}: not found");
+        assert_eq!(again["error"]["message"], missing, "{again}");
+        assert_eq!(again["error"]["code"], -32002, "{again}");
         fs::remove_dir_all(&dir).ok();
     }
 

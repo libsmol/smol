@@ -23,6 +23,7 @@ pub(crate) enum List {
     Sessions,
     Models,
     Servers,
+    Memories,
 }
 
 pub(crate) enum Output {
@@ -170,6 +171,25 @@ impl Session {
                 }
                 rows
             }
+
+            List::Memories => {
+                let mut rows = Vec::new();
+                for memory in self.client.memories(&self.id)? {
+                    // Each memory takes exactly one line
+                    let words: Vec<&str> = memory.text.split_whitespace().collect();
+                    let scope = match memory.project {
+                        true => "project",
+                        false => "global",
+                    };
+                    rows.push(Pick {
+                        value: memory.id.to_string(),
+                        label: words.join(" "),
+                        description: format!("{scope} #{}", memory.id),
+                        current: false,
+                    });
+                }
+                rows
+            }
         };
         Ok(rows)
     }
@@ -206,6 +226,15 @@ impl Session {
         }
 
         Ok(format!("mcp: {name}: {state}"))
+    }
+
+    /// Takes the `value` of a memory's row
+    pub(crate) fn forget(&self, value: &str) -> Result<String> {
+        let id: i64 = value.parse()?;
+        self.client.forget(&self.id, id)?;
+        Ok(format!(
+            "forgot memory {id}; the system prompt drops it next session"
+        ))
     }
 
     pub(crate) fn parting(&self) -> Option<String> {

@@ -74,7 +74,7 @@ model() {
 }
 n=0
 while IFS= read -r line; do
-    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    id=$(printf '%s\n' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
     case $line in
     *'"method":"initialize"'*)
         result='{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"list":{}}}}' ;;
@@ -121,6 +121,13 @@ while IFS= read -r line; do
         printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"call_9","title":"ls docs","kind":"execute","status":"in_progress","_meta":{"_smol/shell":true}}}}'
         printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_9","status":"failed","content":[{"type":"content","content":{"type":"text","text":"alpha\nbeta"}}],"_meta":{"error":"exit 2"}}}}'
         result='{"stopReason":"end_turn"}' ;;
+    *'"method":"_smol/memories"'*)
+        result='{"memories":[{"id":12,"text":"Tests run with pytest","project":true},{"id":99,"text":"Prefers résumé over CV\nand naïve tests","project":false}]}' ;;
+    *'"method":"_smol/forget"'*'"id":99'*)
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32002,"message":"memory: 99: not found"}}\n' "$id"
+        continue ;;
+    *'"method":"_smol/forget"'*)
+        result='{}' ;;
     *'"method":"session/prompt"'*)
         result='{"stopReason":"end_turn"}' ;;
     *)

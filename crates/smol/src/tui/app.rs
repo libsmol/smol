@@ -23,6 +23,7 @@ const DOUBLE_CLICK_WAIT: Duration = Duration::from_millis(500);
 const ANIMATE_EVERY: Duration = Duration::from_millis(100);
 
 const RESUME_PREFIX: &str = ":resume ";
+const MEMORY_PREFIX: &str = ":memory ";
 const MODEL_PREFIX: &str = ":model ";
 const MCP_PREFIX: &str = ":mcp ";
 const SHELL_USAGE: &str = "!<command>";
@@ -50,9 +51,16 @@ pub(crate) struct App {
     history: History,
     pub(crate) choices: Vec<Choice>,
     pub(crate) highlight: ListState,
+    /// The highlighted choice's label and when the highlight landed on it
+    pub(crate) marquee: Option<(String, Instant)>,
+    /// When the highlighted label, too long for the list, moves on next
+    pub(crate) scroll_at: Option<Instant>,
+    /// The value of the memory row Delete marked, which the next event clears unless it is Enter
+    forgetting: Option<String>,
     choices_closed: bool,
     pub(crate) choices_area: Rect,
-    session_rows: Option<Vec<Pick>>,
+    /// A list asked of the agent once while its prefix stays typed
+    fetched: Option<(List, Vec<Pick>)>,
     /// The first item is the listed directory, or empty for the whole cwd
     paths: Option<(String, Vec<String>)>,
     pub(crate) expanded: bool,
@@ -96,6 +104,8 @@ enum Completion {
         typed: usize,
         text: String,
     },
+    /// A memory's row value, which fills in nothing
+    Memory(String),
 }
 
 impl Choice {
@@ -125,6 +135,10 @@ impl Choice {
 
     pub(crate) fn submits(&self) -> bool {
         matches!(&self.completion, Completion::Input(text) if !text.ends_with(' '))
+    }
+
+    pub(crate) fn forgets(&self) -> bool {
+        matches!(self.completion, Completion::Memory(_))
     }
 }
 
@@ -169,6 +183,7 @@ impl Command {
                 }
                 _ => None,
             },
+            (":memory", "") => Some(Self::List(List::Memories)),
             (":quit", "") => Some(Self::Quit),
             _ => None,
         };
@@ -201,7 +216,7 @@ impl Hint {
     }
 }
 
-const HINTS: [Hint; 5] = [
+const HINTS: [Hint; 6] = [
     Hint {
         usage: ":new",
         summary: "start a new session",
@@ -217,6 +232,10 @@ const HINTS: [Hint; 5] = [
     Hint {
         usage: ":mcp <on|off> <server>",
         summary: "turn an MCP server on (again) or off",
+    },
+    Hint {
+        usage: ":memory",
+        summary: "list the memories, and forget one with del then enter",
     },
     Hint {
         usage: ":quit",
@@ -239,9 +258,12 @@ impl App {
             history: History::default(),
             choices: Vec::new(),
             highlight: ListState::default().with_selected(Some(0)),
+            marquee: None,
+            scroll_at: None,
+            forgetting: None,
             choices_closed: false,
             choices_area: Rect::default(),
-            session_rows: None,
+            fetched: None,
             paths: None,
             expanded: false,
             animating: false,
@@ -276,7 +298,8 @@ impl App {
         }
 
         let animated = self.animating && self.drawn.elapsed() >= ANIMATE_EVERY;
-        let dirty = mem::take(&mut self.dirty) || self.run.is_some() || animated;
+        let scrolled = self.scroll_at.is_some_and(|at| at <= Instant::now());
+        let dirty = mem::take(&mut self.dirty) || self.run.is_some() || animated || scrolled;
         if dirty {
             self.drawn = Instant::now();
         }
@@ -305,6 +328,18 @@ impl App {
         Some(index.min(last))
     }
 
+    /// Whether Enter now forgets the highlighted memory
+    pub(crate) fn marked(&self) -> bool {
+        let Some(index) = self.highlighted() else {
+            return false;
+        };
+        let choice = &self.choices[index];
+        match (&self.forgetting, &choice.completion) {
+            (Some(marked), Completion::Memory(value)) => marked == value,
+            _ => false,
+        }
+    }
+
     pub(crate) fn submit_text(&mut self, text: &str) {
         let Some(command) = Command::parse(text) else {
             self.transcript.task(text);
@@ -330,6 +365,7 @@ impl App {
                 return self.info(empty_text(List::Servers))
             }
             Command::List(List::Servers) => return self.complete(MCP_PREFIX),
+            Command::List(List::Memories) => return self.complete(MEMORY_PREFIX),
             Command::Quit => {
                 self.quit = true;
                 return;
@@ -391,6 +427,7 @@ impl App {
 
         self.dirty = true;
         let typed = matches!(event, Event::Key(_) | Event::Paste(_));
+        let forgetting = self.forgetting.take();
 
         match event {
             Event::Key(key) => {
@@ -408,6 +445,8 @@ impl App {
                 // The input box wraps, so this counts screen rows
                 let top = self.input.screen_cursor().row == 0;
                 let first = self.input.cursor() == DataCursor(0, 0);
+                let text = self.input.lines().join("\n");
+                let last = offset(&self.input) == text.chars().count();
 
                 match (choice, key.code) {
                     (Some(_), KeyCode::Up) => {
@@ -419,13 +458,39 @@ impl App {
                         self.highlight.select(Some(next));
                     }
                     (Some(choice), KeyCode::Tab) => self.fill(&choice.completion),
+                    (
+                        Some(Choice {
+                            completion: Completion::Memory(value),
+                            ..
+                        }),
+                        KeyCode::Enter,
+                    ) if plain && forgetting.as_ref() == Some(&value) => {
+                        match self.session.forget(&value) {
+                            Ok(text) => self.info(text),
+                            Err(error) => {
+                                let text = format!("{error:#}");
+                                self.failure(text);
+                            }
+                        }
+                        // Asked again on the refresh below, without the memory
+                        self.fetched = None;
+                    }
                     (Some(choice), KeyCode::Enter) if plain => {
                         self.fill(&choice.completion);
                         if choice.submits() {
                             self.submit();
                         }
                     }
+                    // Taking the mark above already dropped it, and the list stays open
+                    (Some(_), KeyCode::Esc) if forgetting.is_some() => {}
                     (Some(_), KeyCode::Esc) => self.choices_closed = true,
+                    (
+                        Some(Choice {
+                            completion: Completion::Memory(value),
+                            ..
+                        }),
+                        KeyCode::Delete,
+                    ) if plain && last => self.forgetting = Some(value),
 
                     (_, KeyCode::Char('c')) if ctrl => match self.run {
                         Some(_) if running => self.interrupt(),
@@ -724,6 +789,7 @@ impl App {
         let lists = [
             (RESUME_PREFIX, List::Sessions),
             (MODEL_PREFIX, List::Models),
+            (MEMORY_PREFIX, List::Memories),
         ];
         let listing = match self.input.lines() {
             [line] => lists
@@ -732,14 +798,19 @@ impl App {
             _ => None,
         };
 
-        // Sessions come from the agent and are asked for once when the prefix is typed
-        let asking = matches!(listing, Some((_, List::Sessions)));
-        if !asking {
-            self.session_rows = None;
-        } else if self.session_rows.is_none() {
-            let asked = self.session.rows(List::Sessions);
+        // Sessions and memories come from the agent and are asked for once when the prefix is typed
+        let asking = match listing {
+            Some((_, list @ (List::Sessions | List::Memories))) => Some(list),
+            _ => None,
+        };
+        let cached = self.fetched.as_ref().map(|(list, _)| *list);
+        if asking.is_none() {
+            self.fetched = None;
+        }
+        if let Some(list) = asking.filter(|_| cached != asking) {
+            let asked = self.session.rows(list);
             match &asked {
-                Ok(rows) if rows.is_empty() => self.info(empty_text(List::Sessions)),
+                Ok(rows) if rows.is_empty() => self.info(empty_text(list)),
                 Ok(_) => {}
                 Err(error) => {
                     let text = format!("{error:#}");
@@ -748,7 +819,7 @@ impl App {
             }
 
             let rows = asked.unwrap_or_default();
-            self.session_rows = Some(rows);
+            self.fetched = Some((list, rows));
         }
 
         let DataCursor(row, col) = self.input.cursor();
@@ -882,7 +953,8 @@ impl App {
                 // A trailing space makes Enter fill without submitting,
                 // and only commands that open a list get one
                 let spaced = format!("{name} ");
-                let opens = [RESUME_PREFIX, MODEL_PREFIX, MCP_PREFIX].contains(&spaced.as_str());
+                let prefixes = [RESUME_PREFIX, MODEL_PREFIX, MCP_PREFIX, MEMORY_PREFIX];
+                let opens = prefixes.contains(&spaced.as_str());
                 let completion = match opens {
                     true => spaced,
                     false => name.to_owned(),
@@ -894,10 +966,10 @@ impl App {
             return;
         };
 
-        // Sessions use only what was already fetched, since asking again here would freeze the UI
-        let rows = match asking {
-            true => self.session_rows.clone(),
-            false => self.session.rows(list).ok(),
+        // Lists from the agent use only what was already fetched, since asking again here would freeze the UI
+        let rows = match &self.fetched {
+            Some((_, rows)) => Some(rows.clone()),
+            None => self.session.rows(list).ok(),
         };
         let query = line[prefix.len()..].trim().to_lowercase();
         for row in rows.unwrap_or_default() {
@@ -913,8 +985,15 @@ impl App {
                 true => "current",
                 false => &row.description,
             };
-            let completion = format!("{prefix}{}", row.value);
-            let choice = Choice::input(row.label, detail, completion);
+            let completion = match list {
+                List::Memories => Completion::Memory(row.value),
+                _ => Completion::Input(format!("{prefix}{}", row.value)),
+            };
+            let choice = Choice {
+                label: row.label,
+                detail: detail.to_owned(),
+                completion,
+            };
             offer(&mut self.choices, choice, exact || current);
         }
     }
@@ -947,6 +1026,7 @@ impl App {
                 self.input.insert_str(text);
                 self.highlight.select_first();
             }
+            Completion::Memory(_) => {}
         }
     }
 
@@ -1303,6 +1383,7 @@ fn empty_text(list: List) -> &'static str {
         List::Sessions => "no other sessions",
         List::Models => "no models",
         List::Servers => "no MCP servers",
+        List::Memories => "no memories",
     }
 }
 
@@ -1510,6 +1591,72 @@ mod tests {
 
         app.session.open(None).expect("open");
         assert_eq!(list(&app, List::Sessions), "s1  old session");
+    }
+
+    #[test]
+    fn memories_picked() {
+        let mut app = app();
+        app.submit_text(":memory");
+        assert_eq!(app.input.lines(), [":memory "]);
+        let picked: Vec<(&str, &str)> = app
+            .choices
+            .iter()
+            .map(|choice| (choice.label.as_str(), choice.detail.as_str()))
+            .collect();
+        let expected = [
+            ("Tests run with pytest", "project #12"),
+            ("Prefers résumé over CV and naïve tests", "global #99"),
+        ];
+        assert_eq!(picked, expected);
+        let status = |app: &mut App| {
+            let terminal = draw(app, 80, 12);
+            let buffer = terminal.backend().buffer();
+            (0..80)
+                .map(|x| buffer[(x, 11)].symbol())
+                .collect::<String>()
+        };
+        let listing = status(&mut app);
+        assert!(
+            listing.contains("↑↓ select · del forget · esc close"),
+            "{listing}"
+        );
+
+        // A held key repeats Delete, which only marks the memory again
+        key(&mut app, KeyCode::Delete);
+        key(&mut app, KeyCode::Delete);
+        assert!(app.marked());
+        let marked = status(&mut app);
+        assert!(marked.contains("enter forget · esc keep"), "{marked}");
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
+
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Delete);
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.marked() && !app.choices.is_empty());
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Delete);
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Delete);
+        key(&mut app, KeyCode::Enter);
+        let expected = [
+            "",
+            "  forgot memory 12; the system prompt drops it next session",
+            "",
+            "✗ memory: 99: not found",
+        ];
+        assert_eq!(shown(&mut app), expected);
+        assert_eq!(app.choices.len(), 2);
+        let found = labels(&mut app, ":memory naïve");
+        assert_eq!(found, ["Prefers résumé over CV and naïve tests"]);
+
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Delete);
+        assert_eq!(app.input.lines(), [":memory naïv"]);
+        assert!(!app.marked());
+        assert_eq!(shown(&mut app), expected);
     }
 
     #[test]
@@ -1858,8 +2005,11 @@ mod tests {
 
     #[test]
     fn path_completions() {
-        let text = |path| match Choice::path(path, 1).completion {
-            Completion::Mention { text, .. } | Completion::Input(text) => text,
+        let text = |path| {
+            let Completion::Mention { text, .. } = Choice::path(path, 1).completion else {
+                panic!("{path}");
+            };
+            text
         };
         assert_eq!(text("src/main.rs"), "@src/main.rs ");
         assert_eq!(text("src/"), "@src/");
@@ -2068,6 +2218,8 @@ mod tests {
         assert_eq!(off, Some(Command::Mcp(false, "fake".to_owned())));
         let wide = Command::parse(":mcp on\u{3000}web");
         assert_eq!(wide, Some(Command::Mcp(true, "web".to_owned())));
+        let memories = Some(Command::List(List::Memories));
+        assert_eq!(Command::parse(":memory"), memories);
 
         for line in ["hello", "quit", "q", "", " :new"] {
             assert_eq!(Command::parse(line), None, "{line}");
@@ -2079,9 +2231,10 @@ mod tests {
         for line in [":mcp fake", ":mcp toggle fake", ":mcp on"] {
             assert_eq!(Command::parse(line), mcp, "{line}");
         }
+        assert_eq!(Command::parse(":memory café"), usage("usage: :memory"));
 
         let commands =
-            ":new, :resume <session>, :model <name>, :mcp <on|off> <server>, :quit, !<command>";
+            ":new, :resume <session>, :model <name>, :mcp <on|off> <server>, :memory, :quit, !<command>";
         for name in [":help", ":", ":)"] {
             let unknown = format!("command: {name}: unknown (commands: {commands})");
             assert_eq!(Command::parse(name), usage(&unknown), "{name}");
@@ -2098,10 +2251,10 @@ mod tests {
             found.iter().map(|hint| hint.name()).collect::<Vec<_>>()
         };
 
-        let all = [":new", ":resume", ":model", ":mcp", ":quit"];
+        let all = [":new", ":resume", ":model", ":mcp", ":memory", ":quit"];
         assert_eq!(names(":"), all);
         assert_eq!(names(":res"), [":resume"]);
-        assert_eq!(names(":m"), [":model", ":mcp"]);
+        assert_eq!(names(":m"), [":model", ":mcp", ":memory"]);
         assert!(names(":resume abc").is_empty() && names("new").is_empty());
 
         for hint in &HINTS {
@@ -2109,7 +2262,7 @@ mod tests {
             assert!(!matches!(parsed, Some(Command::Invalid(_))), "{parsed:?}");
         }
 
-        for prefix in [RESUME_PREFIX, MODEL_PREFIX, MCP_PREFIX] {
+        for prefix in [RESUME_PREFIX, MODEL_PREFIX, MCP_PREFIX, MEMORY_PREFIX] {
             let named = HINTS
                 .iter()
                 .any(|hint| format!("{} ", hint.name()) == prefix);

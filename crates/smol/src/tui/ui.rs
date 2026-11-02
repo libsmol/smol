@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Padding, Paragr
 use ratatui::Frame;
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use reaper::tilde;
+use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -19,6 +20,8 @@ const SIDEBAR_WIDTH: u16 = 32;
 const MIN_WIDE_SCREEN: u16 = 100;
 const MAX_INPUT_ROWS: usize = 10;
 const MAX_CHOICE_ROWS: usize = 10;
+const SCROLL_EVERY: Duration = Duration::from_millis(60);
+const SCROLL_WAIT: Duration = Duration::from_millis(1500);
 
 const PINK: Style = Style::new().fg(theme::PINK);
 const GREEN: Style = Style::new().fg(theme::GREEN);
@@ -464,6 +467,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
 
     let highlighted = app.highlighted();
     app.choices_area = Rect::default();
+    app.scroll_at = None;
+    let marquee = app.marquee.take();
     if let Some(highlighted) = highlighted {
         let choices = &app.choices;
         let count = choices.len();
@@ -476,6 +481,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let inside = conversation.inner(Margin::new(1, 1));
         let room = usize::from(inside.width).saturating_sub(chrome);
         let (label_width, detail_width) = widths(label_width, detail_width, room);
+
+        let picked = &choices[highlighted].label;
+        let since = match marquee {
+            Some((shown, at)) if shown == *picked => at,
+            _ => Instant::now(),
+        };
+        app.marquee = Some((picked.clone(), since));
+        let elapsed = since.elapsed();
+        let (rolling, changes) = rolled(picked, label_width, elapsed);
+        app.scroll_at = changes.map(|changes| since + changes);
 
         let listed = count.min(MAX_CHOICE_ROWS);
         let height = (listed as u16 + 2).min(inside.height);
@@ -497,8 +512,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         }
 
         let mut items = Vec::new();
-        for choice in choices {
-            let label = fitted(&choice.label, label_width);
+        for (index, choice) in choices.iter().enumerate() {
+            let label = match index == highlighted {
+                true => rolling.clone(),
+                false => fitted(&choice.label, label_width),
+            };
             let label = Span::raw(label + "  ");
             let detail = fitted(&choice.detail, detail_width);
             let detail = Span::styled(detail, DIM);
@@ -506,7 +524,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             items.push(ListItem::new(line));
         }
         let pointer = Span::styled("❯ ", PINK);
-        let selected = BOLD.bg(theme::LINE);
+        let selected = match app.marked() {
+            true => BOLD.fg(theme::RED).bg(theme::LINE),
+            false => BOLD.bg(theme::LINE),
+        };
         let list = List::new(items)
             .block(block)
             .highlight_symbol(pointer)
@@ -528,9 +549,12 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         };
         vec![Span::styled(text, style)]
     } else if let Some(highlighted) = highlighted {
-        let text = match app.choices[highlighted].submits() {
-            true => "↑↓ select · tab complete · enter run · esc close",
-            false => "↑↓ select · tab/enter complete · esc close",
+        let choice = &app.choices[highlighted];
+        let text = match (app.marked(), choice.forgets(), choice.submits()) {
+            (true, _, _) => "enter forget · esc keep",
+            (false, true, _) => "↑↓ select · del forget · esc close",
+            (false, false, true) => "↑↓ select · tab complete · enter run · esc close",
+            (false, false, false) => "↑↓ select · tab/enter complete · esc close",
         };
         keys(text)
     } else {
@@ -637,6 +661,46 @@ fn first_row(text: &str, width: usize) -> String {
     }
     let marked = format!("{first}…");
     clipped(&marked, width)
+}
+
+/// The `width` columns of `text` shown `elapsed` after it was highlighted, and when they next change
+fn rolled(text: &str, width: usize, elapsed: Duration) -> (String, Option<Duration>) {
+    let overflow = text.width().saturating_sub(width);
+    if overflow == 0 {
+        return (fitted(text, width), None);
+    }
+
+    let every = SCROLL_EVERY.as_millis() as usize;
+    let pause = SCROLL_WAIT.as_millis() as usize / every;
+    let cycle = overflow + 2 * pause;
+    let steps = elapsed.as_millis() as usize / every;
+    let position = steps % cycle;
+    let offset = position.saturating_sub(pause).min(overflow);
+    let next = match position < pause + overflow {
+        true => position.max(pause) + 1,
+        false => cycle,
+    };
+    let millis = (steps - position + next) * every;
+    let changes = Some(Duration::from_millis(millis as u64));
+    if offset == 0 {
+        return (fitted(text, width), changes);
+    }
+
+    let mut shown = String::new();
+    let mut column = 0;
+    for grapheme in text.graphemes(true) {
+        let start = column;
+        column += grapheme.width();
+        // A wide character cut by either edge is left out
+        if start < offset {
+            continue;
+        }
+        if column > offset + width {
+            break;
+        }
+        shown.push_str(grapheme);
+    }
+    (fitted(&shown, width), changes)
 }
 
 fn tail(text: &str, width: usize) -> String {
@@ -802,6 +866,25 @@ mod tests {
 
         let emoji = first_row("⚠️ careful ✔️ done", 13);
         assert!(emoji.width() <= 13, "{emoji}");
+    }
+
+    #[test]
+    fn long_label_scrolls() {
+        // 20 columns, the snake taking two
+        let text = "café naïve 🐍 résumé";
+        let at = |millis| rolled(text, 10, Duration::from_millis(millis));
+        let next = |millis| Some(Duration::from_millis(millis));
+        let start = fitted(text, 10);
+        assert_eq!(at(0), (start.clone(), next(1560)));
+        assert_eq!(at(1400), (start.clone(), next(1560)));
+        assert_eq!(at(1560), ("afé naïve ".to_owned(), next(1620)));
+        assert_eq!(at(1620), ("fé naïve  ".to_owned(), next(1680)));
+        assert_eq!(at(1860), ("aïve 🐍 ré".to_owned(), next(1920)));
+        assert_eq!(at(2100), (" 🐍 résumé".to_owned(), next(3600)));
+        assert_eq!(at(3540), (" 🐍 résumé".to_owned(), next(3600)));
+        assert_eq!(at(3600), (start, next(5160)));
+        let short = rolled("café", 10, Duration::from_secs(9));
+        assert_eq!(short, ("café      ".to_owned(), None));
     }
 
     #[test]
