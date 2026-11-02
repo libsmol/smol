@@ -1,8 +1,8 @@
 use crate::agent::{Brief, Place, Status};
 use crate::config::Role;
 use crate::memory::{
-    exit_code, AgentStep, Call, CallError, Ending, Exit, MemoryStep, ShellStep, StepError,
-    TaskStep, MAX_OBSERVATION_CHARS, MAX_PRINT_CHARS,
+    exit_code, AgentStep, Attachment, Call, CallError, Ending, Exit, MemoryStep, ShellStep,
+    StepError, TaskStep, MAX_OBSERVATION_CHARS, MAX_PRINT_CHARS,
 };
 use crate::model::{Media, Part};
 use crate::tools::memories::MAX_MEMORY_CHARS;
@@ -18,7 +18,9 @@ pub(crate) const TOOL: &str = "eval";
 /// Mentioning tags makes models write tags into the arguments
 pub(crate) const TOOL_DOC: &str = "Runs Python code.";
 
+/// What the summarizer's transcript calls a message the user wrote while the agent worked
 const UPDATE: &str = "Task update";
+const WROTE: &str = "[The user wrote while you were working]";
 
 const RULES: &str = "- Never make up data or functions; check unfamiliar ones with `help()` first.
 - Do the task instead of describing it.
@@ -35,8 +37,6 @@ const REMEMBERING: &str = "## Rules
 const SHOWN: &str = " Text you write in a reply that runs code is shown to the user.";
 const NAMED: &str =
     " MCP functions list their optional parameters by name only; `help()` on one prints their types and what they do.";
-const UPDATES: &str =
-    "A user message that starts with `Task update:` adds to or changes the current task.";
 const HANDED_BACK: &str = "Only your answer is returned to the agent that assigned this task, so include everything the task asks for.";
 
 /// Errors of `agent()` and its handles go unlabeled, as the worker labels them with the function
@@ -96,7 +96,7 @@ pub(crate) fn retrying(reason: &str) -> String {
 
 pub(crate) fn done(agents: &[String]) -> String {
     let names = agents.join("\n");
-    format!("{DONE}:\n{names}")
+    format!("[{DONE}]\n{names}")
 }
 
 /// Errors of `remember()` and `forget()` go unlabeled too, as the worker labels them with the function
@@ -178,8 +178,16 @@ pub(crate) fn system(
         }
     };
 
+    let updates =
+        format!("A message that starts with `{WROTE}` adds to or changes the current task.");
     let (shown, markdown, note, reader, roles) = match place {
-        Place::Main { roles, .. } => (SHOWN, " in Markdown", UPDATES, "the user", roles.as_slice()),
+        Place::Main { roles, .. } => (
+            SHOWN,
+            " in Markdown",
+            updates.as_str(),
+            "the user",
+            roles.as_slice(),
+        ),
         Place::Delegated(_) => (
             "",
             "",
@@ -209,7 +217,7 @@ pub(crate) fn system(
 `agent()` gives a task to a new agent with the same environment as you, but not this Python session or this conversation, so the task must state everything it needs.
 
 - A single task that fails raises `RuntimeError`; a list of tasks returns the answers in order, with a `RuntimeError` in place of each task that failed.
-- An agent started with `name` that is still running when you answer keeps the task open until it ends, and an `{DONE}:` message tells you when.
+- An agent started with `name` that is still running when you answer keeps the task open until it ends, and an `[{DONE}]` message tells you when.
 
 ## Rules
 
@@ -348,44 +356,48 @@ These need no import. Use them instead of writing your own, and create new files
 }
 
 pub(crate) fn task(step: &TaskStep) -> Vec<Part> {
-    request("New task", step)
+    request(step.text.clone(), step)
 }
 
 pub(crate) fn update(step: &TaskStep) -> Vec<Part> {
-    request(UPDATE, step)
+    let text = format!("{WROTE}\n{}", step.text);
+    request(text, step)
 }
 
-fn request(label: &str, step: &TaskStep) -> Vec<Part> {
-    let task = &step.text;
-    let mut text = format!("{label}:\n{task}");
-    if !step.files.is_empty() {
-        text.push_str("\n\nAttached files:");
+fn request(text: String, step: &TaskStep) -> Vec<Part> {
+    let mut parts = Vec::new();
+    // Parts are sent joined by line breaks, so an empty text would start the message with one
+    if !text.is_empty() || step.files.is_empty() {
+        parts.push(Part::Text(text));
     }
-
-    let mut parts = vec![Part::Text(text)];
     for file in &step.files {
-        let path = &file.path;
         if let Some(media) = &file.media {
-            let attached = Part::Media(path.clone(), media.clone());
+            let attached = Part::Media(file.path.clone(), media.clone());
             parts.push(attached);
             continue;
         }
 
-        let (tag, key) = match (file.resource, path.ends_with('/')) {
-            (true, _) => ("resource", "uri"),
-            (false, true) => ("directory", "path"),
-            (false, false) => ("file", "path"),
-        };
-        let lines = match file.lines {
-            Some(lines) => format!(" lines=\"{}\"", span(lines)),
-            None => String::new(),
-        };
-        let content = file.content.trim_end_matches('\n');
-        let block = format!("<{tag} {key}=\"{path}\"{lines}>\n{content}\n</{tag}>");
+        let block = block(file, &file.content);
         parts.push(Part::Text(block));
     }
 
     parts
+}
+
+/// The tag of an attached file, directory or resource around `content`
+fn block(file: &Attachment, content: &str) -> String {
+    let path = &file.path;
+    let (tag, key) = match (file.resource, path.ends_with('/')) {
+        (true, _) => ("resource", "uri"),
+        (false, true) => ("directory", "path"),
+        (false, false) => ("file", "path"),
+    };
+    let lines = match file.lines {
+        Some(lines) => format!(" lines=\"{}\"", span(lines)),
+        None => String::new(),
+    };
+    let content = content.trim_end_matches('\n');
+    format!("<{tag} {key}=\"{path}\"{lines}>\n{content}\n</{tag}>")
 }
 
 fn span((first, last): (u32, u32)) -> String {
@@ -409,51 +421,67 @@ pub(crate) fn result(printed: Option<&str>, viewed: &[(String, Media)]) -> Vec<P
     parts
 }
 
-pub(crate) const NO_OUTPUT: &str = "(no output)";
+pub(crate) const NO_OUTPUT: &str = "[no output]";
 
 pub(crate) fn cut(count: usize) -> String {
     format!("[{count} characters cut]")
 }
 
 /// Cut-off replies are never sent back, so the model cannot see the last reply this mentions
-const CUT: &str = "Your last reply was discarded: it hit the output length limit, so nothing ran. Write less per reply and split long work across several replies.";
-const NO_CODE: &str = "not run: no Python code in the code argument";
+const CUT: &str =
+    "Your last reply was too long and was discarded, so nothing ran: write less per reply";
+const NO_CODE: &str = "not run: the call had no code";
 pub(crate) const STOPPED: &str = "interrupted by the user";
-const UNRUN: &str = "interrupted by the user before the code ran";
+const UNRUN: &str = "not run: interrupted by the user";
 pub(crate) const SKIPPED: &str = "not run: an earlier call failed";
-const UNREPLIED: &str = "The user interrupted you before you replied.";
+const INTERRUPTED: &str = "The user interrupted you";
 
-/// A step with calls reports this in their replies instead
-pub(crate) fn error(step: &AgentStep) -> Option<String> {
+/// Why a step went wrong, which a step with calls reports in their replies instead
+pub(crate) fn step_reason(step: &AgentStep) -> Option<String> {
     let error = step.error.as_ref()?;
-    let silent = step.text.trim().is_empty() && step.calls.is_empty();
     let text = match error {
         StepError::Cut => CUT,
-        StepError::Interrupted if silent => UNREPLIED,
-        StepError::Interrupted => STOPPED,
+        StepError::Interrupted => INTERRUPTED,
         StepError::Model(_) => return Some(error.to_string()),
     };
     Some(text.to_owned())
 }
 
-/// A call that never ran still needs a reason
-pub(crate) fn call_error(step: &AgentStep, call: &Call) -> Option<String> {
+/// The message for a step that went wrong
+pub(crate) fn error(step: &AgentStep) -> Option<String> {
+    let reason = step_reason(step)?;
+    match step.error {
+        Some(StepError::Model(_)) => Some(reason),
+        _ => Some(format!("[{reason}]")),
+    }
+}
+
+/// Why a call failed, stopped or never ran, which a call that never ran always has
+pub(crate) fn call_reason(step: &AgentStep, call: &Call) -> Option<String> {
     let interrupted = step.error == Some(StepError::Interrupted);
-    let text = match (&call.error, &call.result) {
+    let reason = match (&call.error, &call.result) {
         (Some(CallError::NoTool(name)), _) => {
-            let text =
-                format!("not run: there is no tool named \"{name}\"; the only tool is {TOOL}");
-            return Some(text);
+            format!("not run: no tool named \"{name}\", only {TOOL}")
         }
-        (Some(CallError::NoCode), _) => NO_CODE,
-        (Some(CallError::Interrupted), Some(_)) => STOPPED,
-        (Some(CallError::Interrupted), None) => UNRUN,
-        (Some(CallError::Execution(text)), _) => text,
+        (Some(CallError::NoCode), _) => NO_CODE.to_owned(),
+        (Some(CallError::Interrupted), Some(_)) => STOPPED.to_owned(),
+        (Some(CallError::Interrupted), None) => UNRUN.to_owned(),
+        (Some(CallError::Execution(text)), _) => text.clone(),
         (None, Some(_)) => return None,
-        (None, None) if interrupted => UNRUN,
-        (None, None) => SKIPPED,
+        (None, None) if interrupted => UNRUN.to_owned(),
+        (None, None) => SKIPPED.to_owned(),
     };
-    Some(text.to_owned())
+    Some(reason)
+}
+
+/// The note that ends a call's reply
+pub(crate) fn call_error(step: &AgentStep, call: &Call) -> Option<String> {
+    let reason = call_reason(step, call)?;
+    match call.error {
+        // The user sees these errors too, so they go unbracketed
+        Some(CallError::Execution(_)) => Some(reason),
+        _ => Some(format!("[{reason}]")),
+    }
 }
 
 pub(crate) fn shell(step: &ShellStep) -> String {
@@ -463,36 +491,44 @@ pub(crate) fn shell(step: &ShellStep) -> String {
         output,
         end,
     } = step;
-    let ran = format!("The user ran this {shell} command in the working directory:\n$ {command}");
+    let ran = format!("[The user ran this {shell} command]\n$ {command}");
+    let ended = ended(end);
+    if let Exit::Unstarted(_) = end {
+        return format!("{ran}\n[{ended}]");
+    }
+
     let output = match output.trim_end() {
-        "" => "Output: none".to_owned(),
-        output => format!("Output (stdout and stderr):\n{output}"),
+        "" => NO_OUTPUT,
+        output => output,
     };
-    let end = match end {
+    format!("{ran}\n{output}\n[{ended}]")
+}
+
+fn ended(end: &Exit) -> String {
+    match end {
         Exit::Exited(code) => {
             let code = exit_code(*code);
-            format!("Exit code: {code}")
+            format!("exited with code {code}")
         }
-        Exit::Signaled(signal) => format!("Signal {signal} ended it."),
-        Exit::Interrupted => "The user interrupted it before it exited.".to_owned(),
-        Exit::Unstarted(reason) => return format!("{ran}\nIt did not start: {reason}"),
-    };
-    format!("{ran}\n{output}\n{end}")
+        Exit::Signaled(signal) => format!("ended with signal {signal}"),
+        Exit::Interrupted => STOPPED.to_owned(),
+        Exit::Unstarted(reason) => format!("did not start: {reason}"),
+    }
 }
 
 /// `updates` follow `task` and are left out without one
 pub(crate) fn summarized(summary: &str, task: Option<&str>, updates: &[&str]) -> String {
     let mut text = format!(
-        "Earlier messages were replaced by this summary of your work so far:\n\n<summary>\n{summary}\n</summary>"
+        "[Summary of your work so far, replacing earlier messages]\n<summary>\n{summary}\n</summary>"
     );
     let Some(task) = task else {
         return text;
     };
 
-    let current = format!("\n\nCurrent task:\n{task}");
+    let current = format!("\n\n[Current task]\n{task}");
     text.push_str(&current);
     for update in updates {
-        let update = format!("\n\n{UPDATE}:\n{update}");
+        let update = format!("\n\n{WROTE}\n{update}");
         text.push_str(&update);
     }
     text
@@ -501,17 +537,17 @@ pub(crate) fn summarized(summary: &str, task: Option<&str>, updates: &[&str]) ->
 pub(crate) fn unseen(label: &str, media: &Media) -> String {
     let named = named(label, media);
     let word = media.kind.word();
-    format!("The {named} is not shown: the current model does not take {word}s.")
+    format!("[{named}: not shown, the model takes no {word}s]")
 }
 
 pub(crate) fn missing(label: &str, media: &Media) -> String {
     let named = named(label, media);
-    format!("The {named} is not shown: its saved copy is gone.")
+    format!("[{named}: not shown, its copy was deleted]")
 }
 
 pub(crate) fn dropped(label: &str, media: &Media) -> String {
     let named = named(label, media);
-    format!("The {named} is not shown: only the latest images and videos are.")
+    format!("[{named}: no longer shown]")
 }
 
 /// Viewed and attached media go by path, and media from MCP by the function called
@@ -544,7 +580,7 @@ pub(crate) fn exited(end: Option<&Exit>) -> String {
             let code = exit_code(*code);
             format!("exited with code {code}")
         }
-        Some(Exit::Signaled(signal)) => format!("was ended by signal {signal}"),
+        Some(Exit::Signaled(signal)) => format!("ended with signal {signal}"),
         _ => "exited".to_owned(),
     }
 }
@@ -573,12 +609,13 @@ pub(crate) const SILENT_ERROR: &str = "the tool reported an error without a mess
 pub(crate) const LEFT_BEHIND: &str = "stopped when the code that was running ended";
 pub(crate) const ADDING_SERVER: &str = "not run while an MCP server was being added";
 
-pub(crate) fn unshown(what: &str, mime: &str, size: usize) -> String {
-    format!("[{what}: {mime}, {size} bytes, not shown]")
+/// `label` is the function called
+pub(crate) fn unshown(what: &str, label: &str, mime: &str, size: usize) -> String {
+    format!("[{what} from {label}: not shown, {mime}, {size} bytes]")
 }
 
 pub(crate) fn unkept(label: &str, reason: &str) -> String {
-    format!("[image from {label}: {reason}]")
+    format!("[image from {label}: not shown, {reason}]")
 }
 
 pub(crate) fn uncopied(reason: &str) -> String {
@@ -590,11 +627,15 @@ pub(crate) fn linked(uri: &str) -> String {
 }
 
 pub(crate) fn too_large(size: u64) -> String {
-    format!("{size} bytes, too large to attach; read the parts you need in code")
+    format!("{size} bytes, too large; read the parts you need in code")
 }
 
 pub(crate) fn undecoded(size: u64) -> String {
-    format!("{size} bytes, not UTF-8 text; if it is text in another encoding, decode it in code")
+    format!("{size} bytes, not UTF-8; decode it in code")
+}
+
+pub(crate) fn unattached(reason: &str) -> String {
+    format!("[not attached: {reason}]")
 }
 
 pub fn unserializable(key: &str, kind: &str) -> String {
@@ -619,7 +660,7 @@ pub(crate) fn timed_out(seconds: u64) -> String {
 }
 
 pub(crate) fn media_too_large(word: &str, size: u64, limit: u64) -> String {
-    format!("{size} bytes, over the {limit}-byte limit for an attached {word}")
+    format!("{size} bytes, over the {limit}-byte {word} limit")
 }
 
 pub(crate) const IRREGULAR: &str = "not a regular file";
@@ -648,7 +689,7 @@ pub(crate) fn unviewable(path: &str, images: &str, videos: &str) -> String {
 }
 
 pub(crate) const RESTARTED: &str =
-    "Python was restarted: variables, functions and imports from earlier calls are gone.";
+    "[Python restarted: earlier variables, functions and imports are gone]";
 
 pub(crate) const NAMER: &str = "Reply with a short title for a conversation that starts with the message below: a few words in its language, without quotes or ending punctuation. Do not answer the message.";
 
@@ -658,13 +699,12 @@ pub(crate) const SUMMARIZER: &str =
 
 # The conversation
 
-Each entry starts with a label:
-- `[Task]` and `[Task update]`: what the agent was asked to do
+Each entry starts with a label on a line of its own:
+- `[Task]` and `[Task update]`: what the agent was asked to do, with any attached files in tags such as `<file>`
 - `[Agent]`: the agent's message, which can claim more than the output shows
 - `[Code]`: Python code it ran
-- `[Observation]`: what the code printed
+- `[Observation]`: what the code printed, with a tag such as `<image>` for each image or video it viewed or a function returned
 - `[Error]`: what failed
-- `[Attached ...]`: a file attached to a task, or an image or video that the code viewed or a function returned
 - `[Shell]`: a command the user ran
 - `[Agent done]`: agents started in the background that ended
 
@@ -703,7 +743,7 @@ pub(crate) fn transcript(steps: &[&MemoryStep], max: usize) -> String {
                 let shown = !step.dropped();
                 let text = step.text.trim();
                 if shown && !text.is_empty() {
-                    let said = format!("[Agent]: {text}");
+                    let said = format!("[Agent]\n{text}");
                     entries.push(said);
                 }
                 let calls = match shown {
@@ -712,77 +752,80 @@ pub(crate) fn transcript(steps: &[&MemoryStep], max: usize) -> String {
                 };
                 for call in calls {
                     if !call.unread() {
-                        let code = format!("[Code]: {}", call.code);
+                        let code = format!("[Code]\n{}", call.code);
                         entries.push(code);
                     }
                     let result = call.result.as_ref();
+                    let mut observed = Vec::new();
                     let printed = result.and_then(|result| result.printed.as_deref());
-                    if let Some(printed) = printed {
+                    if let Some(printed) = printed.filter(|printed| *printed != NO_OUTPUT) {
                         let printed = truncated(printed, max);
-                        let observed = format!("[Observation]: {printed}");
-                        entries.push(observed);
+                        observed.push(printed);
                     }
                     for (label, media) in result.map(|result| &result.media).into_iter().flatten() {
-                        let viewed = placeholder(label, media);
-                        entries.push(viewed);
+                        let tag = media_tag(label, media);
+                        observed.push(tag);
                     }
-                    if let Some(error) = call_error(step, call) {
-                        let error = truncated(&error, max);
-                        let error = format!("[Error]: {error}");
+                    if !observed.is_empty() {
+                        let observed = observed.join("\n");
+                        let entry = format!("[Observation]\n{observed}");
+                        entries.push(entry);
+                    }
+                    if let Some(reason) = call_reason(step, call) {
+                        let reason = truncated(&reason, max);
+                        let error = format!("[Error]\n{reason}");
                         entries.push(error);
                     }
                 }
-                let error = error(step).filter(|_| calls.is_empty());
-                if let Some(error) = error {
-                    let error = truncated(&error, max);
-                    let error = format!("[Error]: {error}");
+                let reason = step_reason(step).filter(|_| calls.is_empty());
+                if let Some(reason) = reason {
+                    let reason = truncated(&reason, max);
+                    let error = format!("[Error]\n{reason}");
                     entries.push(error);
                 }
                 continue;
             }
             MemoryStep::Shell(ran) => {
-                let text = shell(ran);
+                let command = &ran.command;
+                let ended = ended(&ran.end);
+                let text = match ran.output.trim_end() {
+                    "" => format!("$ {command}\n{ended}"),
+                    output => format!("$ {command}\n{output}\n{ended}"),
+                };
                 let text = truncated(&text, max);
-                let entry = format!("[Shell]: {text}");
+                let entry = format!("[Shell]\n{text}");
                 entries.push(entry);
                 continue;
             }
             MemoryStep::Done { agents } => {
-                let names = agents.join(", ");
-                let entry = format!("[{DONE}]: {names}");
+                let names = agents.join("\n");
+                let entry = format!("[{DONE}]\n{names}");
                 entries.push(entry);
                 continue;
             }
             MemoryStep::Summary(_) | MemoryStep::Restarted => continue,
         };
 
-        let text = &task.text;
-        let asked = format!("[{label}]: {text}");
-        entries.push(asked);
+        // Attachments look as they did to the agent
+        let mut lines = vec![format!("[{label}]")];
+        if !task.text.is_empty() {
+            lines.push(task.text.clone());
+        }
         for file in &task.files {
-            let path = &file.path;
             let attached = match &file.media {
-                Some(media) => placeholder(path, media),
+                Some(media) => media_tag(&file.path, media),
                 None => {
-                    let content = file.content.trim_end_matches('\n');
-                    let content = truncated(content, max);
-                    let lines = match file.lines {
-                        Some(lines) => format!(", lines {}", span(lines)),
-                        None => String::new(),
-                    };
-                    format!("[Attached {path}{lines}]: {content}")
+                    let content = truncated(&file.content, max);
+                    block(file, &content)
                 }
             };
-            entries.push(attached);
+            lines.push(attached);
         }
+        let asked = lines.join("\n");
+        entries.push(asked);
     }
 
     entries.join("\n\n")
-}
-
-fn placeholder(label: &str, media: &Media) -> String {
-    let named = named(label, media);
-    format!("[Attached {named}]")
 }
 
 pub(crate) fn summary(transcript: &str, previous: Option<&str>, trailing: bool) -> String {
@@ -865,7 +908,7 @@ mod tests {
                         Agent.get(name) -> Agent\n    # Its handle.\n\n\
                         help(request) -> None\n    # Prints the docs.\n```\n\n# Skills";
         assert!(text.contains(built_in), "{text}");
-        let delegating = "`Agent done:` message tells you when.\n\n## Rules\n\n\
+        let delegating = "`[Agent done]` message tells you when.\n\n## Rules\n\n\
                           - Run the independent parts of a task in parallel with `agent([task1, task2, ...])`";
         assert!(text.contains(delegating), "{text}");
         let place = format!(
@@ -1029,11 +1072,14 @@ mod tests {
             error: Some(StepError::Interrupted),
             ..AgentStep::default()
         };
-        let unreplied = "The user interrupted you before you replied.";
-        assert_eq!(error(&stopped("", Vec::new())).as_deref(), Some(unreplied));
-        let plain = "interrupted by the user";
+        let interrupted = "[The user interrupted you]";
+        assert_eq!(
+            error(&stopped("", Vec::new())).as_deref(),
+            Some(interrupted)
+        );
         let prose = stopped("Roses are red", Vec::new());
-        assert_eq!(error(&prose).as_deref(), Some(plain));
+        assert_eq!(error(&prose).as_deref(), Some(interrupted));
+        let plain = "[interrupted by the user]";
 
         let written = Call {
             code: "open('half.txt', 'w')".to_owned(),
@@ -1047,7 +1093,7 @@ mod tests {
         let step = stopped("First, a note.", vec![ran.clone(), written.clone()]);
         assert_eq!(call_error(&step, &ran).as_deref(), Some(plain));
         let unrun = call_error(&step, &written);
-        let expected = "interrupted by the user before the code ran";
+        let expected = "[not run: interrupted by the user]";
         assert_eq!(unrun.as_deref(), Some(expected));
 
         let failed = AgentStep {
@@ -1055,12 +1101,19 @@ mod tests {
             ..step
         };
         let skipped = call_error(&failed, &written);
-        let expected = "not run: an earlier call failed";
+        let expected = "[not run: an earlier call failed]";
         assert_eq!(skipped.as_deref(), Some(expected));
 
+        // Transcript entries carry their own label, so they go unbracketed
         let step = MemoryStep::Action(Box::new(stopped("", Vec::new())));
         let text = transcript(&[&step], usize::MAX);
-        assert_eq!(text, format!("[Error]: {unreplied}"));
+        assert_eq!(text, "[Error]\nThe user interrupted you");
+        let step = MemoryStep::Action(Box::new(failed));
+        let text = transcript(&[&step], usize::MAX);
+        let expected = "[Agent]\nFirst, a note.\n\n\
+                        [Code]\nopen('half.txt', 'w')\n\n[Error]\ninterrupted by the user\n\n\
+                        [Code]\nopen('half.txt', 'w')\n\n[Error]\nnot run: an earlier call failed";
+        assert_eq!(text, expected);
     }
 
     #[test]
@@ -1071,34 +1124,39 @@ mod tests {
             output: output.to_owned(),
             end,
         };
-        let head =
-            "The user ran this fish command in the working directory:\n$ grep order log.txt\n";
+        let head = "[The user ran this fish command]\n$ grep order log.txt\n";
 
         let found = shell(&ran("order 1\norder 2\n", Exit::Exited(0)));
-        let expected = format!("{head}Output (stdout and stderr):\norder 1\norder 2\nExit code: 0");
+        let expected = format!("{head}order 1\norder 2\n[exited with code 0]");
         assert_eq!(found, expected);
         let none = shell(&ran("", Exit::Exited(1)));
-        assert_eq!(none, format!("{head}Output: none\nExit code: 1"));
+        assert_eq!(none, format!("{head}[no output]\n[exited with code 1]"));
         let killed = shell(&ran("", Exit::Signaled(9)));
-        assert_eq!(killed, format!("{head}Output: none\nSignal 9 ended it."));
+        assert_eq!(killed, format!("{head}[no output]\n[ended with signal 9]"));
         #[cfg(windows)]
         {
             let crashed = shell(&ran("", Exit::Exited(0xC0000005_u32 as i32)));
             assert_eq!(
                 crashed,
-                format!("{head}Output: none\nExit code: 0xC0000005")
+                format!("{head}[no output]\n[exited with code 0xC0000005]")
             );
         }
         let stopped = shell(&ran("", Exit::Interrupted));
-        let expected = format!("{head}Output: none\nThe user interrupted it before it exited.");
+        let expected = format!("{head}[no output]\n[interrupted by the user]");
         assert_eq!(stopped, expected);
         let missing = shell(&ran("", Exit::Unstarted("fish not found".to_owned())));
-        assert_eq!(missing, format!("{head}It did not start: fish not found"));
+        assert_eq!(missing, format!("{head}[did not start: fish not found]"));
 
-        // Summaries see the same text
+        // The transcript's label already says the user ran it
         let step = MemoryStep::Shell(ran("", Exit::Exited(1)));
         let text = transcript(&[&step], usize::MAX);
-        assert_eq!(text, format!("[Shell]: {head}Output: none\nExit code: 1"));
+        assert_eq!(text, "[Shell]\n$ grep order log.txt\nexited with code 1");
+        let step = MemoryStep::Shell(ran("order 1\n", Exit::Signaled(9)));
+        let text = transcript(&[&step], usize::MAX);
+        assert_eq!(
+            text,
+            "[Shell]\n$ grep order log.txt\norder 1\nended with signal 9"
+        );
     }
 
     #[test]
@@ -1110,8 +1168,7 @@ mod tests {
         let tag = media_tag("screen.grab", &called);
         assert_eq!(tag, "<image from=\"screen.grab\"/>");
         let note = unseen("screen.grab", &called);
-        let expected =
-            "The image from screen.grab is not shown: the current model does not take images.";
+        let expected = "[image from screen.grab: not shown, the model takes no images]";
         assert_eq!(note, expected);
 
         let result = CodeResult {
@@ -1130,8 +1187,8 @@ mod tests {
         };
         let step = MemoryStep::Action(Box::new(step));
         let transcript = transcript(&[&step], 100);
-        let placeholder =
-            "[Code]: screen.grab()\n\n[Observation]: Captured\n\n[Attached image from screen.grab]";
-        assert_eq!(transcript, placeholder);
+        let observed =
+            "[Code]\nscreen.grab()\n\n[Observation]\nCaptured\n<image from=\"screen.grab\"/>";
+        assert_eq!(transcript, observed);
     }
 }

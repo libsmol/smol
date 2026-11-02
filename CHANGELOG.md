@@ -19,6 +19,17 @@ but their files stay in `~/.smol/history` untouched.
 - A highlighted choice too long for smol's popup list, such as a long memory
   or session title, scrolls through its text after a pause, starting over
   each time the highlight lands on it.
+- The model gets each task as the user wrote it, without the `New task:`
+  line, and attached files follow in their own tags without an
+  `Attached files:` line. What smol itself writes into the conversation is
+  now always in square brackets and shorter: a message sent during a turn
+  starts with `[The user wrote while you were working]` instead of
+  `Task update:`, background agents that end are announced as
+  `[Agent done]`, and notes like `[no output]`,
+  `[not run: an earlier call failed]`, `[not attached: …]` and
+  `[image x.png: not shown, …]` follow one pattern.
+- A prompt with neither text nor attachments is refused with `task: empty`
+  instead of sending the model an empty message.
 
 ## 0.6.5 - 2026-11-02
 
