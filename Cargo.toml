@@ -6,11 +6,11 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/libsmol/smol"
-version = "0.6.3"
+version = "0.6.4"
 
 [workspace.dependencies]
-libsmol = { version = "0.6.3", path = "crates/libsmol" }
-reaper = { package = "libsmol-reaper", version = "0.6.3", path = "crates/reaper" }
+libsmol = { version = "0.6.4", path = "crates/libsmol" }
+reaper = { package = "libsmol-reaper", version = "0.6.4", path = "crates/reaper" }
 
 [profile.release]
 lto = true

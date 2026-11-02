@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.6.4 - 2026-11-02
 
 - smol shows an image that an answer puts on a line of its own, from a path or
   a web address, in the conversation: through Kitty's graphics protocol in
