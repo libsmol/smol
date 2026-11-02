@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.6.3 - 2026-11-02
 
 - The system prompt says that packages installed into the venv can be
   imported right away without naming `pip install`, and words the rules on
