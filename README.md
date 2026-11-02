@@ -195,8 +195,8 @@ functions:
 | `edit(path, old, new)` | Replace text that appears exactly once in a file. |
 | `fetch(url)` | Get a web page as Markdown. |
 | `view(path)` | Show an image or video to the model (offered only when the model takes media). |
-| `remember(text, project=True)` | Keep a memory of up to 300 characters for this folder, or with `project=False` for every folder, and return its id. |
-| `recall(query="")` | The memories of this folder and of every folder that best match the words of `query`, up to 10 as `(id, text)`. |
+| `remember(text, project=True)` | Keep a memory of up to 300 characters for this project, or with `project=False` a global one, and return its id. |
+| `recall(query="")` | Up to 10 of this project's and the global memories as `(id, text)`: those that best match the words of `query`, then the newest. |
 | `forget(id)` | Delete a memory. |
 | `agent(task)` | Give a task to a new agent and return its answer; a list of tasks runs up to 8 agents at a time, and `role=` picks one of your [roles](#roles). With `name=` it runs in the background and returns an `Agent` handle at once. |
 | `Agent.get(name)` | The handle of a background agent, whose `wait(timeout=None)`, `status()` and `stop()` return its answer, say what it is doing and stop it. |
@@ -206,10 +206,10 @@ MCP tools appear as Python objects named after their server, for example
 `github.search_issues(query="...")`.
 
 Memories outlast sessions in `~/.smol/memory.db`, which the code reaches only
-through these functions. When a session opens, its system prompt lists the
-10 newest memories kept for every folder and says how many the session's
-folder has, which the model finds with `recall()`; words are matched whole,
-Chinese ones too.
+through these functions. A project is the session's working directory. When
+a session opens, its system prompt lists the 10 newest global memories and
+says how many the project has, which the model finds with `recall()`; words
+are matched whole, Chinese ones too.
 Agents that `agent()` starts can only recall. To look at them, run
 `sqlite3 ~/.smol/memory.db "select id, text from memories"`; deleting the file
 forgets everything.

@@ -42,8 +42,6 @@ _STDOUT, _STDERR = _stream(1), _stream(2)
 # Only prints to this stream are capped, not ones captured by redirect_stdout
 _SHOWN = None
 
-_MAX_PRINT_CHARS = 8192
-
 def _open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
     opened = _REAL_OPEN(file, mode, buffering, encoding, errors, newline, closefd, opener)
     found = _os.fstat(opened.fileno())
@@ -224,27 +222,22 @@ def _asked(function, method, params):
 
 @_builtin
 def remember(text: str, project: bool = True) -> int:
-    """Saves text as a memory of this folder, or of every folder with project=False, and returns its id.
-
-    Saves text of at most {chars} characters as a memory and returns its id. With project=True only sessions in this folder see it; with project=False every session sees it, and later sessions list the newest such memories under Memories. Keep one fact per memory; to change one, forget() it and remember() the new text."""
+    """Saves text of at most {chars} characters as a memory and returns its id.
+    The memory is for this project, or global with project=False."""
     text = _str("remember", "text", text)
     project = bool(project)
     return _asked("remember", "remember", {"text": text, "project": project})
 
 @_builtin
 def recall(query: str = "") -> list[tuple[int, str]]:
-    """(id, text) of the memories that best match the words of query, or the newest without any.
-
-    Searches the memories of this folder and of every folder for any word of query and returns up to {recalled} as (id, text), best matches first; a query without words returns the newest."""
+    """(id, text) of up to {recalled} memories: those that match any word of query, best first, then the newest."""
     query = _str("recall", "query", query)
     found = _asked("recall", "recall", {"query": query})
     return [(id, text) for id, text in found]
 
 @_builtin
 def forget(id: int) -> None:
-    """Deletes the memory with this id.
-
-    Deletes a memory of this folder or of every folder by the id that remember() and recall() give."""
+    """Deletes the memory with this id."""
     if isinstance(id, bool) or not isinstance(id, int):
         kind = type(id).__name__
         raise TypeError(f"forget: id must be int, not {kind}")

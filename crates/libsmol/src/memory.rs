@@ -5,6 +5,8 @@ use std::fmt;
 use std::ops::Not;
 
 pub(crate) const MAX_OBSERVATION_CHARS: usize = 16_384;
+/// The worker cuts each `print()` to it
+pub const MAX_PRINT_CHARS: usize = 8192;
 /// Errs toward overestimating
 const BYTES_PER_TOKEN: usize = 3;
 /// Providers count differently, so this takes the high end

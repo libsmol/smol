@@ -1398,11 +1398,11 @@ pub(crate) mod tests {
         let mut worker = fresh();
         let code = "a = remember('Deploys the café site on Fridays')\n\
              b = remember('Prefers naïve tests', project=False)\n\
-             [recall('fridays') == [(a, 'Deploys the café site on Fridays')], len(recall()), forget(a), recall('fridays')]";
+             [recall('fridays') == [(a, 'Deploys the café site on Fridays'), (b, 'Prefers naïve tests')], len(recall()), forget(a), recall('fridays') == [(b, 'Prefers naïve tests')]]";
         let output = worker.eval(code);
 
         assert_eq!(output.error, None, "{}", output.logs);
-        assert_eq!(output.logs, "[True, 2, None, []]\n");
+        assert_eq!(output.logs, "[True, 2, None, True]\n");
     }
 
     #[test]

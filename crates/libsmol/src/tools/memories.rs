@@ -153,29 +153,39 @@ impl Memories {
         Ok(id)
     }
 
-    /// The best matches first, or the newest memories when `query` has no words
+    /// The best matches first, then the newest memories up to `MAX_RECALLED`
     async fn recall(&self, query: &str) -> Result<Vec<(i64, String)>, String> {
         let memories = self.clone();
         let query = query.to_owned();
         let searching = move || {
             let matched = matched(&query);
             let connection = opened(&memories.db)?;
-            if matched.is_empty() {
-                let mut newest = connection.prepare(
-                    "SELECT id, text FROM memories WHERE folder = ?1 OR folder IS NULL \
-                     ORDER BY id DESC LIMIT ?2",
+            let mut found = Vec::new();
+            if !matched.is_empty() {
+                let mut best = connection.prepare(
+                    "SELECT memories.id, memories.text FROM terms JOIN memories ON memories.id = terms.rowid \
+                     WHERE terms MATCH ?1 AND (memories.folder = ?2 OR memories.folder IS NULL) \
+                     ORDER BY bm25(terms), memories.id DESC LIMIT ?3",
                 )?;
-                let rows = newest.query_map(params![memories.folder, MAX_RECALLED], pair)?;
-                return rows.collect();
+                let rows = best.query_map(params![matched, memories.folder, MAX_RECALLED], pair)?;
+                found = rows.collect::<rusqlite::Result<Vec<_>>>()?;
             }
 
-            let mut best = connection.prepare(
-                "SELECT memories.id, memories.text FROM terms JOIN memories ON memories.id = terms.rowid \
-                 WHERE terms MATCH ?1 AND (memories.folder = ?2 OR memories.folder IS NULL) \
-                 ORDER BY bm25(terms), memories.id DESC LIMIT ?3",
+            let mut newest = connection.prepare(
+                "SELECT id, text FROM memories WHERE folder = ?1 OR folder IS NULL \
+                 ORDER BY id DESC LIMIT ?2",
             )?;
-            let rows = best.query_map(params![matched, memories.folder, MAX_RECALLED], pair)?;
-            rows.collect()
+            let rows = newest.query_map(params![memories.folder, MAX_RECALLED], pair)?;
+            for row in rows {
+                let row = row?;
+                if found.len() as i64 == MAX_RECALLED {
+                    break;
+                }
+                if !found.contains(&row) {
+                    found.push(row);
+                }
+            }
+            Ok(found)
         };
         self.run(searching).await
     }
@@ -380,16 +390,49 @@ mod tests {
             recalled.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
         };
 
-        assert_eq!(found("安装"), [ids[0]]);
-        assert_eq!(found("共和国"), [ids[2]]);
-        assert_eq!(found("CAFE"), [ids[3]]);
-        assert_eq!(found("nautilus"), [ids[4]]);
-        assert_eq!(found("corner\0nine"), [ids[3]]);
+        let installed = [ids[0], shared, ids[4], ids[3], ids[2], ids[1]];
+        assert_eq!(found("安装"), installed);
+        assert_eq!(found("共和国")[0], ids[2]);
+        assert_eq!(found("CAFE")[0], ids[3]);
+        assert_eq!(found("nautilus")[0], ids[4]);
+        assert_eq!(found("corner\0nine")[0], ids[3]);
         assert_eq!(found("pnpm 依赖 检查")[0], ids[0]);
-        assert_eq!(found("中文"), [shared]);
+        assert_eq!(found("中文")[0], shared);
         let newest = [shared, ids[4], ids[3], ids[2], ids[1], ids[0]];
         assert_eq!(found(""), newest);
         assert!(!found("npm 安装依赖").contains(&theirs));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recall_filled() {
+        let dir = temp_dir("filled");
+        let here = opened(&dir, "/home/zoë/café");
+        let saving = async {
+            let mut ids = Vec::new();
+            for index in 0..12 {
+                let text = match index {
+                    0 => "The résumé template lives in docs".to_owned(),
+                    _ => format!("Naïve note {index}"),
+                };
+                let id = here.remember(&text, true).await.expect("remember");
+                ids.push(id);
+            }
+            ids
+        };
+        let ids = block_on(saving);
+
+        let found = |query: &str| {
+            let recalling = here.recall(query);
+            let recalled = block_on(recalling).expect("recall");
+            recalled.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
+        };
+
+        let newest: Vec<i64> = ids.iter().rev().take(10).copied().collect();
+        assert_eq!(found("unknown words"), newest);
+        let mut matched = vec![ids[0]];
+        matched.extend(&newest[..9]);
+        assert_eq!(found("résumé"), matched);
         fs::remove_dir_all(&dir).ok();
     }
 
