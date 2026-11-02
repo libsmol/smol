@@ -742,7 +742,7 @@ pub(crate) mod tests {
             summary("s2", 3),
         ]);
         let second = prompt::summarized("s2", None, &[]);
-        let task = "New task:\nSecond task".to_owned();
+        let task = "Second task".to_owned();
         let expected = [second, "a3".to_owned(), task, "a4".to_owned()];
         assert_eq!(contents(&memory), expected);
 
@@ -764,11 +764,11 @@ pub(crate) mod tests {
                 summary("s1", 1),
             ],
         };
-        let text = "Earlier messages were replaced by this summary of your work so far:\n\n\
+        let text = "[Summary of your work so far, replacing earlier messages]\n\
             <summary>\ns1\n</summary>\n\n\
-            Current task:\nWrite a poem about autumn\n\n\
-            Task update:\nMake it winter\n\n\
-            Task update:\nOnly four lines";
+            [Current task]\nWrite a poem about autumn\n\n\
+            [The user wrote while you were working]\nMake it winter\n\n\
+            [The user wrote while you were working]\nOnly four lines";
         assert_eq!(contents(&memory), [text, "a3"]);
 
         memory
@@ -812,7 +812,7 @@ pub(crate) mod tests {
             steps: vec![task("Read the orders again"), MemoryStep::Restarted, ran],
         };
         let expected = [
-            "New task:\nRead the orders again",
+            "Read the orders again",
             prompt::RESTARTED,
             "eval:\nprint(orders)",
             "Orders loaded",
@@ -822,7 +822,7 @@ pub(crate) mod tests {
         let steps: Vec<&MemoryStep> = memory.steps.iter().collect();
         let transcript = prompt::transcript(&steps, usize::MAX);
         let skipped =
-            "[Task]: Read the orders again\n\n[Code]: print(orders)\n\n[Observation]: Orders loaded";
+            "[Task]\nRead the orders again\n\n[Code]\nprint(orders)\n\n[Observation]\nOrders loaded";
         assert_eq!(transcript, skipped);
     }
 
@@ -866,7 +866,7 @@ pub(crate) mod tests {
         let long = "café".repeat(10);
         let asked = task(&long);
         memory.steps.push(asked);
-        let unmeasured = 300 + "New task:\n".len() + long.len();
+        let unmeasured = 300 + long.len();
         assert_eq!(tokens(&memory), 120 + estimate(unmeasured));
 
         let thought = AgentStep {
@@ -927,7 +927,7 @@ pub(crate) mod tests {
             ..asked("Look at @src/main.rs")
         };
         let asked = MemoryStep::Task(task);
-        let text = "New task:\nLook at @src/main.rs\n\nAttached files:\n\
+        let text = "Look at @src/main.rs\n\
             <file path=\"src/main.rs\">\nfn main() {}\n</file>\n\
             <directory path=\"docs/\">\na.md\n</directory>\n\
             <file path=\"src/lib.rs\" lines=\"10-12\">\nfn café() {}\n</file>\n\
@@ -935,8 +935,15 @@ pub(crate) mod tests {
             <resource uri=\"zed:///agent/diagnostics\">\nerror: unused café\n</resource>";
         assert_eq!(content(&asked.messages(&mut 0)[0]), text);
         let transcript = prompt::transcript(&[&asked], usize::MAX);
-        let ranged = "[Attached src/lib.rs, lines 10-12]: fn café() {}";
-        assert!(transcript.contains(ranged), "{transcript}");
+        assert_eq!(transcript, format!("[Task]\n{text}"));
+
+        let linked = TaskStep {
+            text: String::new(),
+            files: vec![file("docs/", "a.md")],
+        };
+        let linked = MemoryStep::Task(linked);
+        let only = "<directory path=\"docs/\">\na.md\n</directory>";
+        assert_eq!(content(&linked.messages(&mut 0)[0]), only);
 
         let ran = AgentStep {
             usage: metered(100, 20),
@@ -968,7 +975,7 @@ pub(crate) mod tests {
 
         let asked = MemoryStep::Update(update);
         let messages = asked.messages(&mut 0);
-        let head = "Task update:\nLook at this one\n\nAttached files:";
+        let head = "[The user wrote while you were working]\nLook at this one";
         let file = "<file path=\"notes.txt\">\nCrème brûlée\n</file>";
         let parts = vec![
             Part::Text(head.to_owned()),
@@ -988,9 +995,8 @@ pub(crate) mod tests {
         assert_eq!(unseen, head.len() + note.len() + file.len() + 2);
 
         let transcript = prompt::transcript(&[&asked], usize::MAX);
-        let placeholder = "[Task update]: Look at this one\n\n[Attached image screenshot.png]\n\n\
-            [Attached notes.txt]: Crème brûlée";
-        assert_eq!(transcript, placeholder);
+        let entry = format!("[Task update]\nLook at this one\n{tag}\n{file}");
+        assert_eq!(transcript, entry);
     }
 
     /// Older images give way to a note a batch at a time,
@@ -1021,11 +1027,7 @@ pub(crate) mod tests {
                 for part in parts {
                     match part {
                         Part::Media(..) => shown += 1,
-                        Part::Text(text)
-                            if text.ends_with("only the latest images and videos are.") =>
-                        {
-                            noted += 1
-                        }
+                        Part::Text(text) if text.ends_with("no longer shown]") => noted += 1,
                         Part::Text(_) => {}
                     }
                 }

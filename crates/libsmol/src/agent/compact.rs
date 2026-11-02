@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(content(system), SUMMARIZER);
 
         let asked = content(asked);
-        let start = "<conversation>\n[Task]: Add 1 to x\n\n[Code]: x = 41\n";
+        let start = "<conversation>\n[Task]\nAdd 1 to x\n\n[Code]\nx = 41\n";
         assert!(asked.starts_with(start), "{asked}");
         assert!(!asked.contains("print('data')"), "{asked}");
         assert!(
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(
             after[1..],
             [
-                "Earlier messages were replaced by this summary of your work so far:\n\n<summary>\nx holds 41.\n</summary>\n\nCurrent task:\nAdd 1 to x",
+                "[Summary of your work so far, replacing earlier messages]\n<summary>\nx holds 41.\n</summary>\n\n[Current task]\nAdd 1 to x",
                 "eval:\nprint('data')",
                 "data",
             ]
@@ -530,7 +530,7 @@ mod tests {
             transcripts.push(transcript.to_owned());
         }
         assert!(
-            transcripts[0].contains("[Attached data.txt]: café café café"),
+            transcripts[0].contains("<file path=\"data.txt\">\ncafé café café"),
             "{transcripts:?}"
         );
         assert!(transcripts[1].contains("naïve naïve"), "{transcripts:?}");
@@ -599,7 +599,7 @@ mod tests {
         let requests = run.requests.lock().expect("requests");
         let asked = content(&requests[2][1]);
         assert!(
-            asked.starts_with("<conversation>\n[Task]: Check x\n"),
+            asked.starts_with("<conversation>\n[Task]\nCheck x\n"),
             "{asked}"
         );
         assert!(!asked.contains("Add 1 to x"), "{asked}");
@@ -608,9 +608,9 @@ mod tests {
         assert_eq!(
             after[1..],
             [
-                "Earlier messages were replaced by this summary of your work so far:\n\n<summary>\nx holds 41.\n</summary>",
+                "[Summary of your work so far, replacing earlier messages]\n<summary>\nx holds 41.\n</summary>",
                 "x is 41.",
-                "New task:\nAdd 1 to x",
+                "Add 1 to x",
             ]
         );
     }
@@ -636,7 +636,7 @@ mod tests {
         let requests = run.requests.lock().expect("requests");
         let resent = contents(&requests[4]);
         assert_eq!(resent, contents(&requests[3]));
-        let asked = "New task:\nAdd 1 to x";
+        let asked = "Add 1 to x";
         let count = resent.iter().filter(|text| *text == asked).count();
         assert_eq!(count, 1, "{resent:?}");
     }
@@ -667,10 +667,7 @@ mod tests {
         let asked = content(&requests[2][1]);
         assert!(!asked.contains("notes.txt"), "{asked}");
         let after = contents(&requests[3]);
-        assert_eq!(
-            after[after.len() - 2..],
-            [shown, "New task:\nAdd 1 to x".to_owned()]
-        );
+        assert_eq!(after[after.len() - 2..], [shown, "Add 1 to x".to_owned()]);
     }
 
     /// The latest output is over the recent share but stays because the model has not seen it

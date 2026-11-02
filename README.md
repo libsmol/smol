@@ -232,7 +232,7 @@ while it works. `Agent.get(name)` finds it again, also after Python restarts;
 `wait()` returns its answer, or `None` if it is still running after `timeout`
 seconds, and raises `RuntimeError` if it failed or was stopped. The turn stays
 open until every background agent has ended. When one ends before code took
-its answer, the model gets an "Agent done:" message, and what you type
+its answer, the model gets an "[Agent done]" message, and what you type
 meanwhile reaches it as a task update. smol shows running agents under the
 call that started them, and pins them below the conversation while their rows
 are scrolled out of view.

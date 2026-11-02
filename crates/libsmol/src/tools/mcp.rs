@@ -320,13 +320,13 @@ pub(crate) async fn connect(
                                 Some(Err(reason)) => prompt::unkept(&label, &reason),
                                 None => {
                                     let size = bytes(&image.data);
-                                    prompt::unshown("image", &image.mime_type, size)
+                                    prompt::unshown("image", &label, &image.mime_type, size)
                                 }
                             }
                         }
                         ContentBlock::Audio(audio) => {
                             let size = bytes(&audio.data);
-                            prompt::unshown("audio", &audio.mime_type, size)
+                            prompt::unshown("audio", &label, &audio.mime_type, size)
                         }
                         ContentBlock::Resource(embedded) => match &embedded.resource {
                             ResourceContents::TextResourceContents { text, .. } => text.clone(),
@@ -338,7 +338,8 @@ pub(crate) async fn connect(
                             } => {
                                 let mime = mime_type.as_deref().unwrap_or("binary");
                                 let size = bytes(blob);
-                                prompt::unshown(uri, mime, size)
+                                let resource = format!("resource {uri}");
+                                prompt::unshown(&resource, &label, mime, size)
                             }
                             _ => continue,
                         },

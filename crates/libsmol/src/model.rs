@@ -1385,16 +1385,15 @@ pub(crate) mod tests {
         let expected = json!([
             {"type": "text", "text": "Look at this\n<image path=\"chart.png\"/>"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}},
-            {"type": "text", "text": "And a video\nThe video clip.mp4 is not shown: the current model does not take videos.\nThe image old.png is not shown: its saved copy is gone."},
+            {"type": "text", "text": "And a video\n[video clip.mp4: not shown, the model takes no videos]\n[image old.png: not shown, its copy was deleted]"},
         ]);
         assert_eq!(body["messages"][0]["content"], expected);
 
         let text = ModelSpec::default();
         let (_, unseen) = served(DONE, &text, &conversation, Purpose::Step);
-        let expected =
-            "Look at this\nThe image chart.png is not shown: the current model does not take images.\n\n\
-            And a video\nThe video clip.mp4 is not shown: the current model does not take videos.\n\
-            The image old.png is not shown: the current model does not take images.";
+        let expected = "Look at this\n[image chart.png: not shown, the model takes no images]\n\n\
+            And a video\n[video clip.mp4: not shown, the model takes no videos]\n\
+            [image old.png: not shown, the model takes no images]";
         assert_eq!(unseen["messages"][0]["content"], expected);
 
         let both = ModelSpec {
@@ -1468,7 +1467,7 @@ pub(crate) mod tests {
             ],
         };
         let viewed = Part::Media("chart.png".to_owned(), media);
-        let quiet = Part::Text("(no output)".to_owned());
+        let quiet = Part::Text("[no output]".to_owned());
         let first = ChatMessage::Tool {
             id: "call_2".to_owned(),
             parts: vec![quiet, viewed.clone()],
@@ -1516,7 +1515,7 @@ pub(crate) mod tests {
                     {"id": "call_5", "type": "function", "function": {"name": "_", "arguments": "{}"}},
                 ],
             },
-            {"role": "tool", "content": "(no output)\n<image path=\"chart.png\"/>", "tool_call_id": "call_2"},
+            {"role": "tool", "content": "[no output]\n<image path=\"chart.png\"/>", "tool_call_id": "call_2"},
             {"role": "tool", "content": "<image path=\"chart.png\"/>", "tool_call_id": "call_3"},
             {"role": "tool", "content": "No such tool", "tool_call_id": "call_4"},
             {"role": "tool", "content": "No such tool", "tool_call_id": "call_5"},
