@@ -20,7 +20,7 @@ _STATE = vars(_MAIN)
 
 def _unsent(self, obj):
     if isinstance(obj, (_types.FunctionType, type)) and getattr(obj, "__module__", None) == "__main__":
-        raise _pickle.PicklingError(f"{obj.__qualname__} is defined in your code and can't be sent to another process; put it in a .py file and import it")
+        raise _pickle.PicklingError(f"multiprocessing: {obj.__qualname__}: defined in your code, so it can't be sent to another process; put it in a .py file and import it")
     return NotImplemented
 
 # Spawned processes can't import a __main__ without a file, and a Pool waits forever on one that fails to load it
@@ -304,7 +304,7 @@ class Agent:
         Waits until the agent ends and returns its answer.
         - With timeout, returns None if it is still running after that many seconds; timeout=None waits until it ends.
         - Raises RuntimeError if the agent failed or was stopped.
-        - Once the code has its result, no "{done}:" message is sent for it."""
+        - Once the code has its result, no "[{done}]" message is sent for it."""
         if timeout is not None:
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
                 kind = type(timeout).__name__
@@ -331,7 +331,7 @@ class Agent:
     def stop(self) -> None:
         """Stops it and returns once it has stopped.
 
-        Stops the agent and returns once it has stopped; no "{done}:" message is sent for it."""
+        Stops the agent and returns once it has stopped; no "[{done}]" message is sent for it."""
         _asked("Agent.stop", "stop", {"id": self._id})
 
 # Wrapped once the class exists, which their annotations name

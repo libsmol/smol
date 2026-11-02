@@ -372,6 +372,9 @@ pub(crate) fn serve(
 impl Turn<'_> {
     async fn run(&mut self, task: Task) -> Result<Option<String>> {
         let task = self.agent.attached(task).await;
+        if task.text.trim().is_empty() && task.files.is_empty() {
+            return Err(Error::Refused("empty".to_owned()));
+        }
 
         // The task text survives compaction verbatim, so a task over half the window can never fit
         let copies = &self.agent.copies;
@@ -1051,6 +1054,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn empty_task_refused() {
+        let mut run = recorded(Vec::new(), None, "", Box::new(|_| {}));
+        let mut memory = AgentMemory::default();
+        let error = run.agent.turn(&mut memory, " \n").expect_err("refused");
+        assert_eq!(error.to_string(), "task: empty");
+        assert!(memory.steps.is_empty());
+    }
+
+    #[test]
     fn huge_task_refused() {
         let replies = vec![Ok(reply("Watched it"))];
         let mut run = recorded(replies, Some(40_000), "", Box::new(|_| {}));
@@ -1063,7 +1075,7 @@ pub(crate) mod tests {
         let huge = "crème brûlée ".repeat(5625);
         let error = run.agent.turn(&mut memory, &huge).expect_err("refused");
         let error = error.to_string();
-        let refused = "task: too large: about 30003 tokens, over half of the 40000-token context";
+        let refused = "task: too large: about 30000 tokens, over half of the 40000-token context";
         assert_eq!(error, refused);
         assert!(memory.steps.is_empty());
 
@@ -1098,7 +1110,7 @@ pub(crate) mod tests {
 
         let requests = run.requests.lock().expect("requests");
         let second: Vec<String> = requests[1][1..].iter().map(content).collect();
-        assert_eq!(second, ["New task:\nCount lines"]);
+        assert_eq!(second, ["Count lines"]);
         assert_eq!(memory.steps.len(), 2, "{:?}", memory.steps);
     }
 
@@ -1169,10 +1181,10 @@ pub(crate) mod tests {
 
         let requests = run.requests.lock().expect("requests");
         let first: Vec<String> = requests[0][1..].iter().map(content).collect();
-        assert_eq!(first, ["New task:\nRead the orders", RESTARTED]);
+        assert_eq!(first, ["Read the orders", RESTARTED]);
         let second: Vec<String> = requests[1][1..].iter().map(content).collect();
         let expected = [
-            "New task:\nRead the orders",
+            "Read the orders",
             RESTARTED,
             "eval:\nprint('reading the orders again')",
             "reading the orders again",

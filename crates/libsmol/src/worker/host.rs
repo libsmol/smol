@@ -840,7 +840,7 @@ pub(crate) mod tests {
         let crashed = worker.eval("import os\nos.abort()");
         let crashed = error(crashed);
         #[cfg(unix)]
-        assert_eq!(crashed, "Python was ended by signal 6");
+        assert_eq!(crashed, "Python ended with signal 6");
         // On Windows the exit code of abort depends on the C runtime
         #[cfg(windows)]
         assert!(crashed.starts_with("Python exited with code "), "{crashed}");
@@ -1384,8 +1384,8 @@ pub(crate) mod tests {
                  pool.map(square, [3])";
         let output = worker.eval(code);
         let message = error(output);
-        let expected = "PicklingError: square is defined in your code \
-                        and can't be sent to another process; put it in a .py file and import it";
+        let expected = "PicklingError: multiprocessing: square: defined in your code, \
+                        so it can't be sent to another process; put it in a .py file and import it";
         assert!(message.starts_with(expected), "{message}");
 
         let output = worker.eval("import pickle\npickle.loads(pickle.dumps(square))(3)");
@@ -2103,7 +2103,7 @@ pub(crate) mod tests {
         let output = run("help(agent)\nhelp(Agent.stop)");
         let limit = format!("runs up to {MAX_PARALLEL_AGENTS} agents at a time");
         assert!(output.logs.contains(&limit), "{}", output.logs);
-        let done = format!("no \"{}:\" message", prompt::DONE);
+        let done = format!("no \"[{}]\" message", prompt::DONE);
         assert!(output.logs.contains(&done), "{}", output.logs);
     }
 
@@ -2677,7 +2677,7 @@ pub(crate) mod tests {
         let expected = [
             format!("ValueError: view: latin1.txt: {unviewable}"),
             format!("ValueError: view: fake.png: {unviewable}"),
-            "ValueError: read: album.png: not a regular file".to_owned(),
+            "ValueError: view: album.png: not a regular file".to_owned(),
         ];
         assert_eq!(refused, expected);
         assert!(missing.starts_with("FileNotFoundError: "), "{missing}");

@@ -1085,7 +1085,7 @@ mod tests {
 
         let requests = requests.lock().expect("requests");
         let last = requests.last().expect("request");
-        let told = "The user interrupted you before you replied.";
+        let told = "[The user interrupted you]";
         assert!(last.contains(told), "{last}");
         fs::remove_dir_all(&dir).ok();
     }

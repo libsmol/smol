@@ -70,6 +70,7 @@ A Rust workspace (edition 2021) whose code from the model runs in a pinned CPyth
 - Don't mention things the model shouldn't use. Whatever gets mentioned, the model drifts toward.
 - Review each piece of text on its own first, then review the complete prompt as actually assembled.
 - Output in examples must be captured from real runs. Builtin signatures must be exact and complete.
+- In the conversation, the user's words, the code's output and the errors of running it go as they are, content from elsewhere goes in an XML tag that names it (`<file>`, `<summary>`), and everything else libsmol says goes in square brackets, such as `[no output]`, `[not run: …]` and `[The user wrote while you were working]`.
 - After changing a prompt, test it with deepseek, and compare old against new when in doubt.
 
 ## Safety and configuration
