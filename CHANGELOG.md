@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.6.6 - 2026-11-03
 
 - `:memory` lists the memories the session sees, the project's and then the
   global ones, in a list that typing filters. `del` marks the selected one
