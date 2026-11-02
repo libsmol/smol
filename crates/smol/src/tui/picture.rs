@@ -508,8 +508,14 @@ mod tests {
             absolute,
             Some(Source::File(PathBuf::from("/tmp/résumé.png")))
         );
-        let file = Source::of("file:///tmp/r%C3%A9sum%C3%A9.png", cwd);
-        assert_eq!(file, Some(Source::File(PathBuf::from("/tmp/résumé.png"))));
+        // A file URL has a drive letter on Windows
+        let path = env::temp_dir().join("résumé.png");
+        let file = Url::from_file_path(&path).expect("url");
+        assert!(file.as_str().ends_with("/r%C3%A9sum%C3%A9.png"), "{file}");
+        assert_eq!(Source::of(file.as_str(), cwd), Some(Source::File(path)));
+        let drive = r"C:\Users\zoë\café.png";
+        let windows = Source::of(drive, cwd);
+        assert_eq!(windows, Some(Source::File(PathBuf::from(drive))));
         let web = "https://example.com/a/café.png?size=2";
         assert_eq!(Source::of(web, cwd), Some(Source::Web(web.to_owned())));
         assert_eq!(Source::of("data:image/png;base64,AAAA", cwd), None);
