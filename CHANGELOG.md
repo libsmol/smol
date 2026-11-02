@@ -7,6 +7,34 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- A paste of more than five lines that starts with `!` shows in smol's input
+  box as a shell command, as a shorter one does, and backspace at its start
+  turns it back into a message. It used to look like a message and then run
+  as a shell command when sent.
+- An error in `model.toml`, `agent.toml` or `roles.toml` names the key of a
+  bad value instead of quoting the value, so an API key, header or token
+  written without quotes, or as a string where a table belongs, no longer
+  shows in the error or the log. rmcp's own log lines, which held the whole
+  URL of an MCP server it couldn't reach, are left out of the log by default.
+- An agent that `stop()` or the end of a failed turn stopped ends under its
+  call as it is saved, as "stopped by stop()" or "stopped before it
+  answered", instead of as interrupted by the user until the session was
+  loaded again.
+- An agent started in the background that ends by itself while a step is
+  interrupted or fails is announced with an "Agent done:" message in the next
+  turn, as one that ends between steps is.
+- Output with control characters such as NUL, BEL or backspaces no longer
+  breaks the lines smol draws it on: they are dropped, and a backspace moves
+  back over the character before it as in a terminal.
+- The agents smol pins below the conversation stay there when the window is
+  resized, a call is expanded or an image loads, instead of vanishing for a
+  frame.
+- In Ghostty and kitty an image is sent to the terminal once, and drawing it
+  at another width only places it again. Resizing the window used to send
+  every image wider than the conversation again at each width.
+
 ## 0.6.4 - 2026-11-02
 
 - smol shows an image that an answer puts on a line of its own, from a path or

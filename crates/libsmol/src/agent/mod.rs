@@ -1,8 +1,8 @@
 use crate::config::{Role, Skill};
 use crate::history::MAX_TITLE_CHARS;
 use crate::memory::{
-    bytes, estimate, AgentMemory, AgentStep, Call, Helper, MemoryStep, StepError, SummaryStep,
-    TaskStep, Usage,
+    bytes, estimate, AgentMemory, AgentStep, Call, Ending, Helper, MemoryStep, StepError,
+    SummaryStep, TaskStep, Usage,
 };
 use crate::model::{
     ChatMessage, Finish, Finished, MediaKind, Model, ModelError, Purpose, StreamDelta,
@@ -118,6 +118,8 @@ pub(crate) struct Status {
     pub(crate) usage: Usage,
     /// When it got a slot to run in
     pub(crate) since: Option<Instant>,
+    /// How it ends when `stop()` or the end of the turn rather than the user stopped it
+    pub(crate) stopped: Option<Ending>,
 }
 
 pub(crate) struct Unseen;

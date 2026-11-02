@@ -1027,10 +1027,15 @@ impl App {
             return text;
         }
 
+        // A ! hidden in the placeholder would still run the paste as a shell command
+        let (marker, text) = match shell_command(&text) {
+            Some(command) => ("!", command.to_owned()),
+            None => ("", text),
+        };
         let number = self.pastes.len() + 1;
         let shown = placeholder(number, &text);
         self.pastes.push(text);
-        shown
+        format!("{marker}{shown}")
     }
 
     fn submit(&mut self) {
@@ -1736,6 +1741,29 @@ mod tests {
 
         key(&mut app, KeyCode::Up);
         assert_eq!(app.input.lines(), ["[paste #1: 8 lines]"]);
+    }
+
+    #[test]
+    fn long_shell_folded() {
+        let mut app = app();
+        app.submit_text("wait");
+        let lines: Vec<String> = (1..=7).map(|n| format!("echo café {n}")).collect();
+        let command = lines.join("\n");
+        app.on_event(Event::Paste(format!("  ! {command}")));
+        assert!(app.shell);
+        assert_eq!(app.input.lines(), ["[paste #1: 7 lines]"]);
+
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.queued, [format!("!{command}")]);
+        key(&mut app, KeyCode::Up);
+        assert!(app.shell);
+        assert_eq!(app.input.lines(), ["[paste #1: 7 lines]"]);
+
+        key(&mut app, KeyCode::Home);
+        key(&mut app, KeyCode::Backspace);
+        assert!(!app.shell);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.queued, [command]);
     }
 
     #[test]

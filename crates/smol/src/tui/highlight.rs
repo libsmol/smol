@@ -26,6 +26,7 @@ pub(crate) fn code(language: &str, code: &str) -> Vec<Spans> {
     }
 
     let code = terminal_view(code);
+    let code = printable(code);
     let mut spans = Vec::new();
     let mut at = 0;
     for (range, style) in tokens(&code) {
@@ -45,8 +46,40 @@ pub(crate) fn code(language: &str, code: &str) -> Vec<Spans> {
 pub(crate) fn plain(text: &str, style: Style) -> Vec<Spans> {
     // Escape sequences left in would show up as text and throw off the width
     let text = terminal_view(text);
+    let text = printable(text);
     let span = (text, style);
     lines(vec![span])
+}
+
+/// Wrapping would count control characters that ratatui never draws
+fn printable(text: String) -> String {
+    let drawn = |c: char| !c.is_control() || matches!(c, '\n' | '\t');
+    if text.chars().all(drawn) {
+        return text;
+    }
+
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        let mut cells: Vec<char> = Vec::new();
+        let mut at: usize = 0;
+        for c in line.chars() {
+            if c == '\x08' {
+                at = at.saturating_sub(1);
+                continue;
+            }
+            if !drawn(c) {
+                continue;
+            }
+
+            match cells.get_mut(at) {
+                Some(cell) => *cell = c,
+                None => cells.push(c),
+            }
+            at += 1;
+        }
+        lines.push(String::from_iter(cells));
+    }
+    lines.join("\n")
 }
 
 /// Not a full tokenizer, but it still splits half-written code
@@ -238,5 +271,26 @@ mod tests {
         let python = code("python", "x = 1\r\ny = 'olé'\r\n");
         assert_eq!(python.len(), 3);
         assert_eq!(python[1].last(), Some(&("'olé'".to_owned(), STRING)));
+    }
+
+    #[test]
+    fn controls_dropped() {
+        let nul = "\0".repeat(200);
+        let cases = [
+            (format!("{nul}café"), "café"),
+            (
+                "spin -\x08\\\x08|\x08/ done naïve".to_owned(),
+                "spin / done naïve",
+            ),
+            ("ding\x07 résumé\x08\x08\x08umé".to_owned(), "ding résumé"),
+            (
+                "X\x08X bold\u{85}\tnext\n\x08🐍".to_owned(),
+                "X bold\tnext\n🐍",
+            ),
+        ];
+
+        for (text, shown) in cases {
+            assert_eq!(printable(text.clone()), shown, "{text:?}");
+        }
     }
 }

@@ -57,7 +57,7 @@ const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
 const FETCH_WAIT: Duration = Duration::from_secs(10);
 /// Kitty takes a payload in base64 chunks of at most this many bytes
 const MAX_CHUNK_BYTES: usize = 4096;
-/// Kitty ids above this need a third diacritic
+/// Colors carry the ids, and a larger image id would need a third diacritic
 const MAX_ID: u32 = (1 << 24) - 1;
 
 /// A file's modification time and size, which change when it is written again
@@ -120,7 +120,9 @@ enum Look {
 struct Store {
     /// With the stamp a file had when it was read
     states: HashMap<Source, (State, Option<Stamp>)>,
-    /// Kitty image ids by picture and size in cells, and whether the terminal has the image
+    /// Kitty image ids by picture, and whether the terminal has the image
+    images: HashMap<Source, (u32, bool)>,
+    /// Kitty placement ids by picture and size in cells, and whether the terminal has the placement
     placed: HashMap<(Source, u32, u32), (u32, bool)>,
     /// Ids the terminal still holds for pictures loaded again since
     retired: Vec<u32>,
@@ -191,18 +193,11 @@ pub(crate) fn state(source: &Source) -> State {
         let mut store = STORE.lock().expect("pictures");
         store.states.insert(source.clone(), (loaded, stamp));
 
-        // The terminal's copies of an earlier version go at exit
-        let stale: Vec<_> = store
-            .placed
-            .keys()
-            .filter(|key| key.0 == source)
-            .cloned()
-            .collect();
-        for key in stale {
-            if let Some((id, true)) = store.placed.remove(&key) {
-                store.retired.push(id);
-            }
+        // The terminal's copy of an earlier version goes at exit, and its placements with it
+        if let Some((id, true)) = store.images.remove(&source) {
+            store.retired.push(id);
         }
+        store.placed.retain(|key, _| key.0 != source);
         LOADED.fetch_add(1, Ordering::Relaxed);
     });
     started
@@ -321,17 +316,16 @@ pub(crate) fn drawn(source: &Source, picture: &Picture, room: usize) -> Lines {
     match &picture.look {
         Look::Png(_) => {
             let mut store = STORE.lock().expect("pictures");
+            let Store {
+                images,
+                placed,
+                last_id,
+                ..
+            } = &mut *store;
+            let image = numbered(images, source.clone(), last_id);
             let key = (source.clone(), columns, rows);
-            let id = match store.placed.get(&key) {
-                Some((id, _)) => *id,
-                None => {
-                    store.last_id = store.last_id % MAX_ID + 1;
-                    let id = store.last_id;
-                    store.placed.insert(key, (id, false));
-                    id
-                }
-            };
-            placeholders(id, columns, rows)
+            let placement = numbered(placed, key, last_id);
+            placeholders(image, placement, columns, rows)
         }
         Look::Pixels { pixels, cached } => {
             let mut cached = cached.lock().expect("halves");
@@ -348,9 +342,22 @@ pub(crate) fn drawn(source: &Source, picture: &Picture, room: usize) -> Lines {
 }
 
 /// The image id is the placeholders' foreground color
-fn placeholders(id: u32, columns: u32, rows: u32) -> Lines {
-    let [_, red, green, blue] = id.to_be_bytes();
-    let style = Style::new().fg(Color::Rgb(red, green, blue));
+/// The id of `key`, numbered next when it has none yet
+fn numbered<K: Eq + Hash>(ids: &mut HashMap<K, (u32, bool)>, key: K, last: &mut u32) -> u32 {
+    let next = || {
+        *last = *last % MAX_ID + 1;
+        (*last, false)
+    };
+    ids.entry(key).or_insert_with(next).0
+}
+
+fn placeholders(image: u32, placement: u32, columns: u32, rows: u32) -> Lines {
+    let [_, red, green, blue] = image.to_be_bytes();
+    let [_, under_red, under_green, under_blue] = placement.to_be_bytes();
+    // Kitty reads the placement, and so the size it draws, from the underline color
+    let style = Style::new()
+        .fg(Color::Rgb(red, green, blue))
+        .underline_color(Color::Rgb(under_red, under_green, under_blue));
     let mut lines = Vec::new();
     for row in DIACRITICS.iter().take(rows as usize) {
         let mut cells = String::new();
@@ -397,12 +404,18 @@ fn blended(pixel: &Rgba<u8>) -> Color {
     )
 }
 
-/// Sends the terminal each Kitty image drawn since the last call, which its placeholders then show
+/// Sends the terminal each Kitty image once and a placement for every size it was drawn at,
+/// which its placeholders then show
 pub(crate) fn send(out: &mut impl Write) -> io::Result<()> {
     let mut store = STORE.lock().expect("pictures");
-    let Store { states, placed, .. } = &mut *store;
+    let Store {
+        states,
+        images,
+        placed,
+        ..
+    } = &mut *store;
     let mut wrote = false;
-    for ((source, columns, rows), (id, sent)) in placed.iter_mut() {
+    for (source, (id, sent)) in images.iter_mut() {
         if *sent {
             continue;
         }
@@ -420,13 +433,27 @@ pub(crate) fn send(out: &mut impl Write) -> io::Result<()> {
             let chunk = str::from_utf8(chunk).unwrap_or_default();
             // q=2 keeps the terminal from answering, which would arrive as typed keys
             match index {
-                0 => write!(
-                    out,
-                    "\x1b_Ga=T,U=1,i={id},c={columns},r={rows},f=100,q=2,m={more};{chunk}\x1b\\"
-                )?,
+                0 => write!(out, "\x1b_Ga=t,i={id},f=100,q=2,m={more};{chunk}\x1b\\")?,
                 _ => write!(out, "\x1b_Gm={more};{chunk}\x1b\\")?,
             }
         }
+        *sent = true;
+        wrote = true;
+    }
+
+    // A placement needs the image the terminal already has
+    for ((source, columns, rows), (id, sent)) in placed.iter_mut() {
+        let Some(&(image, true)) = images.get(source) else {
+            continue;
+        };
+        if *sent {
+            continue;
+        }
+
+        write!(
+            out,
+            "\x1b_Ga=p,U=1,i={image},p={id},c={columns},r={rows},q=2\x1b\\"
+        )?;
         *sent = true;
         wrote = true;
     }
@@ -441,7 +468,8 @@ pub(crate) fn send(out: &mut impl Write) -> io::Result<()> {
 /// each by its id, as placeholders don't count as placements on screen
 pub(crate) fn forget(out: &mut impl Write) -> io::Result<()> {
     let store = STORE.lock().expect("pictures");
-    let sent = store.placed.values().filter(|(_, sent)| *sent);
+    // Deleting an image deletes its placements too
+    let sent = store.images.values().filter(|(_, sent)| *sent);
     let ids: Vec<u32> = sent
         .map(|(id, _)| *id)
         .chain(store.retired.clone())
@@ -561,18 +589,20 @@ mod tests {
 
     #[test]
     fn placeholders_numbered() {
-        let lines = placeholders(0x01_02_03, 3, 2);
+        let lines = placeholders(0x01_02_03, 0x04_05_06, 3, 2);
         assert_eq!(lines.len(), 2);
         let span = &lines[1][0];
         assert_eq!(span.style.fg, Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(span.style.underline_color, Some(Color::Rgb(4, 5, 6)));
         assert_eq!(span.content.width(), 3);
         let second: Vec<char> = span.content.chars().skip(3).take(3).collect();
         assert_eq!(second, [PLACEHOLDER, DIACRITICS[1], DIACRITICS[1]]);
     }
 
+    /// A picture drawn at another width gets a placement of its own, and its image goes once
     #[test]
     fn kitty_sent_once() {
-        let path = written("kitty", 8, 8);
+        let path = written("kitty", 80, 80);
         let source = Source::File(path.clone());
         let picture = Arc::new(load(&source, true).expect("load"));
         fs::remove_dir_all(path.parent().expect("dir")).ok();
@@ -582,21 +612,33 @@ mod tests {
         drop(store);
 
         let lines = drawn(&source, &picture, 100);
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 5);
+        let Some(Color::Rgb(red, green, blue)) = lines[0][0].style.fg else {
+            panic!("{:?}", lines[0][0]);
+        };
+        let id = u32::from_be_bytes([0, red, green, blue]);
         let mut out = Vec::new();
         send(&mut out).expect("send");
         let sent = String::from_utf8(out).expect("utf8");
-        assert!(sent.starts_with("\x1b_Ga=T,U=1,i="), "{sent}");
-        assert!(sent.contains(",c=1,r=1,f=100,q=2,m=0;"), "{sent}");
+        let image = format!("\x1b_Ga=t,i={id},f=100,q=2,m=0;");
+        assert!(sent.starts_with(&image), "{sent}");
+        let placed = format!("\x1b_Ga=p,U=1,i={id},p=");
+        assert!(
+            sent.contains(&placed) && sent.ends_with(",c=10,r=5,q=2\x1b\\"),
+            "{sent}"
+        );
 
         let mut again = Vec::new();
         send(&mut again).expect("send");
         assert!(again.is_empty());
 
-        let Some(Color::Rgb(red, green, blue)) = lines[0][0].style.fg else {
-            panic!("{:?}", lines[0][0]);
-        };
-        let id = u32::from_be_bytes([0, red, green, blue]);
+        drawn(&source, &picture, 6);
+        let mut narrower = Vec::new();
+        send(&mut narrower).expect("send");
+        let narrower = String::from_utf8(narrower).expect("utf8");
+        assert!(narrower.starts_with(&placed), "{narrower}");
+        assert!(narrower.ends_with(",c=6,r=3,q=2\x1b\\"), "{narrower}");
+
         let mut freed = Vec::new();
         forget(&mut freed).expect("forget");
         let freed = String::from_utf8(freed).expect("utf8");

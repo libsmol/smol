@@ -45,7 +45,8 @@ use tracing_subscriber::EnvFilter;
 const SAVE_WAIT: Duration = Duration::from_secs(5);
 /// One file per day
 const MAX_LOG_FILES: usize = 5;
-const DEFAULT_LOG: &str = "warn,libsmol=info";
+/// rmcp logs the whole URL of a server it can't reach, which may carry a secret
+const DEFAULT_LOG: &str = "warn,libsmol=info,rmcp=off";
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 pub fn run() -> Result<()> {

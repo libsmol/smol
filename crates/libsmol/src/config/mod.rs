@@ -128,7 +128,7 @@ pub(crate) fn models(dir: &Path) -> Result<Models> {
         let provider = match value.try_into::<Provider>() {
             Ok(provider) => provider,
             Err(e) => {
-                let message = e.message();
+                let message = without_value(e.message());
                 let problem = format!("[model.{name}]: {message}");
                 return Err(invalid(problem));
             }
@@ -408,7 +408,7 @@ pub(crate) fn roles(dir: &Path, project: &Path, models: &Models) -> (Vec<Role>, 
             let spec = match value.try_into::<RoleSpec>() {
                 Ok(spec) => spec,
                 Err(e) => {
-                    let message = e.message();
+                    let message = without_value(e.message());
                     let problem = format!("[{name}]: {message}, skipped");
                     skipped.push(invalid(problem));
                     continue;
@@ -657,7 +657,7 @@ pub(crate) fn agent(dir: &Path) -> Result<(Vec<McpConfig>, Access)> {
         let spec = match value.try_into::<McpSpec>() {
             Ok(spec) => spec,
             Err(e) => {
-                let message = e.message();
+                let message = without_value(e.message());
                 let problem = format!("[mcp.{name}]: {message}");
                 return Err(invalid(problem));
             }
@@ -765,19 +765,50 @@ fn parsed<T: DeserializeOwned>(text: &str) -> Result<T, String> {
     };
 
     let message = e.message();
-    let problem = match e.span() {
-        Some(span) => {
-            let line = text[..span.start].matches('\n').count() + 1;
-            let spot = &text[span];
-            let quoted = format!("`{spot}`");
-            match spot.is_empty() || spot.contains('\n') || message.contains(&quoted) {
-                true => format!("line {line}: {message}"),
-                false => format!("line {line}: {spot}: {message}"),
-            }
-        }
-        None => message.to_owned(),
+    let Some(span) = e.span() else {
+        return Err(message.to_owned());
+    };
+    let head = &text[..span.start];
+    let line = head.matches('\n').count() + 1;
+    let start = head.rfind('\n').map_or(0, |at| at + 1);
+    let before = &text[start..span.start];
+    // Values may be secrets and are never quoted
+    if let Some((key, _)) = before.split_once('=') {
+        let key = key.trim();
+        return Err(format!("line {line}: {key}: {message}"));
+    }
+
+    let rest = &text[span.start..];
+    let after = rest.lines().next().unwrap_or_default();
+    let spot = &text[span];
+    let quoted = format!("`{spot}`");
+    // A line without = may continue a value
+    let named = before.trim_start().starts_with('[') || after.contains('=');
+    let shown = named && !spot.is_empty() && !spot.contains('\n') && !message.contains(&quoted);
+    let problem = match shown {
+        true => format!("line {line}: {spot}: {message}"),
+        false => format!("line {line}: {message}"),
     };
     Err(problem)
+}
+
+/// Serde quotes the value it got, which may be a secret
+fn without_value(message: &str) -> String {
+    for lead in ["invalid type: ", "invalid value: "] {
+        let Some(rest) = message.strip_prefix(lead) else {
+            continue;
+        };
+        let Some(at) = rest.rfind(", expected ") else {
+            continue;
+        };
+
+        let got = &rest[..at];
+        let kind = got.split(['`', '"']).next().unwrap_or(got).trim_end();
+        let expected = &rest[at..];
+        return format!("{lead}{kind}{expected}");
+    }
+
+    message.to_owned()
 }
 
 #[cfg(test)]
@@ -876,6 +907,14 @@ models = [{ id = "m3" }]
             (
                 "[models.\"über\"]\ntype = \"openai-completions\"\n",
                 "line 1: unknown field `models`, expected `model`",
+            ),
+            (
+                "[model.\"café\"]\ntype = \"openai-completions\"\napi_key = sk-café123\nmodels = [{ id = \"m\" }]\n",
+                "line 3: api_key: string values must be quoted, expected literal string",
+            ),
+            (
+                "[model.\"café\"]\ntype = \"openai-completions\"\napi_key = 4242\nmodels = [{ id = \"m\" }]\n",
+                "[model.café]: invalid type: integer, expected a string",
             ),
         ];
 
@@ -1230,6 +1269,14 @@ models = [{ id = "m3" }]
             (
                 "[sandbox]\nnet = true\n",
                 "line 1: unknown field `sandbox`, expected one of `mcp`, `allow`, `deny`",
+            ),
+            (
+                "[mcp.web]\ntype = \"http\"\nurl = \"https://example.com/mcp\"\nheaders = \"Authorization: Bearer naïve\"\n",
+                "[mcp.web]: invalid type: string, expected a map",
+            ),
+            (
+                "[mcp.\"workspace\"]\ntype = \"stdio\"\ncommand = \"x\"\nargs = [\n  \"--quiet\",\n  sk-naïve,\n]\n",
+                "line 6: string values must be quoted, expected literal string",
             ),
         ];
         for (text, problem) in cases {

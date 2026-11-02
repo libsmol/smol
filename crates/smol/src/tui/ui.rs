@@ -290,9 +290,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     // and a scrolled-back view must stay on the same content
     let anchor = app.transcript.anchor(old_top, inner.width, app.expanded);
     let anchor = anchor.filter(|_| app.scrolled_back > 0);
-    let screen = usize::from(inner.height);
     let scrolled = app.scrolled_back != app.drawn_back;
-    app.transcript.view(old_top..old_top + screen, scrolled);
     let rows = app.transcript.rows(inner.width, app.expanded);
 
     app.scrollbar = Rect::default();
@@ -427,6 +425,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             let buffer = frame.buffer_mut();
             selection.highlight(rows, top, inner, buffer);
         }
+
+        // After `rows`, which forgets the view when it lays everything out again
+        app.transcript.view(top..top + height, scrolled);
     }
 
     app.drawn_back = app.scrolled_back;
@@ -1160,5 +1161,43 @@ mod tests {
             narrow[0].contains(" · agents 2 working · ⇡1.2k ⇣340 "),
             "{narrow:?}"
         );
+    }
+
+    /// The frame after a new layout still pins the agents scrolled out of view
+    #[test]
+    fn pins_kept_relayout() {
+        let mut app = app();
+        app.submit_text("wait");
+        let running = ToolCall::new("call_1", "agent(tasks)").status(ToolCallStatus::InProgress);
+        app.transcript.update(&SessionUpdate::ToolCall(running));
+        for (offset, task) in ["Review café.py", "Review naïve.py"].iter().enumerate() {
+            let id = format!("call_1.{}", offset + 1);
+            let meta = json!({ "_smol/agent": true, "parent": "call_1" });
+            let asked = json!({ "task": task, "role": null, "name": null });
+            let opened = ToolCall::new(id.clone(), format!("agent: {task}"))
+                .raw_input(asked)
+                .meta(meta.as_object().cloned());
+            app.transcript.update(&SessionUpdate::ToolCall(opened));
+            helper_update(
+                &mut app,
+                &id,
+                ToolCallStatus::InProgress,
+                &["writing"],
+                json!({}),
+            );
+        }
+        let meta = json!({ "duration": 0.5 });
+        let ended = UsageUpdate::new(0, 1000).meta(meta.as_object().cloned());
+        app.transcript.update(&SessionUpdate::UsageUpdate(ended));
+        fill(&mut app, 40);
+
+        let pinned = |app: &mut App, width| {
+            draw(app, width, 20);
+            app.pinned_area.height
+        };
+        pinned(&mut app, 80);
+        assert!(pinned(&mut app, 80) > 0);
+        pinned(&mut app, 79);
+        assert!(pinned(&mut app, 79) > 0);
     }
 }

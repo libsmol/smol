@@ -2,7 +2,7 @@ use crate::agent::{
     logged_tokens, Agent, Delegating, Event, HelperView, Helpers, Place, Sink, Status, Task, Turn,
     Unseen,
 };
-use crate::memory::{AgentMemory, Ending, Helper};
+use crate::memory::{AgentMemory, Ending, Helper, MemoryStep};
 use crate::prompt;
 use crate::spawn::SHOWN_EVERY;
 use crate::utils::{Interrupt, Reply};
@@ -89,7 +89,7 @@ impl Agent {
                     let mut members = team.members.lock().expect("members");
                     let running = members.get_mut(id).filter(|member| member.helper.running());
                     if let Some(member) = running {
-                        member.stopped = Some(Ending::Stopped {});
+                        member.status.lock().expect("status").stopped = Some(Ending::Stopped {});
                         member.stop.cancel(u64::MAX);
                     }
                     drop(members);
@@ -224,9 +224,19 @@ impl Agent {
                 info!("agent: answered {counted}");
                 Ending::Answer(answer)
             }
+            // Its own interrupt can't tell the user from `stop()` or the turn ending
             Ok(None) => {
-                info!("agent: interrupted {counted}");
-                Ending::Interrupted {}
+                let stopped = watched.status.lock().expect("status").stopped.clone();
+                match stopped {
+                    Some(end) => {
+                        info!("agent: stopped {counted}");
+                        end
+                    }
+                    None => {
+                        info!("agent: interrupted {counted}");
+                        Ending::Interrupted {}
+                    }
+                }
             }
             Err(error) => {
                 warn!("agent: failed, {error} {counted}");
@@ -354,8 +364,6 @@ struct Member {
     status: Arc<Mutex<Status>>,
     /// Stops it alone
     stop: Interrupt,
-    /// How it ends when `stop` rather than the user stopped it
-    stopped: Option<Ending>,
     /// The code got its result or stopped it, so it is not announced
     taken: bool,
     /// The turn has saved its final record
@@ -420,16 +428,10 @@ impl Team {
                         helping.await
                     }
                 };
-                let mut helper = joined.unwrap_or(unfinished);
+                let helper = joined.unwrap_or(unfinished);
 
                 let mut members = team.members.lock().expect("members");
-                let member = &mut members[id];
-                // Its own interrupt can't tell the user from `stop()` or the turn ending
-                let interrupted = helper.end == (Ending::Interrupted {});
-                if let Some(end) = member.stopped.clone().filter(|_| interrupted) {
-                    helper.end = end;
-                }
-                member.helper = helper;
+                members[id].helper = helper;
                 drop(members);
                 team.ended.send_modify(|count| *count += 1);
             };
@@ -439,7 +441,6 @@ impl Team {
                 helper: record,
                 status,
                 stop,
-                stopped: None,
                 taken: false,
                 filed: false,
                 abort,
@@ -566,17 +567,27 @@ impl Turn<'_> {
         }
     }
 
-    /// Stops the agents still running in the background and saves their records,
-    /// aborting those that take longer than `HELPERS_WAIT`
+    /// Announces the agents started in the background that ended, then stops the rest
+    /// and saves their records, aborting those that take longer than `HELPERS_WAIT`
     pub(crate) async fn stopped(&mut self) {
+        // Taken before the rest are stopped, which aren't announced
+        let done = self.ended();
+        if !done.is_empty() {
+            let ended = MemoryStep::Done { agents: done };
+            self.memory.steps.push(ended);
+            self.sink.saved(self.memory);
+        }
+
         if let Some(team) = self.agent.place.team() {
             let user = self.agent.interrupt.triggered();
             {
-                let mut members = team.members.lock().expect("members");
-                for member in members.iter_mut().filter(|member| member.helper.running()) {
-                    if !user && member.stopped.is_none() {
-                        member.stopped = Some(Ending::Unfinished {});
+                let members = team.members.lock().expect("members");
+                for member in members.iter().filter(|member| member.helper.running()) {
+                    let mut status = member.status.lock().expect("status");
+                    if !user && status.stopped.is_none() {
+                        status.stopped = Some(Ending::Unfinished {});
                     }
+                    drop(status);
                     member.stop.cancel(u64::MAX);
                 }
             }
@@ -719,7 +730,7 @@ fn tail(text: &str) -> String {
 mod tests {
     use crate::agent::delegate::{tail, Records, Watched, MAX_PREVIEW_CHARS};
     use crate::agent::tests::{scripted, streamed, with_roles};
-    use crate::agent::{Event, HelperView, Sink, Status, Task, Unseen};
+    use crate::agent::{Event, HelperView, Helpers, Sink, Status, Task, Unseen};
     use crate::config::Role;
     use crate::memory::tests::metered;
     use crate::memory::{AgentMemory, AgentStep, Call, Ending, Helper, MemoryStep};
@@ -729,7 +740,7 @@ mod tests {
     };
     use crate::tests::{cancel_soon, content};
     use crate::tools::mcp::tests::fake;
-    use crate::utils::block_on;
+    use crate::utils::{block_on, Interrupt};
     use crate::worker::host::Added;
     use crate::worker::{AgentCall, Asked};
     use std::sync::{Arc, Mutex};
@@ -1232,6 +1243,85 @@ mod tests {
             ends(ran(&memory, 1)),
             [(Some("slow"), &Ending::Unfinished {})]
         );
+    }
+
+    /// An agent that answered during a step the user interrupts is still announced
+    #[test]
+    fn done_before_interrupt() {
+        let code = "import time\n\
+            cafés = agent('Count the cafés', name='cafés')\n\
+            for _ in range(100):\n    if cafés.status() == 'answered':\n        break\n    time.sleep(0.1)\n\
+            print('answered', flush=True)\n\
+            time.sleep(30)";
+        let model = Background(vec![code], Requests::default());
+        let stopper = Arc::<Mutex<Option<Interrupt>>>::default();
+        let held = Arc::clone(&stopper);
+        let events = move |event: Event| {
+            let Event::Output(_, _, output) = event else {
+                return;
+            };
+            if let Some(interrupt) = held.lock().expect("interrupt").as_ref() {
+                if output.contains("answered") {
+                    interrupt.cancel(u64::MAX);
+                }
+            }
+        };
+        let mut agent = scripted(model, Box::new(events));
+        *stopper.lock().expect("interrupt") = Some(agent.agent.interrupt.clone());
+
+        let mut memory = AgentMemory::default();
+        let answer = agent.turn(&mut memory, "Count them").expect("run");
+        assert_eq!(answer, None);
+        let done = MemoryStep::Done {
+            agents: vec!["cafés".to_owned()],
+        };
+        assert_eq!(memory.steps.last(), Some(&done), "{:?}", memory.steps);
+    }
+
+    /// Records the end each view of an agent closes with
+    struct Closed(Arc<Mutex<Vec<Ending>>>);
+
+    impl Helpers for Closed {
+        fn open(&self, _: usize, _: &Helper) -> Box<dyn HelperView> {
+            let ends = Arc::clone(&self.0);
+            Box::new(Closed(ends))
+        }
+    }
+
+    impl HelperView for Closed {
+        fn shown(&mut self, _: &Status) {}
+
+        fn close(&mut self, helper: &Helper) {
+            let end = helper.end.clone();
+            self.0.lock().expect("ends").push(end);
+        }
+    }
+
+    /// The view of an agent the code stopped closes with the end its record keeps
+    #[test]
+    fn stop_shown() {
+        let model = Background(Vec::new(), Requests::default());
+        let tested = scripted(model, Box::new(|_| {}));
+        let ends = Arc::<Mutex<Vec<Ending>>>::default();
+        let views = Box::new(Closed(Arc::clone(&ends)));
+        let records = Records::default();
+        let mut delegate = tested.agent.delegate(&[], views, &records);
+
+        let asked = Asked {
+            task: "Wait after 30".to_owned(),
+            role: None,
+            name: Some("slow".to_owned()),
+        };
+        let stopping = async {
+            delegate(AgentCall::Start {
+                agents: vec![asked],
+            })
+            .await;
+            delegate(AgentCall::Stop { id: 0 }).await;
+        };
+        block_on(stopping);
+
+        assert_eq!(*ends.lock().expect("ends"), [Ending::Stopped {}]);
     }
 
     /// A handle is found again by name after Python restarts

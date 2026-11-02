@@ -421,7 +421,7 @@ Please attach it when you report a bug.
 
 `SMOL_LOG` sets what is logged, in
 [`RUST_LOG` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html):
-the default is `warn,libsmol=info`, `SMOL_LOG=warn` keeps only problems,
+the default is `warn,libsmol=info,rmcp=off`, `SMOL_LOG=warn` keeps only problems,
 `SMOL_LOG=off` turns the log off.
 
 ## Limitations
