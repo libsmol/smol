@@ -27,9 +27,10 @@ const RULES: &str = "- Never make up data or functions; check unfamiliar ones wi
 const REMEMBERING: &str = "## Rules
 
 - Save with `remember()` what the user asks you to remember, and their preferences and corrections.
-- Also save lasting facts about this project that took work to find out and that no file records, such as pitfalls and approaches that failed.
-- Keep one fact per memory, with `project=False` only when the user says it holds in every project.
-- When a memory turns out wrong or outdated, `forget()` it and remember the corrected fact.";
+- Also save lasting facts about this project that took work to find out and that no file records, such as pitfalls and failed approaches.
+- Keep one fact per memory.
+- Use `project=False` only when the user says the fact holds in every project.
+- When a memory is wrong or outdated, `forget()` it and `remember()` the correct fact.";
 
 const SHOWN: &str = " Text you write in a reply that runs code is shown to the user.";
 const NAMED: &str =
@@ -212,9 +213,9 @@ pub(crate) fn system(
 
 ## Rules
 
-- Give the independent parts of a task to `agent([task1, task2, ...])`, which runs them in parallel.
-- Give long side work where only the result matters to `agent(task)`, which keeps its steps out of this conversation.
-- Start work that can go on in the background with `agent(task, name=\"...\")`, which runs it while you continue.
+- Run the independent parts of a task in parallel with `agent([task1, task2, ...])`.
+- Give long side work to `agent(task)` when only its answer matters; its steps stay out of this conversation.
+- Start work that can go on in the background with `agent(task, name=\"...\")` and continue meanwhile.
 - When the task asks for agents, give each part to `agent([part1, part2, ...])` once the parts are clear.{roles}"
         ),
         Place::Delegated(_) => String::new(),
@@ -315,7 +316,7 @@ Answer as soon as you have the result; if the task needs no code, answer immedia
 
 All calls share one Python session: variables, functions and imports persist across calls.
 
-A call returns what its code printed, plus the value of every top-level expression that is not `None` (strings verbatim, other values as `repr`). Output longer than {MAX_OBSERVATION_CHARS} characters, or a single `print()` longer than {MAX_PRINT_CHARS}, is cut in the middle; the values in your variables are not affected. If the code fails, the result ends with `Error:` followed by the exception and the line that raised it.
+A call returns what its code printed, plus the value of every top-level expression that is not `None` (strings verbatim, other values as `repr`). Output longer than {MAX_OBSERVATION_CHARS} characters, or a single `print()` longer than {MAX_PRINT_CHARS}, is cut in the middle; the values in your variables are not affected.
 
 Write each call as a complete program:
 - Do as much as possible in one call with loops, conditions, the standard library and the functions below.
@@ -336,7 +337,7 @@ These need no import. Use them instead of writing your own, and create new files
 # Environment
 
 - Your code runs on the user's computer ({OS}) in `{cwd}`; the files and programs a task mentions are there.
-- Python is CPython {PYTHON} in a venv kept for this folder: packages you install with `pip install` can be imported in this session right away.{sandbox}
+- Python is CPython {PYTHON} in a venv kept for this folder: packages you install into it can be imported in this session right away.{sandbox}
 - Today is {date} (UTC).
 - Your answer goes to {reader}; no hidden tests or graders check your work.{remembered}
 
@@ -424,11 +425,6 @@ const UNREPLIED: &str = "The user interrupted you before you replied.";
 
 /// A step with calls reports this in their replies instead
 pub(crate) fn error(step: &AgentStep) -> Option<String> {
-    let text = explained(step)?;
-    Some(format!("Error:\n{text}"))
-}
-
-fn explained(step: &AgentStep) -> Option<String> {
     let error = step.error.as_ref()?;
     let silent = step.text.trim().is_empty() && step.calls.is_empty();
     let text = match error {
@@ -442,11 +438,6 @@ fn explained(step: &AgentStep) -> Option<String> {
 
 /// A call that never ran still needs a reason
 pub(crate) fn call_error(step: &AgentStep, call: &Call) -> Option<String> {
-    let text = call_explained(step, call)?;
-    Some(format!("Error:\n{text}"))
-}
-
-fn call_explained(step: &AgentStep, call: &Call) -> Option<String> {
     let interrupted = step.error == Some(StepError::Interrupted);
     let text = match (&call.error, &call.result) {
         (Some(CallError::NoTool(name)), _) => {
@@ -735,13 +726,13 @@ pub(crate) fn transcript(steps: &[&MemoryStep], max: usize) -> String {
                         let viewed = placeholder(label, media);
                         entries.push(viewed);
                     }
-                    if let Some(error) = call_explained(step, call) {
+                    if let Some(error) = call_error(step, call) {
                         let error = truncated(&error, max);
                         let error = format!("[Error]: {error}");
                         entries.push(error);
                     }
                 }
-                let error = explained(step).filter(|_| calls.is_empty());
+                let error = error(step).filter(|_| calls.is_empty());
                 if let Some(error) = error {
                     let error = truncated(&error, max);
                     let error = format!("[Error]: {error}");
@@ -875,11 +866,11 @@ mod tests {
                         help(request) -> None\n    # Prints the docs.\n```\n\n# Skills";
         assert!(text.contains(built_in), "{text}");
         let delegating = "`Agent done:` message tells you when.\n\n## Rules\n\n\
-                          - Give the independent parts of a task to `agent([task1, task2, ...])`";
+                          - Run the independent parts of a task in parallel with `agent([task1, task2, ...])`";
         assert!(text.contains(delegating), "{text}");
         let place = format!(
             ") in `/home/zoë/work`; the files and programs a task mentions are there.\n\
-             - Python is CPython {PYTHON} in a venv kept for this folder: packages you install with `pip install` can be imported in this session right away.\n\
+             - Python is CPython {PYTHON} in a venv kept for this folder: packages you install into it can be imported in this session right away.\n\
              - Today"
         );
         assert!(text.contains(&place), "{text}");
@@ -944,7 +935,7 @@ mod tests {
                        before you start a task, search them with `recall()` for the task's key words.\n\n\
                        ## Rules\n\n- Save with `remember()` what the user asks you to remember, ";
         assert!(text.contains(section), "{text}");
-        let rules = "remember the corrected fact.\n\n# Rules\n\n";
+        let rules = "`remember()` the correct fact.\n\n# Rules\n\n";
         assert!(text.contains(rules), "{text}");
 
         let listed = Listed {
@@ -1039,9 +1030,8 @@ mod tests {
             ..AgentStep::default()
         };
         let unreplied = "The user interrupted you before you replied.";
-        let told = format!("Error:\n{unreplied}");
-        assert_eq!(error(&stopped("", Vec::new())), Some(told));
-        let plain = "Error:\ninterrupted by the user";
+        assert_eq!(error(&stopped("", Vec::new())).as_deref(), Some(unreplied));
+        let plain = "interrupted by the user";
         let prose = stopped("Roses are red", Vec::new());
         assert_eq!(error(&prose).as_deref(), Some(plain));
 
@@ -1057,7 +1047,7 @@ mod tests {
         let step = stopped("First, a note.", vec![ran.clone(), written.clone()]);
         assert_eq!(call_error(&step, &ran).as_deref(), Some(plain));
         let unrun = call_error(&step, &written);
-        let expected = "Error:\ninterrupted by the user before the code ran";
+        let expected = "interrupted by the user before the code ran";
         assert_eq!(unrun.as_deref(), Some(expected));
 
         let failed = AgentStep {
@@ -1065,7 +1055,7 @@ mod tests {
             ..step
         };
         let skipped = call_error(&failed, &written);
-        let expected = "Error:\nnot run: an earlier call failed";
+        let expected = "not run: an earlier call failed";
         assert_eq!(skipped.as_deref(), Some(expected));
 
         let step = MemoryStep::Action(Box::new(stopped("", Vec::new())));

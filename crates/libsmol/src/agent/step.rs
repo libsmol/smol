@@ -511,7 +511,7 @@ mod tests {
         let skipped = &step.calls[1];
         assert!(skipped.result.is_none() && skipped.error.is_none());
         let told = prompt::call_error(step, skipped).unwrap_or_default();
-        assert_eq!(told, "Error:\nnot run: an earlier call failed");
+        assert_eq!(told, "not run: an earlier call failed");
     }
 
     #[test]
@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(printed(step), Some("sleeping"));
         assert_eq!(step.calls[0].error, Some(CallError::Interrupted));
         let unrun = prompt::call_error(step, &step.calls[1]).unwrap_or_default();
-        assert_eq!(unrun, "Error:\ninterrupted by the user before the code ran");
+        assert_eq!(unrun, "interrupted by the user before the code ran");
     }
 
     /// Tag-only code is quietly regenerated until tries run out, then never runs or is echoed back
@@ -563,7 +563,7 @@ mod tests {
 
         let action = MemoryStep::Action(Box::new(steps[0].clone()));
         let sent: Vec<String> = action.messages(&mut 0).iter().map(content).collect();
-        let told = "Error:\nnot run: no Python code in the code argument";
+        let told = "not run: no Python code in the code argument";
         assert_eq!(sent, ["eval:\n", told]);
     }
 
@@ -614,8 +614,8 @@ mod tests {
         let expected = [
             "Let me look first.\neval:\nprint('alpha')\nbash:\n\neval:\nprint('beta')",
             "alpha",
-            "Error:\nnot run: there is no tool named \"bash\"; the only tool is eval",
-            "Error:\nnot run: an earlier call failed",
+            "not run: there is no tool named \"bash\"; the only tool is eval",
+            "not run: an earlier call failed",
         ];
         assert_eq!(sent, expected);
     }
@@ -1200,7 +1200,7 @@ mod tests {
         assert_eq!(codes(step), [""]);
         assert_eq!(step.calls[0].error, None);
         let told = prompt::call_error(step, &step.calls[0]).unwrap_or_default();
-        assert_eq!(told, "Error:\ninterrupted by the user before the code ran");
+        assert_eq!(told, "interrupted by the user before the code ran");
     }
 
     /// An interrupt while the worker restarts tells the model the code never ran
@@ -1235,7 +1235,7 @@ mod tests {
         assert_eq!(last.error, Some(StepError::Interrupted));
         assert!(printed(last).is_none());
         let told = prompt::call_error(last, &last.calls[0]).unwrap_or_default();
-        assert_eq!(told, "Error:\ninterrupted by the user before the code ran");
+        assert_eq!(told, "interrupted by the user before the code ran");
     }
 
     #[test]

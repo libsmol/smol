@@ -804,8 +804,7 @@ mod tests {
             panic!("{:?}", memory.steps);
         };
         let result = step.calls[0].result.as_ref().expect("ran");
-        let nested =
-            "Error:\nNameError: name 'agent' is not defined\n  line 1: print(agent('deeper'))";
+        let nested = "NameError: name 'agent' is not defined\n  line 1: print(agent('deeper'))";
         let crashed = "RuntimeError('agent: stopped before it answered')";
         let printed =
             format!("['Answer: Count the cafés', {crashed}, 'Answer: Spell naïve', {nested:?}]");

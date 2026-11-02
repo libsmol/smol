@@ -7,6 +7,19 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- The system prompt says that packages installed into the venv can be
+  imported right away without naming `pip install`, and words the rules on
+  starting agents and on memories more directly. Keeping one fact per memory
+  and passing `project=False` only when the user says a fact holds in every
+  project are now separate rules.
+- A call that fails or doesn't run no longer starts its reply with `Error:`:
+  the exception and the line that raised it, or why the call didn't run,
+  follow the output after a blank line, and the system prompt no longer
+  explains the marker. In a deepseek run the model recovered from errors as
+  fast as with it.
+
 ## 0.6.2 - 2026-11-02
 
 - The system prompt gives `remember()`'s 300-character limit and says that
