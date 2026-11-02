@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.6.5 - 2026-11-02
 
 - A paste of more than five lines that starts with `!` shows in smol's input
   box as a shell command, as a shorter one does, and backspace at its start
