@@ -304,7 +304,7 @@ class Agent:
         Waits until the agent ends and returns its answer.
         - With timeout, returns None if it is still running after that many seconds; timeout=None waits until it ends.
         - Raises RuntimeError if the agent failed or was stopped.
-        - Once the code has its result, no "{done}:" message is sent for it."""
+        - Once the code has its result, no "[{done}]" message is sent for it."""
         if timeout is not None:
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
                 kind = type(timeout).__name__
@@ -331,7 +331,7 @@ class Agent:
     def stop(self) -> None:
         """Stops it and returns once it has stopped.
 
-        Stops the agent and returns once it has stopped; no "{done}:" message is sent for it."""
+        Stops the agent and returns once it has stopped; no "[{done}]" message is sent for it."""
         _asked("Agent.stop", "stop", {"id": self._id})
 
 # Wrapped once the class exists, which their annotations name

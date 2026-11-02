@@ -90,8 +90,9 @@ pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment
     let limit = kind.map_or(MAX_ATTACH_BYTES, |_| MAX_MEDIA_BYTES);
     let mut lines = None;
     let mut media = None;
-    let content = match fs::metadata(path) {
-        Err(e) => ToolError::os("read", &shown, e).to_string(),
+    // Err holds why the content could not be attached
+    let read = match fs::metadata(path) {
+        Err(e) => Err(cause(&e)),
         Ok(meta) if meta.is_dir() => {
             if !shown.ends_with('/') {
                 shown.push('/');
@@ -100,46 +101,52 @@ pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment
             match ls(path, false, &going) {
                 Ok(names) => {
                     let names: Vec<_> = names.iter().map(|name| name.to_string_lossy()).collect();
-                    names.join("\n")
+                    Ok(names.join("\n"))
                 }
-                Err(e) => e.to_string(),
+                Err(ToolError::Os { source, .. }) => Err(cause(&source)),
+                Err(ToolError::Failed(reason)) => Err(reason),
             }
         }
         // Reading a pipe or a device would block forever
-        Ok(meta) if !meta.is_file() => prompt::failure("read", &shown, prompt::IRREGULAR),
+        Ok(meta) if !meta.is_file() => Err(prompt::IRREGULAR.to_owned()),
         Ok(meta) if meta.len() > limit => match kind {
-            Some(kind) => oversized(kind, meta.len()),
-            None => prompt::too_large(meta.len()),
+            Some(kind) => Err(oversized(kind, meta.len())),
+            None => Err(prompt::too_large(meta.len())),
         },
         Ok(meta) => match fs::read(path) {
-            Err(e) => ToolError::os("read", &shown, e).to_string(),
+            Err(e) => Err(cause(&e)),
             Ok(data) => {
                 let found = sniffed(&data);
                 let size = data.len() as u64;
                 match kind.and(found) {
-                    Some((_, actual, _)) if size > media_limit(actual) => oversized(actual, size),
+                    Some((_, actual, _)) if size > media_limit(actual) => {
+                        Err(oversized(actual, size))
+                    }
                     // A media extension on content that is not media is read as a plain file
-                    None if size > MAX_ATTACH_BYTES => prompt::too_large(size),
+                    None if size > MAX_ATTACH_BYTES => Err(prompt::too_large(size)),
                     Some(found) => match copied(copies, &data, found, false) {
                         Ok(copy) => {
                             media = Some(copy);
-                            String::new()
+                            Ok(String::new())
                         }
-                        Err(e) => ToolError::os("copy", &shown, e).to_string(),
+                        Err(e) => Err(cause(&e)),
                     },
                     None => match (String::from_utf8(data), wanted) {
                         (Ok(text), Some(range)) => {
                             lines = Some(range);
-                            lines_of(&text, range)
+                            Ok(lines_of(&text, range))
                         }
-                        (Ok(text), None) => text,
-                        (Err(_), _) => prompt::undecoded(meta.len()),
+                        (Ok(text), None) => Ok(text),
+                        (Err(_), _) => Err(prompt::undecoded(meta.len())),
                     },
                 }
             }
         },
     };
-    let content = truncated(&content, MAX_OBSERVATION_CHARS);
+    let content = match read {
+        Ok(text) => truncated(&text, MAX_OBSERVATION_CHARS),
+        Err(reason) => prompt::unattached(&reason),
+    };
 
     Attachment {
         path: shown,
@@ -417,14 +424,13 @@ pub(crate) mod tests {
         assert_eq!(shown("src/main.rs"), main);
         assert_eq!(shown("src"), ("src/".to_owned(), "main.rs".to_owned()));
         assert_eq!(shown("").0, "./");
-        let undecoded =
-            "4 bytes, not UTF-8 text; if it is text in another encoding, decode it in code";
+        let undecoded = "[not attached: 4 bytes, not UTF-8; decode it in code]";
         assert_eq!(shown("latin1.txt").1, undecoded);
 
         let (_, cut) = shown("long.txt");
         assert!(cut.contains("\n[10 characters cut]\n"), "{cut}");
         let (_, huge) = shown("huge.txt");
-        let refused = "1200000 bytes, too large to attach; read the parts you need in code";
+        let refused = "[not attached: 1200000 bytes, too large; read the parts you need in code]";
         assert_eq!(huge, refused);
 
         let gone = dir.join("gone.txt");
@@ -432,10 +438,10 @@ pub(crate) mod tests {
         let path = slashed(&gone);
         assert_eq!(outside.path, path);
         // Windows words the reason in the system language
-        let missing = format!("read: {path}: ");
-        assert!(outside.content.starts_with(&missing), "{}", outside.content);
+        let missing = "[not attached: ";
+        assert!(outside.content.starts_with(missing), "{}", outside.content);
         #[cfg(unix)]
-        assert!(outside.content.ends_with(": no such file or directory"));
+        assert_eq!(outside.content, "[not attached: no such file or directory]");
 
         let trailing = format!("{}/src/", dir.display());
         let trailing = PathBuf::from(trailing);
@@ -450,7 +456,7 @@ pub(crate) mod tests {
             // SAFETY: The path is a NUL-terminated C string
             let made = unsafe { libc::mkfifo(named.as_ptr(), 0o600) };
             assert_eq!(made, 0);
-            assert_eq!(shown("pipe").1, "read: pipe: not a regular file");
+            assert_eq!(shown("pipe").1, "[not attached: not a regular file]");
         }
 
         fs::remove_dir_all(&dir).ok();
@@ -497,8 +503,8 @@ pub(crate) mod tests {
 
         let large = attach_path(&dir.join("large.jpg"), &dir, &copies);
         assert!(large.media.is_none());
-        let refused = "65 bytes, over the 64-byte limit for an attached image";
-        assert_eq!(large.content, refused);
+        let refused = "65 bytes, over the 64-byte image limit";
+        assert_eq!(large.content, format!("[not attached: {refused}]"));
 
         assert!(kept(&copies, b"BM").is_none());
         assert!(kept(&copies, b"\0\0\0\x1cftypavif").is_none());
@@ -531,8 +537,9 @@ pub(crate) mod tests {
         write_file(&dir.join("naïve.png"), &mp4);
 
         let image = attach_path(&dir.join("café.mov"), &dir, &copies);
-        let refused = "100 bytes, over the 64-byte limit for an attached image";
-        assert_eq!((image.media, image.content.as_str()), (None, refused));
+        let refused = "100 bytes, over the 64-byte image limit";
+        let unattached = format!("[not attached: {refused}]");
+        assert_eq!((image.media, image.content), (None, unattached));
         let video = attach_path(&dir.join("naïve.png"), &dir, &copies);
         assert_eq!(video.media.map(|media| media.kind), Some(MediaKind::Video));
 

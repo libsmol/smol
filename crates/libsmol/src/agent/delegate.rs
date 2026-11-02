@@ -763,8 +763,7 @@ mod tests {
         ) -> Generating<'a> {
             self.0.lock().expect("requests").push(conversation.to_vec());
             let system = content(&conversation[0]);
-            let asked = content(&conversation[1]);
-            let task = asked.strip_prefix("New task:\n").unwrap_or_default();
+            let task = content(&conversation[1]);
             let last = conversation.last().map(content).unwrap_or_default();
             let first = conversation.len() == 2;
             let (text, code) = match (system.contains("returned to the agent"), first) {
@@ -843,7 +842,10 @@ mod tests {
         let listed = "\nagent(task: str | list[str], *, name: str | list[str] | None = None) -> str | list[str | RuntimeError] | Agent | list[Agent]\n    # A new agent";
         assert!(main.contains(listed), "{main}");
         assert!(main.contains("\nAgent.wait(timeout"), "{main}");
-        assert!(main.contains("Task update"), "{main}");
+        assert!(
+            main.contains("[The user wrote while you were working]"),
+            "{main}"
+        );
         let helped = requests.iter().map(|request| content(&request[0]));
         let helper = helped
             .into_iter()
@@ -851,7 +853,7 @@ mod tests {
             .expect("helper");
         assert!(!helper.contains("agent("), "{helper}");
         assert!(!helper.contains("Agent."), "{helper}");
-        assert!(!helper.contains("Task update"), "{helper}");
+        assert!(!helper.contains("while you were working"), "{helper}");
         let returned =
             "answer immediately. Only your answer is returned to the agent that assigned this task";
         assert!(helper.contains(returned), "{helper}");
@@ -1006,8 +1008,7 @@ mod tests {
         ) -> Generating<'a> {
             self.1.lock().expect("requests").push(conversation.to_vec());
             let system = content(&conversation[0]);
-            let asked = content(&conversation[1]);
-            let task = asked.strip_prefix("New task:\n").unwrap_or_default();
+            let task = content(&conversation[1]);
             let main = !system.contains("returned to the agent");
             let replied = |message: &&ChatMessage| matches!(message, ChatMessage::Assistant { .. });
             let replies = conversation.iter().filter(replied).count();
@@ -1089,7 +1090,7 @@ mod tests {
         let requests = requests.lock().expect("requests");
         let last = requests.last().and_then(|request| request.last());
         let told = last.map(content).unwrap_or_default();
-        assert_eq!(told, "Agent done:\nnaïve");
+        assert_eq!(told, "[Agent done]\nnaïve");
     }
 
     /// While the turn waits for an agent, a message the client queues arrives as a task update

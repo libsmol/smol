@@ -2103,7 +2103,7 @@ pub(crate) mod tests {
         let output = run("help(agent)\nhelp(Agent.stop)");
         let limit = format!("runs up to {MAX_PARALLEL_AGENTS} agents at a time");
         assert!(output.logs.contains(&limit), "{}", output.logs);
-        let done = format!("no \"{}:\" message", prompt::DONE);
+        let done = format!("no \"[{}]\" message", prompt::DONE);
         assert!(output.logs.contains(&done), "{}", output.logs);
     }
 
