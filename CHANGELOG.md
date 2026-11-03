@@ -7,6 +7,14 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## 0.6.7 - 2026-11-03
+
+- Copying an agent's title that wraps over several rows keeps the start of
+  every row. The rows after the first lost as many columns as the agent's
+  symbol and name take on the first.
+- A selection is highlighted only over text, so the highlight ends where each
+  row's text ends and shows exactly what gets copied.
+
 ## 0.6.6 - 2026-11-03
 
 - `:memory` lists the memories the session sees, the project's and then the
