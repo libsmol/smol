@@ -126,6 +126,8 @@ pub(crate) struct Row {
     pub(crate) line: Line<'static>,
     /// Selecting and copying skip the columns before this, and `usize::MAX` skips the row
     pub(crate) mark_width: usize,
+    /// Columns of the gutter, when copying skips more than the highlight does
+    pub(crate) gutter: Option<usize>,
     /// Whitespace a soft wrap folded away, or None at a newline in the source
     pub(crate) joint: Option<String>,
     /// Painted across the whole row when drawn instead of padding the text with spaces
@@ -481,13 +483,11 @@ impl Render {
         let tag = tag(helper);
         // Titles wrap before the tag goes in front, so its width comes off every row
         let limit = limit.saturating_sub(tag.width()).max(1);
-        let first = [
-            Span::styled(row.first, row.style),
-            Span::styled(symbol, tint),
-            Span::styled(tag, DIM),
-        ];
+        // The symbol and the name are text, not part of the gutter, or a selection
+        // that starts further left would be pushed right on this row alone
+        let first = [Span::styled(row.first, row.style)];
         let rest = [Span::styled(row.rest, row.style)];
-        let width = first.iter().map(Span::width).sum();
+        let width = row.first.width();
 
         let most = match (self.expanded, helper.waiting()) {
             (true, _) => usize::MAX,
@@ -500,6 +500,7 @@ impl Render {
             ranges.truncate(most);
         }
         let last = ranges.len().saturating_sub(1);
+        let head = [Span::styled(symbol, tint), Span::styled(tag, DIM)];
         for (at, (range, joint)) in ranges.into_iter().enumerate() {
             let mut title = helper.title[range].to_owned();
             if cut && at == last {
@@ -512,9 +513,16 @@ impl Render {
             };
             let line = [(title, Style::new())];
             self.push_rows(lead, &rest, width, &line, &[]);
-            // Rows wrapped here copy back to the text they came from
-            if let Some(row) = self.rows.last_mut() {
-                row.joint = joint;
+            // Rows wrapped here copy back to the text they came from.
+            // The symbol and the name go before the title, past the gutter, so they copy
+            // with it and the highlight is not pushed right of the rows around it
+            if let Some(last) = self.rows.last_mut() {
+                last.joint = joint;
+                if at == 0 {
+                    last.line.spans.splice(1..1, head.clone());
+                    last.mark_width = width + head.iter().map(Span::width).sum::<usize>();
+                    last.gutter = Some(width);
+                }
             }
         }
 

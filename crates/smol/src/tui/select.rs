@@ -36,8 +36,7 @@ impl Selection {
         (start, end)
     }
 
-    /// The columns the pointer dragged over, which is what gets highlighted
-    fn painted(&self, row: usize) -> Option<Range<usize>> {
+    fn columns(&self, row: usize, mark_width: usize) -> Option<Range<usize>> {
         let (start, end) = self.ordered();
         if row < start.row || row > end.row {
             return None;
@@ -49,23 +48,18 @@ impl Selection {
         } else {
             usize::MAX
         };
+        let from = from.max(mark_width);
         (from < to).then_some(from..to)
-    }
-
-    /// The dragged columns with the gutter and the agent tag left out, which is what gets copied
-    fn columns(&self, row: usize, mark_width: usize) -> Option<Range<usize>> {
-        let columns = self.painted(row)?;
-        let from = columns.start.max(mark_width);
-        (from < columns.end).then_some(from..columns.end)
     }
 
     pub(crate) fn highlight(&self, rows: Rows, top: usize, area: Rect, buf: &mut Buffer) {
         let width = usize::from(area.width);
         for (y, index) in (area.top()..area.bottom()).zip(top..) {
-            if rows.get(index).is_none() {
+            let Some(row) = rows.get(index) else {
                 break;
-            }
-            let Some(columns) = self.painted(index) else {
+            };
+            let skip = row.gutter.unwrap_or(row.mark_width);
+            let Some(columns) = self.columns(index, skip) else {
                 continue;
             };
 
