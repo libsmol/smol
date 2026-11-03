@@ -62,7 +62,7 @@ impl Selection {
                 continue;
             };
 
-            let end = columns.end.min(width);
+            let end = columns.end.min(width).min(row.line.width());
             if columns.start < end {
                 let x = area.x + columns.start as u16;
                 let width = (end - columns.start) as u16;
@@ -363,5 +363,50 @@ mod tests {
         for (row, to) in [(2, 40), (5, 40), (6, 7)] {
             assert_eq!(select((row, 0), (row, to)).text(rows), "", "{row}");
         }
+    }
+
+    #[test]
+    fn wrapped_title_copies() {
+        let reviewing = Helper {
+            name: Some("reviewer".to_owned()),
+            ..helper(
+                "Review the café menu and résumé",
+                ToolCallStatus::InProgress,
+                "",
+            )
+        };
+        let call = Call {
+            id: "call_1".to_owned(),
+            title: "eval".to_owned(),
+            status: ToolCallStatus::Completed,
+            content: vec!["```python\nagent(task)\n```".to_owned()],
+            attachments: Vec::new(),
+            retries: Vec::new(),
+            helpers: vec![reviewing],
+        };
+        let step = Step {
+            items: vec![Item::Call(call)],
+            ..Step::default()
+        };
+        let mut transcript = Transcript::default();
+        transcript.push(Entry::Step(step));
+
+        let rows = transcript.rows(32, false);
+        let all = select((3, 0), (4, 40)).text(rows);
+        assert_eq!(all, "Review the café menu and résumé");
+    }
+
+    #[test]
+    fn highlight_stops_text() {
+        let mut transcript = Transcript::default();
+        transcript.push(Entry::Failure("café\nrésumé 🐍".to_owned()));
+
+        let rows = rows(&mut transcript);
+        let area = Rect::new(0, 0, 12, 4);
+        let mut buf = Buffer::empty(area);
+        select((1, 0), (2, 40)).highlight(rows, 0, area, &mut buf);
+
+        let shaded = |y: u16| (0..12).filter(|x| buf[(*x, y)].bg == LINE).count();
+        assert_eq!([shaded(1), shaded(2)], [4, 9]);
     }
 }

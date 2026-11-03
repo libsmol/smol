@@ -488,6 +488,7 @@ impl Render {
         ];
         let rest = [Span::styled(row.rest, row.style)];
         let width = first.iter().map(Span::width).sum();
+        let rest_width = row.rest.width();
 
         let most = match (self.expanded, helper.waiting()) {
             (true, _) => usize::MAX,
@@ -506,12 +507,12 @@ impl Render {
                 let marked = format!("{title}…");
                 title = clipped(&marked, limit);
             }
-            let lead = match at {
-                0 => &first[..],
-                _ => &rest[..],
+            let (lead, mark_width) = match at {
+                0 => (&first[..], width),
+                _ => (&rest[..], rest_width),
             };
             let line = [(title, Style::new())];
-            self.push_rows(lead, &rest, width, &line, &[]);
+            self.push_rows(lead, &rest, mark_width, &line, &[]);
             // Rows wrapped here copy back to the text they came from
             if let Some(row) = self.rows.last_mut() {
                 row.joint = joint;
