@@ -75,29 +75,18 @@ somewhere else. Running the script again upgrades.
 Releases are built for Linux (x86_64, arm64), macOS (Apple silicon, Intel)
 and Windows (x86_64).
 
-With a recent stable Rust you can also install from crates.io, where the
-agent is `libsmol` and the terminal UI is `libsmol-tui` (its program is still
-`smol`). Keep `--locked`, which builds with the dependency versions the release
-was tested with:
+To build from a checkout, run `./build.sh` (`build.ps1` on Windows). The first
+build downloads the CPython that `libsmol` links, about 100 MB, and keeps it in
+`target/pbs`.
 
-```sh
-cargo install --locked libsmol libsmol-tui
-```
-
-To build from a checkout, run `./build.sh` (`build.ps1` on Windows).
-
-`libsmol setup`, or else the first session, downloads the Python the code runs
-in: CPython 3.14 from
-[python-build-standalone](https://github.com/astral-sh/python-build-standalone)
-(about 30 MB) and the worker module of your `libsmol` version from its GitHub
-release, both checked against their checksums and kept in `~/.smol/runtime`.
-The runtime's checksum is built into `libsmol`; the module's comes from the
-same release's `SHA256SUMS`, as with the install scripts. A session can't
-open until this download has worked once. Another version's runtime or
-module, with that runtime's venvs, is removed once no session has used it for
-a week. A configuration directory serves one operating system and
-architecture, so machines of different kinds that share a home folder each
-need their own `SMOL_CONFIG_DIR`.
+The Python the code runs in is inside `libsmol`: CPython 3.14 from
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone),
+linked in with its standard library, so a session opens without downloading
+anything. On Windows `libsmol` writes the CPython DLL, its extension modules
+and its standard library to `~/.smol/python/<version>` the first time it
+runs, since Windows loads a DLL only from a file. A venv holds packages built
+for one operating system and architecture, so machines of different kinds that
+share a home folder each need their own `SMOL_CONFIG_DIR`.
 
 ## Configure a model
 
@@ -287,8 +276,7 @@ programs it starts:
   `~/.password-store`, `~/.local/share/keyrings`, `~/Library/Keychains`,
   `~/.smol`, `~/.claude`, `~/.claude.json`, `~/.codex`, and the configuration
   directory when `SMOL_CONFIG_DIR` moves it; of the configuration directory
-  they still see the runtime, the worker module, the skills, the venv and the
-  copies of viewed images;
+  they still see the skills, the venv and the copies of viewed images;
 - get only `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `LANG`, `LC_ALL`,
   `LC_CTYPE`, `TERM` and `TZ` from your environment, with the venv's `python`
   and `pip` first on `PATH` and `VIRTUAL_ENV` naming it;
@@ -429,16 +417,17 @@ the default is `warn,libsmol=info,rmcp=off`, `SMOL_LOG=warn` keeps only problems
 ## Limitations
 
 - **The Python is smol's own CPython 3.14**, the same on every machine, in a
-  venv kept for each working directory in `~/.smol/runtime/venvs`. `python`,
-  `pip` and imports resolve to that venv, not to the Pythons and virtualenvs
-  you installed, which stay on `PATH` after it. Every session in the directory
-  and the agents they start share the venv and keep what it installed, until a
-  new runtime gets a new one or the directory is gone and no session has used
+  venv kept for each working directory in `~/.smol/venvs`, whose `python` is
+  `libsmol` itself. `python`, `pip` and imports resolve to that venv, not to
+  the Pythons and virtualenvs you installed, which stay on `PATH` after it.
+  Every session in the directory and the agents they start share the venv and
+  keep what it installed, until the directory is gone and no session has used
   the venv for a week. To start over, delete it while no session in that
   directory is open. `VIRTUAL_ENV` names it, so tools such as uv or poetry
-  install into it too, and a venv the code makes for itself is based on the
-  runtime, which a later smol may replace. On Windows a package with deeply
-  nested files may fail to install unless long paths are turned on
+  install into it too, and a venv the code makes for itself is based on it.
+  The C headers aren't installed, so a package with C code installs only from
+  a wheel, as numpy and pandas do, not from source. On Windows a package with
+  deeply nested files may fail to install unless long paths are turned on
   (`LongPathsEnabled` in the registry).
 - **Interrupting** stops code in place, and the session keeps its variables.
   Code blocked where an interrupt cannot reach it (for example `os.system`, a

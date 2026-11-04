@@ -1,8 +1,11 @@
-use crate::{json_of, python_of, request, send};
-use libsmol::guest::{
-    block_on, fetch, grep, ls, shown_path, unserializable, viewed, Message, ToolError, WorkerCall,
-    WorkerNote,
-};
+use crate::guest::{json_of, python_of, request, send};
+use crate::prompt::unserializable;
+use crate::tools::attach::{shown_path, viewed};
+use crate::tools::files::{grep, ls};
+use crate::tools::web::fetch;
+use crate::tools::ToolError;
+use crate::utils::block_on;
+use crate::worker::{Message, WorkerCall, WorkerNote};
 use pyo3::exceptions::{PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict};

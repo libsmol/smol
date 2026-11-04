@@ -8,29 +8,31 @@ pub(crate) mod python;
 pub(crate) mod sandbox;
 
 /// Holds the `address/token` the agent listens on
-pub const CONTROL_ENV: &str = "SMOL_CONTROL";
-pub const COPIES_ENV: &str = "SMOL_COPIES";
+pub(crate) const CONTROL_ENV: &str = "SMOL_CONTROL";
+pub(crate) const COPIES_ENV: &str = "SMOL_COPIES";
 /// Holds `on`, or `roles` when `agent()` takes a role, and is unset for workers without `agent()`
-pub const AGENTS_ENV: &str = "SMOL_AGENTS";
+pub(crate) const AGENTS_ENV: &str = "SMOL_AGENTS";
+/// Starts libsmol's executable as a worker, followed by `serve` or `repair` and the venv's python
+pub(crate) const WORKER_ARG: &str = "--worker";
 
 /// The marker the worker writes after each snippet's output,
 /// made from the token because the output may hold any fixed marker
-pub fn end_marker(token: &str) -> Vec<u8> {
+pub(crate) fn end_marker(token: &str) -> Vec<u8> {
     let marker = format!("\x02{token}\x03end\n");
     marker.into_bytes()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Function {
-    pub name: String,
-    pub header: String,
-    pub summary: String,
+pub(crate) struct Function {
+    pub(crate) name: String,
+    pub(crate) header: String,
+    pub(crate) summary: String,
 }
 
 /// `untagged` tries variants in order and `Note`, which ignores `id`, must come last
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum Message<C, N> {
+pub(crate) enum Message<C, N> {
     Request {
         id: u64,
         #[serde(flatten)]
@@ -56,12 +58,12 @@ impl<C, N> Message<C, N> {
     }
 }
 
-pub type ToWorker = Message<HostCall, HostNote>;
-pub type FromWorker = Message<WorkerCall, WorkerNote>;
+pub(crate) type ToWorker = Message<HostCall, HostNote>;
+pub(crate) type FromWorker = Message<WorkerCall, WorkerNote>;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub enum HostCall {
+pub(crate) enum HostCall {
     Run {
         code: String,
     },
@@ -76,14 +78,14 @@ pub enum HostCall {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub enum HostNote {
+pub(crate) enum HostNote {
     Cancel { id: u64 },
     RemoveServer { name: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub enum WorkerCall {
+pub(crate) enum WorkerCall {
     /// `called` is the `server.function` as written in the code
     Tool {
         server: String,
@@ -163,7 +165,7 @@ pub(crate) enum Delegation {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub enum WorkerNote {
+pub(crate) enum WorkerNote {
     Ready {
         functions: Vec<Function>,
     },

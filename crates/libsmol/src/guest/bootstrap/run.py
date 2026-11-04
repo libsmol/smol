@@ -260,7 +260,8 @@ def _run(code):
         if last is not None and last.tb_frame.f_code.co_filename != _FILENAME:
             where = last.tb_frame.f_code
             error += f"\n  {where.co_filename}, line {last.tb_lineno}, in {where.co_name}"
-            source = _linecache.getline(where.co_filename, last.tb_lineno).strip()
+            # The module's loader gives the source of what isn't a file, like the stdlib in its zip
+            source = _linecache.getline(where.co_filename, last.tb_lineno, last.tb_frame.f_globals).strip()
             if source:
                 error += f": {source}"
 

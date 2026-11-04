@@ -242,7 +242,7 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
     );
     translator.replay(&memory);
 
-    // The sandbox grants the runtime by the folders that exist when it is made
+    // The sandbox grants the venv by the folder that exists when it is made
     let python = Python::install(&app.config, &cwd).await;
     let python = python.map_err(Error::Python)?;
     if inbox.is_closed() {

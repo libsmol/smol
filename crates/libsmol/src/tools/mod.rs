@@ -9,7 +9,7 @@ pub(crate) mod memories;
 pub(crate) mod web;
 
 #[derive(Debug, thiserror::Error)]
-pub enum ToolError {
+pub(crate) enum ToolError {
     #[error("{}", prompt::failure(.action, .path, &cause(.source)))]
     Os {
         action: &'static str,

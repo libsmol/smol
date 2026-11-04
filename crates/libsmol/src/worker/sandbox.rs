@@ -135,7 +135,7 @@ pub(crate) struct Sandbox {
 
 impl Sandbox {
     /// `config` is hidden like the credential locations,
-    /// but `copies`, skill folders and the parts of `python` in it are not
+    /// but `copies`, skill folders and the venv in it are not
     pub(crate) fn new(
         cwd: &Path,
         copies: &Path,
@@ -213,9 +213,9 @@ impl Sandbox {
                 granted.push((folder.to_owned(), false));
             }
         }
-        for path in [&python.runtime.home, &python.runtime.module] {
-            granted.push((path.clone(), false));
-        }
+        // The worker and the venv's python are libsmol's own executable, wherever it is installed
+        let exe = cpython::executable();
+        granted.push((exe, false));
         for path in [cwd, &scratch, copies, &python.venv, Path::new("/dev")] {
             granted.push((path.to_owned(), true));
         }

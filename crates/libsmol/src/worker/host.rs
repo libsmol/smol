@@ -36,6 +36,8 @@ const CANCEL_EVERY: Duration = Duration::from_millis(500);
 /// Code that closes the worker's own copy of the pipe never lets the end marker through
 const OUTPUT_WAIT: Duration = Duration::from_secs(2);
 const START_WAIT: Duration = Duration::from_secs(30);
+/// The worker greets with it, since one of another version would misread the messages
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) type Calling = Pin<Box<dyn Future<Output = Called> + Send>>;
 pub(crate) type Serving<'a> = dyn FnMut(Service) -> Calling + Send + 'a;
@@ -227,8 +229,17 @@ impl Worker {
             accepted = timed => accepted.ok(),
             _ = group.exited() => None,
         };
+        let expected = format!("{token} {VERSION}");
         let (lines, mut writer) = match accepted {
-            Some(Ok((lines, writer, Some(greeting)))) if greeting == token => (lines, writer),
+            Some(Ok((lines, writer, Some(greeting)))) if greeting == expected => (lines, writer),
+            // An update replaced the executable while the session ran, which `/proc/self/exe` avoids on Linux
+            Some(Ok((_, _, Some(greeting))))
+                if greeting.split(' ').next() == Some(token.as_str()) =>
+            {
+                let version = greeting.split(' ').nth(1).unwrap_or_default();
+                let reason = format!("libsmol {version} replaced {VERSION}, reopen the session");
+                return Err(prompt::unstarted(&reason));
+            }
             _ => {
                 let output = Clip::new(KEPT_BYTES);
                 let reason = start_error(group, pieces, output).await;

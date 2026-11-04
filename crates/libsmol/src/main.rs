@@ -1,8 +1,12 @@
 use libsmol::SETUP_ARG;
 use std::env;
-use std::process::ExitCode;
+use std::process::{self, ExitCode};
 
 fn main() -> ExitCode {
+    if let Some(status) = libsmol::embedded() {
+        process::exit(status);
+    }
+
     let args: Vec<String> = env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let ran = match args[..] {

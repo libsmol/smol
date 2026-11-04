@@ -4,6 +4,7 @@ use std::result;
 mod acp;
 mod agent;
 mod config;
+mod guest;
 mod history;
 mod memory;
 mod model;
@@ -16,22 +17,10 @@ mod worker;
 pub use crate::acp::run;
 pub use crate::config::setup::{run as setup, SETUP_ARG};
 
-/// What the worker module in `crates/worker` builds on, the worker's side of `worker::host`
-#[doc(hidden)]
-pub mod guest {
-    pub use crate::agent::MAX_PARALLEL_AGENTS;
-    pub use crate::memory::MAX_PRINT_CHARS;
-    pub use crate::prompt::{unserializable, DONE, NO_AGENT, NO_MEMORY, SURROGATE};
-    pub use crate::tools::attach::{shown_path, viewed};
-    pub use crate::tools::files::{grep, ls};
-    pub use crate::tools::memories::{MAX_MEMORY_CHARS, MAX_RECALLED};
-    pub use crate::tools::web::fetch;
-    pub use crate::tools::ToolError;
-    pub use crate::utils::{block_on, Waiting};
-    pub use crate::worker::{
-        end_marker, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
-        WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV,
-    };
+/// Runs the roles libsmol's executable takes besides the agent's,
+/// python for the venvs that link to it and the worker, and None when started as the agent
+pub fn embedded() -> Option<i32> {
+    guest::role()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +65,7 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 
 #[cfg(test)]
 mod tests {
+    use crate::guest;
     use crate::model::{ChatMessage, Part};
     use crate::utils::{new_id, Interrupt};
     use serde_json::Value;
@@ -83,8 +73,17 @@ mod tests {
     use std::fs;
     use std::ops::{Deref, DerefMut};
     use std::path::{Path, PathBuf};
+    use std::process;
     use std::thread;
     use std::time::Duration;
+
+    /// Tests start workers and python from the test binary, which has no main of its own
+    #[ctor::ctor]
+    fn divert() {
+        if let Some(status) = guest::role() {
+            process::exit(status);
+        }
+    }
 
     pub(crate) fn temp_dir(name: &str) -> PathBuf {
         let id = new_id();

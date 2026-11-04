@@ -36,6 +36,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # The CPython crates/worker links, which its build script downloads into target/pbs
+      - uses: actions/cache@v4
+        with:
+          path: target/pbs
+          key: pbs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/worker/build.rs') }}
       # Failed runs save the build too, or the next run compiles everything from scratch
       - uses: Swatinem/rust-cache@v2
         with:

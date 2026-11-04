@@ -1,26 +1,26 @@
 [package]
 name = "libsmol-worker"
-description = "The Python module that runs the code of a libsmol session"
+description = "CPython linked statically, with its standard library served from memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+# Hands libsmol's build script the link arguments that only a binary can take
+links = "smolpython"
 
 [lib]
-name = "_smol"
-# With an rlib, `cargo test` builds the library for doc tests and so refreshes the module tests load
-crate-type = ["cdylib", "rlib"]
-# A test binary would leave the Python API unresolved, which only a module may do
-test = false
+name = "worker"
 
 [build-dependencies]
-pyo3-build-config = "0.30"
+ar = "0.9"
+flate2 = "1"
+ruzstd = "0.8"
+serde_json = "1"
+sha2 = "0.11"
+tar = "0.4"
+ureq = "3"
 
 [dependencies]
 libc = "0.2"
-libsmol.workspace = true
-pyo3 = { version = "0.30", features = ["abi3-py314", "extension-module"] }
-reaper.workspace = true
-serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["sync", "time"] }
+pyo3 = "0.30"

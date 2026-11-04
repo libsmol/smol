@@ -16,15 +16,3 @@ for file in target/release/{smol,libsmol}; do
     echo "$bin/$name"
 done
 
-# libsmol looks for the worker module of its own version here
-store="${SMOL_CONFIG_DIR:-$HOME/.smol}/runtime"
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
-case "$(uname -s)" in
-Darwin) suffix=dylib ;;
-*) suffix=so ;;
-esac
-module="$store/worker-$version.$suffix"
-mkdir -p "$store"
-cp "target/release/lib_smol.$suffix" "$module.new"
-mv "$module.new" "$module"
-echo "$module"

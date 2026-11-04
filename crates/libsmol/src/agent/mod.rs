@@ -32,7 +32,7 @@ mod step;
 
 use crate::agent::delegate::{Records, Team};
 
-pub use crate::agent::delegate::MAX_PARALLEL_AGENTS;
+pub(crate) use crate::agent::delegate::MAX_PARALLEL_AGENTS;
 
 const VIEW: &str = "view";
 const MAX_NAMING_CHARS: usize = 2000;

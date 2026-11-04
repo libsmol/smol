@@ -7,6 +7,21 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- The Python is inside `libsmol`: CPython 3.14 is linked in with its
+  standard library, which is read from memory, so a release is only `smol`
+  and `libsmol`. Opening a session no longer downloads a runtime or a worker
+  module, and `libsmol setup` no longer installs them. On Windows `libsmol`
+  writes the CPython DLL and its modules to `~/.smol/python/<version>` the
+  first time it runs.
+- Venvs move to `~/.smol/venvs`, and their `python` is `libsmol` itself.
+  They start empty, so packages installed in the old venvs need installing
+  again. `~/.smol/runtime` isn't used any more and can be deleted.
+- The worker shows as `libsmol` in process lists.
+- smol is no longer published on crates.io. Install it with the install
+  scripts or build it from a checkout.
+
 ## 0.6.8 - 2026-11-04
 
 - The system prompt is reordered and shorter: the general rules follow how

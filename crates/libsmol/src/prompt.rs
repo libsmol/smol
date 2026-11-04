@@ -8,9 +8,9 @@ use crate::model::{Media, Part};
 use crate::tools::memories::MAX_MEMORY_CHARS;
 use crate::utils::truncated;
 use crate::worker::host::Added;
-use crate::worker::python::PYTHON;
 use crate::worker::Function;
 use chrono::Utc;
+use cpython::PYTHON;
 use std::env::consts::OS;
 use std::path::{Path, PathBuf};
 
@@ -40,12 +40,12 @@ const HANDED_BACK: &str = "Only your answer is returned to the agent that assign
 /// Errors of `agent()` and its handles go unlabeled, as the worker labels them with the function
 /// the code called
 pub(crate) const NESTED: &str = "not available to agents started by agent()";
-pub const NO_AGENT: &str = "no such agent";
+pub(crate) const NO_AGENT: &str = "no such agent";
 /// Also what the user sees for an agent that is aborted before it ends
 pub(crate) const UNFINISHED: &str = "stopped before it answered";
 pub(crate) const STOPPED_BY_CODE: &str = "stopped by stop()";
 /// The worker puts it in the docs of `Agent.wait` and `Agent.stop`
-pub const DONE: &str = "Agent done";
+pub(crate) const DONE: &str = "Agent done";
 
 pub(crate) fn unknown_role(name: &str, roles: &[Role]) -> String {
     let names: Vec<&str> = roles.iter().map(|role| role.name.as_str()).collect();
@@ -98,7 +98,7 @@ pub(crate) fn done(agents: &[String]) -> String {
 }
 
 /// Errors of `remember()` and `forget()` go unlabeled too, as the worker labels them with the function
-pub const NO_MEMORY: &str = "no such memory";
+pub(crate) const NO_MEMORY: &str = "no such memory";
 pub(crate) const EMPTY_MEMORY: &str = "text is empty";
 
 pub(crate) fn long_memory(count: usize) -> String {
@@ -628,11 +628,11 @@ pub(crate) fn unattached(reason: &str) -> String {
     format!("[not attached: {reason}]")
 }
 
-pub fn unserializable(key: &str, kind: &str) -> String {
+pub(crate) fn unserializable(key: &str, kind: &str) -> String {
     format!("{key}: {kind} is not JSON-serializable")
 }
 
-pub const SURROGATE: &str = "a str holds a lone surrogate, which isn't valid Unicode";
+pub(crate) const SURROGATE: &str = "a str holds a lone surrogate, which isn't valid Unicode";
 
 pub(crate) fn failure(label: &str, object: &str, reason: &str) -> String {
     format!("{label}: {object}: {reason}")
@@ -851,8 +851,8 @@ mod tests {
         call_error, error, media_tag, shell, system, transcript, unseen, view_summary,
     };
     use crate::tools::memories::Listed;
-    use crate::worker::python::PYTHON;
     use crate::worker::Function;
+    use cpython::PYTHON;
     use std::path::{Path, PathBuf};
 
     #[test]

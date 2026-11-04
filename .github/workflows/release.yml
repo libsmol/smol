@@ -48,45 +48,31 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about
+      # The Intel build runs on the Apple silicon runner through Rosetta, also the python that
+      # crates/worker compiles the stdlib with
+      - name: Install Rosetta
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: sudo softwareupdate --install-rosetta --agree-to-license
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - run: cargo about generate about.hbs -o THIRD-PARTY-LICENSES.html
 
-      # Tests only run debug builds of the host's target, and a module that fails to load opens no session
-      - name: Load the worker module
+      # Tests only run debug builds of the host's target, so each release build is checked as the
+      # python the code gets: the stdlib, a venv with pip, and a wheel's C extension
+      - name: Check the embedded Python
         shell: bash
         run: |
-          source=crates/libsmol/src/worker/python.rs
-          release=$(sed -n 's/^const RELEASE: &str = "\(.*\)";$/\1/p' $source)
-          python=$(sed -n 's/^pub(crate) const PYTHON: &str = "\(.*\)";$/\1/p' $source)
-          sha=$(awk -v target='"${{ matrix.target }}",' '$1 == target { getline; gsub(/[ ",]/, ""); print }' $source)
           case "${{ matrix.target }}" in
-            *windows*) interpreter=python/python.exe module=_smol.dll ;;
-            *apple*) interpreter=python/bin/python module=lib_smol.dylib ;;
-            *) interpreter=python/bin/python module=lib_smol.so ;;
+            *windows*) built=libsmol.exe python=python.exe scripts=Scripts ;;
+            *) built=libsmol python=python3 scripts=bin ;;
           esac
-          # The Intel runtime runs on the Apple silicon runner through Rosetta
-          if [ "${{ matrix.target }}" = x86_64-apple-darwin ]; then
-            sudo softwareupdate --install-rosetta --agree-to-license
-          fi
-          module="$GITHUB_WORKSPACE/target/${{ matrix.target }}/release/$module"
-
-          # Relative names keep Windows drive letters away from tar, which would take them for hosts
-          cd "$RUNNER_TEMP"
-          name=cpython-$python+$release-${{ matrix.target }}-install_only_stripped.tar.gz
-          curl -fsSL -o "$name" "https://github.com/astral-sh/python-build-standalone/releases/download/$release/$name"
-          sum=sha256sum
-          command -v sha256sum >/dev/null || sum="shasum -a 256"
-          echo "$sha  $name" | $sum -c -
-          tar -xzf "$name"
-          "$interpreter" -I - "$module" <<'EOF'
-          import sys
-          from importlib.machinery import ExtensionFileLoader
-          from importlib.util import module_from_spec, spec_from_loader
-          loader = ExtensionFileLoader("_smol", sys.argv[1])
-          module = module_from_spec(spec_from_loader("_smol", loader))
-          loader.exec_module(module)
-          print(sys.version, module.serve, module.repair)
-          EOF
+          # Started under another name, libsmol runs as python
+          check="$RUNNER_TEMP/check"
+          mkdir -p "$check"
+          cp "target/${{ matrix.target }}/release/$built" "$check/$python"
+          "$check/$python" -I -c "import ctypes, decimal, json, lzma, sqlite3, ssl, zlib; print(ssl.OPENSSL_VERSION, sqlite3.sqlite_version)"
+          "$check/$python" -m venv "$check/venv"
+          "$check/venv/$scripts/python" -m pip install --only-binary :all: markupsafe
+          "$check/venv/$scripts/python" -c "import importlib.metadata, markupsafe._speedups, sys; print(sys.version, importlib.metadata.version('markupsafe'))"
 
       # The install scripts download these unversioned names from latest
       - name: Package
@@ -100,13 +86,6 @@ jobs:
             cp "target/${{ matrix.target }}/release/$program$suffix" "dist/$name/"
           done
           cp README.md LICENSE CHANGELOG.md THIRD-PARTY-LICENSES.html "dist/$name/"
-          # libsmol downloads its worker module from the release of its version on first use
-          case "${{ matrix.target }}" in
-            *windows*) module=_smol.dll ;;
-            *apple*) module=lib_smol.dylib ;;
-            *) module=lib_smol.so ;;
-          esac
-          cp "target/${{ matrix.target }}/release/$module" "dist/smol-worker-${{ matrix.target }}"
           cd dist
           case "${{ matrix.target }}" in
             *windows*) 7z a "$name.zip" "$name" ;;
@@ -130,14 +109,14 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      # libsmol downloads the worker module of its own target, which it knows from python.rs
-      - name: Check worker modules
+      # Every target that crates/worker has a CPython for ships, and no other
+      - name: Check targets
         run: |
-          builds=$(sed -n 's/^ *"\([a-z0-9_]*-[a-z0-9_-]*\)",$/\1/p' crates/libsmol/src/worker/python.rs | sort)
-          shipped=$(ls dist | sed -n 's/^smol-worker-//p' | sort)
+          builds=$(sed -n 's/^ *"\([a-z0-9_]*-[a-z0-9_-]*\)",$/\1/p' crates/worker/build.rs | sort)
+          shipped=$(ls dist | sed -n 's/^smol-\(.*\)\.\(tar\.gz\|zip\)$/\1/p' | sort)
           if [ -z "$builds" ] || [ "$builds" != "$shipped" ]; then
-            echo "runtimes in python.rs:" $builds
-            echo "worker modules built:" $shipped
+            echo "builds in crates/worker/build.rs:" $builds
+            echo "archives built:" $shipped
             exit 1
           fi
       - name: Checksums
