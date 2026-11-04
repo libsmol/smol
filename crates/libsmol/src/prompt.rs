@@ -1,10 +1,10 @@
 use crate::agent::{Brief, Place, Status};
 use crate::config::Role;
-use crate::memory::{
+use crate::model::{Media, Part};
+use crate::steps::{
     exit_code, AgentStep, Attachment, Call, CallError, Ending, Exit, MemoryStep, ShellStep,
     StepError, TaskStep, MAX_OBSERVATION_CHARS, MAX_PRINT_CHARS,
 };
-use crate::model::{Media, Part};
 use crate::tools::memories::MAX_MEMORY_CHARS;
 use crate::utils::truncated;
 use crate::worker::host::Added;
@@ -848,13 +848,13 @@ mod tests {
     use crate::agent::tests::main_place;
     use crate::agent::{Brief, Place};
     use crate::config::{Role, Skill};
-    use crate::memory::{
-        AgentStep, Call, CallError, CodeResult, Exit, MemoryStep, ShellStep, StepError,
-    };
     use crate::model::tests::png;
     use crate::model::Media;
     use crate::prompt::{
         call_error, error, media_tag, shell, system, transcript, unseen, view_summary,
+    };
+    use crate::steps::{
+        AgentStep, Call, CallError, CodeResult, Exit, MemoryStep, ShellStep, StepError,
     };
     use crate::tools::memories::Listed;
     use crate::worker::Function;

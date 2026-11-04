@@ -3,7 +3,7 @@ use crate::{Error, Result};
 use reaper::{cause, tilde};
 use reqwest::Url;
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{self, Path, PathBuf};
 use std::sync::Arc;
-use toml::Value;
+use toml::{Table, Value};
 
 pub(crate) mod setup;
 
@@ -45,10 +45,11 @@ pub(crate) fn dir() -> PathBuf {
 struct ModelFile {
     /// The toml crate has `preserve_order` on, which keeps the order of the file
     #[serde(default)]
-    model: toml::Table,
+    model: Table,
 }
 
-#[derive(Deserialize)]
+/// One `[model.<name>]` table, as `models` reads it and `save_model` writes it
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Provider {
     #[serde(rename = "type")]
@@ -58,7 +59,7 @@ struct Provider {
     models: Vec<ModelSpec>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 enum Kind {
     #[serde(rename = "openai-completions")]
     OpenAI,
@@ -184,17 +185,19 @@ pub(crate) fn save_model(
         true => "none",
         false => key,
     };
-    let api = quoted(api);
-    let key = quoted(key);
-    let entry = Value::try_from(spec).expect("serialize");
+    let provider = Provider {
+        kind: Kind::OpenAI,
+        api: Some(api.to_owned()),
+        api_key: Some(key.to_owned()),
+        models: vec![spec.clone()],
+    };
+    let fields = Table::try_from(&provider).expect("serialize");
 
-    let lines = [
-        format!("[model.{name}]"),
-        "type = \"openai-completions\"".to_owned(),
-        format!("api = {api}"),
-        format!("api_key = {key}"),
-        format!("models = [{entry}]"),
-    ];
+    // Each field on a line of its own keeps `models` an inline array, as the README writes it
+    let mut lines = vec![format!("[model.{name}]")];
+    for (field, value) in fields {
+        lines.push(format!("{field} = {value}"));
+    }
     let text = lines.join("\n") + "\n";
 
     let path = dir.join(MODEL_FILE);
@@ -395,7 +398,7 @@ pub(crate) fn roles(dir: &Path, project: &Path, models: &Models) -> (Vec<Role>, 
                 continue;
             }
         };
-        let table: toml::Table = match parsed(&text) {
+        let table: Table = match parsed(&text) {
             Ok(table) => table,
             Err(problem) => {
                 let problem = format!("{problem}, skipped");

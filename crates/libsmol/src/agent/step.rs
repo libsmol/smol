@@ -1,11 +1,11 @@
 use crate::agent::delegate::Records;
 use crate::agent::{generate, retry, Event, Streamed, Turn, MAX_RETRIES};
-use crate::memory::{
-    estimate, text_bytes, AgentStep, Call, CallError, CodeResult, StepError, MAX_OBSERVATION_CHARS,
-};
 use crate::model::{ChatMessage, Finish, Part, Purpose, StreamDelta, Unread, MAX_NAME_CHARS};
 use crate::prompt::{self, TOOL};
 use crate::spawn::SHOWN_EVERY;
+use crate::steps::{
+    estimate, text_bytes, AgentStep, Call, CallError, CodeResult, StepError, MAX_OBSERVATION_CHARS,
+};
 use crate::utils::{seamed, truncated};
 use std::mem;
 use std::time::{Duration, Instant};
@@ -343,8 +343,8 @@ mod tests {
     use crate::agent::step::*;
     use crate::agent::tests::{called, recorded, reply, scripted, Script, ScriptedModel, Tested};
     use crate::agent::Task;
-    use crate::memory::{AgentMemory, MemoryStep};
     use crate::model::{ModelError, TokenUsage};
+    use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::{content, Temp};
     use crate::utils::{new_id, Interrupt};
     use std::fs;

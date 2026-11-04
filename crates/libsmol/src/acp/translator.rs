@@ -1,11 +1,11 @@
 use crate::acp::rpc::{Notice, Peer};
 use crate::acp::{AGENT, SHELL, UPDATE};
 use crate::agent::{Event, HelperView, Helpers, Status, Unseen};
-use crate::memory::{
+use crate::prompt::{SKIPPED, STOPPED, STOPPED_BY_CODE, TOOL, UNFINISHED};
+use crate::steps::{
     estimate, text_bytes, AgentMemory, AgentStep, Call, CallError, Ending, Exit, Helper,
     MemoryStep, ShellStep, StepError, SummaryStep, TaskStep, Usage,
 };
-use crate::prompt::{SKIPPED, STOPPED, STOPPED_BY_CODE, TOOL, UNFINISHED};
 use agent_client_protocol_schema::v1::{
     ContentBlock, ContentChunk, MessageId, Meta, ResourceLink, SessionUpdate, ToolCall,
     ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
@@ -711,10 +711,10 @@ mod tests {
     use crate::acp::translator::*;
     use crate::agent::tests::{called, reply, scripted, streamed, Script, ScriptedModel};
     use crate::agent::Streamed;
-    use crate::memory::tests::{asked, coded, metered, replied};
-    use crate::memory::{CodeResult, Helper};
     use crate::model::tests::png;
     use crate::model::{Finish, ModelError};
+    use crate::steps::tests::{asked, coded, metered, replied};
+    use crate::steps::{CodeResult, Helper};
     use serde_json::Value;
     use std::env;
     use std::path::MAIN_SEPARATOR;

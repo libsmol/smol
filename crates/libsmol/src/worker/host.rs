@@ -1,7 +1,7 @@
-use crate::memory::{CallError, MAX_OBSERVATION_CHARS};
 use crate::model::Media;
 use crate::prompt::{self, ADDING_SERVER, LEFT_BEHIND, NO_SERVER};
 use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
+use crate::steps::{CallError, MAX_OBSERVATION_CHARS};
 use crate::tools::mcp::Server;
 use crate::utils::{new_id, Interrupt, Reply};
 use crate::worker::workplace::Workplace;
@@ -190,17 +190,21 @@ impl Worker {
         // libsmol's own executable, which the code can't write, unlike the venv's python.
         // On Linux it is the file this process runs, also once an update replaced it
         let exe = worker::executable();
-        let place = &self.workplace;
+        let Workplace {
+            cwd,
+            copies,
+            venv,
+            sandbox,
+            ..
+        } = &*self.workplace;
         #[cfg(target_os = "linux")]
-        let mut command = place
-            .sandbox
-            .command(Path::new("/proc/self/exe"), &place.cwd);
+        let mut command = sandbox.command(Path::new("/proc/self/exe"), cwd);
         // Process lists would show the worker as `/proc/self/exe`
         #[cfg(target_os = "linux")]
         command.arg0(&exe);
         #[cfg(not(target_os = "linux"))]
-        let mut command = place.sandbox.command(&exe, &place.cwd);
-        command.arg(WORKER_ARG).arg(&place.venv.path);
+        let mut command = sandbox.command(&exe, cwd);
+        command.arg(WORKER_ARG).arg(&venv.path);
 
         let failed = |e: io::Error| {
             let reason = cause(&e);
@@ -213,7 +217,7 @@ impl Worker {
 
         command
             .env(CONTROL_ENV, control)
-            .env(COPIES_ENV, &place.copies)
+            .env(COPIES_ENV, copies)
             .stdin(Stdio::null());
         let agents = match self.delegation {
             Delegation::Off => None,
@@ -667,8 +671,9 @@ async fn start_error(group: Group, mut pieces: Receiver<Piece>, mut output: Clip
 pub(crate) mod tests {
     use crate::agent::tests::main_place;
     use crate::agent::{serve, Brief, Delegating, MAX_PARALLEL_AGENTS};
-    use crate::memory::CallError;
+    use crate::config::Access;
     use crate::prompt::{self, system};
+    use crate::steps::CallError;
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
     use crate::tools::mcp::tests::{fake, started};
     use crate::tools::mcp::Server;
@@ -758,8 +763,7 @@ pub(crate) mod tests {
 
     fn build(interrupt: Interrupt, cwd: PathBuf, delegation: Delegation) -> Temp<Tried> {
         let dir = temp_dir("session");
-        let copies = dir.join("copies");
-        let workplace = opened(&cwd, &copies);
+        let workplace = opened(&cwd, &dir, &Access::default());
         let restarted = false;
         let building = Worker::new(&interrupt, Arc::new(workplace), &[], delegation, restarted);
         let worker = block_on(building).expect("worker");

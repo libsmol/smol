@@ -640,8 +640,8 @@ pub(crate) fn estimate(bytes: usize) -> u64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::memory::*;
     use crate::model::tests::png;
+    use crate::steps::*;
     use crate::tests::content;
 
     pub(crate) fn metered(input: u64, output: u64) -> Usage {

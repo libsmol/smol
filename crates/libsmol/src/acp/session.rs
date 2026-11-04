@@ -7,8 +7,8 @@ use crate::agent::{
 };
 use crate::config::{self, Access, McpConfig, Models};
 use crate::history::{Lock, SessionMeta, Settings};
-use crate::memory::{AgentMemory, Exit, MemoryStep};
 use crate::spawn::{spawn_shell, Group};
+use crate::steps::{AgentMemory, Exit, MemoryStep};
 use crate::tools::memories::{Listed, Memories};
 use crate::utils::Interrupt;
 use crate::worker::host::Worker;
@@ -689,9 +689,9 @@ mod tests {
     use crate::acp::{rfc3339, App};
     use crate::history::tests::saved;
     use crate::history::{HistoryStore, Settings};
-    use crate::memory::tests::{asked, coded, one_task, replied};
-    use crate::memory::{AgentMemory, MemoryStep};
     use crate::prompt::{NAMER, RESTARTED};
+    use crate::steps::tests::{asked, coded, one_task, replied};
+    use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::temp_dir;
     use crate::tools::mcp::tests::SCRIPT;
     use crate::tools::memories::Memories;

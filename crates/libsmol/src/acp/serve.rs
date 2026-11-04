@@ -572,7 +572,7 @@ mod tests {
     use crate::acp::App;
     use crate::history::tests::saved;
     use crate::history::{HistoryStore, Settings};
-    use crate::memory::tests::one_task;
+    use crate::steps::tests::one_task;
     use crate::tests::temp_dir;
     use crate::tools::memories::Memories;
     use crate::utils::{block_on, Interrupt};

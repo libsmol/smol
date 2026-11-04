@@ -428,7 +428,6 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     use crate::worker::sandbox::{landlock_abi, spread, Grant};
     use crate::worker::sandbox::{profile, sweep, LOCK, PIP_CACHE_ENV, TEMP_PREFIX};
-    use crate::worker::venv::tests::shared_venv;
     use crate::worker::workplace::tests::opened;
     use crate::worker::workplace::{Workplace, PASSED_ENV};
     use crate::worker::Delegation;
@@ -442,16 +441,8 @@ pub(crate) mod tests {
     use std::os::unix::net::SocketAddr;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::net::UnixListener;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Arc;
-
-    /// A session in `cwd` whose config folder is `config`
-    fn confined(cwd: &Path, config: &Path, access: &Access) -> Workplace {
-        let copies = config.join("copies");
-        let venv = shared_venv(config, cwd);
-        let opening = Workplace::open(cwd.to_owned(), copies, venv, config, &[], access);
-        opening.expect("workplace")
-    }
 
     #[test]
     fn profile_built() {
@@ -554,7 +545,7 @@ pub(crate) mod tests {
             hidden: vec![dir.join("secret")],
             ..Access::default()
         };
-        let workplace = confined(&cwd, &dir.join("config"), &access);
+        let workplace = opened(&cwd, &dir.join("config"), &access);
         #[cfg(target_os = "macos")]
         assert!(workplace.sandbox.enforced());
         if !workplace.sandbox.enforced() {
@@ -593,7 +584,7 @@ pub(crate) mod tests {
             hidden: vec![cwd.join("a/b")],
             ..Access::default()
         };
-        let workplace = confined(&cwd, &dir.join("config"), &access);
+        let workplace = opened(&cwd, &dir.join("config"), &access);
         #[cfg(target_os = "macos")]
         assert!(workplace.sandbox.enforced());
         if !workplace.sandbox.enforced() {
@@ -625,7 +616,7 @@ pub(crate) mod tests {
             hidden: vec![cwd.join(".env")],
             ..Access::default()
         };
-        let workplace = confined(&cwd, &dir.join("config"), &access);
+        let workplace = opened(&cwd, &dir.join("config"), &access);
         #[cfg(target_os = "macos")]
         assert!(workplace.sandbox.enforced());
         if !workplace.sandbox.enforced() {
@@ -662,7 +653,7 @@ pub(crate) mod tests {
         let address = SocketAddr::from_abstract_name(&name).expect("name");
         #[cfg(target_os = "linux")]
         let _scoped = UnixListener::bind_addr(&address).expect("bind");
-        let workplace = confined(&cwd, &dir.join("config"), &Access::default());
+        let workplace = opened(&cwd, &dir.join("config"), &Access::default());
         #[cfg(target_os = "macos")]
         assert!(workplace.sandbox.enforced());
         if !workplace.sandbox.enforced() {
@@ -732,7 +723,7 @@ pub(crate) mod tests {
             env: vec![allowed.clone()],
             ..Access::default()
         };
-        let workplace = confined(&cwd, &dir, &access);
+        let workplace = opened(&cwd, &dir, &access);
         let scratch = workplace.sandbox.temp.join("tmp").display().to_string();
         let cached = match workplace.sandbox.enforced() {
             true => "True",
@@ -755,7 +746,7 @@ pub(crate) mod tests {
         let dir = temp_dir("swept");
         let cwd = dir.join("café");
         fs::create_dir_all(&cwd).expect("dir");
-        let live = opened(&cwd, &dir.join("copies"));
+        let live = opened(&cwd, &dir, &Access::default());
         let id = new_id();
         let name = format!("{TEMP_PREFIX}{id}");
         let stale = env::temp_dir().join(name);

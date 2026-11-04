@@ -237,7 +237,7 @@ pub(crate) trait Model: Send + Sync {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelSpec {
     pub(crate) id: String,

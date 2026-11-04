@@ -1,6 +1,6 @@
-use crate::memory::{Attachment, MAX_OBSERVATION_CHARS};
 use crate::model::{Media, MediaKind};
 use crate::prompt;
+use crate::steps::{Attachment, MAX_OBSERVATION_CHARS};
 use crate::tools::files::{ls, slashed};
 use crate::tools::ToolError;
 use crate::utils::{new_id, truncated};
@@ -345,7 +345,7 @@ fn media_limit(kind: MediaKind) -> u64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::memory::MAX_OBSERVATION_CHARS;
+    use crate::steps::MAX_OBSERVATION_CHARS;
     use crate::tests::{temp_dir, write_file};
     use crate::tools::attach::*;
     #[cfg(unix)]

@@ -1,5 +1,5 @@
 use crate::config::McpConfig;
-use crate::memory::{AgentMemory, MemoryStep};
+use crate::steps::{AgentMemory, MemoryStep};
 use crate::utils::new_id;
 use crate::{Error, Result};
 use reaper::{cause, tilde};
@@ -299,8 +299,8 @@ fn read_meta(reader: impl Read) -> Option<SessionMeta> {
 pub(crate) mod tests {
     use crate::config::McpKind;
     use crate::history::*;
-    use crate::memory::tests::{asked, one_task};
-    use crate::memory::{Attachment, Exit, ShellStep, TaskStep};
+    use crate::steps::tests::{asked, one_task};
+    use crate::steps::{Attachment, Exit, ShellStep, TaskStep};
     use crate::tests::temp_dir;
 
     /// Saves it as a new session

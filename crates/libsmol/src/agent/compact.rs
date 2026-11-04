@@ -1,9 +1,9 @@
 use crate::agent::{retry, text_reply, Event, Turn};
-use crate::memory::{
-    bytes, estimate, text_bytes, MemoryStep, StepError, SummaryStep, Usage, MAX_OBSERVATION_CHARS,
-};
 use crate::model::{ChatMessage, Purpose};
 use crate::prompt::{self, SUMMARIZER};
+use crate::steps::{
+    bytes, estimate, text_bytes, MemoryStep, StepError, SummaryStep, Usage, MAX_OBSERVATION_CHARS,
+};
 use crate::utils::truncated;
 use crate::Result;
 use std::time::Instant;
@@ -224,9 +224,9 @@ fn squeezed(steps: &[&MemoryStep], budget: u64) -> String {
 mod tests {
     use crate::agent::compact::*;
     use crate::agent::tests::{called, recorded, reply, Run, Script};
-    use crate::memory::tests::{asked, coded, metered, replied};
-    use crate::memory::{AgentMemory, AgentStep, Attachment, Exit, ShellStep, TaskStep};
     use crate::model::{Finish, Generating, MediaKind, Model, ModelError, StreamDelta, TokenUsage};
+    use crate::steps::tests::{asked, coded, metered, replied};
+    use crate::steps::{AgentMemory, AgentStep, Attachment, Exit, ShellStep, TaskStep};
     use crate::tests::content;
     use std::sync::{Arc, Mutex};
 

@@ -2,9 +2,9 @@ use crate::agent::{
     logged_tokens, Agent, Delegating, Event, HelperView, Helpers, Place, Sink, Status, Task, Turn,
     Unseen,
 };
-use crate::memory::{AgentMemory, Ending, Helper, MemoryStep};
 use crate::prompt;
 use crate::spawn::SHOWN_EVERY;
+use crate::steps::{AgentMemory, Ending, Helper, MemoryStep};
 use crate::utils::{Interrupt, Reply};
 use crate::worker::host::{Added, Called, Calling, Worker};
 use crate::worker::AgentCall;
@@ -732,12 +732,12 @@ mod tests {
     use crate::agent::tests::{scripted, streamed, with_roles};
     use crate::agent::{Event, HelperView, Helpers, Sink, Status, Task, Unseen};
     use crate::config::Role;
-    use crate::memory::tests::metered;
-    use crate::memory::{AgentMemory, AgentStep, Call, Ending, Helper, MemoryStep};
     use crate::model::{
         ChatMessage, Finish, Finished, Generating, Model, ModelError, Purpose, StreamDelta,
         TokenUsage,
     };
+    use crate::steps::tests::metered;
+    use crate::steps::{AgentMemory, AgentStep, Call, Ending, Helper, MemoryStep};
     use crate::tests::{cancel_soon, content};
     use crate::tools::mcp::tests::fake;
     use crate::utils::{block_on, Interrupt};

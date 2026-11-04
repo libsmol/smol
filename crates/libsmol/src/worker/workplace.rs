@@ -162,19 +162,11 @@ pub(crate) mod tests {
     use crate::worker::workplace::Workplace;
     use std::path::Path;
 
-    /// The config folder is the parent of `copies`
-    pub(crate) fn opened(cwd: &Path, copies: &Path) -> Workplace {
-        let config = copies.parent().expect("parent");
-        let access = Access::default();
+    /// A session in `cwd` whose config folder is `config`, with its copies in it
+    pub(crate) fn opened(cwd: &Path, config: &Path, access: &Access) -> Workplace {
+        let copies = config.join("copies");
         let venv = shared_venv(config, cwd);
-        let opening = Workplace::open(
-            cwd.to_owned(),
-            copies.to_owned(),
-            venv,
-            config,
-            &[],
-            &access,
-        );
+        let opening = Workplace::open(cwd.to_owned(), copies, venv, config, &[], access);
         opening.expect("workplace")
     }
 }

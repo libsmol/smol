@@ -1,13 +1,13 @@
 use crate::config::{Role, Skill};
 use crate::history::MAX_TITLE_CHARS;
-use crate::memory::{
-    bytes, estimate, AgentMemory, AgentStep, Call, Ending, Helper, MemoryStep, StepError,
-    SummaryStep, TaskStep, Usage,
-};
 use crate::model::{
     ChatMessage, Finish, Finished, MediaKind, Model, ModelError, Purpose, StreamDelta,
 };
 use crate::prompt;
+use crate::steps::{
+    bytes, estimate, AgentMemory, AgentStep, Call, Ending, Helper, MemoryStep, StepError,
+    SummaryStep, TaskStep, Usage,
+};
 use crate::tools::attach::{attach, Mention};
 use crate::tools::memories::{Listed, Memories};
 use crate::utils::Interrupt;
@@ -668,14 +668,14 @@ pub(crate) mod tests {
         title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Records, Sink,
         Streamed, Task, Turn, Unseen, RETRY_WAIT,
     };
-    use crate::config::Role;
+    use crate::config::{Access, Role};
     use crate::history::MAX_TITLE_CHARS;
-    use crate::memory::{AgentMemory, MemoryStep};
     use crate::model::{
         ChatMessage, Finish, Finished, Generating, MediaKind, Model, ModelError, Purpose,
         StreamDelta, TokenUsage, Unread,
     };
     use crate::prompt::{NESTED, RESTARTED};
+    use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::{content, temp_dir, write_file, Temp};
     use crate::tools::attach::tests::mentioned;
     use crate::tools::memories::Memories;
@@ -955,8 +955,7 @@ pub(crate) mod tests {
         let interrupt = Interrupt::default();
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let dir = temp_dir("session");
-        let copies = dir.join("copies");
-        let workplace = Arc::new(opened(&cwd, &copies));
+        let workplace = Arc::new(opened(&cwd, &dir, &Access::default()));
         let delegation = match roles.is_empty() {
             true => Delegation::On,
             false => Delegation::Roles,

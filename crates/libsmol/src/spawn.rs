@@ -1,4 +1,4 @@
-use crate::memory::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
+use crate::steps::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
 use crate::utils::{seamed, Interrupt};
 #[cfg(windows)]
 use encoding_rs::Encoding;
@@ -396,8 +396,8 @@ fn end_of(status: ExitStatus) -> Exit {
 
 #[cfg(test)]
 mod tests {
-    use crate::memory::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
     use crate::spawn::{spawn_shell, Clip};
+    use crate::steps::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
     use crate::tests::temp_dir;
     use crate::utils::{block_on, truncated, Interrupt};
     use std::fs;

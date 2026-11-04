@@ -1,6 +1,6 @@
 use crate::agent::MAX_PARALLEL_AGENTS;
-use crate::memory::MAX_PRINT_CHARS;
 use crate::prompt::{DONE, NO_AGENT, NO_MEMORY, SURROGATE};
+use crate::steps::MAX_PRINT_CHARS;
 use crate::tools::memories::{MAX_MEMORY_CHARS, MAX_RECALLED};
 use crate::tools::ToolError;
 use crate::utils::{block_on, Waiting};
