@@ -135,7 +135,7 @@ pub(crate) fn run(
     resume: Option<&str>,
     task: Option<String>,
 ) -> Result<()> {
-    let session = Session::start(command, model, resume)?;
+    let session = Session::start(command, model, resume, *picture::KITTY)?;
     let mut app = App::new(session);
 
     if resume.is_some() {
@@ -241,7 +241,7 @@ mod tests {
 
     pub(crate) fn app() -> App {
         let agent = fake();
-        let session = Session::start(&agent, None, None).expect("start");
+        let session = Session::start(&agent, None, None, false).expect("start");
         App::new(session)
     }
 

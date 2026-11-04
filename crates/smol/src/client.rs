@@ -35,6 +35,8 @@ use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_
 const EXITED: &str = "agent: exited";
 
 const QUEUED: &str = "_smol/queued";
+/// Declared only when the terminal draws Kitty images
+const IMAGES: &str = "_smol/images";
 const ENQUEUED: &str = "_smol/enqueued";
 const NOTICE: &str = "_smol/notice";
 const MCP: &str = "_smol/mcp";
@@ -294,7 +296,10 @@ pub(crate) struct Client {
 
 impl Client {
     /// `command` must not be empty
-    pub(crate) fn start(command: &[String]) -> Result<(Self, Receiver<Incoming>)> {
+    pub(crate) fn start(
+        command: &[String],
+        images_shown: bool,
+    ) -> Result<(Self, Receiver<Incoming>)> {
         let cwd = match env::current_dir() {
             Ok(cwd) => cwd,
             Err(e) => {
@@ -462,7 +467,10 @@ impl Client {
 
         let info = Implementation::new("smol", env!("CARGO_PKG_VERSION"));
         let queued = (QUEUED.to_owned(), json!(true));
-        let meta = Meta::from_iter([queued]);
+        let mut meta = Meta::from_iter([queued]);
+        if images_shown {
+            meta.insert(IMAGES.to_owned(), json!(true));
+        }
         let auth = AuthCapabilities::new().terminal(true);
         let capabilities = ClientCapabilities::new().auth(auth).meta(meta);
         let initialize = InitializeRequest::new(ProtocolVersion::V1)
@@ -750,7 +758,7 @@ mod tests {
     #[test]
     fn startup_stderr_tail() {
         let agent = shell("printf '\\377\\n' >&2; echo startup failed >&2; exit 3");
-        let Err(error) = Client::start(&agent) else {
+        let Err(error) = Client::start(&agent, false) else {
             panic!("started");
         };
 
@@ -760,9 +768,27 @@ mod tests {
     }
 
     #[test]
+    fn images_declared() {
+        let agent = shell(
+            r#"read -r line
+id=$(printf '%s\n' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
+case $line in
+*'"_smol/images":true'*) name=images ;;
+*) name=plain ;;
+esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"%s","version":"1"}}}\n' "$id" "$name"
+cat >/dev/null"#,
+        );
+        let (client, _inbox) = Client::start(&agent, true).expect("start");
+        assert_eq!(client.agent.name, "images");
+        let (client, _inbox) = Client::start(&agent, false).expect("start");
+        assert_eq!(client.agent.name, "plain");
+    }
+
+    #[test]
     fn requests_after_exit() {
         let agent = fake();
-        let (client, inbox) = Client::start(&agent).expect("fake agent");
+        let (client, inbox) = Client::start(&agent, false).expect("fake agent");
         let opened = client.open(None, None).expect("open");
         let blocks = vec![ContentBlock::from("exit")];
         client.prompt(&opened.id, blocks);

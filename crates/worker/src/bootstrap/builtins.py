@@ -206,9 +206,9 @@ def fetch(url: str) -> str:
 
 @_builtin
 def view(path: str | _os.PathLike) -> None:
-    """Attaches an image or video file to this call's result.
+    """Shows you an image or video file by adding it to this call's result.
 
-    Attaches a PNG, JPEG, GIF or WebP image, or an MP4, WebM or MOV video, to this call's result."""
+    Adds a PNG, JPEG, GIF or WebP image, or an MP4, WebM or MOV video, to this call's result for you to see."""
     path = _path("view", "path", path)
     # The code may have changed directory but the label is relative to the session directory
     absolute = _os.path.abspath(path)

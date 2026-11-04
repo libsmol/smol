@@ -33,6 +33,8 @@ const REMEMBERING: &str = "## Rules
 - When a memory is wrong or outdated, `forget()` it and `remember()` the correct one.";
 
 const SHOWN: &str = " Text in the same reply is shown to the user.";
+/// Worded against view_summary, without which models take view() as showing the user
+const SHOWN_IMAGES: &str = "To show the user an image, such as a chart you saved, put `![alt](path)` on a line of its own.";
 const HANDED_BACK: &str = "Only your answer is returned to the agent that assigned this task, so include everything the task asks for.";
 
 /// Errors of `agent()` and its handles go unlabeled, as the worker labels them with the function
@@ -106,9 +108,11 @@ pub(crate) fn long_memory(count: usize) -> String {
 /// None leaves view() out of the prompt
 pub(crate) fn view_summary(image: bool, video: bool) -> Option<&'static str> {
     match (image, video) {
-        (true, true) => Some("Attaches an image or video file to this call's result."),
-        (true, false) => Some("Attaches an image file to this call's result."),
-        (false, true) => Some("Attaches a video file to this call's result."),
+        (true, true) => {
+            Some("Shows you an image or video file by adding it to this call's result.")
+        }
+        (true, false) => Some("Shows you an image file by adding it to this call's result."),
+        (false, true) => Some("Shows you a video file by adding it to this call's result."),
         (false, false) => None,
     }
 }
@@ -170,6 +174,10 @@ pub(crate) fn system(
         }
     };
 
+    let images = match brief.images_shown {
+        true => format!("\n\n{SHOWN_IMAGES}"),
+        false => String::new(),
+    };
     let updates = format!("A message starting with `{WROTE}` adds to or changes the current task.");
     let (shown, markdown, note, reader, roles) = match place {
         Place::Main { roles, .. } => (
@@ -304,7 +312,7 @@ pub(crate) fn system(
 
 Each reply does one of two things:
 - Run code: call `{TOOL}`, once or several times. Calls run in order; after one fails, the rest are skipped.{shown}
-- Answer: reply{markdown} with no tool call. This ends the task, so answer once you have the result, or at once if no code is needed.
+- Answer: reply{markdown} with no tool call. This ends the task, so answer once you have the result, or at once if no code is needed.{images}
 
 {note}
 
@@ -858,7 +866,7 @@ mod tests {
         let brief = Brief {
             instructions,
             skills,
-            listed: Listed::default(),
+            ..Brief::default()
         };
         let cwd = Path::new("/home/zoë/work");
 
@@ -1039,13 +1047,38 @@ mod tests {
         assert!(!plain.contains("# Role"), "{plain}");
     }
 
+    /// Agents that agent() starts are told too, since their answers can reach the user
+    #[test]
+    fn images_shown() {
+        let cwd = Path::new("/home/zoë/work");
+        let main = main_place(Vec::new());
+        let plain = system(&[], &[], &Brief::default(), cwd, None, &main);
+        assert!(!plain.contains("![alt]"), "{plain}");
+
+        let brief = Brief {
+            images_shown: true,
+            ..Brief::default()
+        };
+        let text = system(&[], &[], &brief, cwd, None, &main);
+        let shown = "no code is needed.\n\n\
+                     To show the user an image, such as a chart you saved, put `![alt](path)` on a line of its own.\n\n\
+                     A message starting with `[The user wrote";
+        assert!(text.contains(shown), "{text}");
+
+        let helper = system(&[], &[], &brief, cwd, None, &Place::Delegated(None));
+        let shown = "no code is needed.\n\n\
+                     To show the user an image, such as a chart you saved, put `![alt](path)` on a line of its own.\n\n\
+                     Only your answer is returned";
+        assert!(helper.contains(shown), "{helper}");
+    }
+
     #[test]
     fn view_summaries() {
-        let both = Some("Attaches an image or video file to this call's result.");
+        let both = Some("Shows you an image or video file by adding it to this call's result.");
         assert_eq!(view_summary(true, true), both);
-        let images = Some("Attaches an image file to this call's result.");
+        let images = Some("Shows you an image file by adding it to this call's result.");
         assert_eq!(view_summary(true, false), images);
-        let videos = Some("Attaches a video file to this call's result.");
+        let videos = Some("Shows you a video file by adding it to this call's result.");
         assert_eq!(view_summary(false, true), videos);
         assert_eq!(view_summary(false, false), None);
     }

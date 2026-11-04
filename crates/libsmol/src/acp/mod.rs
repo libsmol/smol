@@ -22,6 +22,8 @@ mod translator;
 const NOTICE: &str = "_smol/notice";
 const MCP: &str = "_smol/mcp";
 const QUEUED: &str = "_smol/queued";
+/// Declared by a client that shows the images a reply writes in Markdown
+const IMAGES: &str = "_smol/images";
 /// Sent by a client that declared `_smol/queued` when it queues a message during a turn
 const ENQUEUED: &str = "_smol/enqueued";
 const UPDATE: &str = "_smol/update";

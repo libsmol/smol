@@ -13,6 +13,12 @@ but their files stay in `~/.smol/history` untouched.
   to reply, and the environment comes last, after memories and
   instructions. Skills take one line each, and the memory rules three.
 - `help(Agent)` also lists its methods with their signatures.
+- In Kitty and Ghostty, outside tmux, screen and zellij, the model is told
+  to show the user an image by writing `![alt](path)` on a line of its own,
+  so an answer can show the chart or picture it made. ACP clients that show
+  such images can declare `_smol/images` in `clientCapabilities._meta`.
+- `view()` says it shows the file to the model, which models took as
+  showing it to the user.
 
 ## 0.6.7 - 2026-11-03
 

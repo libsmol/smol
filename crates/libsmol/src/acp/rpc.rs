@@ -36,6 +36,8 @@ pub(crate) struct Peer {
     pending: Waiting,
     /// The client declared `_smol/queued`
     queued: AtomicBool,
+    /// The client declared `_smol/images`
+    images: AtomicBool,
 }
 
 impl Peer {
@@ -44,6 +46,7 @@ impl Peer {
             out,
             pending: Waiting::default(),
             queued: AtomicBool::new(false),
+            images: AtomicBool::new(false),
         })
     }
 
@@ -104,6 +107,14 @@ impl Peer {
 
     pub(crate) fn queued(&self) -> bool {
         self.queued.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_images(&self, images: bool) {
+        self.images.store(images, Ordering::Relaxed);
+    }
+
+    pub(crate) fn images(&self) -> bool {
+        self.images.load(Ordering::Relaxed)
     }
 
     pub(crate) fn update(&self, session: &str, update: SessionUpdate) {

@@ -58,8 +58,9 @@ impl Session {
         command: &[String],
         model: Option<String>,
         resume: Option<&str>,
+        images_shown: bool,
     ) -> Result<Self> {
-        let (client, inbox) = Client::start(command)?;
+        let (client, inbox) = Client::start(command, images_shown)?;
         let opened = client.open(resume, None);
         let opened = match opened {
             Err(e) if e.is::<AuthRequired>() => {
@@ -493,7 +494,7 @@ mod tests {
     #[test]
     fn asked_until_settled() {
         let agent = fake();
-        let mut session = Session::start(&agent, None, None).expect("start");
+        let mut session = Session::start(&agent, None, None, false).expect("start");
 
         let switched = session.set_mcp(true, "web").expect("switch");
         assert_eq!(switched, "mcp: web: connecting");
@@ -539,7 +540,7 @@ mod tests {
     #[test]
     fn reconnect_failure_shown() {
         let agent = fake();
-        let mut session = Session::start(&agent, None, None).expect("start");
+        let mut session = Session::start(&agent, None, None, false).expect("start");
         let mut seen = |state: McpState| {
             let message = status("s1", state);
             let outputs = session.receive(message);
@@ -564,7 +565,7 @@ mod tests {
     #[test]
     fn open_resets_state() {
         let agent = fake();
-        let mut session = Session::start(&agent, None, None).expect("start");
+        let mut session = Session::start(&agent, None, None, false).expect("start");
         let off = status("s1", McpState::Off);
         session.receive(off);
         session.set_mcp(true, "web").expect("switch");
@@ -598,7 +599,7 @@ mod tests {
     #[test]
     fn last_save_failed() {
         let agent = fake();
-        let mut session = Session::start(&agent, None, None).expect("start");
+        let mut session = Session::start(&agent, None, None, false).expect("start");
         let failed = || Notice {
             text: "history: disk full".to_owned(),
             retry_in: None,
@@ -625,7 +626,7 @@ mod tests {
     #[test]
     fn dropped_ask_answered() {
         let agent = fake();
-        let mut session = Session::start(&agent, None, None).expect("start");
+        let mut session = Session::start(&agent, None, None, false).expect("start");
         session.prompt("queue");
 
         let mut stops = Vec::new();
@@ -649,10 +650,10 @@ mod tests {
     fn model_carried() {
         let agent = fake();
         let model = Some("m2-café".to_owned());
-        let resumed = Session::start(&agent, model, Some("s1")).expect("start");
+        let resumed = Session::start(&agent, model, Some("s1"), false).expect("start");
         assert_eq!(resumed.model(), "m2-café");
 
-        let mut session = Session::start(&agent, None, None).expect("start");
+        let mut session = Session::start(&agent, None, None, false).expect("start");
         session.set_model("m2-café").expect("switch");
         session.open(None).expect("open");
         assert_eq!(
@@ -692,10 +693,10 @@ done
             shell(&script)
         };
 
-        let session = Session::start(&agent("0"), None, None).expect("start");
+        let session = Session::start(&agent("0"), None, None, false).expect("start");
         assert_eq!(session.id, "s1");
 
-        let failed = Session::start(&agent("1"), None, None);
+        let failed = Session::start(&agent("1"), None, None, false);
         let error = failed.err().expect("error");
         assert_eq!(error.to_string(), "config: model.toml: not found");
     }
@@ -703,7 +704,7 @@ done
     #[test]
     fn latest_in_cwd() {
         let agent = fake();
-        let started = Session::start(&agent, None, Some("latest"));
+        let started = Session::start(&agent, None, Some("latest"), false);
         let mut session = started.expect("start");
         assert_eq!(session.id, "s1");
 

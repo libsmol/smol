@@ -132,7 +132,7 @@ struct Store {
 static STORE: LazyLock<Mutex<Store>> = LazyLock::new(Mutex::default);
 /// Counts loads that ended, so the transcript lays its rows out again
 static LOADED: AtomicU64 = AtomicU64::new(0);
-static KITTY: LazyLock<bool> = LazyLock::new(kitty_terminal);
+pub(crate) static KITTY: LazyLock<bool> = LazyLock::new(kitty_terminal);
 
 /// Only terminals known to draw Kitty's Unicode placeholders, and not inside a multiplexer,
 /// which keeps graphics to itself unless set up to pass them through

@@ -1,6 +1,8 @@
 use crate::acp::rpc::{Lines, Out, Peer};
 use crate::acp::session::{self, Message, Opening, Prompt, Shell};
-use crate::acp::{rfc3339, task_of, to_value, App, ENQUEUED, FORGET, MEMORIES, QUEUED, SHELL};
+use crate::acp::{
+    rfc3339, task_of, to_value, App, ENQUEUED, FORGET, IMAGES, MEMORIES, QUEUED, SHELL,
+};
 use crate::config;
 use crate::config::setup::SETUP_ARG;
 use crate::history::HistoryStore;
@@ -278,6 +280,8 @@ impl Router {
                 let client = &params["clientCapabilities"];
                 let queued = client["_meta"][QUEUED].as_bool() == Some(true);
                 self.app.peer.set_queued(queued);
+                let images = client["_meta"][IMAGES].as_bool() == Some(true);
+                self.app.peer.set_images(images);
                 let terminal = client["auth"]["terminal"].as_bool() == Some(true);
 
                 let close = SessionCloseCapabilities::new();

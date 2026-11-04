@@ -303,6 +303,7 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
         instructions,
         skills,
         listed,
+        images_shown: app.peer.images(),
     };
     let agent = Agent {
         model: Arc::from(built),
@@ -1398,6 +1399,35 @@ mod tests {
         assert!(prompt.contains(header), "{prompt}");
         let listed = "with one role per task.\n\n- `reviewer`: Reviews the café's code\n\n";
         assert!(prompt.contains(listed), "{prompt}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn images_declared() {
+        let dir = temp_dir("images");
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&prompts);
+        let api = model_server(move |body| {
+            let system = system_prompt(body);
+            if system != NAMER {
+                seen.lock().expect("prompts").push(system);
+            }
+            Ok("Done.".to_owned())
+        });
+        let running = async {
+            let mut connection = Connection::open(&dir, &api, "");
+            let capabilities = json!({"_meta": {"_smol/images": true}});
+            let params = json!({"protocolVersion": 1, "clientCapabilities": capabilities});
+            connection.request("initialize", params).await;
+            let session = connection.new_session().await;
+            connection.prompt(&session, "Plot the cafés").await;
+            connection.close().await
+        };
+        block_on(running);
+
+        let prompts = prompts.lock().expect("prompts");
+        let shown = "To show the user an image, such as a chart you saved, put `![alt](path)`";
+        assert!(prompts[0].contains(shown), "{prompts:?}");
         fs::remove_dir_all(&dir).ok();
     }
 

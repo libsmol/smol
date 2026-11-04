@@ -208,12 +208,13 @@ pub(crate) struct Agent {
     pub(crate) place: Place,
 }
 
-/// What the session read when it opened, which the system prompt shows
+/// What the session learned when it opened, which the system prompt shows
 #[derive(Clone, Default)]
 pub(crate) struct Brief {
     pub(crate) instructions: Vec<String>,
     pub(crate) skills: Vec<Skill>,
     pub(crate) listed: Listed,
+    pub(crate) images_shown: bool,
 }
 
 pub(crate) type Delegating<'a> = dyn FnMut(AgentCall) -> Calling + Send + 'a;
