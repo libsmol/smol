@@ -1385,6 +1385,46 @@ pub(crate) mod tests {
         assert_eq!(output.logs, "True\n");
     }
 
+    /// The python the code starts adds PYTHONPATH, unless -E or -I leave out the environment
+    #[test]
+    fn pythonpath_honored() {
+        let (mut worker, dir) = workspace("pythonpath");
+        let code = "import os, subprocess\n\
+             os.makedirs('café', exist_ok=True)\n\
+             _ = open('café/smol_path.py', 'w').write('value = 42')\n\
+             env = dict(os.environ, PYTHONPATH='café')\n\
+             probe = 'import smol_path; print(smol_path.value)'\n\
+             for flags in [[], ['-E'], ['-I']]:\n    \
+                 run = subprocess.run(['python', *flags, '-c', probe], env=env, capture_output=True, text=True)\n    \
+                 print(run.returncode, run.stdout.strip())";
+        let output = worker.eval(code);
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.logs, "0 42\n1 \n1 \n");
+    }
+
+    /// A venv the code makes, inside the session's or inside that one, gets its own python,
+    /// pip and activation scripts
+    #[cfg(unix)]
+    #[test]
+    fn venvs_nested() {
+        let (mut worker, dir) = workspace("nested");
+        let code = "import os, subprocess, venv\n\
+             venv.create('inner', symlinks=True, with_pip=True)\n\
+             names = os.listdir('inner/bin')\n\
+             print('libsmol' in names, 'pip' in names, 'activate' in names)\n\
+             script = '. inner/bin/activate && python -m venv --without-pip deeper && \
+                 deeper/bin/python -c \"import sys; print(sys.prefix)\"'\n\
+             run = subprocess.run(script, shell=True, capture_output=True, text=True)\n\
+             print(run.returncode, run.stdout.strip() == os.path.abspath('deeper'))";
+        let output = worker.eval(code);
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.logs, "False True True\n0 True\n");
+    }
+
     /// A pool fails at once instead of waiting on a process that can't import the code
     #[test]
     fn pool_refuses_code() {

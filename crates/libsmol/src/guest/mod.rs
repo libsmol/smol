@@ -17,16 +17,12 @@ use pyo3::types::{IntoPyDict, PyDict};
 use reaper::cause;
 use serde_json::{json, Value};
 use std::env;
-use std::ffi::{CString, OsStr, OsString};
-#[cfg(unix)]
-use std::fs;
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::process;
+use std::path::PathBuf;
 use std::ptr;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,7 +38,6 @@ const BOOTSTRAP: [&str; 3] = [
     include_str!("bootstrap/mcp.py"),
     include_str!("bootstrap/run.py"),
 ];
-const VENV: &str = include_str!("venv.py");
 /// The agent checks it, since a worker of another version would misread its messages
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -57,11 +52,7 @@ static MAIN: AtomicUsize = AtomicUsize::new(0);
 /// and returns its exit status
 pub(crate) fn role() -> Option<i32> {
     let args: Vec<OsString> = env::args_os().collect();
-    let named = args.first().map(Path::new).and_then(Path::file_stem);
-    let named = named.and_then(OsStr::to_str).unwrap_or_default();
-    // A venv links python, python3, python3.14 and 𝜋thon to libsmol
-    if named.starts_with("python") || named == "𝜋thon" {
-        let status = cpython::python(&args);
+    if let Some(status) = cpython::python(&args) {
         return Some(status);
     }
 
@@ -84,8 +75,9 @@ pub(crate) fn role() -> Option<i32> {
     }
     cpython::start();
     let running = |py: Python<'_>| match role.to_str() {
-        Some("serve") => serve(py, python.clone()),
-        Some("repair") => repair(py, python.clone()),
+        Some("serve") => serve(py, python),
+        // Confined like the worker, since the code may be using the venv
+        Some("repair") => cpython::repair(py, python),
         _ => {
             let shown = role.to_string_lossy();
             let message = format!("worker: {shown}: no such role");
@@ -104,7 +96,7 @@ pub(crate) fn role() -> Option<i32> {
 }
 
 /// Runs on the main thread, where Python raises `KeyboardInterrupt`, until the agent hangs up
-fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
+fn serve(py: Python<'_>, python: &OsStr) -> PyResult<()> {
     let os = py.import("os")?;
     let environ = os.getattr("environ")?;
     // Programs the code starts would inherit these, and they must go before any thread starts
@@ -126,37 +118,7 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
 
     // Taken before site runs the venv's .pth files, which could change it
     let cwd = env::current_dir().unwrap_or_default();
-
-    // The venv's python leads to the libsmol that made it, which may have moved since.
-    // A rename replaces the link in one step, as another worker may be starting alongside
-    #[cfg(unix)]
-    {
-        let bin = Path::new(&python).parent().unwrap_or(Path::new(""));
-        let linked = bin.join("python3");
-        let exe = cpython::executable();
-        if fs::read_link(&linked).ok().as_ref() != Some(&exe) {
-            let id = process::id();
-            let aside = bin.join(format!(".python3-{id}"));
-            fs::remove_file(&aside).ok();
-            let relinked = symlink(&exe, &aside).and_then(|()| fs::rename(&aside, &linked));
-            if let Err(e) = relinked {
-                let reason = cause(&e);
-                let shown = linked.display();
-                let message = format!("worker: {shown}: {reason}");
-                return Err(PyRuntimeError::new_err(message));
-            }
-        }
-    }
-
-    // Site runs again as the venv's interpreter would, with the prefixes it took at start replaced
-    let venv = venv_of(&python);
-    let sys = py.import("sys")?;
-    sys.setattr("executable", &python)?;
-    sys.setattr("prefix", &venv)?;
-    sys.setattr("exec_prefix", &venv)?;
-    let site = py.import("site")?;
-    site.setattr("PREFIXES", [&venv])?;
-    site.call_method0("main")?;
+    cpython::enter(py, python)?;
 
     let Some((address, token)) = control.split_once('/') else {
         let message = format!("worker: {CONTROL_ENV}: not set by the agent");
@@ -204,6 +166,7 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
     let listed: Vec<(String, String, String)> = scope.get_item("_FUNCTIONS")?.extract()?;
 
     // Added earlier, a file in the working directory named like a standard module breaks the bootstrap
+    let sys = py.import("sys")?;
     sys.getattr("path")?.call_method1("insert", (0, ""))?;
     // argparse and runpy read it, and it is empty as in the interactive interpreter
     sys.setattr("argv", [""])?;
@@ -285,25 +248,6 @@ fn serve(py: Python<'_>, python: OsString) -> PyResult<()> {
         let reply = Message::reply(id, result);
         send(&reply);
     }
-}
-
-/// Makes the venv of `python`, or adds what it lacks and keeps the packages it has,
-/// confined like the worker since the code may be using it
-fn repair(py: Python<'_>, python: OsString) -> PyResult<()> {
-    let venv = venv_of(&python);
-    let code = CString::new(VENV).expect("venv.py");
-    let globals = PyDict::new(py);
-    py.run(&code, Some(&globals), None)?;
-    let repairing = globals.as_any().get_item("_repair")?;
-    repairing.call1((venv,))?;
-    Ok(())
-}
-
-/// The venv holding the interpreter in its `bin` or `Scripts` folder
-fn venv_of(python: &OsStr) -> OsString {
-    let python = Path::new(python);
-    let venv = python.parent().and_then(Path::parent).unwrap_or(python);
-    venv.as_os_str().to_owned()
 }
 
 /// Also unsets it for the programs the code starts

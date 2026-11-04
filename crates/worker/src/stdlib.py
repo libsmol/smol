@@ -54,7 +54,23 @@ def _install():
             made.append(reader_class())
         return made[0](self, fullname)
 
+    # venv copies its activation scripts from the folder of its file, which is inside the executable
+    def setup_scripts(self, context):
+        from importlib import resources
+
+        scripts = resources.files("venv") / "scripts"
+        with resources.as_file(scripts) as folder:
+            self.install_scripts(context, str(folder))
+
+    executed = zipimport.zipimporter.exec_module
+
+    def exec_module(self, module):
+        executed(self, module)
+        if self.archive == path and module.__name__ == "venv":
+            module.EnvBuilder.setup_scripts = setup_scripts
+
     zipimport.zipimporter.get_resource_reader = reader
+    zipimport.zipimporter.exec_module = exec_module
 
 
 _install()

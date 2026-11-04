@@ -2045,6 +2045,7 @@ dependencies = [
  "ar",
  "flate2",
  "libc",
+ "libsmol-reaper",
  "pyo3",
  "ruzstd",
  "serde_json",

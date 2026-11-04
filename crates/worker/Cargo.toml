@@ -24,3 +24,4 @@ ureq = "3"
 [dependencies]
 libc = "0.2"
 pyo3 = "0.30"
+reaper.workspace = true
