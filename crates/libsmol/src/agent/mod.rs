@@ -12,12 +12,12 @@ use crate::tools::attach::{attach, Mention};
 use crate::tools::memories::{Listed, Memories};
 use crate::utils::Interrupt;
 use crate::worker::host::{Added, Called, Calling, Serving, Worker};
-use crate::worker::sandbox::Sandbox;
+use crate::worker::workplace::Workplace;
 use crate::worker::{AgentCall, Delegation, Service};
 use crate::{Error, Result};
 use std::fs;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -199,11 +199,9 @@ pub(crate) struct Task {
 pub(crate) struct Agent {
     pub(crate) model: Arc<dyn Model>,
     pub(crate) brief: Brief,
-    pub(crate) cwd: PathBuf,
-    pub(crate) copies: PathBuf,
     pub(crate) interrupt: Interrupt,
-    /// Every worker of the session uses it
-    pub(crate) sandbox: Arc<Sandbox>,
+    /// Every worker of the session runs in it
+    pub(crate) workplace: Arc<Workplace>,
     pub(crate) memories: Memories,
     pub(crate) place: Place,
 }
@@ -295,8 +293,8 @@ impl Agent {
             &functions,
             servers,
             &self.brief,
-            &self.cwd,
-            self.sandbox.writable(),
+            &self.workplace.cwd,
+            self.workplace.writable(),
             &self.place,
         );
 
@@ -333,8 +331,8 @@ impl Agent {
 
     /// Reading files and copying images and videos stays off the async runtime
     async fn attached(&self, task: Task) -> TaskStep {
-        let cwd = self.cwd.clone();
-        let copies = self.copies.clone();
+        let cwd = self.workplace.cwd.clone();
+        let copies = self.workplace.copies.clone();
         let mentions = task.mentions;
         let attaching = move || {
             let attached = mentions
@@ -378,7 +376,7 @@ impl Turn<'_> {
         }
 
         // The task text survives compaction verbatim, so a task over half the window can never fit
-        let copies = &self.agent.copies;
+        let copies = &self.agent.workplace.copies;
         if let Some(window) = self.agent.model.context_window() {
             // Image and video estimates run high, so only text counts toward refusing
             let text_only = |_: MediaKind| false;
@@ -684,7 +682,7 @@ pub(crate) mod tests {
     use crate::utils::{block_on, Interrupt};
     use crate::worker::host::tests::unserved;
     use crate::worker::host::Worker;
-    use crate::worker::sandbox::tests::opened;
+    use crate::worker::workplace::tests::opened;
     use crate::worker::{Delegation, MemoryCall, Service};
     use crate::Result;
     use serde_json::json;
@@ -958,13 +956,19 @@ pub(crate) mod tests {
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let dir = temp_dir("session");
         let copies = dir.join("copies");
-        let sandbox = Arc::new(opened(&cwd, &copies));
+        let workplace = Arc::new(opened(&cwd, &copies));
         let delegation = match roles.is_empty() {
             true => Delegation::On,
             false => Delegation::Roles,
         };
         let restarted = false;
-        let starting = Worker::new(&interrupt, Arc::clone(&sandbox), &[], delegation, restarted);
+        let starting = Worker::new(
+            &interrupt,
+            Arc::clone(&workplace),
+            &[],
+            delegation,
+            restarted,
+        );
         let worker = block_on(starting).expect("worker");
         let memories = Memories::new(&dir, &cwd);
 
@@ -977,10 +981,8 @@ pub(crate) mod tests {
         let agent = Agent {
             model: Arc::new(model),
             brief: Brief::default(),
-            cwd,
-            copies,
             interrupt,
-            sandbox,
+            workplace,
             memories,
             place,
         };
@@ -1083,7 +1085,7 @@ pub(crate) mod tests {
         run.agent
             .turn_attached(&mut memory, &huge, &files)
             .expect_err("refused");
-        let copies = run.agent.agent.copies.clone();
+        let copies = run.agent.agent.workplace.copies.clone();
         let left = fs::read_dir(&copies).expect("copies").count();
         assert_eq!(left, 0);
 

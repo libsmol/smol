@@ -4,7 +4,7 @@ use crate::prompt::{self, ADDING_SERVER, LEFT_BEHIND, NO_SERVER};
 use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
 use crate::tools::mcp::Server;
 use crate::utils::{new_id, Interrupt, Reply};
-use crate::worker::sandbox::Sandbox;
+use crate::worker::workplace::Workplace;
 use crate::worker::{
     end_marker, greeting, AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message,
     Service, ToWorker, WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, WORKER_ARG,
@@ -79,10 +79,10 @@ pub(crate) struct Added {
 
 /// Callers keep track of the installed MCP servers and pass them in on every call
 pub(crate) struct Worker {
-    /// Dropped before the sandbox, which removes the worker's temporary folder and lets go of the venv
+    /// Dropped before the workplace, which removes the worker's temporary folder and lets go of the venv
     live: Option<Live>,
     /// Shared with the workers of agents the code starts
-    sandbox: Arc<Sandbox>,
+    workplace: Arc<Workplace>,
     interrupt: Interrupt,
     delegation: Delegation,
     functions: Vec<Function>,
@@ -145,13 +145,13 @@ impl Worker {
     /// `restarted` means earlier code in the session defined names this new worker lacks
     pub(crate) async fn new(
         interrupt: &Interrupt,
-        sandbox: Arc<Sandbox>,
+        workplace: Arc<Workplace>,
         servers: &[&Added],
         delegation: Delegation,
         restarted: bool,
     ) -> Result<Self> {
         let mut worker = Self {
-            sandbox,
+            workplace,
             interrupt: interrupt.clone(),
             delegation,
             functions: Vec::new(),
@@ -190,14 +190,17 @@ impl Worker {
         // libsmol's own executable, which the code can't write, unlike the venv's python.
         // On Linux it is the file this process runs, also once an update replaced it
         let exe = worker::executable();
+        let place = &self.workplace;
         #[cfg(target_os = "linux")]
-        let mut command = self.sandbox.command(Path::new("/proc/self/exe"));
+        let mut command = place
+            .sandbox
+            .command(Path::new("/proc/self/exe"), &place.cwd);
         // Process lists would show the worker as `/proc/self/exe`
         #[cfg(target_os = "linux")]
         command.arg0(&exe);
         #[cfg(not(target_os = "linux"))]
-        let mut command = self.sandbox.command(&exe);
-        command.arg(WORKER_ARG).arg(&self.sandbox.venv.path);
+        let mut command = place.sandbox.command(&exe, &place.cwd);
+        command.arg(WORKER_ARG).arg(&place.venv.path);
 
         let failed = |e: io::Error| {
             let reason = cause(&e);
@@ -210,7 +213,7 @@ impl Worker {
 
         command
             .env(CONTROL_ENV, control)
-            .env(COPIES_ENV, &self.sandbox.copies)
+            .env(COPIES_ENV, &place.copies)
             .stdin(Stdio::null());
         let agents = match self.delegation {
             Delegation::Off => None,
@@ -672,7 +675,7 @@ pub(crate) mod tests {
     use crate::tools::memories::Memories;
     use crate::utils::{block_on, new_id, Interrupt};
     use crate::worker::host::{Added, Called, Calling, Evaluated, Worker, STOP_WAIT};
-    use crate::worker::sandbox::tests::opened;
+    use crate::worker::workplace::tests::opened;
     use crate::worker::{AgentCall, Delegation, Service};
     use serde_json::{json, Map, Value};
     use std::env;
@@ -756,9 +759,9 @@ pub(crate) mod tests {
     fn build(interrupt: Interrupt, cwd: PathBuf, delegation: Delegation) -> Temp<Tried> {
         let dir = temp_dir("session");
         let copies = dir.join("copies");
-        let sandbox = opened(&cwd, &copies);
+        let workplace = opened(&cwd, &copies);
         let restarted = false;
-        let building = Worker::new(&interrupt, Arc::new(sandbox), &[], delegation, restarted);
+        let building = Worker::new(&interrupt, Arc::new(workplace), &[], delegation, restarted);
         let worker = block_on(building).expect("worker");
 
         let no_agents = |call: AgentCall| -> Calling { panic!("{call:?}") };
@@ -1243,7 +1246,7 @@ pub(crate) mod tests {
     #[test]
     fn views_copied() {
         let (mut worker, dir) = workspace("views");
-        let copies = worker.sandbox.copies.clone();
+        let copies = worker.workplace.copies.clone();
 
         // Rewriting the file later doesn't change the image viewed first
         let code = "import os\n\
@@ -1822,9 +1825,9 @@ pub(crate) mod tests {
         assert_eq!(added, "agent_mcp");
 
         let servers: Vec<&Added> = worker.servers.iter().collect();
-        let sandbox = Arc::clone(&worker.sandbox);
+        let workplace = Arc::clone(&worker.workplace);
         let interrupt = Interrupt::default();
-        let starting = Worker::new(&interrupt, sandbox, &servers, Delegation::Off, false);
+        let starting = Worker::new(&interrupt, workplace, &servers, Delegation::Off, false);
         let mut helper = block_on(starting).expect("worker");
         let mut ignore = |_: &str| {};
         let mut none = unserved;

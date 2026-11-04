@@ -1,6 +1,4 @@
-use crate::config::{Access, Skill};
 use crate::utils::new_id;
-use crate::worker::venv::Venv;
 #[cfg(target_os = "linux")]
 use landlock::{
     Access as _, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
@@ -38,61 +36,6 @@ const LANDLOCK_VERSION: libc::c_uint = 1;
 #[cfg(target_os = "macos")]
 const SEATBELT: &str = "/usr/bin/sandbox-exec";
 
-/// Relative to the home folder
-const CREDENTIALS: &[&str] = &[
-    ".ssh",
-    ".gnupg",
-    ".aws",
-    ".azure",
-    ".kube",
-    ".docker",
-    ".config/gcloud",
-    ".config/gh",
-    ".netrc",
-    ".git-credentials",
-    ".npmrc",
-    ".pypirc",
-    ".cargo/credentials.toml",
-    ".cargo/credentials",
-    ".config/git/credentials",
-    ".pgpass",
-    ".vault-token",
-    ".terraform.d/credentials.tfrc.json",
-    ".password-store",
-    ".local/share/keyrings",
-    "Library/Keychains",
-    ".smol",
-    ".claude",
-    ".claude.json",
-    ".codex",
-];
-
-#[cfg(unix)]
-const PASSED_ENV: &[&str] = &[
-    "HOME", "USER", "LOGNAME", "PATH", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
-];
-#[cfg(windows)]
-const PASSED_ENV: &[&str] = &[
-    "SystemRoot",
-    "SystemDrive",
-    "windir",
-    "ComSpec",
-    "PATHEXT",
-    "PATH",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "USERNAME",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "ProgramData",
-    "ProgramFiles",
-    "ProgramFiles(x86)",
-    "CommonProgramFiles",
-    "NUMBER_OF_PROCESSORS",
-    "PROCESSOR_ARCHITECTURE",
-    "OS",
-];
 #[cfg(unix)]
 const TEMP_ENV: &[&str] = &["TMPDIR"];
 #[cfg(windows)]
@@ -118,30 +61,28 @@ enum Grant {
     Write,
 }
 
-/// What a session's worker and the programs it starts can see, kept across restarts
+/// What the code and the programs it starts may reach. Everything else is readable,
+/// so `read` matters only below a hidden place
+#[derive(Default)]
+pub(crate) struct Rules {
+    /// Names of the environment variables passed on
+    pub(crate) env: Vec<String>,
+    pub(crate) write: Vec<PathBuf>,
+    pub(crate) read: Vec<PathBuf>,
+    /// Places the code can neither read nor write
+    pub(crate) hidden: Vec<PathBuf>,
+}
+
+/// Starts programs confined by `Rules`, with a temporary folder of their own, kept across restarts
 pub(crate) struct Sandbox {
-    cwd: PathBuf,
-    pub(crate) copies: PathBuf,
-    pub(crate) venv: Venv,
     temp: PathBuf,
-    /// The places in `[allow] write` that existed when the session opened
-    writable: Vec<PathBuf>,
     lock: Option<File>,
     env: Vec<(OsString, OsString)>,
     isolation: Option<Isolation>,
 }
 
 impl Sandbox {
-    /// `config` is hidden like the credential locations,
-    /// but `copies`, skill folders and the venv in it are not
-    pub(crate) fn new(
-        cwd: &Path,
-        copies: &Path,
-        config: &Path,
-        skills: &[Skill],
-        access: &Access,
-        venv: Venv,
-    ) -> Result<Self, String> {
+    pub(crate) fn new(rules: &Rules) -> Result<Self, String> {
         let id = new_id();
         let name = format!("{TEMP_PREFIX}{id}");
         let temp = env::temp_dir().join(name);
@@ -155,11 +96,7 @@ impl Sandbox {
 
         // Dropping it when a step below fails removes the temporary folder
         let mut sandbox = Self {
-            cwd: cwd.to_owned(),
-            copies: copies.to_owned(),
-            venv,
             temp: temp.clone(),
-            writable: Vec::new(),
             lock: None,
             env: Vec::new(),
             isolation: None,
@@ -169,21 +106,7 @@ impl Sandbox {
         lock.lock().map_err(|e| failed(&path, e))?;
         sandbox.lock = Some(lock);
 
-        // A Landlock rule holds on to the folder that exists when the rule is made.
-        // An earlier session's code may have swapped one for a link, which the grant would follow
-        let venv = &sandbox.venv;
-        for folder in [copies, &venv.path] {
-            let swapped = fs::symlink_metadata(folder).is_ok_and(|found| !found.is_dir());
-            if swapped {
-                let removed = fs::remove_file(folder).or_else(|_| fs::remove_dir(folder));
-                removed.map_err(|e| failed(folder, e))?;
-            }
-            fs::create_dir_all(folder).map_err(|e| failed(folder, e))?;
-        }
-
-        let passed = PASSED_ENV.iter().copied();
-        let named = access.env.iter().map(String::as_str);
-        for name in passed.chain(named) {
+        for name in &rules.env {
             let Some(value) = env::var_os(name) else {
                 continue;
             };
@@ -195,22 +118,14 @@ impl Sandbox {
         }
 
         let mut granted = vec![(PathBuf::from("/"), false)];
-        for skill in skills {
-            if let Some(folder) = skill.path.parent() {
-                granted.push((folder.to_owned(), false));
-            }
+        for path in &rules.read {
+            granted.push((path.clone(), false));
         }
-        // The worker and the venv's python are libsmol's own executable, wherever it is installed
-        let exe = worker::executable();
-        granted.push((exe, false));
-        for path in [cwd, &scratch, copies, &venv.path, Path::new("/dev")] {
+        for path in [&scratch, Path::new("/dev")] {
             granted.push((path.to_owned(), true));
         }
-        for path in &access.write {
+        for path in &rules.write {
             granted.push((path.clone(), true));
-            if path.exists() {
-                sandbox.writable.push(path.clone());
-            }
         }
 
         // Links resolve before the kernel checks a path, so rules compare real paths
@@ -221,13 +136,7 @@ impl Sandbox {
             }
         }
 
-        let mut hidden = vec![config.to_owned()];
-        if let Some(home) = env::home_dir() {
-            for name in CREDENTIALS {
-                hidden.push(home.join(name));
-            }
-        }
-        hidden.extend(access.hidden.iter().cloned());
+        let mut hidden = rules.hidden.clone();
         for path in &mut hidden {
             if let Ok(resolved) = fs::canonicalize(&path) {
                 *path = resolved;
@@ -251,14 +160,8 @@ impl Sandbox {
         self.isolation.is_some()
     }
 
-    /// Where code may write besides the working directory, the venv and its temporary folder,
-    /// or `None` when files aren't isolated
-    pub(crate) fn writable(&self) -> Option<&[PathBuf]> {
-        self.enforced().then_some(self.writable.as_slice())
-    }
-
-    /// The worker's command before its arguments, confined before it runs any code
-    pub(crate) fn command(&self, program: &Path) -> Command {
+    /// A command before its arguments, starting in `cwd` and confined before it runs any code
+    pub(crate) fn command(&self, program: &Path, cwd: &Path) -> Command {
         #[cfg(target_os = "macos")]
         let mut command = match &self.isolation {
             Some(profile) => {
@@ -270,7 +173,7 @@ impl Sandbox {
         };
         #[cfg(not(target_os = "macos"))]
         let mut command = Command::new(program);
-        command.current_dir(&self.cwd).env_clear();
+        command.current_dir(cwd).env_clear();
         for (name, value) in &self.env {
             command.env(name, value);
         }
@@ -302,8 +205,6 @@ impl Drop for Sandbox {
         // Windows can't remove the lock file while it is open
         self.lock.take();
         fs::remove_dir_all(&self.temp).ok();
-        // Removed only here because the worker's rule is on the folder made at the start
-        fs::remove_dir(&self.copies).ok();
     }
 }
 
@@ -526,10 +427,10 @@ pub(crate) mod tests {
     use crate::worker::host::Worker;
     #[cfg(target_os = "linux")]
     use crate::worker::sandbox::{landlock_abi, spread, Grant};
-    use crate::worker::sandbox::{
-        profile, sweep, Sandbox, LOCK, PASSED_ENV, PIP_CACHE_ENV, TEMP_PREFIX,
-    };
+    use crate::worker::sandbox::{profile, sweep, LOCK, PIP_CACHE_ENV, TEMP_PREFIX};
     use crate::worker::venv::tests::shared_venv;
+    use crate::worker::workplace::tests::opened;
+    use crate::worker::workplace::{Workplace, PASSED_ENV};
     use crate::worker::Delegation;
     use std::env;
     use std::fs;
@@ -544,12 +445,12 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    /// The config folder is the parent of `copies`
-    pub(crate) fn opened(cwd: &Path, copies: &Path) -> Sandbox {
-        let config = copies.parent().expect("parent");
-        let access = Access::default();
+    /// A session in `cwd` whose config folder is `config`
+    fn confined(cwd: &Path, config: &Path, access: &Access) -> Workplace {
+        let copies = config.join("copies");
         let venv = shared_venv(config, cwd);
-        Sandbox::new(cwd, copies, config, &[], &access, venv).expect("sandbox")
+        let opening = Workplace::open(cwd.to_owned(), copies, venv, config, &[], access);
+        opening.expect("workplace")
     }
 
     #[test]
@@ -618,12 +519,12 @@ pub(crate) mod tests {
         assert_eq!(allowed, expected);
     }
 
-    fn evaluated(sandbox: Sandbox, code: &str) -> String {
+    fn evaluated(workplace: Workplace, code: &str) -> String {
         let interrupt = Interrupt::default();
         let restarted = false;
         let starting = Worker::new(
             &interrupt,
-            Arc::new(sandbox),
+            Arc::new(workplace),
             &[],
             Delegation::Off,
             restarted,
@@ -653,18 +554,14 @@ pub(crate) mod tests {
             hidden: vec![dir.join("secret")],
             ..Access::default()
         };
-        let config = dir.join("config");
-        let copies = config.join("copies");
-        let venv = shared_venv(&config, &cwd);
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, venv);
-        let sandbox = sandbox.expect("sandbox");
+        let workplace = confined(&cwd, &dir.join("config"), &access);
         #[cfg(target_os = "macos")]
-        assert!(sandbox.enforced());
-        if !sandbox.enforced() {
+        assert!(workplace.sandbox.enforced());
+        if !workplace.sandbox.enforced() {
             fs::remove_dir_all(&dir).ok();
             return;
         }
-        assert_eq!(sandbox.writable(), Some(&[shared][..]));
+        assert_eq!(workplace.writable(), Some(&[shared][..]));
 
         let code = "import os, subprocess, sys, tempfile\n\
             def tried(act):\n    try:\n        act()\n        return 'ok'\n    except PermissionError:\n        return 'denied'\n\
@@ -677,7 +574,7 @@ pub(crate) mod tests {
              tried(lambda: os.rename(os.getcwd(), '../moved')), tried(lambda: os.rename(sys.prefix, sys.prefix + '-moved')),\n\
              tried(lambda: os.listdir('..')), tried(lambda: os.listdir('/')), linked(),\n\
              subprocess.run(['cat', key], capture_output=True).returncode]";
-        let logs = evaluated(sandbox, code);
+        let logs = evaluated(workplace, code);
         fs::remove_dir_all(&dir).ok();
 
         let expected =
@@ -696,14 +593,10 @@ pub(crate) mod tests {
             hidden: vec![cwd.join("a/b")],
             ..Access::default()
         };
-        let config = dir.join("config");
-        let copies = config.join("copies");
-        let venv = shared_venv(&config, &cwd);
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, venv);
-        let sandbox = sandbox.expect("sandbox");
+        let workplace = confined(&cwd, &dir.join("config"), &access);
         #[cfg(target_os = "macos")]
-        assert!(sandbox.enforced());
-        if !sandbox.enforced() {
+        assert!(workplace.sandbox.enforced());
+        if !workplace.sandbox.enforced() {
             fs::remove_dir_all(&dir).ok();
             return;
         }
@@ -712,7 +605,7 @@ pub(crate) mod tests {
             def tried(act):\n    try:\n        return act()\n    except PermissionError:\n        return 'denied'\n\
             def moved():\n    os.rename('a', 'moved')\n    return open('moved/b/secret.txt').read()\n\
             [tried(lambda: open('a/b/secret.txt').read()), tried(moved)]";
-        let logs = evaluated(sandbox, code);
+        let logs = evaluated(workplace, code);
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(logs, "['denied', 'denied']\n");
@@ -732,14 +625,10 @@ pub(crate) mod tests {
             hidden: vec![cwd.join(".env")],
             ..Access::default()
         };
-        let config = dir.join("config");
-        let copies = config.join("copies");
-        let venv = shared_venv(&config, &cwd);
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, venv);
-        let sandbox = sandbox.expect("sandbox");
+        let workplace = confined(&cwd, &dir.join("config"), &access);
         #[cfg(target_os = "macos")]
-        assert!(sandbox.enforced());
-        if !sandbox.enforced() {
+        assert!(workplace.sandbox.enforced());
+        if !workplace.sandbox.enforced() {
             fs::remove_dir_all(&dir).ok();
             return;
         }
@@ -748,7 +637,7 @@ pub(crate) mod tests {
             def tried(act):\n    try:\n        return act()\n    except PermissionError:\n        return 'denied'\n\
             [tried(lambda: open('data/naïve.txt', 'w').write('x')), tried(lambda: open('.env').read()),\n \
              tried(lambda: sorted(os.listdir('.')))]";
-        let logs = evaluated(sandbox, code);
+        let logs = evaluated(workplace, code);
         let written = outside.join("naïve.txt").exists();
         fs::remove_dir_all(&dir).ok();
 
@@ -773,14 +662,10 @@ pub(crate) mod tests {
         let address = SocketAddr::from_abstract_name(&name).expect("name");
         #[cfg(target_os = "linux")]
         let _scoped = UnixListener::bind_addr(&address).expect("bind");
-        let config = dir.join("config");
-        let copies = config.join("copies");
-        let venv = shared_venv(&config, &cwd);
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &Access::default(), venv);
-        let sandbox = sandbox.expect("sandbox");
+        let workplace = confined(&cwd, &dir.join("config"), &Access::default());
         #[cfg(target_os = "macos")]
-        assert!(sandbox.enforced());
-        if !sandbox.enforced() {
+        assert!(workplace.sandbox.enforced());
+        if !workplace.sandbox.enforced() {
             fs::remove_dir_all(&dir).ok();
             return;
         }
@@ -799,7 +684,7 @@ pub(crate) mod tests {
             own = socket.socket(socket.AF_UNIX)\nown.bind('own.sock')\nown.listen()\n\
             [{probes}]"
         );
-        let logs = evaluated(sandbox, &code);
+        let logs = evaluated(workplace, &code);
         fs::remove_dir_all(&dir).ok();
 
         #[cfg(target_os = "linux")]
@@ -847,11 +732,9 @@ pub(crate) mod tests {
             env: vec![allowed.clone()],
             ..Access::default()
         };
-        let copies = dir.join("copies");
-        let venv = shared_venv(&dir, &cwd);
-        let sandbox = Sandbox::new(&cwd, &copies, &dir, &[], &access, venv).expect("sandbox");
-        let scratch = sandbox.temp.join("tmp").display().to_string();
-        let cached = match sandbox.enforced() {
+        let workplace = confined(&cwd, &dir, &access);
+        let scratch = workplace.sandbox.temp.join("tmp").display().to_string();
+        let cached = match workplace.sandbox.enforced() {
             true => "True",
             false => "False",
         };
@@ -860,7 +743,7 @@ pub(crate) mod tests {
              cache = os.environ.get('PIP_CACHE_DIR', '').startswith({scratch:?})\n\
              [name in os.environ for name in ({allowed:?}, {dropped:?})] + [tempfile.gettempdir() == {scratch:?}, cache]"
         );
-        let logs = evaluated(sandbox, &code);
+        let logs = evaluated(workplace, &code);
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(logs, format!("[True, False, True, {cached}]\n"));
@@ -880,8 +763,8 @@ pub(crate) mod tests {
         fs::write(stale.join(LOCK), "").expect("lock");
 
         sweep();
-        let kept = [cwd.exists(), live.temp.exists(), stale.exists()];
-        let temp = live.temp.clone();
+        let kept = [cwd.exists(), live.sandbox.temp.exists(), stale.exists()];
+        let temp = live.sandbox.temp.clone();
         drop(live);
         let left = [temp.exists(), dir.join("copies").exists()];
         fs::remove_dir_all(&dir).ok();

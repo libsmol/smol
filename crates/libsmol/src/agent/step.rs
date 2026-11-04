@@ -23,7 +23,7 @@ impl Turn<'_> {
         let mut conversation = self.memory.conversation(&self.system, &takes, window);
 
         // Saved sessions store only the file names of copies
-        let copies = &self.agent.copies;
+        let copies = &self.agent.workplace.copies;
         for message in &mut conversation {
             let parts = match message {
                 ChatMessage::User(parts) | ChatMessage::Tool { parts, .. } => parts,
@@ -417,7 +417,7 @@ mod tests {
 
     /// Interrupts only once the code is really running and has created the file `name`
     fn interrupt_started(agent: &Tested, name: &str) {
-        let marker = agent.agent.cwd.join(name);
+        let marker = agent.agent.workplace.cwd.join(name);
         let interrupt = agent.agent.interrupt.clone();
         thread::spawn(move || {
             while !marker.exists() {

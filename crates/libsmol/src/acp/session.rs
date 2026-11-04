@@ -12,8 +12,8 @@ use crate::spawn::{spawn_shell, Group};
 use crate::tools::memories::{Listed, Memories};
 use crate::utils::Interrupt;
 use crate::worker::host::Worker;
-use crate::worker::sandbox::Sandbox;
 use crate::worker::venv::Venv;
+use crate::worker::workplace::Workplace;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     ContentBlock, LoadSessionResponse, NewSessionResponse, PromptResponse, SessionConfigOption,
@@ -248,9 +248,16 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
     if inbox.is_closed() {
         return Err(Error::SessionNotFound(meta.id));
     }
-    let sandbox = Sandbox::new(&cwd, &copies, &app.config, &skills, &access, venv);
-    let sandbox = sandbox.map_err(Error::Python)?;
-    let sandbox = Arc::new(sandbox);
+    let opening = Workplace::open(
+        cwd.clone(),
+        copies.clone(),
+        venv,
+        &app.config,
+        &skills,
+        &access,
+    );
+    let workplace = opening.map_err(Error::Python)?;
+    let workplace = Arc::new(workplace);
 
     let queue = ClientQueue {
         peer: Arc::clone(&app.peer),
@@ -266,7 +273,7 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
     // No restart notice again when no code has run since the last restart
     let ran = memory.ran_code();
     let delegation = place.delegation();
-    let starting = Worker::new(&interrupt, Arc::clone(&sandbox), &[], delegation, ran);
+    let starting = Worker::new(&interrupt, Arc::clone(&workplace), &[], delegation, ran);
     let worker = starting.await?;
 
     let response = match loading {
@@ -308,10 +315,8 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
     let agent = Agent {
         model: Arc::from(built),
         brief,
-        cwd,
-        copies,
         interrupt: interrupt.clone(),
-        sandbox,
+        workplace,
         memories,
         place,
     };
@@ -467,7 +472,7 @@ impl Session {
         let translator = &mut self.keeper.translator;
         translator.shell(&shell.command);
         let mut shown = |output: &str| translator.shell_output(output);
-        let cwd = &self.agent.cwd;
+        let cwd = &self.agent.workplace.cwd;
         let (ran, left) = spawn_shell(&shell.command, cwd, &self.interrupt, &mut shown).await;
         self.background.extend(left);
 

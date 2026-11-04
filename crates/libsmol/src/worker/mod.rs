@@ -7,6 +7,7 @@ pub(crate) mod guest;
 pub(crate) mod host;
 pub(crate) mod sandbox;
 pub(crate) mod venv;
+pub(crate) mod workplace;
 
 /// Holds the `address/token` the agent listens on
 pub(crate) const CONTROL_ENV: &str = "SMOL_CONTROL";

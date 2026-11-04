@@ -194,12 +194,12 @@ impl Agent {
                 }
                 watched.show(false);
 
-                let sandbox = Arc::clone(&self.sandbox);
+                let workplace = Arc::clone(&self.workplace);
                 let installed: Vec<&Added> = servers.iter().collect();
                 let delegation = self.place.delegation();
                 let restarted = false;
                 let starting =
-                    Worker::new(&self.interrupt, sandbox, &installed, delegation, restarted);
+                    Worker::new(&self.interrupt, workplace, &installed, delegation, restarted);
                 match starting.await {
                     Ok(mut worker) => {
                         let task = Task {
