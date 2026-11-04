@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
-## Unreleased
+## 0.6.8 - 2026-11-04
 
 - The system prompt is reordered and shorter: the general rules follow how
   to reply, and the environment comes last, after memories and
@@ -17,8 +17,8 @@ but their files stay in `~/.smol/history` untouched.
   to show the user an image by writing `![alt](path)` on a line of its own,
   so an answer can show the chart or picture it made. ACP clients that show
   such images can declare `_smol/images` in `clientCapabilities._meta`.
-- `view()` says it shows the file to the model, which models took as
-  showing it to the user.
+- `view()` now says it shows the file to the model. Its old wording led
+  models to believe the user had seen the file too.
 
 ## 0.6.7 - 2026-11-03
 
