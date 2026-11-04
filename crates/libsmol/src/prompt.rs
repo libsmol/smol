@@ -28,15 +28,11 @@ const RULES: &str = "- Never make up data or functions; check unfamiliar ones wi
 /// Only for agents whose worker offers `remember()`
 const REMEMBERING: &str = "## Rules
 
-- Save with `remember()` what the user asks you to remember, and their preferences and corrections.
-- Also save lasting facts about this project that took work to find out and that no file records, such as pitfalls and failed approaches.
-- Keep one fact per memory.
-- Use `project=False` only when the user says the fact holds in every project.
-- When a memory is wrong or outdated, `forget()` it and `remember()` the correct fact.";
+- `remember()` what the user asks you to remember or corrects you on, their preferences, and hard-won facts no file records, such as pitfalls and failed approaches.
+- One fact per memory, kept for this project unless the user says it holds everywhere (`project=False`).
+- When a memory is wrong or outdated, `forget()` it and `remember()` the correct one.";
 
-const SHOWN: &str = " Text you write in a reply that runs code is shown to the user.";
-const NAMED: &str =
-    " MCP functions list their optional parameters by name only; `help()` on one prints their types and what they do.";
+const SHOWN: &str = " Text in the same reply is shown to the user.";
 const HANDED_BACK: &str = "Only your answer is returned to the agent that assigned this task, so include everything the task asks for.";
 
 /// Errors of `agent()` and its handles go unlabeled, as the worker labels them with the function
@@ -157,29 +153,24 @@ pub(crate) fn system(
         listed.push_str("\n\n");
         listed.push_str(&section);
     }
-    let named = match servers.is_empty() {
-        true => "",
-        false => NAMED,
-    };
 
     let mut entries = Vec::new();
     for skill in &brief.skills {
         let name = &skill.name;
         let description = &skill.description;
         let path = skill.path.display();
-        let entry = format!("## Skill `{name}`\n\n{description}\n\n- `{path}`");
+        let entry = format!("- `{name}`: {description} (`{path}`)");
         entries.push(entry);
     }
     let skills = match entries.is_empty() {
         true => String::new(),
         false => {
-            let entries = entries.join("\n\n");
-            format!("\n\n# Skills\n\nWhen a task matches a skill below, read and follow its `SKILL.md`; paths in it are relative to its folder.\n\n{entries}")
+            let entries = entries.join("\n");
+            format!("\n\n# Skills\n\nWhen a task matches a skill, read and follow its `SKILL.md`; paths in it are relative to its folder.\n\n{entries}")
         }
     };
 
-    let updates =
-        format!("A message that starts with `{WROTE}` adds to or changes the current task.");
+    let updates = format!("A message starting with `{WROTE}` adds to or changes the current task.");
     let (shown, markdown, note, reader, roles) = match place {
         Place::Main { roles, .. } => (
             SHOWN,
@@ -214,17 +205,14 @@ pub(crate) fn system(
         Place::Main { .. } => format!(
             "\n\n# Sub-agents
 
-`agent()` gives a task to a new agent with the same environment as you, but not this Python session or this conversation, so the task must state everything it needs.
+`agent()` hands a task to a new agent with your environment but not your Python session or this conversation, so the task must state everything it needs. A named agent still running when you answer keeps the task open, and an `[{DONE}]` message says when it ends.
 
-- A single task that fails raises `RuntimeError`; a list of tasks returns the answers in order, with a `RuntimeError` in place of each task that failed.
-- An agent started with `name` that is still running when you answer keeps the task open until it ends, and an `[{DONE}]` message tells you when.
+## When to use
 
-## Rules
-
-- Run the independent parts of a task in parallel with `agent([task1, task2, ...])`.
-- Give long side work to `agent(task)` when only its answer matters; its steps stay out of this conversation.
-- Start work that can go on in the background with `agent(task, name=\"...\")` and continue meanwhile.
-- When the task asks for agents, give each part to `agent([part1, part2, ...])` once the parts are clear.{roles}"
+- Independent parts: run them in parallel with `agent([task1, task2, ...])`.
+- Long side work whose steps you don't need: `agent(task)`.
+- Work that can go on in the background: `agent(task, name=\"...\")`, then continue.
+- The task asks for agents: once the parts are clear, `agent([part1, part2, ...])`.{roles}"
         ),
         Place::Delegated(_) => String::new(),
     };
@@ -260,7 +248,7 @@ pub(crate) fn system(
                 places.push(place);
             }
             let places = places.join(", ");
-            format!("\n- Your code runs in a sandbox: writing outside {places}, the venv and `$TMPDIR`, or reading some private files, fails with `PermissionError`.\n- Put temporary files in `$TMPDIR`, which `tempfile` uses and which is removed when the session ends; if a tool fails because it cannot write its cache, rerun it with the cache there.")
+            format!("\n- Sandbox: writing outside {places}, the venv and `$TMPDIR` (used by `tempfile`), or reading some private files, raises `PermissionError`. If a tool fails because it cannot write its cache, rerun it with the cache in `$TMPDIR`.")
         }
         None => String::new(),
     };
@@ -293,7 +281,7 @@ pub(crate) fn system(
         count => Some(format!("{count} memories")),
     };
     if let Some(counted) = counted {
-        let here = format!("This project has {counted} of its own; before you start a task, search them with `recall()` for the task's key words.");
+        let here = format!("This project has {counted} of its own, not listed here; before you start a task, `recall()` its key words.");
         kept.push(here);
     }
     let remembering = functions.iter().any(|function| function.name == "remember");
@@ -310,48 +298,48 @@ pub(crate) fn system(
 
     let date = Utc::now().format("%Y-%m-%d");
     format!(
-        "You complete tasks by running Python code with the `{TOOL}` tool.
+        "You complete tasks by running Python code with the `{TOOL}` tool.{role}
 
 # How to reply
 
-Each reply does exactly one of these:
-- Run code: call `{TOOL}`. A reply may contain several calls; they run in order, and once one fails, the rest are skipped.{shown}
-- Answer: reply{markdown} without a tool call. This ends the task.
+Each reply does one of two things:
+- Run code: call `{TOOL}`, once or several times. Calls run in order; after one fails, the rest are skipped.{shown}
+- Answer: reply{markdown} with no tool call. This ends the task, so answer once you have the result, or at once if no code is needed.
 
-Answer as soon as you have the result; if the task needs no code, answer immediately. {note}{role}
+{note}
+
+# Rules
+
+{RULES}
 
 # Running code
 
-All calls share one Python session: variables, functions and imports persist across calls.
-
-A call returns what its code printed, plus the value of every top-level expression that is not `None` (strings verbatim, other values as `repr`). Output longer than {MAX_OBSERVATION_CHARS} characters, or a single `print()` longer than {MAX_PRINT_CHARS}, is cut in the middle; the values in your variables are not affected.
+- All calls share one Python session; variables, functions and imports persist.
+- A call returns what it printed plus the value of each top-level expression that isn't `None` (strings as is, others as `repr`).
+- Output over {MAX_OBSERVATION_CHARS} characters, or one `print()` over {MAX_PRINT_CHARS}, is cut in the middle; your variables keep the full values.
 
 Write each call as a complete program:
-- Do as much as possible in one call with loops, conditions, the standard library and the functions below.
-- Print only what you need to see; read large or many files in parts, or search them with `grep()`.
-- Reuse the data, functions and imports the session already holds; reload data only if its source changed.
-- Put code you will run again in a function.
+- Do as much as you can per call, with loops, conditions, the standard library and the functions below.
+- Print only what you need; read large or many files in parts, or search them with `grep()`.
+- Reuse what the session holds; reload data only if its source changed.
+- Put code you will rerun in a function.
 
 # Functions
 
-These need no import. Use them instead of writing your own, and create new files with `open()`.{named}
+These need no import; use them instead of writing your own. What is listed here is a summary; `help()` prints the rest.
 
 ## Built-in
 
 ```python
 {stubs}
-```{listed}{skills}{agents}
+```{listed}{skills}{agents}{remembered}{instructions}
 
 # Environment
 
-- Your code runs on the user's computer ({OS}) in `{cwd}`; the files and programs a task mentions are there.
-- Python is CPython {PYTHON} in a venv kept for this folder: packages you install into it can be imported in this session right away.{sandbox}
-- Today is {date} (UTC).
-- Your answer goes to {reader}; no hidden tests or graders check your work.{remembered}
-
-# Rules
-
-{RULES}{instructions}",
+- Your code runs on the user's computer ({OS}) in `{cwd}`.
+- Python: CPython {PYTHON} in a venv kept for this folder; packages you install import right away.{sandbox}
+- Your answer goes to {reader}; no hidden tests or graders check it.
+- Today is {date} (UTC).",
     )
 }
 
@@ -901,24 +889,28 @@ mod tests {
                         Agent.get(name) -> Agent\n    # Its handle.\n\n\
                         help(request) -> None\n    # Prints the docs.\n```\n\n# Skills";
         assert!(text.contains(built_in), "{text}");
-        let delegating = "`[Agent done]` message tells you when.\n\n## Rules\n\n\
-                          - Run the independent parts of a task in parallel with `agent([task1, task2, ...])`";
+        let delegating = "`[Agent done]` message says when it ends.\n\n## When to use\n\n\
+                          - Independent parts: run them in parallel with `agent([task1, task2, ...])`";
         assert!(text.contains(delegating), "{text}");
         let place = format!(
-            ") in `/home/zoë/work`; the files and programs a task mentions are there.\n\
-             - Python is CPython {PYTHON} in a venv kept for this folder: packages you install into it can be imported in this session right away.\n\
+            ") in `/home/zoë/work`.\n\
+             - Python: CPython {PYTHON} in a venv kept for this folder; packages you install import right away.\n\
+             - Your answer goes to the user; no hidden tests or graders check it.\n\
              - Today"
         );
         assert!(text.contains(&place), "{text}");
         let skill = "\n\n# Skills\n\n\
-             When a task matches a skill below, read and follow its `SKILL.md`; paths in it are relative to its folder.\n\n\
-             ## Skill `weekly`\n\nWrite the weekly report\n\n- `/home/zoë/.smol/skills/weekly/SKILL.md`\n\n# Sub-agents\n\n";
+             When a task matches a skill, read and follow its `SKILL.md`; paths in it are relative to its folder.\n\n\
+             - `weekly`: Write the weekly report (`/home/zoë/.smol/skills/weekly/SKILL.md`)\n\n# Sub-agents\n\n";
         assert!(text.contains(skill), "{text}");
-        let files = " or is uncertain.\n\n# Instructions\n\n\
+        let files = "`agent([part1, part2, ...])`.\n\n# Instructions\n\n\
                      Follow these instructions:\n\n\
                      <instructions>\nReply in French\n</instructions>\n\n\
-                     <instructions>\nIndent with tabs\n</instructions>";
-        assert!(text.ends_with(files), "{text}");
+                     <instructions>\nIndent with tabs\n</instructions>\n\n# Environment\n\n";
+        assert!(text.contains(files), "{text}");
+        let rules = "the current task.\n\n# Rules\n\n- Never make up data or functions;";
+        assert!(text.contains(rules), "{text}");
+        assert!(text.ends_with(" (UTC)."), "{text}");
 
         let empty = Brief::default();
         let plain = system(&[], &[], &empty, cwd, Some(&[]), &main);
@@ -927,14 +919,14 @@ mod tests {
         assert!(!plain.contains("# Roles"), "{plain}");
         assert!(!plain.contains("# Memories"), "{plain}");
         assert!(!plain.contains("remember()"), "{plain}");
-        assert!(!plain.contains("MCP functions"), "{plain}");
-        let sandbox = "right away.\n- Your code runs in a sandbox: writing outside `/home/zoë/work`, the venv and `$TMPDIR`, ";
+        let sandbox =
+            "right away.\n- Sandbox: writing outside `/home/zoë/work`, the venv and `$TMPDIR` (used by `tempfile`), ";
         assert!(plain.contains(sandbox), "{plain}");
 
         let registry = [PathBuf::from("/home/zoë/.cargo/registry")];
         let allowed = system(&[], &[], &empty, cwd, Some(&registry), &main);
         let sandbox =
-            "writing outside `/home/zoë/work`, `/home/zoë/.cargo/registry`, the venv and `$TMPDIR`, ";
+            "writing outside `/home/zoë/work`, `/home/zoë/.cargo/registry`, the venv and `$TMPDIR` (used by `tempfile`), ";
         assert!(allowed.contains(sandbox), "{allowed}");
     }
 
@@ -963,15 +955,15 @@ mod tests {
 
         let functions = [remember];
         let text = system(&functions, &[], &brief, cwd, None, &main);
-        let section = "check your work.\n\n# Memories\n\n\
+        let section = "`agent([part1, part2, ...])`.\n\n# Memories\n\n\
                        Global memories:\n\
                        - [7] Writes résumés in French\n\
                        - [3] Prefers tabs over spaces\n\n\
-                       This project has 12 memories of its own; \
-                       before you start a task, search them with `recall()` for the task's key words.\n\n\
-                       ## Rules\n\n- Save with `remember()` what the user asks you to remember, ";
+                       This project has 12 memories of its own, not listed here; \
+                       before you start a task, `recall()` its key words.\n\n\
+                       ## Rules\n\n- `remember()` what the user asks you to remember or corrects you on, ";
         assert!(text.contains(section), "{text}");
-        let rules = "`remember()` the correct fact.\n\n# Rules\n\n";
+        let rules = "`remember()` the correct one.\n\n# Environment\n\n";
         assert!(text.contains(rules), "{text}");
 
         let listed = Listed {
@@ -991,7 +983,8 @@ mod tests {
 
         let empty = Brief::default();
         let bare = system(&functions, &[], &empty, cwd, None, &main);
-        let rules = "check your work.\n\n# Memories\n\n## Rules\n\n- Save with `remember()`";
+        let rules =
+            "`agent([part1, part2, ...])`.\n\n# Memories\n\n## Rules\n\n- `remember()` what";
         assert!(bare.contains(rules), "{bare}");
 
         let listed = Listed {
@@ -1003,9 +996,10 @@ mod tests {
             ..Brief::default()
         };
         let helper = system(&[], &[], &counted, cwd, None, &Place::Delegated(None));
-        let section = "check your work.\n\n# Memories\n\n\
-                       This project has 1 memory of its own; \
-                       before you start a task, search them with `recall()` for the task's key words.\n\n# Rules\n\n";
+        let section =
+            "`help()` prints the rest.\n\n## Built-in\n\n```python\n\n```\n\n# Memories\n\n\
+                       This project has 1 memory of its own, not listed here; \
+                       before you start a task, `recall()` its key words.\n\n# Environment\n\n";
         assert!(helper.contains(section), "{helper}");
         assert!(!helper.contains("remember("), "{helper}");
     }
@@ -1035,8 +1029,8 @@ mod tests {
 
         let played = Place::Delegated(Some(reviewer));
         let helper = system(&[], &[], &empty, cwd, None, &played);
-        let own = "include everything the task asks for.\n\n# Role\n\n\
-                   Your role is `reviewer`: Reviews the café's code\n\n# Running code";
+        let own = "with the `eval` tool.\n\n# Role\n\n\
+                   Your role is `reviewer`: Reviews the café's code\n\n# How to reply\n\n";
         assert!(helper.contains(own), "{helper}");
         assert!(!helper.contains("# Roles"), "{helper}");
         let reader = "- Your answer goes to the agent that assigned this task;";

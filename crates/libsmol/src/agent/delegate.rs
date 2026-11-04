@@ -855,7 +855,7 @@ mod tests {
         assert!(!helper.contains("Agent."), "{helper}");
         assert!(!helper.contains("while you were working"), "{helper}");
         let returned =
-            "answer immediately. Only your answer is returned to the agent that assigned this task";
+            "no code is needed.\n\nOnly your answer is returned to the agent that assigned this task";
         assert!(helper.contains(returned), "{helper}");
     }
 

@@ -7,6 +7,13 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/history` untouched.
 
+## Unreleased
+
+- The system prompt is reordered and shorter: the general rules follow how
+  to reply, and the environment comes last, after memories and
+  instructions. Skills take one line each, and the memory rules three.
+- `help(Agent)` also lists its methods with their signatures.
+
 ## 0.6.7 - 2026-11-03
 
 - Copying an agent's title that wraps over several rows keeps the start of

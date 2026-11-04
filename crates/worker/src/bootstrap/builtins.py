@@ -118,7 +118,7 @@ def _path(function, name, value):
 
 @_builtin
 def edit(path: str | _os.PathLike, old: str, new: str) -> None:
-    """Replaces old with new in a text file.
+    """Replaces old with new in a text file; create new files with open().
     Raises ValueError and leaves the file unchanged unless old appears exactly once."""
     path = _path("edit", "path", path)
     old = _str("edit", "old", old)
@@ -449,6 +449,13 @@ def help(request: object) -> None:
     doc = source or _inspect.getdoc(target)
     if doc:
         parts.append(doc)
+    if isinstance(target, type) and hasattr(target, "_smol_header"):
+        for member in vars(target):
+            method = getattr(target, member)
+            if callable(method) and hasattr(method, "_smol_header"):
+                summary = _inspect.getdoc(method).split("\n\n")[0]
+                indented = summary.replace("\n", "\n    ")
+                parts.append(f"\n{method._smol_header}\n    {indented}")
 
     text = "\n".join(parts)
     print(text, limit=None)

@@ -2095,6 +2095,15 @@ pub(crate) mod tests {
             "Agent.stop() -> None",
         ];
         assert_eq!(methods, listed);
+        let helped = worker.eval("help(Agent)").logs;
+        let summaries = "\n\nAgent.get(name: str) -> Agent | None\n    The handle of the agent last started with this name, also after Python restarts.\n\n\
+                         Agent.wait(timeout: float | None = None) -> str | None\n    Its answer once it ends, or None if it is still running after timeout seconds.\n    Raises RuntimeError if it failed or was stopped.\n\n\
+                         Agent.status() -> str\n    ";
+        assert!(helped.contains(summaries), "{helped}");
+        assert!(
+            helped.contains("\n\nAgent.stop() -> None\n    Stops it"),
+            "{helped}"
+        );
     }
 
     /// Docs name the limit and the message the agent sets
@@ -2305,9 +2314,6 @@ pub(crate) mod tests {
         let empty = Brief::default();
         let text = system(&[], &servers, &empty, cwd, None, &main);
 
-        let named = "`open()`. MCP functions list their optional parameters by name only; \
-                     `help()` on one prints their types and what they do.\n\n## Built-in";
-        assert!(text.contains(named), "{text}");
         let listed = "\n\n## MCP `news_web`\n\nSearches the web and the news\n\nRead-only\n\n\
                       ```python\nnews_web.echo_text(the_text=None) -> str\n\
                       news_web.search(query: str, days=None) -> str\n```\n\n\
