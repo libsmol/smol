@@ -36,8 +36,9 @@ A real run with DeepSeek on smol's own source:
   [Agent Client Protocol](https://agentclientprotocol.com), so Zed or any other
   ACP client can drive it; `smol` is just one such client. The few extras that
   ACP has no message for (`!` commands, queued updates, the agents `agent()`
-  starts, listing and forgetting memories) use `_smol/`
-  extensions, which other clients ignore as the protocol requires.
+  starts, listing and forgetting memories, a client that shows the images an
+  answer links) use `_smol/` extensions, which other clients ignore as the
+  protocol requires.
 
 > [!WARNING]
 > **The sandbox guards your credentials and keeps other files from being
