@@ -4,7 +4,7 @@ def _install():
 
     path = _stdlib.path()
     original = zipimport.zipimporter.get_resource_reader
-    made = []
+    Reader = None
 
     # Imported on the first read, since zipfile and importlib.resources would slow every start
     def reader_class():
@@ -20,7 +20,7 @@ def _install():
         # zipfile opens an archive with plain open(), which reads the executable instead
         archive = zipfile.ZipFile(_stdlib.open())
 
-        class Stored(zipfile.Path):
+        class Entry(zipfile.Path):
             pass
 
         def copy(path, target):
@@ -33,7 +33,7 @@ def _install():
                 shutil.copyfileobj(source, copied)
 
         # The copy keeps its name, which pip reads a wheel's version from
-        @_common.as_file.register(Stored)
+        @_common.as_file.register(Entry)
         @contextlib.contextmanager
         def as_file(path):
             with tempfile.TemporaryDirectory() as folder:
@@ -43,16 +43,17 @@ def _install():
 
         class Reader(ZipReader):
             def files(self):
-                return Stored(archive, self.prefix)
+                return Entry(archive, self.prefix)
 
         return Reader
 
     def reader(self, fullname):
+        nonlocal Reader
         if self.archive != path:
             return original(self, fullname)
-        if not made:
-            made.append(reader_class())
-        return made[0](self, fullname)
+        if Reader is None:
+            Reader = reader_class()
+        return Reader(self, fullname)
 
     # venv copies its activation scripts from the folder of its file, which is inside the executable
     def setup_scripts(self, context):

@@ -1,10 +1,11 @@
 use crate::model::ModelError;
+use crate::worker::guest;
+use std::ffi::OsString;
 use std::result;
 
 mod acp;
 mod agent;
 mod config;
-mod guest;
 mod history;
 mod memory;
 mod model;
@@ -17,10 +18,9 @@ mod worker;
 pub use crate::acp::run;
 pub use crate::config::setup::{run as setup, SETUP_ARG};
 
-/// Runs the roles libsmol's executable takes besides the agent's,
-/// python for the venvs that link to it and the worker, and None when started as the agent
-pub fn embedded() -> Option<i32> {
-    guest::role()
+/// Runs as a session's worker when started as one with `args`, and returns its exit status
+pub fn run_worker(args: &[OsString]) -> Option<i32> {
+    guest::main(args)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -65,11 +65,11 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 
 #[cfg(test)]
 mod tests {
-    use crate::guest;
     use crate::model::{ChatMessage, Part};
     use crate::utils::{new_id, Interrupt};
     use serde_json::Value;
     use std::env;
+    use std::ffi::OsString;
     use std::fs;
     use std::ops::{Deref, DerefMut};
     use std::path::{Path, PathBuf};
@@ -80,7 +80,9 @@ mod tests {
     /// Tests start workers and python from the test binary, which has no main of its own
     #[ctor::ctor]
     fn divert() {
-        if let Some(status) = guest::role() {
+        let args: Vec<OsString> = env::args_os().collect();
+        let embedded = worker::main(&args).or_else(|| crate::run_worker(&args));
+        if let Some(status) = embedded {
             process::exit(status);
         }
     }

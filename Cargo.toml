@@ -9,9 +9,8 @@ repository = "https://github.com/libsmol/smol"
 version = "0.6.8"
 
 [workspace.dependencies]
-cpython = { package = "libsmol-worker", path = "crates/worker" }
-libsmol = { path = "crates/libsmol" }
 reaper = { package = "libsmol-reaper", path = "crates/reaper" }
+worker = { package = "libsmol-worker", path = "crates/worker" }
 
 [profile.release]
 lto = true

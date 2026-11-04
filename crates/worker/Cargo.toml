@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 publish = false
 # Hands libsmol's build script the link arguments that only a binary can take
-links = "smolpython"
+links = "worker"
 
 [lib]
 name = "worker"

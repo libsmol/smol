@@ -10,8 +10,7 @@ use std::env;
 #[cfg(unix)]
 use std::ffi::c_char;
 use std::ffi::{CString, OsStr, OsString};
-#[cfg(unix)]
-use std::fs;
+use std::fs::{self, File};
 use std::mem::MaybeUninit;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -29,13 +28,29 @@ use std::slice;
 
 mod stdlib;
 
-pub const PYTHON: &str = env!("SMOL_PYTHON");
+pub const PYTHON_VERSION: &str = env!("SMOL_PYTHON_VERSION");
 
 const VENV: &str = include_str!("venv.py");
+/// Held in a venv while a worker enters it
+const LOCK: &str = ".lock";
+
+/// Where a venv keeps its interpreter and the scripts pip installs
+#[cfg(unix)]
+const SCRIPTS: &str = "bin";
+#[cfg(windows)]
+const SCRIPTS: &str = "Scripts";
+#[cfg(unix)]
+const EXE: &str = "python";
+#[cfg(windows)]
+const EXE: &str = "python.exe";
+#[cfg(unix)]
+const PIP: &str = "pip";
+#[cfg(windows)]
+const PIP: &str = "pip.exe";
 
 enum Role<'a> {
-    /// Isolated, writing no bytecode and in UTF-8 mode, as `-I -B -X utf8` would make it
-    Worker,
+    /// Writing no bytecode and in UTF-8 mode too, as `-I -B -X utf8` would make it
+    Isolated,
     /// The command line, its own name first
     Python(&'a [OsString]),
 }
@@ -98,7 +113,7 @@ fn initialize(role: Role<'_>) {
     let home = exe.parent().unwrap_or(Path::new("")).to_owned();
 
     let argv: Vec<OsString> = match role {
-        Role::Worker => vec![exe.clone().into_os_string()],
+        Role::Isolated => vec![exe.clone().into_os_string()],
         Role::Python(args) => args.to_vec(),
     };
     let count = argv.len() as ffi::Py_ssize_t;
@@ -122,7 +137,7 @@ fn initialize(role: Role<'_>) {
         let mut pre = MaybeUninit::<ffi::PyPreConfig>::uninit();
         let mut config = MaybeUninit::<ffi::PyConfig>::uninit();
         match role {
-            Role::Worker => {
+            Role::Isolated => {
                 ffi::PyPreConfig_InitIsolatedConfig(pre.as_mut_ptr());
                 ffi::PyConfig_InitIsolatedConfig(config.as_mut_ptr());
             }
@@ -136,7 +151,7 @@ fn initialize(role: Role<'_>) {
 
         // The command line's own -X utf8 and -I reach the preconfiguration only with it
         match role {
-            Role::Worker => {
+            Role::Isolated => {
                 pre.utf8_mode = 1;
                 checked(ffi::Py_PreInitialize(&pre));
             }
@@ -165,7 +180,7 @@ fn initialize(role: Role<'_>) {
             pointers.as_mut_ptr().cast(),
         ));
 
-        if let Role::Worker = role {
+        if let Role::Isolated = role {
             config.write_bytecode = 0;
             let executable = wide(exe.as_os_str());
             let field = &raw mut config.executable;
@@ -192,7 +207,7 @@ fn initialize(role: Role<'_>) {
         if let Role::Python(_) = role {
             checked(ffi::PyConfig_Read(&mut config));
         }
-        let searched = stdlib::searched(config.use_environment != 0);
+        let searched = stdlib::search_paths(config.use_environment != 0);
         config.module_search_paths_set = 1;
         let paths = &raw mut config.module_search_paths;
         for path in &searched {
@@ -209,7 +224,7 @@ fn initialize(role: Role<'_>) {
 
 /// Runs as the python command line when started by a name a venv gives its interpreter,
 /// with `args` its own name first, and returns its exit status
-pub fn python(args: &[OsString]) -> Option<i32> {
+pub fn main(args: &[OsString]) -> Option<i32> {
     let named = args.first().map(Path::new).and_then(Path::file_stem);
     let named = named.and_then(OsStr::to_str).unwrap_or_default();
     // A venv links python, python3, python3.14 and 𝜋thon to this program
@@ -223,19 +238,56 @@ pub fn python(args: &[OsString]) -> Option<i32> {
     Some(status)
 }
 
-/// Starts the interpreter of a worker. Modules appended to the inittab before it are built in
-pub fn start() {
-    initialize(Role::Worker);
+/// Runs `run` in an isolated interpreter, prints the error it ends with, and returns the exit status.
+/// Modules appended to the inittab before it are built in
+pub fn isolated(run: impl FnOnce(Python<'_>) -> PyResult<()>) -> i32 {
+    initialize(Role::Isolated);
+    let ran = Python::attach(run);
+    if let Err(error) = &ran {
+        Python::attach(|py| error.print(py));
+    }
+
+    // SAFETY: Called once, on the thread that started it, which flushes what the code wrote
+    let finished = unsafe { ffi::Py_FinalizeEx() };
+    match ran {
+        Ok(()) => finished,
+        Err(_) => 1,
+    }
 }
 
-/// Makes the interpreter `start` started that of the venv holding `python`, the way the venv's
-/// own python runs. This runs the venv's `.pth` files, which the code can write
-pub fn enter(py: Python<'_>, python: &OsStr) -> PyResult<()> {
+/// Makes an isolated interpreter that of `venv`, the way the venv's own python runs,
+/// after making the venv or adding what it lacks while keeping its packages.
+/// This runs the venv's `.pth` files, which the code can write
+pub fn enter(py: Python<'_>, venv: &Path) -> PyResult<()> {
+    let bin = venv.join(SCRIPTS);
+    let interpreter = bin.join(EXE);
+
+    // Other workers of the same directory may be entering it alongside
+    let locking = File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(venv.join(LOCK));
+    let lock = locking.ok();
+    if let Some(lock) = &lock {
+        // A file system without locks only loses the protection
+        lock.lock().ok();
+    }
+    // `venv` writes `pyvenv.cfg` before it finishes, and pip after the interpreter
+    let found = |name: &str| fs::symlink_metadata(bin.join(name)).is_ok();
+    if !found(EXE) || !found(PIP) {
+        let code = CString::new(VENV).expect("venv.py");
+        let globals = PyDict::new(py);
+        py.run(&code, Some(&globals), None)?;
+        let repairing = globals.as_any().get_item("_repair")?;
+        repairing.call1((venv.as_os_str(),))?;
+    }
+    drop(lock);
+
     // The venv's python leads to the program that made it, which may have moved since.
     // A rename replaces the link in one step, as another worker may be starting alongside
     #[cfg(unix)]
     {
-        let bin = Path::new(python).parent().unwrap_or(Path::new(""));
         let linked = bin.join("python3");
         let exe = executable();
         if fs::read_link(&linked).ok().as_ref() != Some(&exe) {
@@ -252,40 +304,26 @@ pub fn enter(py: Python<'_>, python: &OsStr) -> PyResult<()> {
         }
     }
 
-    // Site runs again with the prefixes it took at start replaced
-    let venv = venv_of(python);
+    // Programs the code starts find the venv's python and pip first, as once it is activated
+    let environ = py.import("os")?.getattr("environ")?;
+    let mut paths = vec![bin];
+    if let Some(listed) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&listed));
+    }
+    if let Ok(joined) = env::join_paths(paths) {
+        environ.set_item("PATH", joined)?;
+    }
+    environ.set_item("VIRTUAL_ENV", venv.as_os_str())?;
+
+    // Site runs again with the prefixes it took at start replaced. PyO3 makes a path a `Path`
     let sys = py.import("sys")?;
-    sys.setattr("executable", python)?;
+    sys.setattr("executable", interpreter.as_os_str())?;
     // venv links a new venv to it and names the links after it
-    sys.setattr("_base_executable", python)?;
-    sys.setattr("prefix", &venv)?;
-    sys.setattr("exec_prefix", &venv)?;
+    sys.setattr("_base_executable", interpreter.as_os_str())?;
+    sys.setattr("prefix", venv.as_os_str())?;
+    sys.setattr("exec_prefix", venv.as_os_str())?;
     let site = py.import("site")?;
-    site.setattr("PREFIXES", [&venv])?;
+    site.setattr("PREFIXES", [venv.as_os_str()])?;
     site.call_method0("main")?;
     Ok(())
-}
-
-/// Makes the venv of `python`, or adds what it lacks and keeps the packages it has
-pub fn repair(py: Python<'_>, python: &OsStr) -> PyResult<()> {
-    let venv = venv_of(python);
-    let code = CString::new(VENV).expect("venv.py");
-    let globals = PyDict::new(py);
-    py.run(&code, Some(&globals), None)?;
-    let repairing = globals.as_any().get_item("_repair")?;
-    repairing.call1((venv,))?;
-    Ok(())
-}
-
-/// Flushes and stops the interpreter `start` started
-pub fn finish() -> i32 {
-    // SAFETY: Called once, on the thread that started it
-    unsafe { ffi::Py_FinalizeEx() }
-}
-
-/// The venv holding the interpreter in its `bin` or `Scripts` folder
-fn venv_of(python: &OsStr) -> OsString {
-    let python = Path::new(python);
-    let venv = python.parent().and_then(Path::parent).unwrap_or(python);
-    venv.as_os_str().to_owned()
 }

@@ -3,16 +3,17 @@ use crate::utils::Reply;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub(crate) mod guest;
 pub(crate) mod host;
-pub(crate) mod python;
 pub(crate) mod sandbox;
+pub(crate) mod venv;
 
 /// Holds the `address/token` the agent listens on
 pub(crate) const CONTROL_ENV: &str = "SMOL_CONTROL";
 pub(crate) const COPIES_ENV: &str = "SMOL_COPIES";
 /// Holds `on`, or `roles` when `agent()` takes a role, and is unset for workers without `agent()`
 pub(crate) const AGENTS_ENV: &str = "SMOL_AGENTS";
-/// Starts libsmol's executable as a worker, followed by `serve` or `repair` and the venv's python
+/// Starts libsmol's executable as a session's worker, followed by the venv it runs as
 pub(crate) const WORKER_ARG: &str = "--worker";
 
 /// The marker the worker writes after each snippet's output,
@@ -20,6 +21,12 @@ pub(crate) const WORKER_ARG: &str = "--worker";
 pub(crate) fn end_marker(token: &str) -> Vec<u8> {
     let marker = format!("\x02{token}\x03end\n");
     marker.into_bytes()
+}
+
+/// The worker's first line, with its version since one of another version would misread the messages
+pub(crate) fn greeting(token: &str) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    format!("{token} {version}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

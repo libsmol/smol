@@ -11,7 +11,7 @@ use tar::Archive;
 
 /// The python-build-standalone release and the CPython it builds
 const RELEASE: &str = "20261026";
-const PYTHON: &str = "3.14.10";
+const VERSION: &str = "3.14.10";
 /// Each target's archive and its sha256.
 /// release.yml reads the targets from here, each a quoted triple on a line of its own
 const BUILDS: [(&str, &str, &str); 5] = [
@@ -54,7 +54,7 @@ fn main() {
     let host = env::var("HOST").expect("host");
     let zip = out.join("stdlib.zip");
     println!("cargo:rustc-env=SMOL_STDLIB={}", zip.display());
-    println!("cargo:rustc-env=SMOL_PYTHON={PYTHON}");
+    println!("cargo:rustc-env=SMOL_PYTHON_VERSION={VERSION}");
 
     // Checking a target without a build, as clippy does for windows-gnu, needs no CPython
     let built = BUILDS.iter().find(|(name, ..)| *name == target);
@@ -70,7 +70,7 @@ fn main() {
         .filter(|dir| dir.join("CACHEDIR.TAG").exists());
     let root = tagged.last().expect("target dir");
     let cache = root.join("pbs");
-    let named = format!("cpython-{PYTHON}+{RELEASE}-{target}");
+    let named = format!("cpython-{VERSION}+{RELEASE}-{target}");
     let folder = cache.join(&named);
     let unpacked = folder.join(".unpacked");
     if !unpacked.exists() {
@@ -118,35 +118,13 @@ fn main() {
     let relative = core["static_lib"].as_str().expect("static lib");
     let library = python.join(relative);
 
-    // The members' names, from the GNU table of long names or the BSD names before each body
-    let data = fs::read(&library).expect("libpython");
+    let file = File::open(&library).expect("libpython");
+    let mut archive = ar::Archive::new(file);
     let mut members = Vec::new();
-    let mut long: &[u8] = &[];
-    let mut at = 8;
-    while at + 60 <= data.len() {
-        let header = &data[at..at + 60];
-        let name = String::from_utf8_lossy(&header[..16]).trim_end().to_owned();
-        let size = String::from_utf8_lossy(&header[48..58]).trim().to_owned();
-        let size: usize = size.parse().expect("member size");
-        let body = &data[at + 60..at + 60 + size];
-        if name == "//" {
-            long = body;
-        } else if let Some(length) = name.strip_prefix("#1/") {
-            let length: usize = length.parse().expect("name length");
-            let named = String::from_utf8_lossy(&body[..length]);
-            members.push(named.trim_end_matches('\0').to_owned());
-        } else if let Some(Ok(offset)) = name.strip_prefix('/').map(str::parse::<usize>) {
-            let rest = &long[offset..];
-            let end = rest
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .unwrap_or(rest.len());
-            let named = String::from_utf8_lossy(&rest[..end]);
-            members.push(named.trim_end_matches('/').to_owned());
-        } else {
-            members.push(name.trim_end_matches('/').to_owned());
-        }
-        at += 60 + size + size % 2;
+    while let Some(entry) = archive.next_entry() {
+        let entry = entry.expect("libpython");
+        let name = String::from_utf8_lossy(entry.header().identifier());
+        members.push(name.into_owned());
     }
 
     // The installed libpython leaves out objects that the python executable links on its own

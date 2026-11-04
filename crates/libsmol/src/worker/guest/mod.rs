@@ -1,12 +1,12 @@
 use crate::agent::MAX_PARALLEL_AGENTS;
-use crate::guest::builtins::{builtins, value_error};
 use crate::memory::MAX_PRINT_CHARS;
 use crate::prompt::{DONE, NO_AGENT, NO_MEMORY, SURROGATE};
 use crate::tools::memories::{MAX_MEMORY_CHARS, MAX_RECALLED};
 use crate::tools::ToolError;
 use crate::utils::{block_on, Waiting};
+use crate::worker::guest::builtins::{builtins, value_error};
 use crate::worker::{
-    end_marker, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
+    end_marker, greeting, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
     WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, WORKER_ARG,
 };
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
@@ -19,10 +19,10 @@ use serde_json::{json, Value};
 use std::env;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,8 +38,6 @@ const BOOTSTRAP: [&str; 3] = [
     include_str!("bootstrap/mcp.py"),
     include_str!("bootstrap/run.py"),
 ];
-/// The agent checks it, since a worker of another version would misread its messages
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static CALLS: LazyLock<Waiting> = LazyLock::new(Waiting::default);
 static CONTROL: OnceLock<Mutex<TcpStream>> = OnceLock::new();
@@ -48,15 +46,9 @@ static RUNNING: Mutex<Option<u64>> = Mutex::new(None);
 #[cfg(unix)]
 static MAIN: AtomicUsize = AtomicUsize::new(0);
 
-/// Runs the role libsmol's executable was started in besides the agent's,
-/// and returns its exit status
-pub(crate) fn role() -> Option<i32> {
-    let args: Vec<OsString> = env::args_os().collect();
-    if let Some(status) = cpython::python(&args) {
-        return Some(status);
-    }
-
-    let [_, flag, role, python] = &args[..] else {
+/// Runs as a session's worker when started as one, and returns its exit status
+pub(crate) fn main(args: &[OsString]) -> Option<i32> {
+    let [_, flag, venv] = args else {
         return None;
     };
     if flag != WORKER_ARG {
@@ -66,37 +58,20 @@ pub(crate) fn role() -> Option<i32> {
     // Started through `/proc/self/exe`, the process would show as `exe`
     #[cfg(target_os = "linux")]
     {
-        let exe = cpython::executable();
+        let exe = worker::executable();
         let own = exe.file_name().unwrap_or_default();
         if let Ok(name) = CString::new(own.as_encoded_bytes()) {
             // SAFETY: Renames only the calling thread, which is the process's main one
             unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
         }
     }
-    cpython::start();
-    let running = |py: Python<'_>| match role.to_str() {
-        Some("serve") => serve(py, python),
-        // Confined like the worker, since the code may be using the venv
-        Some("repair") => cpython::repair(py, python),
-        _ => {
-            let shown = role.to_string_lossy();
-            let message = format!("worker: {shown}: no such role");
-            Err(PyRuntimeError::new_err(message))
-        }
-    };
-    let ran = Python::attach(running);
-    if let Err(error) = &ran {
-        Python::attach(|py| error.print(py));
-    }
-    let finished = cpython::finish();
-    match ran {
-        Ok(()) => Some(finished),
-        Err(_) => Some(1),
-    }
+    let serving = |py: Python<'_>| serve(py, Path::new(venv));
+    let status = worker::isolated(serving);
+    Some(status)
 }
 
 /// Runs on the main thread, where Python raises `KeyboardInterrupt`, until the agent hangs up
-fn serve(py: Python<'_>, python: &OsStr) -> PyResult<()> {
+fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
     let os = py.import("os")?;
     let environ = os.getattr("environ")?;
     // Programs the code starts would inherit these, and they must go before any thread starts
@@ -118,7 +93,7 @@ fn serve(py: Python<'_>, python: &OsStr) -> PyResult<()> {
 
     // Taken before site runs the venv's .pth files, which could change it
     let cwd = env::current_dir().unwrap_or_default();
-    cpython::enter(py, python)?;
+    worker::enter(py, venv)?;
 
     let Some((address, token)) = control.split_once('/') else {
         let message = format!("worker: {CONTROL_ENV}: not set by the agent");
@@ -130,8 +105,9 @@ fn serve(py: Python<'_>, python: &OsStr) -> PyResult<()> {
         PyRuntimeError::new_err(message)
     };
     let mut stream = TcpStream::connect(address).map_err(failed)?;
-    let greeting = format!("{token} {VERSION}\n");
-    stream.write_all(greeting.as_bytes()).map_err(failed)?;
+    let mut line = greeting(token);
+    line.push('\n');
+    stream.write_all(line.as_bytes()).map_err(failed)?;
     let reading = stream.try_clone().map_err(failed)?;
     CONTROL.set(Mutex::new(stream)).ok();
     let marker = end_marker(token);

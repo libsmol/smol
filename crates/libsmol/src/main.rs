@@ -1,9 +1,13 @@
 use libsmol::SETUP_ARG;
 use std::env;
+use std::ffi::OsString;
 use std::process::{self, ExitCode};
 
 fn main() -> ExitCode {
-    if let Some(status) = libsmol::embedded() {
+    let args: Vec<OsString> = env::args_os().collect();
+    // A venv's python and a session's worker are libsmol too
+    let embedded = worker::main(&args).or_else(|| libsmol::run_worker(&args));
+    if let Some(status) = embedded {
         process::exit(status);
     }
 

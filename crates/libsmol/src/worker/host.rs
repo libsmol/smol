@@ -4,11 +4,10 @@ use crate::prompt::{self, ADDING_SERVER, LEFT_BEHIND, NO_SERVER};
 use crate::spawn::{drain, Clip, Group, Piece, DRAIN_WAIT, KEPT_BYTES, SHOWN_EVERY};
 use crate::tools::mcp::Server;
 use crate::utils::{new_id, Interrupt, Reply};
-use crate::worker::python;
 use crate::worker::sandbox::Sandbox;
 use crate::worker::{
-    end_marker, AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message, Service,
-    ToWorker, WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV,
+    end_marker, greeting, AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message,
+    Service, ToWorker, WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, WORKER_ARG,
 };
 use crate::{Error, Result};
 use reaper::cause;
@@ -18,6 +17,8 @@ use std::future::{self, Future};
 use std::io;
 use std::mem;
 use std::path::Component;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -36,8 +37,6 @@ const CANCEL_EVERY: Duration = Duration::from_millis(500);
 /// Code that closes the worker's own copy of the pipe never lets the end marker through
 const OUTPUT_WAIT: Duration = Duration::from_secs(2);
 const START_WAIT: Duration = Duration::from_secs(30);
-/// The worker greets with it, since one of another version would misread the messages
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) type Calling = Pin<Box<dyn Future<Output = Called> + Send>>;
 pub(crate) type Serving<'a> = dyn FnMut(Service) -> Calling + Send + 'a;
@@ -188,8 +187,17 @@ impl Worker {
             return Ok(());
         }
 
-        let prepared = python::command(&self.sandbox).await;
-        let mut command = prepared.map_err(|reason| prompt::unstarted(&reason))?;
+        // libsmol's own executable, which the code can't write, unlike the venv's python.
+        // On Linux it is the file this process runs, also once an update replaced it
+        let exe = worker::executable();
+        #[cfg(target_os = "linux")]
+        let mut command = self.sandbox.command(Path::new("/proc/self/exe"));
+        // Process lists would show the worker as `/proc/self/exe`
+        #[cfg(target_os = "linux")]
+        command.arg0(&exe);
+        #[cfg(not(target_os = "linux"))]
+        let mut command = self.sandbox.command(&exe);
+        command.arg(WORKER_ARG).arg(&self.sandbox.venv.path);
 
         let failed = |e: io::Error| {
             let reason = cause(&e);
@@ -229,15 +237,13 @@ impl Worker {
             accepted = timed => accepted.ok(),
             _ = group.exited() => None,
         };
-        let expected = format!("{token} {VERSION}");
+        let expected = greeting(&token);
         let (lines, mut writer) = match accepted {
-            Some(Ok((lines, writer, Some(greeting)))) if greeting == expected => (lines, writer),
+            Some(Ok((lines, writer, Some(said)))) if said == expected => (lines, writer),
             // An update replaced the executable while the session ran, which `/proc/self/exe` avoids on Linux
-            Some(Ok((_, _, Some(greeting))))
-                if greeting.split(' ').next() == Some(token.as_str()) =>
-            {
-                let version = greeting.split(' ').nth(1).unwrap_or_default();
-                let reason = format!("libsmol {version} replaced {VERSION}, reopen the session");
+            Some(Ok((_, _, Some(said)))) if said.starts_with(&token) => {
+                let version = said.split_once(' ').map(|(_, version)| version);
+                let reason = prompt::replaced(version.unwrap_or_default());
                 return Err(prompt::unstarted(&reason));
             }
             _ => {

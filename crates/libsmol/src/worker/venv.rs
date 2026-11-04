@@ -1,8 +1,4 @@
-use crate::memory::Exit;
-use crate::spawn::{drain, Clip, Group, Piece, KEPT_BYTES};
 use crate::utils::folded;
-use crate::worker::sandbox::Sandbox;
-use crate::worker::WORKER_ARG;
 use reaper::{cause, tilde};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
@@ -10,49 +6,31 @@ use std::env;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, SystemTime};
-use tokio::process::Command;
-use tokio::select;
 use tokio::task;
 use tracing::{info, Span};
 
 /// Holds the venvs and their locks in the config directory
 const VENVS: &str = "venvs";
-/// Held by a repair while it makes or completes a venv
-const VENVS_LOCK: &str = "lock";
 /// Without long paths Windows refuses paths over 260 characters, and packages nest deep in a venv
 const MAX_NAME_CHARS: usize = 16;
 
 /// How long the venv of a directory that is gone stays unused before it is removed
 const MIN_IDLE: Duration = Duration::from_hours(7 * 24);
 
-/// Where pip puts the scripts it installs
-#[cfg(unix)]
-const SCRIPTS: &str = "bin";
-#[cfg(windows)]
-const SCRIPTS: &str = "Scripts";
-#[cfg(unix)]
-const EXE: &str = "python";
-#[cfg(windows)]
-const EXE: &str = "python.exe";
-#[cfg(unix)]
-const PIP: &str = "pip";
-#[cfg(windows)]
-const PIP: &str = "pip.exe";
-
-/// The venv kept for a session's working directory, which libsmol's own CPython runs as
-pub(crate) struct Python {
+/// The venv kept for a session's working directory, which the worker makes and completes as it
+/// enters it. The agent never reads or follows anything in it, since the code can write it
+pub(crate) struct Venv {
     /// Where the code installs packages
-    pub(crate) venv: PathBuf,
+    pub(crate) path: PathBuf,
     /// Shared, and naming the working directory so the venv goes once that is gone
     _held: File,
 }
 
-impl Python {
+impl Venv {
     /// Also removes in the background the venvs of working directories that are gone,
     /// once no session used them for `MIN_IDLE`
-    pub(crate) async fn install(config: &Path, cwd: &Path) -> Result<Self, String> {
+    pub(crate) async fn open(config: &Path, cwd: &Path) -> Result<Self, String> {
         let venvs = venvs_of(config);
         let venv = venv_for(&venvs, cwd);
         let failed = |e: io::Error| {
@@ -76,92 +54,11 @@ impl Python {
         };
         task::spawn_blocking(sweeping);
 
-        Ok(Self { venv, _held: hold })
+        Ok(Self {
+            path: venv,
+            _held: hold,
+        })
     }
-
-    /// Holds `python` and `pip`, which programs the code starts find first on `PATH`
-    pub(crate) fn bin(&self) -> PathBuf {
-        self.venv.join(SCRIPTS)
-    }
-
-    /// Complete once `venv` has installed pip, which it does after the interpreter.
-    /// Only looked up, never read or followed, since the code can write the venv
-    fn ready(&self) -> bool {
-        let bin = self.bin();
-        let found = |name: &str| fs::symlink_metadata(bin.join(name)).is_ok();
-        found(EXE) && found(PIP)
-    }
-}
-
-/// The worker's command, with the venv made or completed first when it lacks `python` or `pip`
-pub(crate) async fn command(sandbox: &Sandbox) -> Result<Command, String> {
-    let python = &sandbox.python;
-    let venv = python.bin().join(EXE);
-
-    if !python.ready() {
-        // Another session in this directory may have made it while this one waited
-        let venvs = python.venv.parent().unwrap_or(Path::new(""));
-        let _lock = locked(venvs).await?;
-        if !python.ready() {
-            let mut repairing = running(sandbox, "repair", &venv);
-            repairing.stdin(Stdio::null());
-            let shown = tilde(&python.venv);
-            let failed = |e: io::Error| {
-                let reason = cause(&e);
-                format!("{shown}: {reason}")
-            };
-            let (mut group, mut pieces) = Group::start(repairing, None).map_err(failed)?;
-
-            let mut output = Clip::new(KEPT_BYTES);
-            // Read while it runs, since a full pipe would stall it
-            let exit = loop {
-                select! {
-                    exit = group.exited() => break exit,
-                    Some(piece) = pieces.recv() => {
-                        if let Piece::Output(bytes) = piece {
-                            output.push(&bytes);
-                        }
-                    }
-                }
-            };
-            drain(&mut pieces, &mut output).await;
-
-            if exit != Some(Exit::Exited(0)) {
-                let (said, _) = output.text();
-                // The last line, where a traceback names its exception, keeps the error on one line
-                let last = said
-                    .lines()
-                    .rev()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty());
-                let reason = match (last, exit) {
-                    (Some(last), _) => last.to_owned(),
-                    (None, Some(exit)) => exit.to_string(),
-                    (None, None) => String::new(),
-                };
-                return Err(format!("{shown}: {reason}"));
-            }
-            info!("python: venv made [path={shown}]");
-        }
-    }
-
-    let serving = running(sandbox, "serve", &venv);
-    Ok(serving)
-}
-
-/// Starts libsmol's own executable, which the code can't write, unlike the venv's python.
-/// On Linux it is the file this process runs, also once an update replaced the one at its path
-fn running(sandbox: &Sandbox, role: &str, venv: &Path) -> Command {
-    let exe = cpython::executable();
-    #[cfg(target_os = "linux")]
-    let mut command = sandbox.command(Path::new("/proc/self/exe"));
-    // Process lists would show the worker as `/proc/self/exe`
-    #[cfg(target_os = "linux")]
-    command.arg0(&exe);
-    #[cfg(not(target_os = "linux"))]
-    let mut command = sandbox.command(&exe);
-    command.arg(WORKER_ARG).arg(role).arg(venv);
-    command
 }
 
 #[cfg(not(test))]
@@ -260,35 +157,9 @@ fn hex(bytes: &[u8]) -> String {
     digits.concat()
 }
 
-/// Waits off the runtime's thread while another session repairs a venv
-async fn locked(venvs: &Path) -> Result<File, String> {
-    let path = venvs.join(VENVS_LOCK);
-    lock(path, "", File::lock).await
-}
-
-/// Waits off the runtime's thread while another session removes it,
-/// and dates the lock, which says when a session last used the item
-async fn held(item: &Path, record: &str) -> Result<File, String> {
-    let path = lock_of(item);
-    let file = lock(path, record, File::lock_shared).await?;
-    // Windows allows changing the time of a file that other sessions hold
-    file.set_modified(SystemTime::now()).ok();
-    Ok(file)
-}
-
-/// Next to the item, hidden from the code with the config directory, of which only the item is granted
-fn lock_of(item: &Path) -> PathBuf {
-    let mut path = item.as_os_str().to_owned();
-    path.push(".lock");
-    PathBuf::from(path)
-}
-
-/// Writes `record` into a lock that is still empty, before any lock forbids it on Windows
-async fn lock(
-    path: PathBuf,
-    record: &str,
-    locking: fn(&File) -> io::Result<()>,
-) -> Result<File, String> {
+/// Takes the venv's lock shared and dates it, which says when a session last used the venv
+async fn held(venv: &Path, record: &str) -> Result<File, String> {
+    let path = lock_of(venv);
     let shown = tilde(&path);
     let record = record.to_owned();
     let opening = move || {
@@ -298,27 +169,40 @@ async fn lock(
             .write(true)
             .truncate(false)
             .open(&path)?;
+        // Written into a lock that is still empty, before any lock forbids it on Windows.
         // A record that can't be written only keeps the venv from being cleaned up
         if !record.is_empty() && file.metadata()?.len() == 0 {
             file.write_all(record.as_bytes()).ok();
         }
         // A file system without locks only loses the protection, as the history does
-        locking(&file).ok();
+        file.lock_shared().ok();
         io::Result::Ok(file)
     };
+    // Off the runtime's thread, since it waits while another session removes the venv
     let opened = task::spawn_blocking(opening).await.expect("lock");
     let failed = |e: io::Error| {
         let reason = cause(&e);
         format!("{shown}: {reason}")
     };
-    opened.map_err(failed)
+    let file = opened.map_err(failed)?;
+
+    // Windows allows changing the time of a file that other sessions hold
+    file.set_modified(SystemTime::now()).ok();
+    Ok(file)
+}
+
+/// Next to the venv, hidden from the code with the config directory, of which only the venv is granted
+fn lock_of(venv: &Path) -> PathBuf {
+    let mut path = venv.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::tests::temp_dir;
     use crate::utils::{block_on, new_id};
-    use crate::worker::python::{held, lock_of, sweep_venvs, venv_name, Python, MIN_IDLE};
+    use crate::worker::venv::{held, lock_of, sweep_venvs, venv_name, Venv, MIN_IDLE};
     use std::env;
     use std::fs::{self, File};
     #[cfg(unix)]
@@ -327,9 +211,9 @@ pub(crate) mod tests {
     use std::time::{Duration, SystemTime};
 
     /// The venv tests share
-    pub(crate) fn installed(config: &Path, cwd: &Path) -> Python {
-        let installing = Python::install(config, cwd);
-        block_on(installing).expect("python")
+    pub(crate) fn shared_venv(config: &Path, cwd: &Path) -> Venv {
+        let opening = Venv::open(config, cwd);
+        block_on(opening).expect("venv")
     }
 
     /// A file holding the text, last changed at the time
@@ -426,15 +310,15 @@ pub(crate) mod tests {
     fn marks_use() {
         let dir = temp_dir("held");
         fs::create_dir_all(&dir).expect("dir");
-        let item = dir.join("item");
-        let holding = held(&item, "");
+        let venv = dir.join("venv");
+        let holding = held(&venv, "");
         let first = block_on(holding).expect("hold");
         first.set_modified(SystemTime::UNIX_EPOCH).expect("age");
 
         // Another session takes it while the first still holds it
-        let holding = held(&item, "");
+        let holding = held(&venv, "");
         let second = block_on(holding).expect("hold");
-        let lock = lock_of(&item);
+        let lock = lock_of(&venv);
         let used = fs::metadata(lock).and_then(|found| found.modified());
         let used = used.expect("time");
         assert!(used > SystemTime::UNIX_EPOCH, "{used:?}");

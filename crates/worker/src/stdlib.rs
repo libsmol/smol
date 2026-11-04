@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 static STDLIB: &[u8] = include_bytes!(env!("SMOL_STDLIB"));
 /// `sys.path` names the stdlib by the executable's path, which only `open_code` reads as the zip
-static ARCHIVE: OnceLock<PathBuf> = OnceLock::new();
+static ARCHIVE_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// Hands the same bytes to what reads the stdlib as files
 const ADAPTERS: &str = include_str!("stdlib.py");
 
@@ -22,12 +22,12 @@ unsafe extern "C" {
 
 /// Reads the stdlib zip in place, so every process shares the executable's pages
 #[pyclass(module = "_stdlib")]
-struct Stored {
+struct Archive {
     position: usize,
 }
 
 #[pymethods]
-impl Stored {
+impl Archive {
     #[pyo3(signature = (size = -1))]
     fn read<'py>(&mut self, py: Python<'py>, size: isize) -> Bound<'py, PyBytes> {
         let start = self.position.min(STDLIB.len());
@@ -82,19 +82,19 @@ impl Stored {
 
 #[pymodule]
 mod _stdlib {
-    use crate::stdlib::{Stored, ARCHIVE};
+    use crate::stdlib::{Archive, ARCHIVE_PATH};
     use pyo3::prelude::*;
     use std::ffi::OsString;
 
     #[pyfunction]
-    fn open() -> Stored {
-        Stored { position: 0 }
+    fn open() -> Archive {
+        Archive { position: 0 }
     }
 
     /// The `sys.path` entry the stdlib comes from
     #[pyfunction]
     fn path() -> OsString {
-        let archive = ARCHIVE.get().cloned().unwrap_or_default();
+        let archive = ARCHIVE_PATH.get().cloned().unwrap_or_default();
         archive.into_os_string()
     }
 }
@@ -106,8 +106,8 @@ unsafe extern "C" fn open_code(path: *mut ffi::PyObject, _data: *mut c_void) -> 
     let path = unsafe { Bound::from_borrowed_ptr(py, path) };
 
     let wanted = path.extract::<PathBuf>().ok();
-    let opened = match wanted.as_ref() == ARCHIVE.get() {
-        true => Bound::new(py, Stored { position: 0 }).map(Bound::into_any),
+    let opened = match wanted.as_ref() == ARCHIVE_PATH.get() {
+        true => Bound::new(py, Archive { position: 0 }).map(Bound::into_any),
         false => match py.import("_io") {
             Ok(io) => io.call_method1("open", (&path, "rb")),
             Err(error) => Err(error),
@@ -125,7 +125,7 @@ unsafe extern "C" fn open_code(path: *mut ffi::PyObject, _data: *mut c_void) -> 
 /// Serves the stdlib as a zip at `archive`, which must be a file since zipimport checks.
 /// Runs before the interpreter starts
 pub(crate) fn install(archive: &Path) {
-    ARCHIVE.set(archive.to_owned()).ok();
+    ARCHIVE_PATH.set(archive.to_owned()).ok();
     pyo3::append_to_inittab!(_stdlib);
     // SAFETY: The interpreter hasn't started, and no other thread is in it
     unsafe { PyFile_SetOpenCodeHook(open_code, ptr::null_mut()) };
@@ -133,7 +133,7 @@ pub(crate) fn install(archive: &Path) {
 
 /// Where imports look, set by hand since CPython's own search can't find the stdlib.
 /// That search would also add PYTHONPATH, when `environment` lets it count
-pub(crate) fn searched(environment: bool) -> Vec<PathBuf> {
+pub(crate) fn search_paths(environment: bool) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let listed = env::var_os("PYTHONPATH").unwrap_or_default();
     if environment && !listed.is_empty() {
@@ -146,7 +146,7 @@ pub(crate) fn searched(environment: bool) -> Vec<PathBuf> {
         }
     }
 
-    let archive = ARCHIVE.get().cloned().unwrap_or_default();
+    let archive = ARCHIVE_PATH.get().cloned().unwrap_or_default();
     paths.push(archive);
     paths
 }

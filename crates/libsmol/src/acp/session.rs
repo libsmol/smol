@@ -12,8 +12,8 @@ use crate::spawn::{spawn_shell, Group};
 use crate::tools::memories::{Listed, Memories};
 use crate::utils::Interrupt;
 use crate::worker::host::Worker;
-use crate::worker::python::Python;
 use crate::worker::sandbox::Sandbox;
+use crate::worker::venv::Venv;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     ContentBlock, LoadSessionResponse, NewSessionResponse, PromptResponse, SessionConfigOption,
@@ -243,12 +243,12 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
     translator.replay(&memory);
 
     // The sandbox grants the venv by the folder that exists when it is made
-    let python = Python::install(&app.config, &cwd).await;
-    let python = python.map_err(Error::Python)?;
+    let venv = Venv::open(&app.config, &cwd).await;
+    let venv = venv.map_err(Error::Python)?;
     if inbox.is_closed() {
         return Err(Error::SessionNotFound(meta.id));
     }
-    let sandbox = Sandbox::new(&cwd, &copies, &app.config, &skills, &access, python);
+    let sandbox = Sandbox::new(&cwd, &copies, &app.config, &skills, &access, venv);
     let sandbox = sandbox.map_err(Error::Python)?;
     let sandbox = Arc::new(sandbox);
 
@@ -691,7 +691,7 @@ mod tests {
     use crate::tools::mcp::tests::SCRIPT;
     use crate::tools::memories::Memories;
     use crate::utils::block_on;
-    use crate::worker::python::tests::interpreter;
+    use crate::worker::venv::tests::interpreter;
     use crate::worker::MemoryCall;
     use crate::Error;
     use reaper::tilde;

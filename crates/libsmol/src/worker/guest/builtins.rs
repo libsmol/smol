@@ -1,10 +1,10 @@
-use crate::guest::{json_of, python_of, request, send};
 use crate::prompt::unserializable;
 use crate::tools::attach::{shown_path, viewed};
 use crate::tools::files::{grep, ls};
 use crate::tools::web::fetch;
 use crate::tools::ToolError;
 use crate::utils::block_on;
+use crate::worker::guest::{json_of, python_of, request, send};
 use crate::worker::{Message, WorkerCall, WorkerNote};
 use pyo3::exceptions::{PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;

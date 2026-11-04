@@ -1,6 +1,6 @@
 use crate::config::{Access, Skill};
 use crate::utils::new_id;
-use crate::worker::python::Python;
+use crate::worker::venv::Venv;
 #[cfg(target_os = "linux")]
 use landlock::{
     Access as _, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
@@ -17,7 +17,6 @@ use std::ffi::c_void;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
-use std::iter;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -35,7 +34,7 @@ const LOCK: &str = "lock";
 /// `LANDLOCK_CREATE_RULESET_VERSION`, which libc doesn't define
 #[cfg(target_os = "linux")]
 const LANDLOCK_VERSION: libc::c_uint = 1;
-/// Applies a profile and starts a program under it, by full path since `PATH` leads to the venv first
+/// Applies a profile and starts a program under it, by full path rather than looked up on `PATH`
 #[cfg(target_os = "macos")]
 const SEATBELT: &str = "/usr/bin/sandbox-exec";
 
@@ -98,7 +97,6 @@ const PASSED_ENV: &[&str] = &[
 const TEMP_ENV: &[&str] = &["TMPDIR"];
 #[cfg(windows)]
 const TEMP_ENV: &[&str] = &["TEMP", "TMP"];
-const VENV_ENV: &str = "VIRTUAL_ENV";
 const PIP_CACHE_ENV: &str = "PIP_CACHE_DIR";
 
 /// The Landlock ruleset the worker restricts itself with
@@ -124,7 +122,7 @@ enum Grant {
 pub(crate) struct Sandbox {
     cwd: PathBuf,
     pub(crate) copies: PathBuf,
-    pub(crate) python: Python,
+    pub(crate) venv: Venv,
     temp: PathBuf,
     /// The places in `[allow] write` that existed when the session opened
     writable: Vec<PathBuf>,
@@ -142,7 +140,7 @@ impl Sandbox {
         config: &Path,
         skills: &[Skill],
         access: &Access,
-        python: Python,
+        venv: Venv,
     ) -> Result<Self, String> {
         let id = new_id();
         let name = format!("{TEMP_PREFIX}{id}");
@@ -159,7 +157,7 @@ impl Sandbox {
         let mut sandbox = Self {
             cwd: cwd.to_owned(),
             copies: copies.to_owned(),
-            python,
+            venv,
             temp: temp.clone(),
             writable: Vec::new(),
             lock: None,
@@ -173,8 +171,8 @@ impl Sandbox {
 
         // A Landlock rule holds on to the folder that exists when the rule is made.
         // An earlier session's code may have swapped one for a link, which the grant would follow
-        let python = &sandbox.python;
-        for folder in [copies, &python.venv] {
+        let venv = &sandbox.venv;
+        for folder in [copies, &venv.path] {
             let swapped = fs::symlink_metadata(folder).is_ok_and(|found| !found.is_dir());
             if swapped {
                 let removed = fs::remove_file(folder).or_else(|_| fs::remove_dir(folder));
@@ -186,26 +184,15 @@ impl Sandbox {
         let passed = PASSED_ENV.iter().copied();
         let named = access.env.iter().map(String::as_str);
         for name in passed.chain(named) {
-            let Some(mut value) = env::var_os(name) else {
+            let Some(value) = env::var_os(name) else {
                 continue;
             };
-            // Programs the code starts find the venv's `python` and `pip` first
-            if name == "PATH" {
-                let bin = iter::once(python.bin());
-                let rest = env::split_paths(&value);
-                let paths = bin.chain(rest);
-                if let Ok(joined) = env::join_paths(paths) {
-                    value = joined;
-                }
-            }
             sandbox.env.push((OsString::from(name), value));
         }
         for name in TEMP_ENV {
             let value = scratch.clone().into_os_string();
             sandbox.env.push((OsString::from(name), value));
         }
-        let venv = python.venv.clone().into_os_string();
-        sandbox.env.push((OsString::from(VENV_ENV), venv));
 
         let mut granted = vec![(PathBuf::from("/"), false)];
         for skill in skills {
@@ -214,9 +201,9 @@ impl Sandbox {
             }
         }
         // The worker and the venv's python are libsmol's own executable, wherever it is installed
-        let exe = cpython::executable();
+        let exe = worker::executable();
         granted.push((exe, false));
-        for path in [cwd, &scratch, copies, &python.venv, Path::new("/dev")] {
+        for path in [cwd, &scratch, copies, &venv.path, Path::new("/dev")] {
             granted.push((path.to_owned(), true));
         }
         for path in &access.write {
@@ -537,12 +524,12 @@ pub(crate) mod tests {
     use crate::utils::{block_on, new_id, Interrupt};
     use crate::worker::host::tests::unserved;
     use crate::worker::host::Worker;
-    use crate::worker::python::tests::installed;
     #[cfg(target_os = "linux")]
     use crate::worker::sandbox::{landlock_abi, spread, Grant};
     use crate::worker::sandbox::{
-        profile, sweep, Sandbox, LOCK, PASSED_ENV, PIP_CACHE_ENV, TEMP_PREFIX, VENV_ENV,
+        profile, sweep, Sandbox, LOCK, PASSED_ENV, PIP_CACHE_ENV, TEMP_PREFIX,
     };
+    use crate::worker::venv::tests::shared_venv;
     use crate::worker::Delegation;
     use std::env;
     use std::fs;
@@ -561,8 +548,8 @@ pub(crate) mod tests {
     pub(crate) fn opened(cwd: &Path, copies: &Path) -> Sandbox {
         let config = copies.parent().expect("parent");
         let access = Access::default();
-        let python = installed(config, cwd);
-        Sandbox::new(cwd, copies, config, &[], &access, python).expect("sandbox")
+        let venv = shared_venv(config, cwd);
+        Sandbox::new(cwd, copies, config, &[], &access, venv).expect("sandbox")
     }
 
     #[test]
@@ -668,8 +655,8 @@ pub(crate) mod tests {
         };
         let config = dir.join("config");
         let copies = config.join("copies");
-        let python = installed(&config, &cwd);
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, python);
+        let venv = shared_venv(&config, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, venv);
         let sandbox = sandbox.expect("sandbox");
         #[cfg(target_os = "macos")]
         assert!(sandbox.enforced());
@@ -711,8 +698,8 @@ pub(crate) mod tests {
         };
         let config = dir.join("config");
         let copies = config.join("copies");
-        let python = installed(&config, &cwd);
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, python);
+        let venv = shared_venv(&config, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, venv);
         let sandbox = sandbox.expect("sandbox");
         #[cfg(target_os = "macos")]
         assert!(sandbox.enforced());
@@ -747,8 +734,8 @@ pub(crate) mod tests {
         };
         let config = dir.join("config");
         let copies = config.join("copies");
-        let python = installed(&config, &cwd);
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, python);
+        let venv = shared_venv(&config, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &access, venv);
         let sandbox = sandbox.expect("sandbox");
         #[cfg(target_os = "macos")]
         assert!(sandbox.enforced());
@@ -788,8 +775,8 @@ pub(crate) mod tests {
         let _scoped = UnixListener::bind_addr(&address).expect("bind");
         let config = dir.join("config");
         let copies = config.join("copies");
-        let python = installed(&config, &cwd);
-        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &Access::default(), python);
+        let venv = shared_venv(&config, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &config, &[], &Access::default(), venv);
         let sandbox = sandbox.expect("sandbox");
         #[cfg(target_os = "macos")]
         assert!(sandbox.enforced());
@@ -843,7 +830,8 @@ pub(crate) mod tests {
             let passed = PASSED_ENV
                 .iter()
                 .any(|known| known.eq_ignore_ascii_case(&name));
-            let set = name.starts_with("SMOL_") || name == VENV_ENV || name == PIP_CACHE_ENV;
+            // The worker sets VIRTUAL_ENV as it enters the venv
+            let set = name.starts_with("SMOL_") || name == "VIRTUAL_ENV" || name == PIP_CACHE_ENV;
             if !passed && !set {
                 unpassed.push(name);
             }
@@ -860,8 +848,8 @@ pub(crate) mod tests {
             ..Access::default()
         };
         let copies = dir.join("copies");
-        let python = installed(&dir, &cwd);
-        let sandbox = Sandbox::new(&cwd, &copies, &dir, &[], &access, python).expect("sandbox");
+        let venv = shared_venv(&dir, &cwd);
+        let sandbox = Sandbox::new(&cwd, &copies, &dir, &[], &access, venv).expect("sandbox");
         let scratch = sandbox.temp.join("tmp").display().to_string();
         let cached = match sandbox.enforced() {
             true => "True",

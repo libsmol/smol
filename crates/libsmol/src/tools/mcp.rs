@@ -444,7 +444,7 @@ pub(crate) mod tests {
     use crate::tests::temp_dir;
     use crate::tools::mcp::{connect, Link, Server};
     use crate::utils::block_on;
-    use crate::worker::python::tests::interpreter;
+    use crate::worker::venv::tests::interpreter;
     use serde_json::{json, Map, Value};
     use std::collections::BTreeMap;
     use std::fs;

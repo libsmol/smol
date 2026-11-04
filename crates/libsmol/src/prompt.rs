@@ -10,9 +10,9 @@ use crate::utils::truncated;
 use crate::worker::host::Added;
 use crate::worker::Function;
 use chrono::Utc;
-use cpython::PYTHON;
 use std::env::consts::OS;
 use std::path::{Path, PathBuf};
+use worker::PYTHON_VERSION;
 
 pub(crate) const TOOL: &str = "eval";
 /// Mentioning tags makes models write tags into the arguments
@@ -345,7 +345,7 @@ These need no import; use them instead of writing your own. What is listed here 
 # Environment
 
 - Your code runs on the user's computer ({OS}) in `{cwd}`.
-- Python: CPython {PYTHON} in a venv kept for this folder; packages you install import right away.{sandbox}
+- Python: CPython {PYTHON_VERSION} in a venv kept for this folder; packages you install import right away.{sandbox}
 - Your answer goes to {reader}; no hidden tests or graders check it.
 - Today is {date} (UTC).",
     )
@@ -590,6 +590,12 @@ pub(crate) fn unstarted(said: &str) -> String {
         "" => "did not start".to_owned(),
         said => format!("did not start: {said}"),
     }
+}
+
+/// A worker greeted with `version` after an update replaced libsmol
+pub(crate) fn replaced(version: &str) -> String {
+    let own = env!("CARGO_PKG_VERSION");
+    format!("libsmol {version} replaced {own}, reopen the session")
 }
 
 /// Errors from MCP functions, which the Python side prefixes with `server.function:`
@@ -852,8 +858,8 @@ mod tests {
     };
     use crate::tools::memories::Listed;
     use crate::worker::Function;
-    use cpython::PYTHON;
     use std::path::{Path, PathBuf};
+    use worker::PYTHON_VERSION;
 
     #[test]
     fn system_sections() {
@@ -902,7 +908,7 @@ mod tests {
         assert!(text.contains(delegating), "{text}");
         let place = format!(
             ") in `/home/zoë/work`.\n\
-             - Python: CPython {PYTHON} in a venv kept for this folder; packages you install import right away.\n\
+             - Python: CPython {PYTHON_VERSION} in a venv kept for this folder; packages you install import right away.\n\
              - Your answer goes to the user; no hidden tests or graders check it.\n\
              - Today"
         );
