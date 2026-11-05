@@ -17,8 +17,6 @@ use std::future::{self, Future};
 use std::io;
 use std::mem;
 use std::path::Component;
-#[cfg(target_os = "linux")]
-use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -188,22 +186,21 @@ impl Worker {
         }
 
         // The worker is libsmol's own executable, which the code can't write, unlike the venv's python
-        let exe = worker::executable();
         let Workplace {
             cwd,
             copies,
             venv,
             sandbox,
+            program,
             ..
         } = &*self.workplace;
-        // The file this process runs, also once an update replaced the one at `exe`
-        #[cfg(target_os = "linux")]
-        let mut command = sandbox.command(Path::new("/proc/self/exe"), cwd);
+        let mut command = sandbox.command(program, cwd);
         // Process lists would show it as `/proc/self/exe`
         #[cfg(target_os = "linux")]
-        command.arg0(&exe);
-        #[cfg(not(target_os = "linux"))]
-        let mut command = sandbox.command(&exe, cwd);
+        {
+            let exe = worker::executable();
+            command.arg0(exe);
+        }
         command.arg(WORKER_ARG).arg(&venv.path);
 
         let failed = |e: io::Error| {
@@ -1436,6 +1433,50 @@ pub(crate) mod tests {
 
         assert_eq!(output.error, None, "{}", output.logs);
         assert_eq!(output.logs, "False True True\n0 True\n");
+    }
+
+    /// A venv the code makes gets a python.exe that relays to the interpreter, pip and activation scripts
+    #[cfg(windows)]
+    #[test]
+    fn venvs_nested() {
+        let (mut worker, dir) = workspace("nested");
+        let code = "import os, subprocess, venv\n\
+             venv.create('café', with_pip=True)\n\
+             names = os.listdir(r'café\\Scripts')\n\
+             print('python.exe' in names, 'pip.exe' in names, 'activate.bat' in names)\n\
+             probe = 'import sys; print(sys.prefix)'\n\
+             run = subprocess.run([r'café\\Scripts\\python.exe', '-c', probe], capture_output=True, text=True)\n\
+             print(run.returncode, run.stdout.strip() == os.path.abspath('café'))";
+        let output = worker.eval(code);
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.logs, "True True True\n0 True\n");
+    }
+
+    /// Extension modules reach the interpreter by the names python314.dll and python3.dll,
+    /// and the venv's python relays to it
+    #[cfg(windows)]
+    #[test]
+    fn interpreter_named() {
+        let (minor, _) = worker::PYTHON_VERSION.rsplit_once('.').expect("version");
+        let name = format!("python{}.dll", minor.replace('.', ""));
+        let mut worker = fresh();
+        let code = format!(
+            "import ctypes, subprocess, sys\n\
+             address = lambda function: ctypes.cast(function, ctypes.c_void_p).value\n\
+             forwarded = address(ctypes.WinDLL('python3').Py_IsInitialized) == address(ctypes.pythonapi.Py_IsInitialized)\n\
+             kernel = ctypes.WinDLL('kernel32')\n\
+             kernel.GetModuleHandleW.restype = ctypes.c_void_p\n\
+             named = kernel.GetModuleHandleW({name:?}) == sys.dllhandle\n\
+             probe = 'import sys; print(sys.prefix == sys.base_prefix, sys.executable == sys._base_executable)'\n\
+             run = subprocess.run(['python', '-c', probe], capture_output=True, text=True)\n\
+             print(forwarded, named, run.returncode, run.stdout.strip())"
+        );
+        let output = worker.eval(&code);
+
+        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.logs, "True True 0 False False\n");
     }
 
     /// A pool fails at once instead of waiting on a process that can't import the code

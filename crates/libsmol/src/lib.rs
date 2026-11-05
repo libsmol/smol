@@ -21,8 +21,9 @@ pub use crate::config::setup::{run as setup, SETUP_ARG};
 /// Runs as a venv's python or as a session's worker when started as one with `args`,
 /// and returns its exit status
 pub fn embedded(args: &[OsString]) -> Option<i32> {
-    // The worker crate, which the worker module shadows here
-    ::worker::main(args).or_else(|| guest::main(args))
+    // The worker goes first, since Windows starts it under the interpreter's name.
+    // `::worker` is the crate, which the worker module shadows here
+    guest::main(args).or_else(|| ::worker::main(args))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,14 +107,17 @@ mod tests {
         linked
     }
 
-    /// Windows makes links only with a privilege, so the test binary is linked hard or copied
+    /// Windows makes links only with a privilege, so the test binary is linked hard or copied,
+    /// under the name it runs as python by there
     #[cfg(windows)]
     pub(crate) fn interpreter() -> PathBuf {
         let exe = env::current_exe().expect("test binary");
         let deps = exe.parent().expect("deps");
-        let named = deps.join("python3.exe");
+        let (minor, _) = worker::PYTHON_VERSION.rsplit_once('.').expect("version");
+        let name = format!("python{}.dll", minor.replace('.', ""));
+        let named = deps.join(&name);
         let id = new_id();
-        let aside = deps.join(format!(".python3-{id}.exe"));
+        let aside = deps.join(format!(".{name}-{id}"));
         if fs::hard_link(&exe, &aside).is_err() {
             fs::copy(&exe, &aside).expect("copy");
         }

@@ -14,7 +14,7 @@ mod windows;
 #[cfg(unix)]
 pub use crate::unix::{guard, kill_all, prepare, Group, Mark};
 #[cfg(windows)]
-pub use crate::windows::{guard, kill_all, prepare, Group, Mark};
+pub use crate::windows::{guard, kill_all, prepare, prepare_attached, Group, Mark};
 
 /// Searches PATH by hand because commands like `npx` are .cmd files on Windows
 /// and the standard library only finds .exe

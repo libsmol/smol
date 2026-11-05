@@ -39,6 +39,12 @@ pub fn prepare(command: &mut Command) -> Mark {
     Mark(())
 }
 
+/// Like `prepare`, but the program shares this console and gets its Ctrl-C
+pub fn prepare_attached(command: &mut Command) -> Mark {
+    command.creation_flags(CREATE_SUSPENDED);
+    Mark(())
+}
+
 /// Dropping it kills every process in the job, descendants included
 pub struct Group {
     job: usize,

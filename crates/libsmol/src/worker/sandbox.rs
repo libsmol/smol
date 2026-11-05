@@ -708,7 +708,9 @@ pub(crate) mod tests {
                 .any(|known| known.eq_ignore_ascii_case(&name));
             // The worker sets VIRTUAL_ENV as it enters the venv
             let set = name.starts_with("SMOL_") || name == "VIRTUAL_ENV" || name == PIP_CACHE_ENV;
-            if !passed && !set {
+            // Windows keeps each drive's folder in names like `=C:`, which os.environ leaves out
+            let hidden = name.starts_with('=');
+            if !passed && !set && !hidden {
                 unpassed.push(name);
             }
         }

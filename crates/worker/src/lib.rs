@@ -20,8 +20,12 @@ use std::slice;
 
 mod stdlib;
 mod venv;
+#[cfg(windows)]
+mod windows;
 
 pub use crate::venv::enter;
+#[cfg(windows)]
+pub use crate::windows::program;
 
 pub const PYTHON_VERSION: &str = env!("SMOL_PYTHON_VERSION");
 
@@ -84,9 +88,24 @@ pub fn executable() -> PathBuf {
     exe
 }
 
+/// The file a worker starts from: this process's own on Linux, which an update replacing the file
+/// leaves alone. `home` matters only on Windows
+#[cfg(target_os = "linux")]
+pub fn program(_home: &Path) -> Result<PathBuf, String> {
+    Ok(PathBuf::from("/proc/self/exe"))
+}
+
+/// The file a worker starts from. `home` matters only on Windows
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn program(_home: &Path) -> Result<PathBuf, String> {
+    Ok(executable())
+}
+
 fn initialize(role: Role<'_>) {
     let exe = executable();
     stdlib::install(&exe);
+    #[cfg(windows)]
+    windows::builtins();
     let home = exe.parent().unwrap_or(Path::new("")).to_owned();
 
     let argv: Vec<OsString> = match role {
@@ -202,8 +221,20 @@ pub fn main(args: &[OsString]) -> Option<i32> {
     let named = args.first().map(Path::new).and_then(Path::file_stem);
     let named = named.and_then(OsStr::to_str).unwrap_or_default();
     // A venv links python, python3, python3.14 and 𝜋thon to this program
+    #[cfg(unix)]
     if !named.starts_with("python") && named != "𝜋thon" {
         return None;
+    }
+    // A venv's python.exe is this program too, and the interpreter runs as python314.dll,
+    // the name extension modules import CPython by
+    #[cfg(windows)]
+    {
+        if named.eq_ignore_ascii_case("python") {
+            return Some(windows::relay());
+        }
+        if !named.eq_ignore_ascii_case(windows::NAME) {
+            return None;
+        }
     }
 
     initialize(Role::Python(args));

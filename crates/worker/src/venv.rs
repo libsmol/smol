@@ -1,10 +1,9 @@
-#[cfg(unix)]
 use crate::executable;
-#[cfg(unix)]
+#[cfg(windows)]
+use crate::windows::{link, replace, same_file, sweep};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-#[cfg(unix)]
 use reaper::cause;
 use std::env;
 use std::ffi::CString;
@@ -18,8 +17,13 @@ use std::process;
 const VENV: &str = include_str!("venv.py");
 /// Held in a venv while a worker enters it
 const LOCK: &str = ".lock";
+
 /// The interpreter's link, which `venv.py` names too, since one named after libsmol would start the agent
+#[cfg(unix)]
 const LINKED: &str = "python3";
+/// The interpreter's hard link, which relays to the interpreter its pyvenv.cfg names
+#[cfg(windows)]
+const LINKED: &str = "python.exe";
 
 /// Where a venv keeps its interpreter and the scripts pip installs
 #[cfg(unix)]
@@ -53,26 +57,33 @@ pub fn enter(py: Python<'_>, venv: &Path) -> PyResult<()> {
         lock.lock().ok();
     }
 
-    // The link leads to the libsmol that made it, which may have moved since,
+    // The link leads to the libsmol that made it, which may have moved or been replaced since,
     // and venv keeps a link that is there, also one that leads nowhere
+    let linked = bin.join(LINKED);
+    let exe = executable();
     #[cfg(unix)]
-    {
-        let linked = bin.join(LINKED);
-        let exe = executable();
-        let stale = fs::read_link(&linked).is_ok_and(|target| target != exe);
-        if stale {
-            // A rename replaces it in one step, while programs of other sessions may be starting it
+    let stale = fs::read_link(&linked).is_ok_and(|target| target != exe);
+    #[cfg(windows)]
+    let stale = linked.exists() && !same_file(&linked, &exe);
+    if stale {
+        // A rename replaces it in one step, while programs of other sessions may be starting it
+        #[cfg(unix)]
+        let relinked = {
             let id = process::id();
             let aside = bin.join(format!(".{LINKED}-{id}"));
             fs::remove_file(&aside).ok();
-            let relinked = symlink(&exe, &aside).and_then(|()| fs::rename(&aside, &linked));
-            if let Err(e) = relinked {
-                let reason = cause(&e);
-                let shown = linked.display();
-                let message = format!("worker: {shown}: {reason}");
-                return Err(PyRuntimeError::new_err(message));
-            }
+            symlink(&exe, &aside).and_then(|()| fs::rename(&aside, &linked))
+        };
+        #[cfg(windows)]
+        let relinked = replace(&linked, |fresh| link(&exe, fresh));
+        if let Err(e) = relinked {
+            let reason = cause(&e);
+            let shown = linked.display();
+            let message = format!("worker: {shown}: {reason}");
+            return Err(PyRuntimeError::new_err(message));
         }
+        #[cfg(windows)]
+        sweep(&linked);
     }
 
     // `venv` writes `pyvenv.cfg` before it finishes, and pip after the interpreter.
@@ -98,12 +109,19 @@ pub fn enter(py: Python<'_>, venv: &Path) -> PyResult<()> {
         environ.set_item("PATH", joined)?;
     }
     environ.set_item("VIRTUAL_ENV", venv.as_os_str())?;
+    // They read and write UTF-8 like the worker, where Windows would give them its ANSI code page
+    #[cfg(windows)]
+    environ.set_item("PYTHONUTF8", "1")?;
 
     // PyO3 would make a path a `pathlib.Path`, where these are `str`
     let sys = py.import("sys")?;
     sys.setattr("executable", interpreter.as_os_str())?;
     // venv links a new venv to it and names the links after it
+    #[cfg(unix)]
     sys.setattr("_base_executable", interpreter.as_os_str())?;
+    // multiprocessing starts it directly, since the handles it passes would stay in the relay
+    #[cfg(windows)]
+    sys.setattr("_base_executable", exe.as_os_str())?;
     sys.setattr("prefix", venv.as_os_str())?;
     sys.setattr("exec_prefix", venv.as_os_str())?;
 

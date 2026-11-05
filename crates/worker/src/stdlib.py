@@ -63,12 +63,42 @@ def _install():
         with resources.as_file(scripts) as folder:
             self.install_scripts(context, str(folder))
 
+    # On Windows a venv's python.exe is this program too, which relays to the interpreter its pyvenv.cfg names
+    def setup_python(self, context):
+        import os
+        import shutil
+        import sys
+
+        if os.path.exists(context.env_exe):
+            return
+        try:
+            os.link(sys._base_executable, context.env_exe)
+        except OSError:
+            shutil.copyfile(sys._base_executable, context.env_exe)
+
     executed = zipimport.zipimporter.exec_module
 
     def exec_module(self, module):
         executed(self, module)
-        if self.archive == path and module.__name__ == "venv":
-            module.EnvBuilder.setup_scripts = setup_scripts
+        if self.archive != path or module.__name__ != "venv":
+            return
+        builder = module.EnvBuilder
+        builder.setup_scripts = setup_scripts
+        if module.os.name != "nt":
+            return
+
+        # venv names the interpreter after sys._base_executable, which is python314.dll here
+        directories = builder.ensure_directories
+
+        def ensure_directories(self, env_dir):
+            context = directories(self, env_dir)
+            context.python_exe = "python.exe"
+            context.env_exe = module.os.path.join(context.bin_path, "python.exe")
+            context.env_exec_cmd = context.env_exe
+            return context
+
+        builder.ensure_directories = ensure_directories
+        builder.setup_python = setup_python
 
     zipimport.zipimporter.get_resource_reader = reader
     zipimport.zipimporter.exec_module = exec_module

@@ -70,6 +70,8 @@ pub(crate) struct Workplace {
     pub(crate) copies: PathBuf,
     pub(crate) venv: Venv,
     pub(crate) sandbox: Sandbox,
+    /// The file workers start from
+    pub(crate) program: PathBuf,
     writable: Option<Vec<PathBuf>>,
 }
 
@@ -129,12 +131,15 @@ impl Workplace {
             }
         }
         let writable = sandbox.enforced().then_some(existing);
+        let home = home_of(config);
+        let program = worker::program(&home)?;
 
         Ok(Self {
             cwd,
             copies,
             venv,
             sandbox,
+            program,
             writable,
         })
     }
@@ -151,6 +156,21 @@ impl Drop for Workplace {
         // Removed only here, and only when empty, because the worker's rule is on the folder made at the start
         fs::remove_dir(&self.copies).ok();
     }
+}
+
+/// Where the interpreter's files live on Windows, which every venv's pyvenv.cfg names
+#[cfg(not(test))]
+fn home_of(config: &Path) -> PathBuf {
+    config.to_owned()
+}
+
+/// Tests share a venv, whose pyvenv.cfg must name a home that outlives each test's config folder
+#[cfg(test)]
+fn home_of(_: &Path) -> PathBuf {
+    let exe = env::current_exe().expect("test binary");
+    let deps = exe.parent().expect("deps");
+    let built = deps.parent().expect("profile");
+    built.to_owned()
 }
 
 #[cfg(test)]
