@@ -1,6 +1,5 @@
-use crate::utils::folded;
+use crate::history::VENV;
 use reaper::{cause, tilde};
-use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::env;
 use std::fs::{self, File};
@@ -9,11 +8,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::task;
 use tracing::{info, Span};
-
-/// Holds the venvs and their locks in the config directory
-const VENVS: &str = "venvs";
-/// Without long paths Windows refuses paths over 260 characters, and packages nest deep in a venv
-const MAX_NAME_CHARS: usize = 16;
 
 /// How long the venv of a directory that is gone stays unused before it is removed
 const MIN_IDLE: Duration = Duration::from_hours(7 * 24);
@@ -28,31 +22,32 @@ pub(crate) struct Venv {
 }
 
 impl Venv {
-    /// Also removes in the background the venvs of working directories that are gone,
-    /// once no session used them for `MIN_IDLE`
-    pub(crate) async fn open(config: &Path, cwd: &Path) -> Result<Self, String> {
-        let venvs = venvs_of(config);
-        let venv = venv_for(&venvs, cwd);
+    /// Also removes in the background the venvs of the projects next to `project`
+    /// whose working directories are gone, once no session used them for `MIN_IDLE`
+    pub(crate) async fn open(project: &Path, cwd: &Path) -> Result<Self, String> {
         let failed = |e: io::Error| {
             let reason = cause(&e);
-            let shown = tilde(&venvs);
+            let shown = tilde(project);
             format!("{shown}: {reason}")
         };
-        fs::create_dir_all(&venvs).map_err(failed)?;
+        fs::create_dir_all(project).map_err(failed)?;
 
         // A working directory that isn't UTF-8 can't be named, and its venv stays
         let record = cwd.to_str().unwrap_or_default();
+        let venv = venv_in(project);
         let hold = held(&venv, record).await?;
 
-        let own = lock_of(&venv);
-        let swept = venvs.clone();
-        let span = Span::current();
-        // Tokio runs every session on one thread, which removing a large venv would hold for seconds
-        let sweeping = move || {
-            let _entered = span.enter();
-            sweep_venvs(&swept, &own);
-        };
-        task::spawn_blocking(sweeping);
+        if let Some(projects) = project.parent() {
+            let projects = projects.to_owned();
+            let own = lock_of(&venv);
+            let span = Span::current();
+            // Tokio runs every session on one thread, which removing a large venv would hold for seconds
+            let sweeping = move || {
+                let _entered = span.enter();
+                sweep_venvs(&projects, &own);
+            };
+            task::spawn_blocking(sweeping);
+        }
 
         Ok(Self {
             path: venv,
@@ -62,52 +57,30 @@ impl Venv {
 }
 
 #[cfg(not(test))]
-fn venvs_of(config: &Path) -> PathBuf {
-    config.join(VENVS)
+fn venv_in(project: &Path) -> PathBuf {
+    project.join(VENV)
 }
 
-/// Tests share the venvs in the profile folder
+/// Tests share one venv in the profile folder
 #[cfg(test)]
-fn venvs_of(_: &Path) -> PathBuf {
+fn venv_in(_: &Path) -> PathBuf {
     let exe = env::current_exe().expect("test binary");
     let deps = exe.parent().expect("deps");
     let built = deps.parent().expect("profile");
-    built.join(VENVS)
+    built.join(VENV)
 }
 
-/// Named after the working directory
-#[cfg(not(test))]
-fn venv_for(venvs: &Path, cwd: &Path) -> PathBuf {
-    let name = venv_name(cwd);
-    venvs.join(name)
-}
-
-/// Tests share one venv
-#[cfg(test)]
-fn venv_for(venvs: &Path, _: &Path) -> PathBuf {
-    venvs.join("venv")
-}
-
-/// The folder's name and a hash of the whole path, both as `folded` spells them
-fn venv_name(cwd: &Path) -> String {
-    let cwd = PathBuf::from(folded(cwd));
-    let digest = Sha256::digest(cwd.as_os_str().as_encoded_bytes());
-    let digits: Vec<String> = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    let hash = digits.concat();
-    let named = cwd.file_name().unwrap_or_default().to_string_lossy();
-    let named: String = named.chars().take(MAX_NAME_CHARS).collect();
-    format!("{named}-{}", &hash[..16])
-}
-
-/// Removes the venvs of working directories that are gone, once no session used them for `MIN_IDLE`
-fn sweep_venvs(venvs: &Path, own: &Path) {
-    let Ok(entries) = fs::read_dir(venvs) else {
+/// Removes the venvs of the projects whose working directories are gone,
+/// once no session used them for `MIN_IDLE`, and then the projects left empty
+fn sweep_venvs(projects: &Path, own: &Path) {
+    let Ok(entries) = fs::read_dir(projects) else {
         return;
     };
     for entry in entries.flatten() {
-        let lock = entry.path();
-        let locking = lock.extension().is_some_and(|ext| ext == "lock");
-        if lock == own || !locking {
+        let project = entry.path();
+        let venv = project.join(VENV);
+        let lock = lock_of(&venv);
+        if lock == own {
             continue;
         }
 
@@ -132,8 +105,7 @@ fn sweep_venvs(venvs: &Path, own: &Path) {
         }
 
         // The lock goes only with the venv, or a venv left behind would have none
-        let folder = lock.with_extension("");
-        let removed = match fs::remove_dir_all(&folder) {
+        let removed = match fs::remove_dir_all(&venv) {
             Ok(()) => true,
             Err(e) => e.kind() == io::ErrorKind::NotFound,
         };
@@ -143,7 +115,8 @@ fn sweep_venvs(venvs: &Path, own: &Path) {
         // Windows removes no file that is still open
         drop(file);
         fs::remove_file(&lock).ok();
-        let shown = tilde(&folder);
+        fs::remove_dir(&project).ok();
+        let shown = tilde(&venv);
         info!("python: venv removed [path={shown}]");
     }
 }
@@ -191,16 +164,18 @@ fn lock_of(venv: &Path) -> PathBuf {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::history::VENV;
     use crate::tests::temp_dir;
     use crate::utils::block_on;
-    use crate::worker::venv::{held, lock_of, sweep_venvs, venv_name, Venv, MIN_IDLE};
+    use crate::worker::venv::{held, lock_of, sweep_venvs, Venv, MIN_IDLE};
     use std::fs::{self, File};
     use std::path::Path;
     use std::time::{Duration, SystemTime};
 
-    /// The venv tests share
+    /// The venv tests share, opened for a project in `config`
     pub(crate) fn shared_venv(config: &Path, cwd: &Path) -> Venv {
-        let opening = Venv::open(config, cwd);
+        let project = config.join("project");
+        let opening = Venv::open(&project, cwd);
         block_on(opening).expect("venv")
     }
 
@@ -214,7 +189,7 @@ pub(crate) mod tests {
     #[test]
     fn venvs_swept() {
         let config = temp_dir("venvs");
-        let venvs = config.join("venvs");
+        let projects = config.join("projects");
         let here = config.join("naïve");
         let gone = config.join("café").display().to_string();
         let now = SystemTime::now();
@@ -224,26 +199,34 @@ pub(crate) mod tests {
 
         let venvs_made = [
             ("unused", &gone, aged),
+            ("saved", &gone, aged),
             ("recent", &gone, now),
             ("present", &here, aged),
             ("held", &gone, aged),
             ("own", &gone, aged),
         ];
         for (name, record, time) in venvs_made {
-            let venv = venvs.join(name);
+            let venv = projects.join(name).join(VENV);
             fs::create_dir_all(&venv).expect("venv");
             let lock = lock_of(&venv);
             dated(&lock, record, time);
         }
-        let holding = File::open(venvs.join("held.lock")).expect("open");
+        let session = projects.join("saved").join("s1.json");
+        fs::write(session, "{}").expect("session");
+        let lock = lock_of(&projects.join("held").join(VENV));
+        let holding = File::open(lock).expect("open");
         holding.lock_shared().expect("hold");
 
-        let own = venvs.join("own.lock");
-        sweep_venvs(&venvs, &own);
+        let own = lock_of(&projects.join("own").join(VENV));
+        sweep_venvs(&projects, &own);
         let mut left: Vec<String> = Vec::new();
-        for entry in fs::read_dir(&venvs).expect("venvs").flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            left.push(name);
+        for project in fs::read_dir(&projects).expect("projects").flatten() {
+            let named = project.file_name().to_string_lossy().into_owned();
+            for entry in fs::read_dir(project.path()).expect("project").flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                left.push(format!("{named}/{name}"));
+            }
+            left.push(named);
         }
         left.sort();
         drop(holding);
@@ -251,13 +234,19 @@ pub(crate) mod tests {
 
         let expected = [
             "held",
-            "held.lock",
+            "held/.venv",
+            "held/.venv.lock",
             "own",
-            "own.lock",
+            "own/.venv",
+            "own/.venv.lock",
             "present",
-            "present.lock",
+            "present/.venv",
+            "present/.venv.lock",
             "recent",
-            "recent.lock",
+            "recent/.venv",
+            "recent/.venv.lock",
+            "saved",
+            "saved/s1.json",
         ];
         assert_eq!(left, expected);
     }
@@ -281,30 +270,5 @@ pub(crate) mod tests {
 
         drop((first, second));
         fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn venvs_named() {
-        let name = venv_name(Path::new("/home/zoë/naïve café"));
-        assert!(name.starts_with("naïve café-"), "{name}");
-        assert_eq!(name.chars().count(), "naïve café-".chars().count() + 16);
-
-        let long = "🐍".repeat(100);
-        let path = Path::new("/home").join(&long);
-        let name = venv_name(&path);
-        assert_eq!(name.chars().count(), 16 + 1 + 16, "{name}");
-        assert_ne!(
-            venv_name(Path::new("/a/work")),
-            venv_name(Path::new("/b/work"))
-        );
-        assert_eq!(
-            venv_name(Path::new("/a/./work/")),
-            venv_name(Path::new("/a/work"))
-        );
-        #[cfg(windows)]
-        assert_eq!(
-            venv_name(Path::new(r"C:\Users\Zoë\Café")),
-            venv_name(Path::new(r"c:\users\zoë\CAFÉ"))
-        );
     }
 }

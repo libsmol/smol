@@ -174,8 +174,9 @@ Run `smol` in the directory you want to work in, then type a task.
 
 `smol "<task>"` starts with a task, `smol --resume latest` resumes the last
 session and `smol --model <name>` picks the model. Sessions are saved as JSON
-under `~/.smol/history`, with copies of the images and videos the model looked
-at.
+in a folder for each working directory under `~/.smol/projects`, with copies of
+the images and videos the model looked at, and resume only in the directory
+they were started in.
 
 ### What the code can use
 
@@ -417,9 +418,10 @@ the default is `warn,libsmol=info,rmcp=off`, `SMOL_LOG=warn` keeps only problems
 ## Limitations
 
 - **The Python is smol's own CPython 3.14**, the same on every machine, in a
-  venv kept for each working directory in `~/.smol/venvs`, whose `python` is
-  `libsmol` itself. `python`, `pip` and imports resolve to that venv, not to
-  the Pythons and virtualenvs you installed, which stay on `PATH` after it.
+  venv kept for each working directory in `.venv` in its folder under
+  `~/.smol/projects`, whose `python` is `libsmol` itself. `python`, `pip` and
+  imports resolve to that venv, not to the Pythons and virtualenvs you
+  installed, which stay on `PATH` after it.
   Every session in the directory and the agents they start share the venv and
   keep what it installed, until the directory is gone and no session has used
   the venv for a week. To start over, delete it while no session in that

@@ -5,7 +5,7 @@ while the version is 0.x, a minor release may break things.
 
 Sessions are saved with a format number. A release that changes the format says so
 here; sessions saved in an older format are no longer listed and can't be resumed,
-but their files stay in `~/.smol/history` untouched.
+but their files stay in `~/.smol/projects` untouched.
 
 ## Unreleased
 
@@ -15,9 +15,13 @@ but their files stay in `~/.smol/history` untouched.
   module, and `libsmol setup` no longer installs them. On Windows `libsmol`
   writes the CPython DLL and its modules to `~/.smol/python/<version>` the
   first time it runs.
-- Venvs move to `~/.smol/venvs`, and their `python` is `libsmol` itself.
-  They start empty, so packages installed in the old venvs need installing
-  again. `~/.smol/runtime` isn't used any more and can be deleted.
+- Each working directory gets a folder in `~/.smol/projects` that holds its
+  sessions and its venv, `.venv`, whose `python` is `libsmol` itself. A
+  session resumes only in the directory it was started in; elsewhere the
+  error names that directory. Sessions in `~/.smol/history` are no longer
+  listed or resumed, and the new venvs start empty, so packages installed in
+  the old ones need installing again. `~/.smol/history` and `~/.smol/runtime`
+  aren't used any more and can be deleted.
 - The worker shows as `libsmol` in process lists.
 - smol is no longer published on crates.io. Install it with the install
   scripts or build it from a checkout.

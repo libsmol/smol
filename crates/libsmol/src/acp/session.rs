@@ -171,9 +171,9 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
 
     // Read the saved session only after locking because another process
     // saves its last step before releasing the lock
-    let lock = app.store.lock(&session)?;
+    let lock = app.store.lock(&cwd, &session)?;
     let (mut meta, memory) = match loading {
-        true => app.store.load(&session)?,
+        true => app.store.load(&cwd, &session)?,
         false => {
             let meta = SessionMeta::new(session, Settings::default());
             (meta, AgentMemory::default())
@@ -231,7 +231,7 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
     let built = models.make(&meta.settings.model)?;
     let options = options(&models, &meta.settings, &servers);
 
-    let copies = app.store.copies(&meta.id)?;
+    let copies = app.store.copies(&cwd, &meta.id)?;
     let window = built.context_window();
     let mut translator = Translator::new(
         meta.id.clone(),
@@ -242,7 +242,8 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
     );
     translator.replay(&memory);
 
-    let venv = Venv::open(&app.config, &cwd).await;
+    let project = app.store.project(&cwd);
+    let venv = Venv::open(&project, &cwd).await;
     let venv = venv.map_err(Error::Python)?;
     if inbox.is_closed() {
         return Err(Error::SessionNotFound(meta.id));
@@ -702,7 +703,7 @@ mod tests {
     use std::fs;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -797,7 +798,7 @@ mod tests {
             let (sent, output) = mpsc::unbounded_channel();
             let app = App {
                 peer: Peer::new(Out::Lines(sent)),
-                store: HistoryStore::new(dir.join("history")),
+                store: HistoryStore::new(dir),
                 config: dir.to_owned(),
             };
             let serving = serve(lines, Arc::new(app));
@@ -875,8 +876,12 @@ mod tests {
         })
     }
 
-    fn stored(dir: &Path) -> HistoryStore {
-        HistoryStore::new(dir.join("history"))
+    /// A saved session's settings in `CWD`, where the tests open sessions
+    fn here() -> Settings {
+        Settings {
+            cwd: PathBuf::from(CWD),
+            ..Settings::default()
+        }
     }
 
     #[test]
@@ -902,7 +907,8 @@ mod tests {
         };
         let (session, seen) = block_on(running);
 
-        let (meta, _) = stored(&dir).load(&session).expect("load");
+        let store = HistoryStore::new(&dir);
+        let (meta, _) = store.load(Path::new(CWD), &session).expect("load");
         assert_eq!(meta.title, "Snake game");
         assert_eq!(meta.settings.name, "Snake game");
 
@@ -951,7 +957,8 @@ mod tests {
         };
         let session = block_on(running);
 
-        let (meta, _) = stored(&dir).load(&session).expect("load");
+        let store = HistoryStore::new(&dir);
+        let (meta, _) = store.load(Path::new(CWD), &session).expect("load");
         assert_eq!(meta.title, "Make");
         fs::remove_dir_all(&dir).ok();
     }
@@ -1007,8 +1014,7 @@ mod tests {
     fn closed_while_opening() {
         let dir = temp_dir("closed-opening");
         let memory = one_task("Take a look at the café");
-        let settings = Settings::default();
-        saved(&stored(&dir), &memory, "s1", &settings);
+        saved(&HistoryStore::new(&dir), &memory, "s1", &here());
 
         let running = async {
             let mut connection = Connection::open(&dir, "http://127.0.0.1:1/v1", "");
@@ -1072,7 +1078,8 @@ mod tests {
         let stop = answer.map(|answer| &answer["result"]["stopReason"]);
         assert_eq!(stop, Some(&json!("cancelled")));
 
-        let (_, memory) = stored(&dir).load(&session).expect("load");
+        let store = HistoryStore::new(&dir);
+        let (_, memory) = store.load(Path::new(CWD), &session).expect("load");
         let mut kinds = Vec::new();
         for step in &memory.steps {
             let kind = match step {
@@ -1098,8 +1105,7 @@ mod tests {
     fn shell_saved() {
         let dir = temp_dir("shell");
         let memory = one_task("Take a look");
-        let settings = Settings::default();
-        saved(&stored(&dir), &memory, "s1", &settings);
+        saved(&HistoryStore::new(&dir), &memory, "s1", &here());
 
         // The command queues behind the session load and is replied to only after it runs
         let running = async {
@@ -1118,7 +1124,8 @@ mod tests {
         assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
         let marked = |message: &Value| message["params"]["update"]["_meta"]["_smol/shell"] == true;
         assert!(seen.iter().any(marked), "{seen:?}");
-        let (_, saved) = stored(&dir).load("s1").expect("load");
+        let store = HistoryStore::new(&dir);
+        let (_, saved) = store.load(Path::new(CWD), "s1").expect("load");
         let Some(MemoryStep::Shell(ran)) = saved.steps.last() else {
             panic!("{:?}", saved.steps);
         };
@@ -1139,11 +1146,10 @@ mod tests {
             MemoryStep::Restarted,
             MemoryStep::Action(Box::new(answered)),
         ]);
-        let store = stored(&dir);
-        let settings = Settings::default();
+        let store = HistoryStore::new(&dir);
         for (session, steps) in [("s1", unrestarted), ("s2", restarted)] {
             let memory = AgentMemory { steps };
-            saved(&store, &memory, session, &settings);
+            saved(&store, &memory, session, &here());
         }
 
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1327,9 +1333,9 @@ mod tests {
         };
         let settings = Settings {
             model: "mock/old-model".to_owned(),
-            ..Settings::default()
+            ..here()
         };
-        saved(&stored(&dir), &memory, "s1", &settings);
+        saved(&HistoryStore::new(&dir), &memory, "s1", &settings);
 
         let running = async {
             let mut connection = Connection::open(&dir, "http://127.0.0.1:1/v1", "");

@@ -7,7 +7,7 @@ use crate::config;
 use crate::config::setup::SETUP_ARG;
 use crate::history::HistoryStore;
 use crate::tools::memories::{Kept, Memories};
-use crate::utils::{block_on, folded, new_id, Interrupt};
+use crate::utils::{block_on, new_id, Interrupt};
 use crate::worker::sandbox;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
@@ -99,7 +99,7 @@ pub fn run() -> Result<()> {
 
     let app = App {
         peer: Peer::new(Out::Stdout),
-        store: HistoryStore::new(dir.join("history")),
+        store: HistoryStore::new(&dir),
         config: dir,
     };
 
@@ -323,13 +323,8 @@ impl Router {
             }
             m if m == names.session_list => {
                 let request: ListSessionsRequest = parsed(params)?;
-                let wanted = request.cwd.as_deref().map(folded);
                 let mut sessions = Vec::new();
-                for meta in self.app.store.list()? {
-                    let cwd = folded(&meta.settings.cwd);
-                    if wanted.as_ref().is_some_and(|wanted| *wanted != cwd) {
-                        continue;
-                    }
+                for meta in self.app.store.list(request.cwd.as_deref())? {
                     let updated = rfc3339(meta.updated_at);
                     let info = SessionInfo::new(meta.id, meta.settings.cwd)
                         .title(meta.title)
@@ -429,12 +424,17 @@ impl Router {
             return Err(Error::InvalidParams(message));
         }
 
-        // An unreadable config must not close the open session with the same id
+        // An unreadable config, or a session saved for another directory,
+        // must not close the open session with the same id
         let models = config::models(&self.app.config);
         let agent = config::agent(&self.app.config);
-        let (models, (servers, access)) = match (models, agent) {
-            (Ok(models), Ok(agent)) => (models, agent),
-            (Err(error), _) | (_, Err(error)) => {
+        let located = match loading {
+            true => self.app.store.locate(&cwd, &session),
+            false => Ok(()),
+        };
+        let (models, (servers, access)) = match (models, agent, located) {
+            (Ok(models), Ok(agent), Ok(())) => (models, agent),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                 error!("session: open failed, {error}");
                 return Err(error);
             }
@@ -580,6 +580,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::fs;
+    use std::future;
     use std::path::Path;
     #[cfg(windows)]
     use std::path::PathBuf;
@@ -593,7 +594,7 @@ mod tests {
         let (lines, sent) = mpsc::unbounded_channel();
         let app = App {
             peer: Peer::new(Out::Lines(lines)),
-            store: HistoryStore::new(dir.to_owned()),
+            store: HistoryStore::new(dir),
             config: dir.to_owned(),
         };
         let router = Router {
@@ -664,11 +665,17 @@ mod tests {
 
         let loading = async {
             // The old task saves a readable session only after it is cancelled
-            fs::write(dir.join("s1.json"), "half saved").expect("write");
+            let project = app.store.project(&dir);
+            fs::create_dir_all(&project).expect("project");
+            fs::write(project.join("s1.json"), "half saved").expect("write");
             let saving = Arc::clone(&app);
+            let cwd = dir.clone();
             let old = task::spawn(async move {
                 time::sleep(Duration::from_millis(200)).await;
-                let settings = Settings::default();
+                let settings = Settings {
+                    cwd,
+                    ..Settings::default()
+                };
                 saved(&saving.store, &memory, "s1", &settings);
             });
             let (sender, _inbox) = mpsc::unbounded_channel();
@@ -725,7 +732,13 @@ mod tests {
         let model = "[model.mock]\ntype = \"openai-completions\"\napi = \"http://127.0.0.1:1/v1\"\nmodels = [{ id = \"m1\" }]\n";
         fs::create_dir_all(&dir).expect("dir");
         fs::write(dir.join("model.toml"), model).expect("model.toml");
-        let held = router.app.store.lock("s1").expect("lock");
+        let memory = one_task("Count the orders");
+        let settings = Settings {
+            cwd: dir.clone(),
+            ..Settings::default()
+        };
+        saved(&router.app.store, &memory, "s1", &settings);
+        let held = router.app.store.lock(&dir, "s1").expect("lock");
 
         let answering = async {
             // The open locks only after the old session ends, so the prompt is queued before the lock fails
@@ -782,6 +795,47 @@ mod tests {
         assert_eq!(answers[0]["result"]["stopReason"], "cancelled");
         let refused = answers[1]["error"]["message"].as_str().unwrap_or_default();
         assert!(refused.contains("open in another process"), "{answers:?}");
+    }
+
+    /// A load from another directory is refused before it closes the open session
+    #[test]
+    fn other_cwd_kept() {
+        let dir = temp_dir("other-cwd");
+        let (mut router, _sent) = router(&dir);
+        let model = "[model.mock]\ntype = \"openai-completions\"\napi = \"http://127.0.0.1:1/v1\"\nmodels = [{ id = \"m1\" }]\n";
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("model.toml"), model).expect("model.toml");
+        let memory = one_task("Fix the café menu");
+        let settings = Settings {
+            cwd: dir.join("naïve"),
+            ..Settings::default()
+        };
+        saved(&router.app.store, &memory, "s1", &settings);
+        let interrupt = Interrupt::default();
+
+        let loading = async {
+            let running = future::pending::<()>();
+            let (sender, _inbox) = mpsc::unbounded_channel();
+            let opened = Handle {
+                sender,
+                interrupt: interrupt.clone(),
+                enqueued: Arc::default(),
+                received: 0,
+                span: Span::none(),
+                task: task::spawn(running),
+                memories: Memories::new(&dir, &dir),
+            };
+            router.sessions.insert("s1".to_owned(), opened);
+
+            let params = json!({"sessionId": "s1", "cwd": dir, "mcpServers": []});
+            router.request(&json!(1), "session/load", params)
+        };
+        let refused = block_on(loading).expect_err("elsewhere").to_string();
+        fs::remove_dir_all(&dir).ok();
+
+        assert!(refused.contains(": belongs to "), "{refused}");
+        assert!(router.sessions.contains_key("s1"));
+        assert!(!interrupt.cancelled(0));
     }
 
     #[test]
