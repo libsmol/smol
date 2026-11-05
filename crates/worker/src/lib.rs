@@ -105,7 +105,7 @@ fn initialize(role: Role<'_>) {
     let exe = executable();
     stdlib::install(&exe);
     #[cfg(windows)]
-    windows::builtins();
+    windows::prepare();
     let home = exe.parent().unwrap_or(Path::new("")).to_owned();
 
     let argv: Vec<OsString> = match role {
@@ -215,8 +215,8 @@ fn initialize(role: Role<'_>) {
     Python::attach(stdlib::adapt);
 }
 
-/// Runs as the python command line when started by a name a venv gives its interpreter,
-/// with `args` its own name first, and returns its exit status
+/// Runs as the python command line when started under the interpreter's name, or on Windows
+/// as the relay a venv's python.exe is, with `args` its own name first, and returns its exit status
 pub fn main(args: &[OsString]) -> Option<i32> {
     let named = args.first().map(Path::new).and_then(Path::file_stem);
     let named = named.and_then(OsStr::to_str).unwrap_or_default();

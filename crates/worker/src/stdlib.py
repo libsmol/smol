@@ -74,7 +74,8 @@ def _install():
         try:
             os.link(sys._base_executable, context.env_exe)
         except OSError:
-            shutil.copyfile(sys._base_executable, context.env_exe)
+            # Kept current by its size and the time it was written, which copy2 keeps
+            shutil.copy2(sys._base_executable, context.env_exe)
 
     executed = zipimport.zipimporter.exec_module
 

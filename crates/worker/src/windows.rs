@@ -39,8 +39,8 @@ unsafe extern "C" {
     static mut PyWin_DLLhModule: HMODULE;
 }
 
-/// Must run before the interpreter starts
-pub(crate) fn builtins() {
+/// Builds in the extension modules CPython's own table leaves out, before the interpreter starts
+pub(crate) fn prepare() {
     // SAFETY: Runs once, before the interpreter starts and with no other thread in it
     unsafe {
         PyWin_DLLhModule = GetModuleHandleW(ptr::null());
@@ -211,8 +211,9 @@ pub(crate) fn replace(path: &Path, make: impl FnOnce(&Path) -> io::Result<()>) -
     fs::rename(&fresh, path)
 }
 
-/// Removes what `replace` moved aside from `path`, except the files still running,
-/// which a later call finds unused
+/// Removes what `replace` left beside `path`: the files it moved aside, except those still running,
+/// which a later call finds unused, and one it was making when its process ended.
+/// The caller holds the lock `replace` runs under
 pub(crate) fn sweep(path: &Path) {
     let Some(folder) = path.parent() else {
         return;
@@ -224,7 +225,8 @@ pub(crate) fn sweep(path: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && name.ends_with(".old") {
+        let left = name.ends_with(".old") || name.ends_with(".new");
+        if name.starts_with(&prefix) && left {
             fs::remove_file(entry.path()).ok();
         }
     }

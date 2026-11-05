@@ -196,6 +196,9 @@ fn main() {
         // Extensions ask for the import libraries of the DLLs they were built for, which this image replaces
         arguments.push(format!("/NODEFAULTLIB:{dll}.lib"));
         arguments.push("/NODEFAULTLIB:python3.lib".to_owned());
+        // Quiets a warning for each object, which would bury a real error: pbs ships no PDB for them (4099),
+        // and they and PyO3 import from the DLL what this image defines (4217, 4286)
+        arguments.push("/IGNORE:4099,4217,4286".to_owned());
 
         let mut table = String::from("unsafe extern \"C\" {\n");
         for (_, init) in &modules {

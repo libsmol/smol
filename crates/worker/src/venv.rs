@@ -74,6 +74,7 @@ pub fn enter(py: Python<'_>, venv: &Path) -> PyResult<()> {
             fs::remove_file(&aside).ok();
             symlink(&exe, &aside).and_then(|()| fs::rename(&aside, &linked))
         };
+        // The one there may be running, which Windows moves aside but doesn't replace
         #[cfg(windows)]
         let relinked = replace(&linked, |fresh| link(&exe, fresh));
         if let Err(e) = relinked {
@@ -82,9 +83,9 @@ pub fn enter(py: Python<'_>, venv: &Path) -> PyResult<()> {
             let message = format!("worker: {shown}: {reason}");
             return Err(PyRuntimeError::new_err(message));
         }
-        #[cfg(windows)]
-        sweep(&linked);
     }
+    #[cfg(windows)]
+    sweep(&linked);
 
     // `venv` writes `pyvenv.cfg` before it finishes, and pip after the interpreter.
     // Links are followed, since `python` leads to libsmol through `python3`
