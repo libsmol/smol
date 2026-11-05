@@ -436,7 +436,7 @@ the default is `warn,libsmol=info,rmcp=off`, `SMOL_LOG=warn` keeps only problems
   install unless long paths are turned on (`LongPathsEnabled` in the registry).
 - **Interrupting** stops code in place, and the session keeps its variables.
   Code blocked where an interrupt cannot reach it (for example `os.system`, a
-  long call inside a C extension, or most blocking calls on Windows) gets 3
+  long call inside a C extension, or reading a pipe or socket on Windows) gets 3
   seconds, then the Python process is restarted and its variables are lost.
   The model is told when that happens.
 - **Only OpenAI-compatible chat completions endpoints** are supported for now.

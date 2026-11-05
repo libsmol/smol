@@ -24,6 +24,10 @@ but their files stay in `~/.smol/projects` untouched.
   the old ones need installing again. `~/.smol/history` and `~/.smol/runtime`
   aren't used any more and can be deleted.
 - The worker shows as `libsmol` in process lists.
+- On Windows an interrupt wakes code in `time.sleep`, waits on locks, events
+  and queues, `Thread.join` and `subprocess.run`, as Ctrl-C does, and the
+  session keeps its variables. Such code used to run on for 3 seconds until
+  Python was restarted.
 - smol is no longer published on crates.io. Install it with the install
   scripts or build it from a checkout.
 

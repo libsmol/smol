@@ -10,8 +10,6 @@ use crate::worker::{
     WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, WORKER_ARG,
 };
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
-#[cfg(windows)]
-use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyDict};
 use reaper::cause;
@@ -266,10 +264,11 @@ fn interrupt() {
     unsafe { libc::pthread_kill(main, libc::SIGINT) };
 }
 
+/// Like Ctrl-C, it also wakes CPython's own waits, which the interrupt flag alone leaves asleep
 #[cfg(windows)]
 fn interrupt() {
-    // SAFETY: Python allows it from any thread without the GIL, and SIGINT is 2 on Windows too
-    unsafe { ffi::PyErr_SetInterruptEx(2) };
+    // SAFETY: The C runtime runs Python's handler on this thread, which only sets flags and an event
+    unsafe { libc::raise(libc::SIGINT) };
 }
 
 /// Marks the end of the output on `output`, the worker's own copy of the pipe the code writes to
