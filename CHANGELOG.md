@@ -12,9 +12,10 @@ but their files stay in `~/.smol/projects` untouched.
 - The Python is inside `libsmol`: CPython 3.14 is linked in with its
   standard library, which is read from memory, so a release is only `smol`
   and `libsmol`. Opening a session no longer downloads a runtime or a worker
-  module, and `libsmol setup` no longer installs them. On Windows `libsmol`
-  writes the CPython DLL and its modules to `~/.smol/python/<version>` the
-  first time it runs.
+  module, and `libsmol setup` no longer installs them. On Windows, where
+  packages' extension modules find CPython by the name `python314.dll`,
+  `libsmol` keeps a hard link to itself by that name in `~/.smol`, with
+  `python3.dll` beside it, and a venv's `python.exe` is a hard link too.
 - Each working directory gets a folder in `~/.smol/projects` that holds its
   sessions and its venv, `.venv`, whose `python` is `libsmol` itself. A
   session resumes only in the directory it was started in; elsewhere the

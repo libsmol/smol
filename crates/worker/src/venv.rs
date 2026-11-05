@@ -1,6 +1,6 @@
 use crate::executable;
 #[cfg(windows)]
-use crate::windows::{link, replace, same_file, sweep};
+use crate::windows::{link, replace, same_build, sweep};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -64,7 +64,7 @@ pub fn enter(py: Python<'_>, venv: &Path) -> PyResult<()> {
     #[cfg(unix)]
     let stale = fs::read_link(&linked).is_ok_and(|target| target != exe);
     #[cfg(windows)]
-    let stale = linked.exists() && !same_file(&linked, &exe);
+    let stale = linked.exists() && !same_build(&linked, &exe);
     if stale {
         // A rename replaces it in one step, while programs of other sessions may be starting it
         #[cfg(unix)]

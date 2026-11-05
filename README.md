@@ -77,16 +77,20 @@ and Windows (x86_64).
 
 To build from a checkout, run `./build.sh` (`build.ps1` on Windows). The first
 build downloads the CPython that `libsmol` links, about 100 MB, and keeps it in
-`target/pbs`.
+`target/pbs`. On Windows the build needs the Visual Studio 2022 Build Tools
+(MSVC 14.44 or later) and [Strawberry Perl](https://strawberryperl.com) for
+OpenSSL; set `OPENSSL_SRC_PERL` to its `perl.exe` when another Perl, such as
+Git's, comes first on `PATH`.
 
 The Python the code runs in is inside `libsmol`: CPython 3.14 from
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone),
 linked in with its standard library, so a session opens without downloading
-anything. On Windows `libsmol` writes the CPython DLL, its extension modules
-and its standard library to `~/.smol/python/<version>` the first time it
-runs, since Windows loads a DLL only from a file. A venv holds packages built
-for one operating system and architecture, so machines of different kinds that
-share a home folder each need their own `SMOL_CONFIG_DIR`.
+anything. On Windows the extension modules of packages find CPython by the
+name `python314.dll`, so `libsmol` keeps a hard link to itself by that name in
+`~/.smol`, with the small `python3.dll` beside it, and runs Python from there.
+A venv holds packages built for one operating system and architecture, so
+machines of different kinds that share a home folder each need their own
+`SMOL_CONFIG_DIR`.
 
 ## Configure a model
 

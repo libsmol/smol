@@ -4,6 +4,10 @@
 HMODULE PyWin_DLLhModule = NULL;
 const char *PyWin_DLLVersionString = SMOL_WINVER;
 
+/* _ssl was built against an OpenSSL with compression, while this one has none,
+   so SSL_get_current_compression returns NULL and _ssl never calls this */
+int COMP_get_type(const void *method) { return 0; }
+
 /* _ctypes was built against libffi's DLL, so it reaches each function and type through __imp_ */
 #define FUNCTION(name) extern int name(); void *__imp_##name = (void *)name;
 #define TYPE(name) extern char ffi_type_##name; void *__imp_ffi_type_##name = &ffi_type_##name;

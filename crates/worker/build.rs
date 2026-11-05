@@ -45,7 +45,7 @@ const BUILDS: [(&str, &str, &str); 5] = [
 const EMPTY_ZIP: [u8; 22] = [
     0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
-/// The extension modules `inittab.rs` lists, of which a target without a build has none
+/// The `inittab.rs` of a target whose CPython builds every extension module in, or that has none
 const NO_MODULES: &str =
     "pub(crate) static MODULES: &[(&std::ffi::CStr, unsafe extern \"C\" fn() -> *mut pyo3::ffi::PyObject)] = &[];\n";
 
@@ -59,14 +59,14 @@ fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let windows = target.contains("windows");
     let (minor, _) = VERSION.rsplit_once('.').expect("version");
-    let name = format!("python{}", minor.replace('.', ""));
+    let dll = format!("python{}", minor.replace('.', ""));
 
     let zip = out.join("stdlib.zip");
     let inittab = out.join("inittab.rs");
     let mut forwarder = out.join("python3.dll");
     println!("cargo:rustc-env=SMOL_STDLIB={}", zip.display());
     println!("cargo:rustc-env=SMOL_PYTHON_VERSION={VERSION}");
-    println!("cargo:rustc-env=SMOL_PYTHON_NAME={name}");
+    println!("cargo:rustc-env=SMOL_PYTHON_NAME={dll}");
 
     // Checking a target without a build, as clippy does for windows-gnu, needs no CPython
     let built = BUILDS.iter().find(|(name, ..)| *name == target);
@@ -179,8 +179,8 @@ fn main() {
         }
         // The official build gets the last two from its project defaults, which PYTHON.json leaves out
         let listed = core["links"].as_array().into_iter().flatten();
-        let named = listed.map(|link| link["name"].as_str().expect("link name"));
-        for library in named.chain(["advapi32", "bcrypt"]) {
+        let libraries = listed.map(|link| link["name"].as_str().expect("link name"));
+        for library in libraries.chain(["advapi32", "bcrypt"]) {
             let library = library.to_owned();
             if !systems.contains(&(library.clone(), false)) {
                 systems.push((library, false));
@@ -194,7 +194,7 @@ fn main() {
         // pbs builds LTCG objects on Windows, which only MSVC's linker reads
         arguments.push("/LTCG".to_owned());
         // Extensions ask for the import libraries of the DLLs they were built for, which this image replaces
-        arguments.push(format!("/NODEFAULTLIB:{name}.lib"));
+        arguments.push(format!("/NODEFAULTLIB:{dll}.lib"));
         arguments.push("/NODEFAULTLIB:python3.lib".to_owned());
 
         let mut table = String::from("unsafe extern \"C\" {\n");

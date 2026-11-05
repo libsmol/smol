@@ -4,9 +4,7 @@ use reaper::{cause, tilde, Group};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
-use std::mem;
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -15,9 +13,6 @@ use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::HMODULE;
-use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-};
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::Environment::GetCommandLineW;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -77,7 +72,7 @@ pub fn program(home: &Path) -> Result<PathBuf, String> {
 
     let program = home.join(format!("{NAME}.dll"));
     let exe = executable();
-    if !same_file(&program, &exe) {
+    if !same_build(&program, &exe) {
         let replaced = replace(&program, |fresh| link(&exe, fresh));
         replaced.map_err(|e| failed(&program, e))?;
     }
@@ -174,23 +169,16 @@ unsafe extern "system" fn handled(_: u32) -> BOOL {
     1
 }
 
-/// Whether both paths name the same file, as hard links do
-pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
-    let identity = |path: &Path| {
-        let file = File::open(path).ok()?;
-        // SAFETY: The struct is plain data, which the call fills in
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { mem::zeroed() };
-        // SAFETY: The handle stays open for the call
-        let got = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
-        let found = (
-            info.dwVolumeSerialNumber,
-            info.nFileIndexHigh,
-            info.nFileIndexLow,
-        );
-        (got != 0).then_some(found)
+/// Whether `a` is the build `b` is: a hard link to it, or a copy made across volumes,
+/// which keeps its size and the time it was last written
+pub(crate) fn same_build(a: &Path, b: &Path) -> bool {
+    let stamp = |path: &Path| {
+        let found = fs::metadata(path).ok()?;
+        let written = found.modified().ok()?;
+        Some((found.len(), written))
     };
-    let known = identity(a);
-    known.is_some() && known == identity(b)
+    let known = stamp(a);
+    known.is_some() && known == stamp(b)
 }
 
 /// A hard link, or a copy when the folders are on different volumes

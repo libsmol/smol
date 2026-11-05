@@ -48,6 +48,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about
+      # The static OpenSSL builds with a native Perl, and Git's on PATH lacks modules it uses
+      - if: runner.os == 'Windows'
+        run: echo "OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe" >> $env:GITHUB_ENV
       # The Intel build runs on the Apple silicon runner through Rosetta, also the python that
       # crates/worker compiles the stdlib with
       - name: Install Rosetta
@@ -62,10 +65,10 @@ jobs:
         shell: bash
         run: |
           case "${{ matrix.target }}" in
-            *windows*) built=libsmol.exe python=python.exe scripts=Scripts ;;
+            *windows*) built=libsmol.exe python=python314.dll scripts=Scripts ;;
             *) built=libsmol python=python3 scripts=bin ;;
           esac
-          # Started under another name, libsmol runs as python
+          # Started under the interpreter's name, libsmol runs as python
           check="$RUNNER_TEMP/check"
           mkdir -p "$check"
           cp "target/${{ matrix.target }}/release/$built" "$check/$python"
