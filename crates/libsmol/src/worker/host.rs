@@ -1451,7 +1451,12 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(output.error, None, "{}", output.logs);
-        assert_eq!(output.logs, "True True True\n0 True\n");
+        // venv warns first when the path has short names, as the CI runner's TEMP does
+        assert!(
+            output.logs.ends_with("True True True\n0 True\n"),
+            "{}",
+            output.logs
+        );
     }
 
     /// Extension modules reach the interpreter by the names python314.dll and python3.dll,
