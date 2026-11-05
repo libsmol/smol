@@ -345,7 +345,19 @@ fn main() {
         // GNU ld looks up an archive only for what the files before it left undefined,
         // and the libraries don't come in that order, so Linux links with lld as well
         match target.contains("apple") {
-            true => arguments.push("-Wl,-export_dynamic".to_owned()),
+            true => {
+                arguments.push("-Wl,-export_dynamic".to_owned());
+                // The objects check the macOS version through compiler-rt, which rustc's -nodefaultlibs
+                // leaves out. std defines the same function, but a release's LTO drops it as unused
+                let printed = Command::new("cc").arg("-print-resource-dir").output();
+                let printed = printed.expect("cc");
+                let resources = String::from_utf8(printed.stdout).expect("resource dir");
+                let runtime = Path::new(resources.trim()).join("lib/darwin/libclang_rt.osx.a");
+                if !runtime.exists() {
+                    panic!("{}: not found", runtime.display());
+                }
+                arguments.push(runtime.display().to_string());
+            }
             false => {
                 let tools =
                     Path::new(sysroot.trim()).join(format!("lib/rustlib/{host}/bin/gcc-ld"));
