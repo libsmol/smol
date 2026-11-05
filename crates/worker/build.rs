@@ -232,17 +232,6 @@ fn main() {
         fs::remove_file(folder.join("pycore.dylib")).ok();
         fs::rename(&partial, &native).expect("pycore");
     }
-    let archived = File::create(out.join("libpycore.a")).expect("pycore");
-    let mut builder = ar::Builder::new(archived);
-    let objects = fs::read_dir(&native).expect("pycore");
-    for object in objects {
-        let object = object.expect("pycore").path();
-        builder.append_path(&object).expect("pycore");
-    }
-    drop(builder);
-    // Every C API function stays, which extension modules that pip installs look up at load time.
-    // Kept whole, since this archive has no symbol table to pull its member by
-    println!("cargo:rustc-link-lib=static:+whole-archive=pycore");
     for (name, framework) in systems {
         let kind = match framework {
             true => "framework",
@@ -254,7 +243,7 @@ fn main() {
     // GNU ld looks up an archive only for what the files before it left undefined,
     // and the libraries don't come in that order, so Linux links with lld as well.
     // A dependency's link arguments don't reach a binary, so libsmol's build script repeats them
-    let arguments = match target.contains("apple") {
+    let mut arguments = match target.contains("apple") {
         true => vec!["-Wl,-export_dynamic".to_owned()],
         false => {
             let tools = Path::new(sysroot.trim()).join(format!("lib/rustlib/{host}/bin/gcc-ld"));
@@ -266,13 +255,21 @@ fn main() {
             ]
         }
     };
+    // Objects link whole, keeping every C API function that extension modules pip installs
+    // look up at load time. In an archive Apple's linker takes them only 8-byte aligned
+    let objects = fs::read_dir(&native).expect("pycore");
+    for object in objects {
+        let object = object.expect("pycore").path();
+        arguments.push(object.display().to_string());
+    }
     for argument in &arguments {
         println!("cargo:rustc-link-arg={argument}");
     }
     println!("cargo:link_args={}", arguments.join(";"));
 
-    let interpreter = python.join("install/bin/python3.14");
-    let stdlib = python.join("install/lib/python3.14");
+    let (minor, _) = VERSION.rsplit_once('.').expect("version");
+    let interpreter = python.join(format!("install/bin/python{minor}"));
+    let stdlib = python.join(format!("install/lib/python{minor}"));
     let manifest = env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir");
     let packing = Path::new(&manifest).join("pack.py");
     // The target's own python compiles the stdlib, which another host runs only through emulation

@@ -441,10 +441,9 @@ fn root_cause(top: &(dyn error::Error + 'static), closed: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::config::{McpConfig, McpKind};
-    use crate::tests::temp_dir;
+    use crate::tests::{interpreter, temp_dir};
     use crate::tools::mcp::{connect, Link, Server};
     use crate::utils::block_on;
-    use crate::worker::venv::tests::interpreter;
     use serde_json::{json, Map, Value};
     use std::collections::BTreeMap;
     use std::fs;

@@ -187,8 +187,7 @@ impl Worker {
             return Ok(());
         }
 
-        // libsmol's own executable, which the code can't write, unlike the venv's python.
-        // On Linux it is the file this process runs, also once an update replaced it
+        // The worker is libsmol's own executable, which the code can't write, unlike the venv's python
         let exe = worker::executable();
         let Workplace {
             cwd,
@@ -197,9 +196,10 @@ impl Worker {
             sandbox,
             ..
         } = &*self.workplace;
+        // The file this process runs, also once an update replaced the one at `exe`
         #[cfg(target_os = "linux")]
         let mut command = sandbox.command(Path::new("/proc/self/exe"), cwd);
-        // Process lists would show the worker as `/proc/self/exe`
+        // Process lists would show it as `/proc/self/exe`
         #[cfg(target_os = "linux")]
         command.arg0(&exe);
         #[cfg(not(target_os = "linux"))]

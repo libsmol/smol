@@ -242,7 +242,6 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
     );
     translator.replay(&memory);
 
-    // The sandbox grants the venv by the folder that exists when it is made
     let venv = Venv::open(&app.config, &cwd).await;
     let venv = venv.map_err(Error::Python)?;
     if inbox.is_closed() {
@@ -692,11 +691,10 @@ mod tests {
     use crate::prompt::{NAMER, RESTARTED};
     use crate::steps::tests::{asked, coded, one_task, replied};
     use crate::steps::{AgentMemory, MemoryStep};
-    use crate::tests::temp_dir;
+    use crate::tests::{interpreter, temp_dir};
     use crate::tools::mcp::tests::SCRIPT;
     use crate::tools::memories::Memories;
     use crate::utils::block_on;
-    use crate::worker::venv::tests::interpreter;
     use crate::worker::MemoryCall;
     use crate::Error;
     use reaper::tilde;

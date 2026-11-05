@@ -18,9 +18,11 @@ mod worker;
 pub use crate::acp::run;
 pub use crate::config::setup::{run as setup, SETUP_ARG};
 
-/// Runs as a session's worker when started as one with `args`, and returns its exit status
-pub fn run_worker(args: &[OsString]) -> Option<i32> {
-    guest::main(args)
+/// Runs as a venv's python or as a session's worker when started as one with `args`,
+/// and returns its exit status
+pub fn embedded(args: &[OsString]) -> Option<i32> {
+    // The worker crate, which the worker module shadows here
+    ::worker::main(args).or_else(|| guest::main(args))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +74,8 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::ops::{Deref, DerefMut};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
     use std::process;
     use std::thread;
@@ -81,10 +85,41 @@ mod tests {
     #[ctor::ctor]
     fn divert() {
         let args: Vec<OsString> = env::args_os().collect();
-        let embedded = worker::main(&args).or_else(|| crate::run_worker(&args));
-        if let Some(status) = embedded {
+        if let Some(status) = crate::embedded(&args) {
             process::exit(status);
         }
+    }
+
+    /// The test binary as python, for programs tests start outside the sandbox.
+    /// Tests run in parallel, so a stale link is replaced by a rename
+    #[cfg(unix)]
+    pub(crate) fn interpreter() -> PathBuf {
+        let exe = env::current_exe().expect("test binary");
+        let deps = exe.parent().expect("deps");
+        let linked = deps.join("python3");
+        if fs::read_link(&linked).ok().as_ref() != Some(&exe) {
+            let id = new_id();
+            let aside = deps.join(format!(".python3-{id}"));
+            symlink(&exe, &aside).expect("link");
+            fs::rename(&aside, &linked).expect("link");
+        }
+        linked
+    }
+
+    /// Windows makes links only with a privilege, so the test binary is linked hard or copied
+    #[cfg(windows)]
+    pub(crate) fn interpreter() -> PathBuf {
+        let exe = env::current_exe().expect("test binary");
+        let deps = exe.parent().expect("deps");
+        let named = deps.join("python3.exe");
+        let id = new_id();
+        let aside = deps.join(format!(".python3-{id}.exe"));
+        if fs::hard_link(&exe, &aside).is_err() {
+            fs::copy(&exe, &aside).expect("copy");
+        }
+        // Another test may be running the one already there
+        fs::rename(&aside, &named).ok();
+        named
     }
 
     pub(crate) fn temp_dir(name: &str) -> PathBuf {

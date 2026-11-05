@@ -46,7 +46,7 @@ static RUNNING: Mutex<Option<u64>> = Mutex::new(None);
 #[cfg(unix)]
 static MAIN: AtomicUsize = AtomicUsize::new(0);
 
-/// Runs as a session's worker when started as one, and returns its exit status
+/// Runs as a session's worker when started as one with `args`, and returns its exit status
 pub(crate) fn main(args: &[OsString]) -> Option<i32> {
     let [_, flag, venv] = args else {
         return None;

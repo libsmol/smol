@@ -5,9 +5,7 @@ use std::process::{self, ExitCode};
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().collect();
-    // A venv's python and a session's worker are libsmol too
-    let embedded = worker::main(&args).or_else(|| libsmol::run_worker(&args));
-    if let Some(status) = embedded {
+    if let Some(status) = libsmol::embedded(&args) {
         process::exit(status);
     }
 

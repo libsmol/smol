@@ -40,12 +40,12 @@ const HANDED_BACK: &str = "Only your answer is returned to the agent that assign
 /// Errors of `agent()` and its handles go unlabeled, as the worker labels them with the function
 /// the code called
 pub(crate) const NESTED: &str = "not available to agents started by agent()";
-pub(crate) const NO_AGENT: &str = "no such agent";
+pub const NO_AGENT: &str = "no such agent";
 /// Also what the user sees for an agent that is aborted before it ends
 pub(crate) const UNFINISHED: &str = "stopped before it answered";
 pub(crate) const STOPPED_BY_CODE: &str = "stopped by stop()";
 /// The worker puts it in the docs of `Agent.wait` and `Agent.stop`
-pub(crate) const DONE: &str = "Agent done";
+pub const DONE: &str = "Agent done";
 
 pub(crate) fn unknown_role(name: &str, roles: &[Role]) -> String {
     let names: Vec<&str> = roles.iter().map(|role| role.name.as_str()).collect();
@@ -98,7 +98,7 @@ pub(crate) fn done(agents: &[String]) -> String {
 }
 
 /// Errors of `remember()` and `forget()` go unlabeled too, as the worker labels them with the function
-pub(crate) const NO_MEMORY: &str = "no such memory";
+pub const NO_MEMORY: &str = "no such memory";
 pub(crate) const EMPTY_MEMORY: &str = "text is empty";
 
 pub(crate) fn long_memory(count: usize) -> String {
@@ -592,10 +592,10 @@ pub(crate) fn unstarted(said: &str) -> String {
     }
 }
 
-/// A worker greeted with `version` after an update replaced libsmol
+/// A worker greeted with `version` after an update replaced libsmol, which only a new libsmol fixes
 pub(crate) fn replaced(version: &str) -> String {
     let own = env!("CARGO_PKG_VERSION");
-    format!("libsmol {version} replaced {own}, reopen the session")
+    format!("libsmol {version} replaced {own}, restart libsmol")
 }
 
 /// Errors from MCP functions, which the Python side prefixes with `server.function:`
@@ -634,11 +634,11 @@ pub(crate) fn unattached(reason: &str) -> String {
     format!("[not attached: {reason}]")
 }
 
-pub(crate) fn unserializable(key: &str, kind: &str) -> String {
+pub fn unserializable(key: &str, kind: &str) -> String {
     format!("{key}: {kind} is not JSON-serializable")
 }
 
-pub(crate) const SURROGATE: &str = "a str holds a lone surrogate, which isn't valid Unicode";
+pub const SURROGATE: &str = "a str holds a lone surrogate, which isn't valid Unicode";
 
 pub(crate) fn failure(label: &str, object: &str, reason: &str) -> String {
     format!("{label}: {object}: {reason}")

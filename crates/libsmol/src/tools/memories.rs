@@ -15,9 +15,9 @@ use tracing::info;
 const DB: &str = "memory.db";
 
 /// The worker puts it in the docs of `remember()`
-pub(crate) const MAX_MEMORY_CHARS: usize = 300;
+pub const MAX_MEMORY_CHARS: usize = 300;
 /// SQLite takes integers as `i64`, and the worker puts it in the docs of `recall()`
-pub(crate) const MAX_RECALLED: i64 = 10;
+pub const MAX_RECALLED: i64 = 10;
 const MAX_LISTED: i64 = 10;
 
 const BUSY_WAIT: Duration = Duration::from_secs(5);

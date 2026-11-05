@@ -165,7 +165,7 @@ fn lines_of(text: &str, (first, last): (u32, u32)) -> String {
     picked.join("\n")
 }
 
-pub(crate) fn viewed(path: &Path, copies: &Path) -> Result<Media, ToolError> {
+pub fn viewed(path: &Path, copies: &Path) -> Result<Media, ToolError> {
     let shown = slashed(path);
     let Some(kind) = kind_of(path) else {
         let refused = unviewable(&shown);
@@ -268,7 +268,7 @@ pub(crate) fn read_copy(path: &Path, kind: MediaKind) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
-pub(crate) fn shown_path(path: &Path, cwd: &Path) -> String {
+pub fn shown_path(path: &Path, cwd: &Path) -> String {
     let relative = path.strip_prefix(cwd).unwrap_or(path);
     let mut shown = slashed(relative);
     if shown.is_empty() {

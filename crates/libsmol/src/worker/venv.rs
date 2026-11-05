@@ -3,7 +3,7 @@ use reaper::{cause, tilde};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::env;
-use std::fs::{self, File, Metadata};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -18,8 +18,8 @@ const MAX_NAME_CHARS: usize = 16;
 /// How long the venv of a directory that is gone stays unused before it is removed
 const MIN_IDLE: Duration = Duration::from_hours(7 * 24);
 
-/// The venv kept for a session's working directory, which the worker makes and completes as it
-/// enters it. The agent never reads or follows anything in it, since the code can write it
+/// The venv kept for a session's working directory, whose contents the worker makes as it enters it.
+/// The agent never reads or follows anything in it, since the code can write it
 pub(crate) struct Venv {
     /// Where the code installs packages
     pub(crate) path: PathBuf,
@@ -92,7 +92,8 @@ fn venv_for(venvs: &Path, _: &Path) -> PathBuf {
 fn venv_name(cwd: &Path) -> String {
     let cwd = PathBuf::from(folded(cwd));
     let digest = Sha256::digest(cwd.as_os_str().as_encoded_bytes());
-    let hash = hex(&digest);
+    let digits: Vec<String> = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let hash = digits.concat();
     let named = cwd.file_name().unwrap_or_default().to_string_lossy();
     let named: String = named.chars().take(MAX_NAME_CHARS).collect();
     format!("{named}-{}", &hash[..16])
@@ -123,8 +124,10 @@ fn sweep_venvs(venvs: &Path, own: &Path) {
         if file.try_lock().is_err() {
             continue;
         }
-        // A drive or share that is away reads as gone too
-        if !unused(file.metadata()) {
+        // A drive or share that is away reads as gone too, so only a lock unused for `MIN_IDLE` counts
+        let modified = file.metadata().and_then(|found| found.modified());
+        let idle = modified.ok().and_then(|time| time.elapsed().ok());
+        if !idle.is_some_and(|idle| idle > MIN_IDLE) {
             continue;
         }
 
@@ -143,18 +146,6 @@ fn sweep_venvs(venvs: &Path, own: &Path) {
         let shown = tilde(&folder);
         info!("python: venv removed [path={shown}]");
     }
-}
-
-/// Last used, by the time a session last took its lock, more than `MIN_IDLE` ago
-fn unused(found: io::Result<Metadata>) -> bool {
-    let modified = found.and_then(|found| found.modified());
-    let idle = modified.ok().and_then(|time| time.elapsed().ok());
-    idle.is_some_and(|idle| idle > MIN_IDLE)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let digits: Vec<String> = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    digits.concat()
 }
 
 /// Takes the venv's lock shared and dates it, which says when a session last used the venv
@@ -201,13 +192,10 @@ fn lock_of(venv: &Path) -> PathBuf {
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::tests::temp_dir;
-    use crate::utils::{block_on, new_id};
+    use crate::utils::block_on;
     use crate::worker::venv::{held, lock_of, sweep_venvs, venv_name, Venv, MIN_IDLE};
-    use std::env;
     use std::fs::{self, File};
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::time::{Duration, SystemTime};
 
     /// The venv tests share
@@ -272,38 +260,6 @@ pub(crate) mod tests {
             "recent.lock",
         ];
         assert_eq!(left, expected);
-    }
-
-    /// The test binary as python, for programs tests start outside the sandbox.
-    /// Tests run in parallel, so a stale link is replaced by a rename
-    #[cfg(unix)]
-    pub(crate) fn interpreter() -> PathBuf {
-        let exe = env::current_exe().expect("test binary");
-        let deps = exe.parent().expect("deps");
-        let linked = deps.join("python3");
-        if fs::read_link(&linked).ok().as_ref() != Some(&exe) {
-            let id = new_id();
-            let aside = deps.join(format!(".python3-{id}"));
-            symlink(&exe, &aside).expect("link");
-            fs::rename(&aside, &linked).expect("link");
-        }
-        linked
-    }
-
-    /// Windows makes links only with a privilege, so the test binary is linked hard or copied
-    #[cfg(windows)]
-    pub(crate) fn interpreter() -> PathBuf {
-        let exe = env::current_exe().expect("test binary");
-        let deps = exe.parent().expect("deps");
-        let named = deps.join("python3.exe");
-        let id = new_id();
-        let aside = deps.join(format!(".python3-{id}.exe"));
-        if fs::hard_link(&exe, &aside).is_err() {
-            fs::copy(&exe, &aside).expect("copy");
-        }
-        // Another test may be running the one already there
-        fs::rename(&aside, &named).ok();
-        named
     }
 
     #[test]

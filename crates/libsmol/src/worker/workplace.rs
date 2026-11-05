@@ -70,13 +70,11 @@ pub(crate) struct Workplace {
     pub(crate) copies: PathBuf,
     pub(crate) venv: Venv,
     pub(crate) sandbox: Sandbox,
-    /// The places in `[allow] write` that existed when the session opened, while files are isolated
     writable: Option<Vec<PathBuf>>,
 }
 
 impl Workplace {
-    /// The code may write the session's places and read its skills, and `config` is hidden like
-    /// the credential locations, besides what agent.toml allows and denies
+    /// Decides what the code may reach, on top of agent.toml's `[allow]` and `[deny]`
     pub(crate) fn open(
         cwd: PathBuf,
         copies: PathBuf,
@@ -141,8 +139,8 @@ impl Workplace {
         })
     }
 
-    /// Where code may write besides the working directory, the venv and its temporary folder,
-    /// or `None` when files aren't isolated
+    /// The places in `[allow] write` that existed when the session opened, which the code may write
+    /// besides its own, or `None` when files aren't isolated
     pub(crate) fn writable(&self) -> Option<&[PathBuf]> {
         self.writable.as_deref()
     }

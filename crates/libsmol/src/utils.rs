@@ -50,7 +50,7 @@ static DRIVER: LazyLock<()> = LazyLock::new(|| {
     started.recv().ok();
 });
 
-pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+pub fn block_on<F: Future>(future: F) -> F::Output {
     #[cfg(test)]
     LazyLock::force(&DRIVER);
     RUNTIME.block_on(future)
@@ -59,7 +59,7 @@ pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
 pub type Reply = Result<Value, String>;
 
 #[derive(Default)]
-pub(crate) struct Waiting {
+pub struct Waiting {
     next: AtomicU64,
     waiters: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
 }

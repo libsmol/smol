@@ -102,10 +102,7 @@ fn initialize(role: Role<'_>) {
     #[cfg(unix)]
     let mut pointers: Vec<*const c_char> = owned.iter().map(|arg| arg.as_ptr()).collect();
     #[cfg(windows)]
-    let mut owned: Vec<Vec<wchar_t>> = argv
-        .iter()
-        .map(|arg| arg.encode_wide().chain([0]).collect())
-        .collect();
+    let mut owned: Vec<Vec<wchar_t>> = argv.iter().map(|arg| wide(arg)).collect();
     #[cfg(windows)]
     let mut pointers: Vec<*mut wchar_t> = owned.iter_mut().map(|arg| arg.as_mut_ptr()).collect();
 
