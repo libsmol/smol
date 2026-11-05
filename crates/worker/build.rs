@@ -1,7 +1,7 @@
 use ruzstd::decoding::StreamingDecoder;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
@@ -41,13 +41,6 @@ const BUILDS: [(&str, &str, &str); 5] = [
         "7a828feea84763362f5e56031a12eee5d2697196ccf987b21ccce5ec9ad4a00f",
     ),
 ];
-/// The end record of a zip with no entries
-const EMPTY_ZIP: [u8; 22] = [
-    0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-];
-/// The `inittab.rs` of a target whose CPython builds every extension module in, or that has none
-const NO_MODULES: &str =
-    "pub(crate) static MODULES: &[(&std::ffi::CStr, unsafe extern \"C\" fn() -> *mut pyo3::ffi::PyObject)] = &[];\n";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -62,24 +55,24 @@ fn main() {
     let dll = format!("python{}", minor.replace('.', ""));
 
     let zip = out.join("stdlib.zip");
-    let inittab = out.join("inittab.rs");
-    let mut forwarder = out.join("python3.dll");
+    let table = out.join("inittab.rs");
+    let forwarder = out.join("python3.dll");
     println!("cargo:rustc-env=SMOL_STDLIB={}", zip.display());
     println!("cargo:rustc-env=SMOL_PYTHON_VERSION={VERSION}");
     println!("cargo:rustc-env=SMOL_PYTHON_NAME={dll}");
+    println!("cargo:rustc-env=SMOL_PYTHON3_DLL={}", forwarder.display());
 
     // Checking a target without a build, as clippy does for windows-gnu, needs no CPython
     let built = BUILDS.iter().find(|(name, ..)| *name == target);
     let Some((_, flavor, sha)) = built else {
-        fs::write(&zip, EMPTY_ZIP).expect("empty zip");
-        fs::write(&inittab, NO_MODULES).expect("inittab");
+        let empty = inittab(&[]);
+        fs::write(&table, empty).expect("inittab");
+        fs::write(&zip, "").expect("stdlib");
         fs::write(&forwarder, "").expect("python3.dll");
-        println!("cargo:rustc-env=SMOL_PYTHON3_DLL={}", forwarder.display());
         return;
     };
 
-    // Shared by every profile and target folder, since the archive is large.
-    // Cargo tags the target directory and each target's folder in it, and the outermost is the root
+    // The outermost folder Cargo tags is the target directory, shared by every profile and target
     let tagged = out
         .ancestors()
         .filter(|dir| dir.join("CACHEDIR.TAG").exists());
@@ -91,7 +84,13 @@ fn main() {
 
     // Cargo locks each profile's folder alone, so builds of other profiles may fill the cache alongside
     fs::create_dir_all(&cache).expect("cache");
-    let held = File::create(cache.join(format!("{named}.lock"))).expect("lock");
+    let lock = cache.join(format!("{named}.lock"));
+    let held = File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock)
+        .expect("lock");
     held.lock().expect("lock");
 
     if !unpacked.exists() {
@@ -101,17 +100,20 @@ fn main() {
             let digits: Vec<String> = digest.iter().map(|byte| format!("{byte:02x}")).collect();
             digits.concat()
         };
-        let kept = fs::read(&archive)
-            .ok()
-            .filter(|bytes| hashed(bytes) == *sha);
-        if kept.is_none() {
+        let kept = fs::read(&archive).is_ok_and(|bytes| hashed(&bytes) == *sha);
+        if !kept {
             let url = format!(
                 "https://github.com/astral-sh/python-build-standalone/releases/download/{RELEASE}/{named}-{flavor}"
             );
-            let response = ureq::get(&url).call().expect("download");
+            let response = match ureq::get(&url).call() {
+                Ok(response) => response,
+                Err(e) => panic!("{url}: {e}"),
+            };
             let mut body = response.into_body().into_reader();
             let mut bytes = Vec::new();
-            body.read_to_end(&mut bytes).expect("download");
+            if let Err(e) = body.read_to_end(&mut bytes) {
+                panic!("{url}: {e}");
+            }
             if hashed(&bytes) != *sha {
                 panic!("{url}: checksum mismatch");
             }
@@ -128,8 +130,7 @@ fn main() {
     }
     let python = folder.join("python");
 
-    let described = python.join("PYTHON.json");
-    let info = fs::read_to_string(described).expect("PYTHON.json");
+    let info = fs::read_to_string(python.join("PYTHON.json")).expect("PYTHON.json");
     let info: Value = serde_json::from_str(&info).expect("PYTHON.json");
     let core = &info["build_info"]["core"];
     let extensions = info["build_info"]["extensions"]
@@ -138,11 +139,9 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out.display());
 
     let mut arguments = Vec::new();
-    let mut systems = Vec::new();
+    let mut systems = BTreeSet::new();
     if windows {
-        // The official build makes a DLL of the core and a .pyd of each other extension module,
-        // and they all link into one image here.
-        // dl_nt.obj holds a DllMain, which _ctypes defines too, and two globals windows.c defines instead
+        // dl_nt.obj's DllMain clashes with the one _ctypes defines, and windows.c defines its globals
         for object in core["objs"].as_array().expect("objects") {
             let relative = object.as_str().expect("object");
             if !relative.ends_with("/dl_nt.obj") {
@@ -151,6 +150,7 @@ fn main() {
             }
         }
 
+        // The official build makes a .pyd of each, which links in here along with the core
         let mut modules = Vec::new();
         // Extensions may each carry a copy of the same library, such as expat
         let mut seen = HashSet::new();
@@ -163,87 +163,70 @@ fn main() {
             let init = variant["init_fn"].as_str().expect("init function");
             modules.push((module.clone(), init.to_owned()));
             for object in variant["objs"].as_array().into_iter().flatten() {
-                let object = python.join(object.as_str().expect("object"));
+                let relative = object.as_str().expect("object");
+                let object = python.join(relative);
                 let base = object.file_name().expect("name").to_string_lossy();
                 if seen.insert(base.to_lowercase()) {
                     arguments.push(object.display().to_string());
                 }
             }
             for link in variant["links"].as_array().into_iter().flatten() {
-                let library = link["name"].as_str().expect("link name").to_owned();
-                let system = link["system"].as_bool() == Some(true);
-                if system && !systems.contains(&(library.clone(), false)) {
-                    systems.push((library, false));
+                let library = link["name"].as_str().expect("link name");
+                if link["system"].as_bool() == Some(true) {
+                    systems.insert((library.to_owned(), false));
                 }
             }
         }
-        // The official build gets the last two from its project defaults, which PYTHON.json leaves out
+        // PYTHON.json leaves out the last two, which the official build gets from its project defaults
         let listed = core["links"].as_array().into_iter().flatten();
         let libraries = listed.map(|link| link["name"].as_str().expect("link name"));
         for library in libraries.chain(["advapi32", "bcrypt"]) {
-            let library = library.to_owned();
-            if !systems.contains(&(library.clone(), false)) {
-                systems.push((library, false));
-            }
+            systems.insert((library.to_owned(), false));
         }
         for library in ["zlib-ng.lib", "liblzma.lib"] {
             let library = python.join("build/lib").join(library);
             arguments.push(library.display().to_string());
         }
 
-        // pbs builds LTCG objects on Windows, which only MSVC's linker reads
         arguments.push("/LTCG".to_owned());
-        // Extensions ask for the import libraries of the DLLs they were built for, which this image replaces
+        // Extensions ask for the import libraries of the DLLs this image replaces
         arguments.push(format!("/NODEFAULTLIB:{dll}.lib"));
         arguments.push("/NODEFAULTLIB:python3.lib".to_owned());
-        // Quiets a warning for each object, which would bury a real error: pbs ships no PDB for them (4099),
-        // and they and PyO3 import from the DLL what this image defines (4217, 4286)
+        // pbs ships no PDBs (4099), and its objects import what this image defines (4217, 4286)
         arguments.push("/IGNORE:4099,4217,4286".to_owned());
 
-        let mut table = String::from("unsafe extern \"C\" {\n");
-        for (_, init) in &modules {
-            table.push_str(&format!("    fn {init}() -> *mut pyo3::ffi::PyObject;\n"));
-        }
-        table.push_str("}\n\n/// The extension modules CPython's own table leaves out, as the official build makes .pyd files of them\n");
-        table.push_str("pub(crate) static MODULES: &[(&std::ffi::CStr, unsafe extern \"C\" fn() -> *mut pyo3::ffi::PyObject)] = &[\n");
-        for (module, init) in &modules {
-            table.push_str(&format!("    (c\"{module}\", {init}),\n"));
-        }
-        table.push_str("];\n");
-        fs::write(&inittab, table).expect("inittab");
+        let listed = inittab(&modules);
+        fs::write(&table, listed).expect("inittab");
 
         let winver = format!("\"{minor}\"");
-        let shims = manifest.join("src/windows.c");
         cc::Build::new()
-            .file(shims)
+            .file(manifest.join("src/windows.c"))
             .define("SMOL_WINVER", winver.as_str())
             .compile("smolwin");
-        // pyo3-ffi asks for pythonXY.lib, which an empty library satisfies, as the objects define everything
+        // pyo3-ffi links pythonXY, which an empty library satisfies, as the objects define everything
         let empty = out.join("empty.c");
         fs::write(&empty, "").expect("empty.c");
         cc::Build::new()
             .file(&empty)
             .cargo_metadata(false)
             .compile("pythonXY");
-        forwarder = python.join("install/python3.dll");
+        fs::copy(python.join("install/python3.dll"), &forwarder).expect("python3.dll");
     } else {
-        fs::write(&inittab, NO_MODULES).expect("inittab");
-        fs::write(&forwarder, "").expect("python3.dll");
-
+        let apple = target.contains("apple");
         let relative = core["static_lib"].as_str().expect("static lib");
         let library = python.join(relative);
         let file = File::open(&library).expect("libpython");
         let mut archive = ar::Archive::new(file);
-        let mut members = Vec::new();
+        let mut members = HashSet::new();
         while let Some(entry) = archive.next_entry() {
             let entry = entry.expect("libpython");
             let name = String::from_utf8_lossy(entry.header().identifier());
-            members.push(name.into_owned());
+            members.insert(name.into_owned());
         }
 
         // The installed libpython leaves out objects that the python executable links on its own
-        let mut extra = Vec::new();
-        let mut statics = Vec::new();
+        let mut extra = BTreeSet::new();
+        let mut statics = BTreeSet::new();
         for variants in extensions.values() {
             let variant = &variants[0];
             if !variant["shared_lib"].is_null() {
@@ -252,34 +235,25 @@ fn main() {
             for object in variant["objs"].as_array().into_iter().flatten() {
                 let relative = object.as_str().expect("object");
                 let object = python.join(relative);
-                let name = object
-                    .file_name()
-                    .expect("name")
-                    .to_string_lossy()
-                    .into_owned();
-                if !members.contains(&name) && !extra.contains(&object) {
-                    extra.push(object);
+                let name = object.file_name().expect("name").to_string_lossy();
+                if !members.contains(name.as_ref()) {
+                    extra.insert(object);
                 }
             }
             for link in variant["links"].as_array().into_iter().flatten() {
                 let name = link["name"].as_str().expect("link name").to_owned();
                 let framework = link["framework"].as_bool().unwrap_or(false);
                 if let Some(path) = link["path_static"].as_str() {
-                    let path = python.join(path);
-                    if !statics.contains(&(name.clone(), path.clone())) {
-                        statics.push((name, path));
-                    }
-                } else if !systems.contains(&(name.clone(), framework)) {
-                    systems.push((name, framework));
+                    statics.insert((name, python.join(path)));
+                } else {
+                    systems.insert((name, framework));
                 }
             }
         }
         for link in core["links"].as_array().into_iter().flatten() {
             let name = link["name"].as_str().expect("link name").to_owned();
             let framework = link["framework"].as_bool().unwrap_or(false);
-            if !systems.contains(&(name.clone(), framework)) {
-                systems.push((name, framework));
-            }
+            systems.insert((name, framework));
         }
 
         // Renamed, since a crate may link its own copy of the same library, such as rusqlite's SQLite
@@ -294,18 +268,18 @@ fn main() {
 
         // libpython and the objects it leaves out are LLVM bitcode, which only lld reads.
         // Compiled once into native objects, every later link stays quick and small
-        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
+        let rustc = env::var_os("RUSTC").expect("rustc");
         let printed = Command::new(rustc).args(["--print", "sysroot"]).output();
         let printed = printed.expect("sysroot");
         let sysroot = String::from_utf8(printed.stdout).expect("sysroot");
-        let lld = Path::new(sysroot.trim()).join(format!("lib/rustlib/{host}/bin/rust-lld"));
+        let tools = Path::new(sysroot.trim()).join(format!("lib/rustlib/{host}/bin"));
         let native = folder.join("pycore");
         if !native.exists() {
             let partial = folder.join("pycore.part");
             fs::remove_dir_all(&partial).ok();
             fs::create_dir_all(&partial).expect("pycore");
-            let mut linking = Command::new(&lld);
-            match target.contains("apple") {
+            let mut linking = Command::new(tools.join("rust-lld"));
+            match apple {
                 // ld64.lld has no -r, so a dylib links it and its LTO leaves the objects in the folder
                 true => {
                     let arch = match target.starts_with("aarch64") {
@@ -342,9 +316,7 @@ fn main() {
             fs::rename(&partial, &native).expect("pycore");
         }
 
-        // GNU ld looks up an archive only for what the files before it left undefined,
-        // and the libraries don't come in that order, so Linux links with lld as well
-        match target.contains("apple") {
+        match apple {
             true => {
                 arguments.push("-Wl,-export_dynamic".to_owned());
                 // The objects check the macOS version through compiler-rt, which rustc's -nodefaultlibs
@@ -358,12 +330,12 @@ fn main() {
                 }
                 arguments.push(runtime.display().to_string());
             }
+            // GNU ld looks up an archive only for what the files before it left undefined,
+            // and the libraries don't come in that order
             false => {
-                let tools =
-                    Path::new(sysroot.trim()).join(format!("lib/rustlib/{host}/bin/gcc-ld"));
-                let tools = tools.display();
+                let gcc = tools.join("gcc-ld");
                 arguments.push("-fuse-ld=lld".to_owned());
-                arguments.push(format!("-B{tools}"));
+                arguments.push(format!("-B{}", gcc.display()));
                 arguments.push("-Wl,--export-dynamic".to_owned());
             }
         }
@@ -389,7 +361,6 @@ fn main() {
         println!("cargo:rustc-link-arg={argument}");
     }
     println!("cargo:link_args={}", arguments.join(";"));
-    println!("cargo:rustc-env=SMOL_PYTHON3_DLL={}", forwarder.display());
 
     let (interpreter, stdlib) = match windows {
         true => (
@@ -401,11 +372,10 @@ fn main() {
             python.join(format!("install/lib/python{minor}")),
         ),
     };
-    let packing = manifest.join("pack.py");
     // The target's own python compiles the stdlib, which another host runs only through emulation
     let status = Command::new(&interpreter)
         .arg("-I")
-        .arg(packing)
+        .arg(manifest.join("pack.py"))
         .arg(stdlib)
         .arg(&zip)
         .status();
@@ -417,4 +387,19 @@ fn main() {
             interpreter.display()
         ),
     }
+}
+
+/// The `inittab.rs` that builds in `modules`, each a name and its init function
+fn inittab(modules: &[(String, String)]) -> String {
+    let mut table = String::from("unsafe extern \"C\" {\n");
+    for (_, init) in modules {
+        table.push_str(&format!("    fn {init}() -> *mut pyo3::ffi::PyObject;\n"));
+    }
+    table.push_str("}\n\n");
+    table.push_str("static MODULES: &[(&std::ffi::CStr, unsafe extern \"C\" fn() -> *mut pyo3::ffi::PyObject)] = &[\n");
+    for (module, init) in modules {
+        table.push_str(&format!("    (c\"{module}\", {init}),\n"));
+    }
+    table.push_str("];\n");
+    table
 }
