@@ -421,16 +421,15 @@ the default is `warn,libsmol=info,rmcp=off`, `SMOL_LOG=warn` keeps only problems
   venv kept for each working directory in `.venv` in its folder under
   `~/.smol/projects`, whose `python` is `libsmol` itself. `python`, `pip` and
   imports resolve to that venv, not to the Pythons and virtualenvs you
-  installed, which stay on `PATH` after it.
-  Every session in the directory and the agents they start share the venv and
-  keep what it installed, until the directory is gone and no session has used
-  the venv for a week. To start over, delete it while no session in that
-  directory is open. `VIRTUAL_ENV` names it, so tools such as uv or poetry
-  install into it too, and a venv the code makes for itself is based on it.
-  The C headers aren't installed, so a package with C code installs only from
-  a wheel, as numpy and pandas do, not from source. On Windows a package with
-  deeply nested files may fail to install unless long paths are turned on
-  (`LongPathsEnabled` in the registry).
+  installed, which stay on `PATH` after it. Every session in the directory and
+  the agents they start share the venv and keep what it installed, until the
+  directory is gone and no session has used the venv for a week. To start
+  over, delete it while no session in that directory is open. `VIRTUAL_ENV`
+  names it, so tools such as uv or poetry install into it too, and a venv the
+  code makes for itself is based on it. The C headers aren't installed, so a
+  package with C code installs only from a wheel, as numpy and pandas do, not
+  from source. On Windows a package with deeply nested files may fail to
+  install unless long paths are turned on (`LongPathsEnabled` in the registry).
 - **Interrupting** stops code in place, and the session keeps its variables.
   Code blocked where an interrupt cannot reach it (for example `os.system`, a
   long call inside a C extension, or most blocking calls on Windows) gets 3

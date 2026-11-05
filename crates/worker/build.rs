@@ -73,8 +73,13 @@ fn main() {
     let named = format!("cpython-{VERSION}+{RELEASE}-{target}");
     let folder = cache.join(&named);
     let unpacked = folder.join(".unpacked");
+
+    // Cargo locks each profile's folder alone, so builds of other profiles may fill the cache alongside
+    fs::create_dir_all(&cache).expect("cache");
+    let held = File::create(cache.join(format!("{named}.lock"))).expect("lock");
+    held.lock().expect("lock");
+
     if !unpacked.exists() {
-        fs::create_dir_all(&cache).expect("cache");
         let archive = cache.join(format!("{named}-{flavor}"));
         let hashed = |bytes: &[u8]| -> String {
             let digest = Sha256::digest(bytes);
@@ -232,6 +237,8 @@ fn main() {
         fs::remove_file(folder.join("pycore.dylib")).ok();
         fs::rename(&partial, &native).expect("pycore");
     }
+    drop(held);
+
     for (name, framework) in systems {
         let kind = match framework {
             true => "framework",

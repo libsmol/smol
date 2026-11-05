@@ -75,8 +75,9 @@ pub fn enter(py: Python<'_>, venv: &Path) -> PyResult<()> {
         }
     }
 
-    // `venv` writes `pyvenv.cfg` before it finishes, and pip after the interpreter
-    let found = |name: &str| fs::symlink_metadata(bin.join(name)).is_ok();
+    // `venv` writes `pyvenv.cfg` before it finishes, and pip after the interpreter.
+    // Links are followed, since `python` leads to libsmol through `python3`
+    let found = |name: &str| fs::metadata(bin.join(name)).is_ok();
     if !found(EXE) || !found(PIP) {
         let code = CString::new(VENV).expect("venv.py");
         let globals = PyDict::new(py);
