@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
-## Unreleased
+## 0.7.0 - 2026-11-05
 
 - The Python is inside `libsmol`: CPython 3.14 is linked in with its
   standard library, which is read from memory, so a release is only `smol`
