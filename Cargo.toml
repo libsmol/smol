@@ -6,7 +6,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/libsmol/smol"
-version = "0.7.0"
+version = "0.7.1"
 
 [workspace.dependencies]
 reaper = { package = "libsmol-reaper", path = "crates/reaper" }

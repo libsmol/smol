@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
-## Unreleased
+## 0.7.1 - 2026-11-06
 
 - A program or thread the code leaves running no longer stops when it prints
   between calls. Its output used to fill the pipe and block it until the next
