@@ -318,6 +318,9 @@ impl Session {
                     let entry = match &server.state {
                         McpState::Connected { .. } if switched_on => Entry::Info(text),
                         McpState::Failed { .. } if switched_on || dropped => Entry::Failure(text),
+                        McpState::Unauthorized { .. } if switched_on || dropped => {
+                            Entry::Warning(text)
+                        }
                         // States sent before the switch still show it off,
                         // so wait for this connection's result
                         _ => continue,
@@ -459,7 +462,7 @@ mod tests {
         Incoming::Update(session.to_owned(), update)
     }
 
-    /// The infos and failures that receiving `message` added
+    /// The infos, warnings and failures that receiving `message` added
     fn shown(session: &mut Session, message: Incoming) -> Vec<String> {
         let before = session.conversation.entries().len();
         session.receive(message);
@@ -468,6 +471,7 @@ mod tests {
         for entry in &session.conversation.entries()[before..] {
             match entry {
                 Entry::Info(text) => shown.push(text.clone()),
+                Entry::Warning(text) => shown.push(format!("! {text}")),
                 Entry::Failure(text) => shown.push(format!("✗ {text}")),
                 _ => {}
             }
@@ -540,6 +544,14 @@ mod tests {
         assert!(seen(McpState::Connecting).is_empty());
         let error = "connection refused".to_owned();
         assert!(seen(McpState::Failed { error }).is_empty());
+
+        assert!(seen(McpState::Connected { tools: 2 }).is_empty());
+        let error = "authorization required".to_owned();
+        let refused = seen(McpState::Unauthorized { error });
+        assert_eq!(
+            refused,
+            ["! mcp: web: unauthorized: authorization required"]
+        );
     }
 
     #[test]

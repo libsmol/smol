@@ -84,6 +84,7 @@ pub(crate) enum McpState {
     Connecting,
     Connected { tools: usize },
     Failed { error: String },
+    Unauthorized { error: String },
 }
 
 impl fmt::Display for McpState {
@@ -96,6 +97,7 @@ impl fmt::Display for McpState {
                 write!(f, "connected, {tools}")
             }
             McpState::Failed { error } => write!(f, "failed: {error}"),
+            McpState::Unauthorized { error } => write!(f, "unauthorized: {error}"),
         }
     }
 }
@@ -792,7 +794,7 @@ cat >/dev/null"#,
 
     #[test]
     fn mcp_wire_format() {
-        let text = r#"{"sessionId":"s1","servers":[{"name":"web","state":"off"},{"name":"web","state":"connected","tools":3},{"name":"web","state":"failed","error":"connection refused"}]}"#;
+        let text = r#"{"sessionId":"s1","servers":[{"name":"web","state":"off"},{"name":"web","state":"connected","tools":3},{"name":"web","state":"failed","error":"connection refused"},{"name":"web","state":"unauthorized","error":"authorization required"}]}"#;
         let params: Value = serde_json::from_str(text).expect("json");
         let servers = Vec::<McpStatus>::deserialize(&params["servers"]).expect("servers");
 
@@ -800,10 +802,13 @@ cat >/dev/null"#,
             .iter()
             .map(|server| server.state.to_string())
             .collect();
-        assert_eq!(
-            states,
-            ["off", "connected, 3 tools", "failed: connection refused"]
-        );
+        let expected = [
+            "off",
+            "connected, 3 tools",
+            "failed: connection refused",
+            "unauthorized: authorization required",
+        ];
+        assert_eq!(states, expected);
         assert_eq!(servers[1].to_string(), "mcp: web: connected, 3 tools");
     }
 }

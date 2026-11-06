@@ -16,6 +16,7 @@ pub(crate) const HUES: usize = 8;
 
 pub(crate) enum Entry {
     Info(String),
+    Warning(String),
     Failure(String),
     Task(String),
     Step(Step),

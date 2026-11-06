@@ -26,10 +26,12 @@ use rmcp::RoleClient;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::error;
+use std::fmt;
 use std::io;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -59,35 +61,81 @@ pub(crate) struct Server {
     pub(crate) call: Arc<CallFn>,
 }
 
+/// Why a server can't be used
+#[derive(Debug, PartialEq)]
+pub(crate) enum Down {
+    Failed(String),
+    Unauthorized(String),
+}
+
+impl Down {
+    fn of(error: &(dyn error::Error + 'static), text: String) -> Self {
+        match unauthorized(error) {
+            true => Down::Unauthorized(text),
+            false => Down::Failed(text),
+        }
+    }
+}
+
+impl fmt::Display for Down {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Down::Failed(error) | Down::Unauthorized(error) => f.write_str(error),
+        }
+    }
+}
+
 /// A connected server that disconnects when dropped
 pub(crate) struct Link {
     service: RunningService<RoleClient, ()>,
     /// Reads stderr until the server exits and returns the last few lines
     said: Option<JoinHandle<String>>,
+    refused: Arc<OnceLock<String>>,
 }
 
 impl Link {
-    /// Returns when the connection ended and the last lines the server wrote to stderr
-    pub(crate) async fn ended(self) -> (Instant, String) {
+    pub(crate) async fn ended(self) -> (Instant, Down) {
         self.service.waiting().await.ok();
         let at = Instant::now();
+        if let Some(reason) = self.refused.get() {
+            return (at, Down::Unauthorized(reason.clone()));
+        }
+
         let said = last_lines(self.said).await;
-        (at, said)
+        let error = match said.is_empty() {
+            true => prompt::NO_SERVER.to_owned(),
+            false => format!("{}\n{said}", prompt::NO_SERVER),
+        };
+        (at, Down::Failed(error))
     }
 }
 
 /// The server's process group is dropped together with the connection
 struct Connection {
     peer: Peer<RoleClient>,
-    token: Option<RunningServiceCancellationToken>,
+    token: Mutex<Option<RunningServiceCancellationToken>>,
+    refused: Arc<OnceLock<String>>,
     _process: Option<Process>,
+}
+
+impl Connection {
+    fn close(&self) {
+        let token = self.token.lock().expect("token").take();
+        if let Some(token) = token {
+            token.cancel();
+        }
+    }
+
+    /// The reason is set before closing because `Link::ended` reads it once the connection is closed
+    fn refuse(&self, reason: &str) {
+        self.refused.set(reason.to_owned()).ok();
+        self.close();
+    }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        if let Some(token) = self.token.take() {
-            token.cancel();
-        }
+        self.close();
     }
 }
 
@@ -119,7 +167,7 @@ pub(crate) async fn connect(
     server: &McpConfig,
     cwd: &Path,
     copies: PathBuf,
-) -> Result<(Server, Link), String> {
+) -> Result<(Server, Link), Down> {
     let mut process = None;
     let mut said = None;
     let handshake = async {
@@ -144,7 +192,7 @@ pub(crate) async fn connect(
                 let unstarted = |e: io::Error| {
                     let shown = program.display();
                     let reason = cause(&e);
-                    format!("start: {shown}: {reason}")
+                    Down::Failed(format!("start: {shown}: {reason}"))
                 };
                 let spawned = command.spawn();
                 let mut child = spawned.map_err(unstarted)?;
@@ -180,12 +228,13 @@ pub(crate) async fn connect(
             }
             McpKind::Http { url, headers } => {
                 let builder = Client::builder();
-                let client = http_client(builder)?;
+                let client = http_client(builder);
+                let client = client.map_err(Down::Failed)?;
                 let config = StreamableHttpClientTransportConfig::with_uri(url.clone());
                 let mut worker = StreamableHttpClientWorker::new(client, config);
                 for (name, value) in headers {
                     // Values may hold secrets and are never printed
-                    let invalid = |part| format!("header: {name}: invalid {part}");
+                    let invalid = |part| Down::Failed(format!("header: {name}: invalid {part}"));
                     let header = name.parse::<HeaderName>();
                     let header = header.map_err(|_| invalid("name"))?;
                     let value = value.parse::<HeaderValue>();
@@ -202,7 +251,8 @@ pub(crate) async fn connect(
             Ok(service) => service,
             Err(e) => {
                 let reason = root_cause(&e, CLOSED_EARLY);
-                return Err(format!("connect: {reason}"));
+                let text = format!("connect: {reason}");
+                return Err(Down::of(&e, text));
             }
         };
 
@@ -216,7 +266,8 @@ pub(crate) async fn connect(
                 Ok(page) => page,
                 Err(e) => {
                     let reason = root_cause(&e, prompt::NO_SERVER);
-                    return Err(format!("list tools: {reason}"));
+                    let text = format!("list tools: {reason}");
+                    return Err(Down::of(&e, text));
                 }
             };
             listed.extend(page.tools);
@@ -238,12 +289,14 @@ pub(crate) async fn connect(
         Ok(connected) => connected,
         Err(_) => {
             let seconds = HANDSHAKE_WAIT.as_secs();
-            Err(format!("connect: timed out after {seconds}s"))
+            Err(Down::Failed(format!("connect: timed out after {seconds}s")))
         }
     };
     let (service, listed) = match connected {
         Ok(connected) => connected,
-        Err(reason) => {
+        // Only HTTP servers answer 401, and they have no stderr
+        Err(down @ Down::Unauthorized(_)) => return Err(down),
+        Err(Down::Failed(reason)) => {
             // The reason is usually in its stderr, which only ends once a hung server is killed
             drop(process.take());
             let reading = said.take();
@@ -252,7 +305,7 @@ pub(crate) async fn connect(
                 true => reason,
                 false => format!("{reason}\n{lines}"),
             };
-            return Err(message);
+            return Err(Down::Failed(message));
         }
     };
 
@@ -266,9 +319,11 @@ pub(crate) async fn connect(
 
     let peer = service.peer().clone();
     let token = service.cancellation_token();
+    let refused = Arc::new(OnceLock::new());
     let connection = Arc::new(Connection {
         peer,
-        token: Some(token),
+        token: Mutex::new(Some(token)),
+        refused: Arc::clone(&refused),
         _process: process,
     });
     let call = move |function: String, arguments: Map<String, Value>, label: String| -> Calling {
@@ -277,12 +332,24 @@ pub(crate) async fn connect(
         Box::pin(async move {
             let mut media = Vec::new();
             let calling = async {
+                // The server stays installed until the turn ends
+                if let Some(reason) = connection.refused.get() {
+                    return Err(reason.clone());
+                }
+                let failed = |e: ServiceError| {
+                    let reason = root_cause(&e, prompt::NO_SERVER);
+                    if unauthorized(&e) {
+                        connection.refuse(&reason);
+                    }
+                    reason
+                };
+
                 let params = CallToolRequestParams::new(function).with_arguments(arguments);
                 let request = CallToolRequest::new(params);
                 let request = ClientRequest::CallToolRequest(request);
                 let options = PeerRequestOptions::no_options();
                 let sent = connection.peer.send_cancellable_request(request, options);
-                let handle = sent.await.map_err(|e| root_cause(&e, prompt::NO_SERVER))?;
+                let handle = sent.await.map_err(failed)?;
 
                 let mut unanswered = Unanswered {
                     peer: handle.peer.clone(),
@@ -291,7 +358,7 @@ pub(crate) async fn connect(
                 let replied = handle.await_response().await;
                 unanswered.id = None;
 
-                let replied = replied.map_err(|e| root_cause(&e, prompt::NO_SERVER))?;
+                let replied = replied.map_err(failed)?;
                 let result = match replied {
                     ServerResult::CallToolResult(result) => result,
                     _ => {
@@ -381,7 +448,11 @@ pub(crate) async fn connect(
         tools,
         call: Arc::new(call),
     };
-    let link = Link { service, said };
+    let link = Link {
+        service,
+        said,
+        refused,
+    };
     Ok((server, link))
 }
 
@@ -413,10 +484,30 @@ fn said_lines(tail: &[u8]) -> String {
     lines[start..].join("\n")
 }
 
-/// Follows rmcp errors by type where they lack `source` and returns `closed` when the peer hung up
+/// The next error down the chain, following rmcp errors by type where they lack `source`
+fn below<'a>(
+    current: &'a (dyn error::Error + 'static),
+) -> Option<&'a (dyn error::Error + 'static)> {
+    let starting = current.downcast_ref::<ClientInitializeError>();
+    if let Some(ClientInitializeError::TransportError { error, .. }) = starting {
+        return Some(error);
+    }
+    let serving = current.downcast_ref::<ServiceError>();
+    if let Some(ServiceError::TransportSend(error)) = serving {
+        return Some(error);
+    }
+    let posting = current.downcast_ref::<StreamableHttpError<reqwest::Error>>();
+    if let Some(StreamableHttpError::Client(error)) = posting {
+        return Some(error);
+    }
+
+    current.source()
+}
+
+/// Returns `closed` when the peer hung up
 fn root_cause(top: &(dyn error::Error + 'static), closed: &str) -> String {
-    let mut current = top;
-    loop {
+    let mut root = top;
+    for current in iter::successors(Some(top), |current| below(*current)) {
         if let Some(http) = current.downcast_ref::<reqwest::Error>() {
             return http_cause(http);
         }
@@ -434,36 +525,35 @@ fn root_cause(top: &(dyn error::Error + 'static), closed: &str) -> String {
         if ended {
             return closed.to_owned();
         }
-
-        let mut inner = current.source();
-        if let Some(ClientInitializeError::TransportError { error, .. }) = starting {
-            inner = Some(error);
-        }
-        if let Some(ServiceError::TransportSend(error)) = serving {
-            inner = Some(error);
-        }
-        let posting = current.downcast_ref::<StreamableHttpError<reqwest::Error>>();
-        if let Some(StreamableHttpError::Client(error)) = posting {
-            inner = Some(error);
-        }
-
-        match inner {
-            Some(next) => current = next,
-            None => return cause(current),
-        }
+        root = current;
     }
+
+    cause(root)
+}
+
+/// rmcp reports a 401 this way only with the `WWW-Authenticate` challenge the MCP spec requires
+fn unauthorized(top: &(dyn error::Error + 'static)) -> bool {
+    let refused = |current: &(dyn error::Error + 'static)| {
+        let posting = current.downcast_ref::<StreamableHttpError<reqwest::Error>>();
+        matches!(posting, Some(StreamableHttpError::AuthRequired(_)))
+    };
+    let mut chain = iter::successors(Some(top), |current| below(*current));
+
+    chain.any(refused)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::config::{McpConfig, McpKind};
     use crate::tests::{interpreter, temp_dir};
-    use crate::tools::mcp::{connect, said_lines, Link, Server};
+    use crate::tools::mcp::{connect, said_lines, Down, Link, Server};
     use crate::utils::block_on;
     use serde_json::{json, Map};
     use std::collections::BTreeMap;
     use std::fs;
+    use std::io::{BufRead, BufReader};
     use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
     use std::time::Duration;
     use tokio::{task, time};
 
@@ -514,10 +604,36 @@ pub(crate) mod tests {
         let copies = temp_dir("copies");
 
         let connecting = connect(server, cwd, copies);
-        let Err(failed) = block_on(connecting) else {
-            panic!("connected");
+        let Err(Down::Failed(failed)) = block_on(connecting) else {
+            panic!("not failed");
         };
         failed
+    }
+
+    /// The fake server over HTTP, answering `refused` with 401, until the child is dropped
+    fn served(refused: &str) -> (McpConfig, Child) {
+        let mut command = Command::new(interpreter());
+        command
+            .args([SCRIPT, "--http", refused])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut child = command.spawn().expect("spawn");
+        let stdout = child.stdout.take().expect("stdout");
+        let mut port = String::new();
+        BufReader::new(stdout).read_line(&mut port).expect("port");
+
+        let port = port.trim();
+        let kind = McpKind::Http {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: BTreeMap::new(),
+        };
+        let server = McpConfig {
+            name: "remote".to_owned(),
+            description: None,
+            enabled: true,
+            kind,
+        };
+        (server, child)
     }
 
     #[test]
@@ -682,13 +798,51 @@ pub(crate) mod tests {
             let failed = calling.await.result.expect_err("exited");
             let ending = link.ended();
             let ended = time::timeout(Duration::from_secs(5), ending).await;
-            let said = ended.map(|(_, said)| said);
-            (failed, said)
+            let down = ended.map(|(_, down)| down);
+            (failed, down)
         };
-        let (failed, said) = block_on(running);
+        let (failed, down) = block_on(running);
 
         assert_eq!(failed, "server disconnected");
-        assert_eq!(said.ok().as_deref(), Some("written at exit"));
+        let said = Down::Failed("server disconnected\nwritten at exit".to_owned());
+        assert_eq!(down.ok(), Some(said));
+    }
+
+    #[test]
+    fn credentials_refused() {
+        let cwd = Path::new(CWD);
+        let copies = temp_dir("copies");
+        let refused = "authorization required: Bearer error=\"invalid_token\"";
+
+        let (server, _child) = served("initialize");
+        let connecting = connect(&server, cwd, copies.clone());
+        let Err(down) = block_on(connecting) else {
+            panic!("connected");
+        };
+        let handshake = format!("connect: {refused}");
+        assert_eq!(down, Down::Unauthorized(handshake));
+
+        // A refused call ends the connection, and later calls get the same reason
+        let (server, _child) = served("tools/call");
+        let running = async {
+            let (server, link) = connect(&server, cwd, copies).await.expect("connect");
+            let mut failed = Vec::new();
+            for _ in 0..2 {
+                let label = "remote.add".to_owned();
+                let calling = (server.call)("add".to_owned(), Map::new(), label);
+                let error = calling.await.result.expect_err("refused");
+                failed.push(error);
+            }
+            let ending = link.ended();
+            let ended = time::timeout(Duration::from_secs(5), ending).await;
+            let down = ended.map(|(_, down)| down);
+            (failed, down)
+        };
+        let (failed, down) = block_on(running);
+
+        assert_eq!(failed, [refused, refused]);
+        let call = Down::Unauthorized(refused.to_owned());
+        assert_eq!(down.ok(), Some(call));
     }
 
     #[test]

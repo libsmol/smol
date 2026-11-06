@@ -5,7 +5,7 @@ use crate::tui::picture::{self, Source};
 use crate::tui::theme::HELPERS;
 use crate::tui::transcript::Group;
 use crate::tui::{
-    clipped, in_out, joined, spinner, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG,
+    clipped, in_out, joined, spinner, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG, YELLOW,
 };
 use pulldown_cmark::Alignment;
 use ratatui::style::{Color, Modifier, Style};
@@ -40,6 +40,10 @@ const FAILURE: Mark = Mark {
     first: "✗ ",
     rest: "  ",
     style: RED,
+};
+const WARNING: Mark = Mark {
+    style: YELLOW,
+    ..FAILURE
 };
 const TASK: Mark = Mark {
     first: "❯ ",
@@ -171,6 +175,7 @@ impl Render {
     pub(crate) fn entry(&mut self, entry: &Entry) {
         match entry {
             Entry::Info(text) => self.paragraph(BODY, text, DIM),
+            Entry::Warning(text) => self.paragraph(WARNING, text, YELLOW),
             Entry::Failure(text) => self.paragraph(FAILURE, text, RED),
             Entry::Step(step) => self.step(step),
 

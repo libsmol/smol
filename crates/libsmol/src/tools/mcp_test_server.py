@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+import http.server
 import json
 import sys
+import threading
 import time
 
 TOOLS = [
@@ -86,9 +88,11 @@ MIXED = [
 ]
 
 
+OUTBOX = []
+
+
 def send(msg):
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
+    OUTBOX.append(msg)
 
 
 def result(msg_id, payload):
@@ -152,7 +156,56 @@ def handle(msg):
             send({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "unknown tool"}})
 
 
+class Http(http.server.BaseHTTPRequestHandler):
+    refused = None
+
+    def reply(self, status, body=b"", headers=()):
+        self.send_response(status)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        length = int(self.headers["Content-Length"])
+        msg = json.loads(self.rfile.read(length))
+        if msg.get("method") == self.refused:
+            challenge = ("WWW-Authenticate", 'Bearer error="invalid_token"')
+            self.reply(401, headers=[challenge])
+            return
+
+        handle(msg)
+        if not OUTBOX:
+            self.reply(202)
+            return
+        body = json.dumps(OUTBOX.pop()).encode()
+        self.reply(200, body, [("Content-Type", "application/json")])
+
+    # There is no stream of server messages and no session to delete
+    def do_GET(self):
+        self.reply(405)
+
+    do_DELETE = do_GET
+
+    def log_message(self, *args):
+        pass
+
+
+# Prints the port and serves until stdin closes
+def serve(refused):
+    Http.refused = refused
+    server = http.server.HTTPServer(("127.0.0.1", 0), Http)
+    print(server.server_port, flush=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    sys.stdin.read()
+
+
 def main():
+    if sys.argv[1:2] == ["--http"]:
+        serve(sys.argv[2])
+        return
+
     # MCP messages are UTF-8 but Windows reads stdin in the system code page by default
     sys.stdin.reconfigure(encoding="utf-8")
     for line in sys.stdin:
@@ -164,6 +217,10 @@ def main():
         except json.JSONDecodeError:
             continue
         handle(msg)
+        for reply in OUTBOX:
+            sys.stdout.write(json.dumps(reply) + "\n")
+        OUTBOX.clear()
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":

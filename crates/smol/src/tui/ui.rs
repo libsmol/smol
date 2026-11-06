@@ -5,6 +5,7 @@ use crate::tui::picture;
 use crate::tui::render::{wrap_ranges, Target};
 use crate::tui::{
     clipped, fitted, in_out, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG,
+    YELLOW,
 };
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -107,6 +108,12 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         if failed > 0 {
             usage += &format!(" · mcp {failed} failed");
         }
+        let unauthorized =
+            |server: &&McpStatus| matches!(server.state, McpState::Unauthorized { .. });
+        let unauthorized = app.session.mcp.iter().filter(unauthorized).count();
+        if unauthorized > 0 {
+            usage += &format!(" · mcp {unauthorized} unauthorized");
+        }
         usage.push(' ');
 
         usage_width = usage.width();
@@ -197,6 +204,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                     (theme::GREEN, Span::styled(tools, DIM))
                 }
                 McpState::Failed { .. } => (theme::RED, Span::styled("failed", RED)),
+                McpState::Unauthorized { .. } => {
+                    (theme::YELLOW, Span::styled("unauthorized", YELLOW))
+                }
             };
             let dot = Style::new().fg(dot);
             let dot = Span::styled("● ", dot);

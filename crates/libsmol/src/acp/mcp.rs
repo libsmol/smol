@@ -1,8 +1,7 @@
 use crate::acp::rpc::SessionPeer;
 use crate::config::McpConfig;
 use crate::history::Settings;
-use crate::prompt;
-use crate::tools::mcp::{connect, Server};
+use crate::tools::mcp::{connect, Down, Server};
 use crate::worker::host::{Added, Worker};
 use serde_json::json;
 use std::mem;
@@ -45,21 +44,18 @@ enum McpState {
         since: Instant,
         added: Added,
     },
-    Failed {
-        error: String,
-    },
+    Down(Down),
 }
 
 pub(crate) enum McpEvent {
     Attempted {
         attempt: u64,
-        result: Result<Server, String>,
+        result: Result<Server, Down>,
     },
-    /// `said` is the last thing the server wrote to stderr
     Ended {
         attempt: u64,
         at: Instant,
-        said: String,
+        down: Down,
     },
 }
 
@@ -161,9 +157,11 @@ impl McpPool {
                     Ok(server) => {
                         let installed = self.installed();
                         let adding = worker.add_server(server, &installed);
-                        adding.await.map_err(|error| error.to_string())
+                        adding
+                            .await
+                            .map_err(|error| Down::Failed(error.to_string()))
                     }
-                    Err(error) => Err(error),
+                    Err(down) => Err(down),
                 };
 
                 let name = &self.servers[index].config.name;
@@ -178,20 +176,22 @@ impl McpPool {
                             added,
                         }
                     }
-                    Err(error) => {
-                        let logged = error.replace('\n', " | ");
+                    Err(down) => {
+                        let logged = down.to_string().replace('\n', " | ");
                         warn!("mcp[{name}]: connect failed, {logged}");
-                        let error = match dropped {
-                            Some(dropped) => format!("{dropped}\n{error}"),
-                            None => error,
+                        let down = match (down, dropped) {
+                            (Down::Failed(error), Some(dropped)) => {
+                                Down::Failed(format!("{dropped}\n{error}"))
+                            }
+                            (down, _) => down,
                         };
-                        McpState::Failed { error }
+                        McpState::Down(down)
                     }
                 };
                 self.servers[index].state = state;
             }
 
-            McpEvent::Ended { attempt, at, said } => {
+            McpEvent::Ended { attempt, at, down } => {
                 let current = |server: &Mcp| match server.state {
                     McpState::Connected { attempt: now, .. } => now == attempt,
                     _ => false,
@@ -206,22 +206,13 @@ impl McpPool {
                 };
                 worker.remove_server(&added.name);
 
-                let disconnected = prompt::NO_SERVER;
-                let error = match said.is_empty() {
-                    true => disconnected.to_owned(),
-                    false => format!("{disconnected}\n{said}"),
-                };
                 let name = &self.servers[index].config.name;
-                let logged = error.replace('\n', " | ");
-                match at - since >= MIN_UPTIME {
-                    true => {
-                        warn!("mcp[{name}]: disconnected, {logged} [reconnect=true]");
-                        self.attempt(index, Some(error));
-                    }
-                    false => {
-                        warn!("mcp[{name}]: disconnected, {logged} [reconnect=false]");
-                        self.servers[index].state = McpState::Failed { error };
-                    }
+                let logged = down.to_string().replace('\n', " | ");
+                let reconnect = matches!(down, Down::Failed(_)) && at - since >= MIN_UPTIME;
+                warn!("mcp[{name}]: disconnected, {logged} [reconnect={reconnect}]");
+                match down {
+                    Down::Failed(error) if reconnect => self.attempt(index, Some(error)),
+                    down => self.servers[index].state = McpState::Down(down),
                 }
             }
         }
@@ -240,8 +231,11 @@ impl McpPool {
                     let tools = added.server.tools.len();
                     json!({ "name": name, "state": "connected", "tools": tools })
                 }
-                McpState::Failed { error } => {
+                McpState::Down(Down::Failed(error)) => {
                     json!({ "name": name, "state": "failed", "error": error })
+                }
+                McpState::Down(Down::Unauthorized(error)) => {
+                    json!({ "name": name, "state": "unauthorized", "error": error })
                 }
             };
             listed.push(entry);
@@ -271,8 +265,8 @@ impl McpPool {
                 return;
             };
             // Record the drop time here because events wait for a running turn to end
-            let (at, said) = link.ended().await;
-            let event = McpEvent::Ended { attempt, at, said };
+            let (at, down) = link.ended().await;
+            let event = McpEvent::Ended { attempt, at, down };
             outbox.send(event).ok();
         });
         self.servers[index].state = McpState::Connecting { attempt, dropped };
