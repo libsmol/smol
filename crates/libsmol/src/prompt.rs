@@ -30,7 +30,7 @@ const RULES: &str = "- Never make up data or functions; check unfamiliar ones wi
 /// Only for agents whose worker offers `remember()`
 const REMEMBERING: &str = "## Rules
 
-- `remember()` what the user asks you to remember or corrects you on, their preferences, and hard-won facts no file records, such as pitfalls and failed approaches.
+- `remember()` what the user asks you to, their preferences and rules, and hard-won lessons such as pitfalls, as bare facts.
 - One fact per memory, kept for this project unless the user says it holds everywhere (`project=False`).
 - When a memory is wrong or outdated, `forget()` it and `remember()` the correct one.";
 
@@ -979,7 +979,7 @@ mod tests {
                        - [3] Prefers tabs over spaces\n\n\
                        This project has 12 memories of its own, not listed here; \
                        before you start a task, `recall()` its key words.\n\n\
-                       ## Rules\n\n- `remember()` what the user asks you to remember or corrects you on, ";
+                       ## Rules\n\n- `remember()` what the user asks you to, their preferences and rules, ";
         assert!(text.contains(section), "{text}");
         let rules = "`remember()` the correct one.\n\n# Environment\n\n";
         assert!(text.contains(rules), "{text}");

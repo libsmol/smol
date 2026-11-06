@@ -13,6 +13,8 @@ but their files stay in `~/.smol/projects` untouched.
   unauthorized, in yellow, rather than as failed or still connected. A 401 on
   a call ends the connection and is reported in the conversation; the server
   isn't reconnected, since new credentials take effect in a new session.
+- The memory rules ask for bare facts, so fewer memories record who asked for
+  a rule, which round it came from or how it used to be.
 
 ## 0.7.1 - 2026-11-06
 
