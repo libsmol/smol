@@ -5,6 +5,8 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::time::Instant;
 
+const UNSENT_HINT: &str = "Goes to the model with your next message";
+
 /// The rows of the agents of one call with agents at work, counted from the start of its
 /// settled entry or, with no entry, of the held rows
 #[derive(Debug)]
@@ -154,6 +156,10 @@ impl Transcript {
             }
             if let Some(step) = talk.live() {
                 render.step(step);
+            }
+            if talk.shell_unsent() {
+                let hint = Entry::Info(UNSENT_HINT.to_owned());
+                render.entry(&hint);
             }
             self.groups.retain(|group| group.entry.is_some());
             self.groups.append(&mut render.groups);
@@ -732,7 +738,14 @@ mod tests {
         let running = ToolCallUpdate::new("call_1", running);
         talk.update(&SessionUpdate::ToolCallUpdate(running));
         assert!(talk.shelling());
-        let expected = ["", "! ls docs", "  ╰ notes.md"];
+        let expected = [
+            "",
+            "! ls docs",
+            "  ╰ notes.md",
+            "",
+            "  Goes to the model with your next",
+            "  message",
+        ];
         assert_eq!(rows(&mut transcript, &talk), expected);
 
         let error = Meta::from_iter([("error".to_owned(), json!("exit 2"))]);
@@ -742,6 +755,7 @@ mod tests {
         assert!(!talk.shelling());
 
         // After it ends, calls with the same ID or without the flag belong to the model
+        talk.task("Summarize the naïve notes");
         let late = ToolCallUpdateFields::new().content(vec![content("todo.md")]);
         let late = ToolCallUpdate::new("call_1", late);
         talk.update(&SessionUpdate::ToolCallUpdate(late));
@@ -752,6 +766,8 @@ mod tests {
             "! ls docs",
             "  ├ notes.md",
             "  ✗ exit 2",
+            "",
+            "❯ Summarize the naïve notes",
             "",
             "  ⚙ eval",
         ];

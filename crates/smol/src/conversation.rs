@@ -157,6 +157,14 @@ impl Conversation {
         self.held.iter().any(running)
     }
 
+    /// The agent sends the commands the user ran with the next task
+    pub(crate) fn shell_unsent(&self) -> bool {
+        let mut entries = self.entries.iter().chain(&self.held).rev();
+        let last = entries.find(|entry| matches!(entry, Entry::Shell(_) | Entry::Task(_)));
+
+        matches!(last, Some(Entry::Shell(_)))
+    }
+
     pub(crate) fn unstarted(&self) -> bool {
         let asked = matches!(self.held.first(), Some(Entry::Task(_)));
         let step = |entry: &Entry| matches!(entry, Entry::Step(_));
