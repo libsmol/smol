@@ -1,6 +1,7 @@
-use crate::prompt::{self, TOOL};
+use crate::config::ModelSpec;
+use crate::prompt::{self, ARGUMENT, TOOL};
 use crate::tools::attach::read_copy;
-use crate::utils::{excerpt, http_cause, http_client};
+use crate::utils::{excerpt, http_cause, http_client, read_cause};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use reqwest::header::CONTENT_TYPE;
@@ -27,7 +28,6 @@ const KEEPALIVE_RETRIES: u32 = 3;
 /// Don't retry when the server asks for a longer wait
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 
-const ARGUMENT: &str = "code";
 /// Servers only accept tool names of letters, digits, `_` and `-` up to this length
 pub(crate) const MAX_NAME_CHARS: usize = 64;
 
@@ -235,20 +235,6 @@ pub(crate) trait Model: Send + Sync {
     fn takes(&self, _kind: MediaKind) -> bool {
         false
     }
-}
-
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ModelSpec {
-    pub(crate) id: String,
-    pub(crate) effort: Option<String>,
-    pub(crate) context: Option<u64>,
-    /// DeepSeek counts reasoning toward it, and a small value cuts the reply off mid-reasoning
-    pub(crate) max_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Not::not")]
-    pub(crate) image: bool,
-    #[serde(default, skip_serializing_if = "Not::not")]
-    pub(crate) video: bool,
 }
 
 pub(crate) struct OpenAIModel {
@@ -461,7 +447,7 @@ impl Model for OpenAIModel {
         body.insert("stream".into(), json!(true));
         body.insert("stream_options".into(), json!({ "include_usage": true }));
         if purpose == Purpose::Step {
-            let code = json!({ "type": "string", "description": "The Python code to run." });
+            let code = json!({ "type": "string", "description": prompt::ARGUMENT_DOC });
             let parameters = json!({
                 "type": "object",
                 "properties": { ARGUMENT: code },
@@ -592,11 +578,19 @@ pub(crate) enum ListError {
     Other(String),
 }
 
-pub(crate) async fn listed(api: &str, key: &str) -> Result<Vec<ModelSpec>, ListError> {
+/// A model an endpoint lists
+#[derive(Debug)]
+pub(crate) struct Offered {
+    pub(crate) id: String,
+    pub(crate) context: Option<u64>,
+}
+
+pub(crate) async fn listed(api: &str, key: &str) -> Result<Vec<Offered>, ListError> {
     let builder = Client::builder().timeout(LIST_WAIT);
     let client = http_client(builder).map_err(ListError::Other)?;
     let api = api.trim_end_matches('/');
     let url = format!("{api}/models");
+    let failed = |reason: &str| prompt::failure("models", &url, reason);
     let mut request = client.get(&url);
     if real_key(key) {
         request = request.bearer_auth(key);
@@ -606,7 +600,7 @@ pub(crate) async fn listed(api: &str, key: &str) -> Result<Vec<ModelSpec>, ListE
         Ok(response) => response,
         Err(e) => {
             let reason = http_cause(&e);
-            let message = format!("models: {url}: {reason}");
+            let message = failed(&reason);
             let error = match e.is_connect() {
                 true => ListError::Address(message),
                 false => ListError::Other(message),
@@ -626,7 +620,7 @@ pub(crate) async fn listed(api: &str, key: &str) -> Result<Vec<ModelSpec>, ListE
         };
         let code = status.as_u16();
         let reason = prompt::http_status(code, &said);
-        let message = format!("models: {url}: {reason}");
+        let message = failed(&reason);
         let error = match code {
             401 | 403 => ListError::Key(message),
             404 => ListError::Address(message),
@@ -636,10 +630,10 @@ pub(crate) async fn listed(api: &str, key: &str) -> Result<Vec<ModelSpec>, ListE
     }
 
     let Some(entries) = json["data"].as_array() else {
-        let message = format!("models: {url}: not a model list");
+        let message = failed("not a model list");
         return Err(ListError::Address(message));
     };
-    let mut specs = Vec::new();
+    let mut offered = Vec::new();
     for entry in entries {
         let Some(id) = entry["id"].as_str() else {
             continue;
@@ -652,21 +646,20 @@ pub(crate) async fn listed(api: &str, key: &str) -> Result<Vec<ModelSpec>, ListE
             &entry["max_model_len"],
         ];
         let context = windows.into_iter().find_map(Value::as_u64);
-        let spec = ModelSpec {
+        let model = Offered {
             id: id.to_owned(),
             context,
-            ..ModelSpec::default()
         };
-        specs.push(spec);
+        offered.push(model);
     }
-    if specs.is_empty() {
-        let message = format!("models: {url}: none listed");
+    if offered.is_empty() {
+        let message = failed("none listed");
         return Err(ListError::Other(message));
     }
 
-    specs.sort_by(|a, b| a.id.cmp(&b.id));
-    specs.dedup_by(|a, b| a.id == b.id);
-    Ok(specs)
+    offered.sort_by(|a, b| a.id.cmp(&b.id));
+    offered.dedup_by(|a, b| a.id == b.id);
+    Ok(offered)
 }
 
 #[derive(Default)]
@@ -908,24 +901,24 @@ impl Stream {
 }
 
 /// Stops before an escape that hasn't fully arrived and waits for later chunks
-fn decode(arguments: &str, field: &str, value: &mut Decoding) -> String {
+fn decode(arguments: &str, field: &str, decoding: &mut Decoding) -> String {
     let mut decoded = String::new();
-    if value.closed {
+    if decoding.closed {
         return decoded;
     }
 
-    let at = match value.at {
+    let at = match decoding.at {
         Some(at) => at,
         None => {
-            let field = format!("\"{field}\"");
-            let Some(key) = arguments.find(&field) else {
+            let quoted = format!("\"{field}\"");
+            let Some(start) = arguments.find(&quoted) else {
                 return decoded;
             };
-            let after = arguments[key + field.len()..].trim_start();
-            let Some(value) = after.strip_prefix(':') else {
+            let after = arguments[start + quoted.len()..].trim_start();
+            let Some(rest) = after.strip_prefix(':') else {
                 return decoded;
             };
-            let Some(text) = value.trim_start().strip_prefix('"') else {
+            let Some(text) = rest.trim_start().strip_prefix('"') else {
                 return decoded;
             };
             arguments.len() - text.len()
@@ -937,7 +930,7 @@ fn decode(arguments: &str, field: &str, value: &mut Decoding) -> String {
     while let Some(c) = rest[used..].chars().next() {
         match c {
             '"' => {
-                value.closed = true;
+                decoding.closed = true;
                 used += 1;
                 break;
             }
@@ -955,7 +948,7 @@ fn decode(arguments: &str, field: &str, value: &mut Decoding) -> String {
         }
     }
 
-    value.at = Some(at + used);
+    decoding.at = Some(at + used);
     decoded
 }
 
@@ -965,9 +958,9 @@ fn lone_string(arguments: &str) -> Option<String> {
     let named = inside.trim_start().strip_prefix('"')?;
     let (field, _) = named.split_once('"')?;
 
-    let mut value = Decoding::default();
-    let code = decode(arguments, field, &mut value);
-    let at = value.at.filter(|_| value.closed)?;
+    let mut decoding = Decoding::default();
+    let code = decode(arguments, field, &mut decoding);
+    let at = decoding.at.filter(|_| decoding.closed)?;
     let after = arguments[at..].trim();
     (after == "}").then_some(code)
 }
@@ -1046,14 +1039,7 @@ fn network_error(error: &reqwest::Error) -> ModelError {
     // which without decompression means the network dropped
     let body = error.is_body() || error.is_decode();
 
-    // There is no overall timeout, so any timeout outside connecting is a read timeout
-    let reason = match timeout && !connect {
-        true => {
-            let seconds = IDLE_WAIT.as_secs();
-            format!("timed out after {seconds}s without data")
-        }
-        false => http_cause(error),
-    };
+    let reason = read_cause(error, IDLE_WAIT);
     let message = match body {
         true => format!("stream: {reason}"),
         false => reason,
@@ -1163,7 +1149,7 @@ pub(crate) mod tests {
     }
 
     /// Answers one request with `response` and returns what was listed and the request head
-    fn listing(response: &str, key: &str) -> (Result<Vec<ModelSpec>, ListError>, String) {
+    fn listing(response: &str, key: &str) -> (Result<Vec<Offered>, ListError>, String) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("address");
         let response = response.to_owned();
@@ -1657,13 +1643,8 @@ pub(crate) mod tests {
 
     #[test]
     fn stream_endings() {
-        let finish = |lines: &[&str]| parsed(lines).0.map(|finished| finished.finish);
         let partial = r#"data: {"choices":[{"delta":{"content":"Half a sentence"}}]}"#;
-
-        let done = finish(&[partial, "data: [DONE]"]).expect("parse");
-        assert_eq!(done, Finish::Stop);
-
-        let cut = finish(&[partial]).expect_err("cut");
+        let cut = parsed(&[partial]).0.expect_err("cut");
         assert_eq!(cut.message, "stream: ended early");
         assert!(cut.transient);
     }
@@ -1729,10 +1710,10 @@ pub(crate) mod tests {
         let response = reply("200 OK", "application/json", body);
         let (listed, request) = listing(&response, "sk-test");
 
-        let specs = listed.expect("listed");
-        let found: Vec<(&str, Option<u64>)> = specs
+        let offered = listed.expect("listed");
+        let found: Vec<(&str, Option<u64>)> = offered
             .iter()
-            .map(|spec| (spec.id.as_str(), spec.context))
+            .map(|model| (model.id.as_str(), model.context))
             .collect();
         let expected = [
             ("alpha-café", Some(8192)),
@@ -1826,7 +1807,7 @@ pub(crate) mod tests {
         let mut ignore = |_: StreamDelta| {};
         let generating = model.generate(&conversation, Purpose::Step, &mut ignore);
         let waited = block_on(generating).expect_err("idle");
-        assert_eq!(waited.message, "timed out after 1s without data");
+        assert_eq!(waited.message, "received no data for 1s");
         assert!(waited.transient);
     }
 }

@@ -1,22 +1,24 @@
 use crate::agent::{Brief, Place, Status};
 use crate::config::Role;
-use crate::model::{Media, Part};
+use crate::model::{Media, MediaKind, Part};
 use crate::steps::{
     exit_code, AgentStep, Attachment, Call, CallError, Ending, Exit, MemoryStep, ShellStep,
-    StepError, TaskStep, MAX_OBSERVATION_CHARS, MAX_PRINT_CHARS,
+    StepError, TaskStep, MAX_OBSERVATION_CHARS,
 };
 use crate::tools::memories::MAX_MEMORY_CHARS;
 use crate::utils::truncated;
 use crate::worker::host::Added;
-use crate::worker::Function;
+use crate::worker::{Function, MAX_PRINT_CHARS};
 use chrono::Utc;
 use std::env::consts::OS;
 use std::path::{Path, PathBuf};
 use worker::PYTHON_VERSION;
 
 pub(crate) const TOOL: &str = "eval";
+pub(crate) const ARGUMENT: &str = "code";
 /// Mentioning tags makes models write tags into the arguments
 pub(crate) const TOOL_DOC: &str = "Runs Python code.";
+pub(crate) const ARGUMENT_DOC: &str = "The Python code to run.";
 
 /// What the summarizer's transcript calls a message the user wrote while the agent worked
 const UPDATE: &str = "Task update";
@@ -62,10 +64,10 @@ pub(crate) fn agent_status(status: &Status, end: &Ending) -> String {
     match end {
         Ending::Answer(_) => return "answered".to_owned(),
         Ending::Error(error) => return format!("failed: {error}"),
-        Ending::Interrupted {} => return STOPPED.to_owned(),
-        Ending::Stopped {} => return STOPPED_BY_CODE.to_owned(),
-        Ending::Unfinished {} => return UNFINISHED.to_owned(),
         Ending::Running {} => {}
+        stopped => match stopped.outcome() {
+            Ok(text) | Err(text) => return text.to_owned(),
+        },
     }
 
     let Some(since) = status.since else {
@@ -105,8 +107,10 @@ pub(crate) fn long_memory(count: usize) -> String {
     format!("{count} characters, over the {MAX_MEMORY_CHARS}-character limit")
 }
 
+const VIEW: &str = "view";
+
 /// None leaves view() out of the prompt
-pub(crate) fn view_summary(image: bool, video: bool) -> Option<&'static str> {
+fn view_summary(image: bool, video: bool) -> Option<&'static str> {
     match (image, video) {
         (true, true) => {
             Some("Shows you an image or video file by adding it to this call's result.")
@@ -126,11 +130,20 @@ pub(crate) fn system(
     cwd: &Path,
     writable: Option<&[PathBuf]>,
     place: &Place,
+    takes: &dyn Fn(MediaKind) -> bool,
 ) -> String {
+    let image = takes(MediaKind::Image);
+    let video = takes(MediaKind::Video);
+    let viewing = view_summary(image, video);
     let mut stubs = Vec::new();
     for function in functions {
+        let summary = match (function.name.as_str(), viewing) {
+            (VIEW, None) => continue,
+            (VIEW, Some(summary)) => summary,
+            _ => function.summary.as_str(),
+        };
         let mut stub = function.header.clone();
-        for line in function.summary.lines() {
+        for line in summary.lines() {
             stub.push_str("\n    # ");
             stub.push_str(line);
         }
@@ -198,7 +211,8 @@ pub(crate) fn system(
 
     let mut entries = Vec::new();
     for role in roles {
-        let entry = format!("- `{}`: {}", role.name, role.description);
+        let description = one_line(&role.description);
+        let entry = format!("- `{}`: {description}", role.name);
         entries.push(entry);
     }
     let roles = match roles.first() {
@@ -264,9 +278,8 @@ pub(crate) fn system(
     let memories = &brief.listed;
     let mut lines = Vec::new();
     for (id, text) in &memories.newest {
-        // A memory may hold line breaks, which would end its item
-        let words: Vec<&str> = text.lines().collect();
-        let line = format!("- [{id}] {}", words.join(" "));
+        let text = one_line(text);
+        let line = format!("- [{id}] {text}");
         lines.push(line);
     }
     let mut kept = Vec::new();
@@ -292,8 +305,7 @@ pub(crate) fn system(
         let here = format!("This project has {counted} of its own, not listed here; before you start a task, `recall()` its key words.");
         kept.push(here);
     }
-    let remembering = functions.iter().any(|function| function.name == "remember");
-    if remembering {
+    if place.remembers() {
         kept.push(REMEMBERING.to_owned());
     }
     let remembered = match kept.is_empty() {
@@ -351,6 +363,13 @@ These need no import; use them instead of writing your own. What is listed here 
     )
 }
 
+/// Line breaks would end a list item
+fn one_line(text: &str) -> String {
+    let lines = text.lines().map(str::trim);
+    let lines: Vec<&str> = lines.filter(|line| !line.is_empty()).collect();
+    lines.join(" ")
+}
+
 pub(crate) fn task(step: &TaskStep) -> Vec<Part> {
     request(step.text.clone(), step)
 }
@@ -388,18 +407,12 @@ fn block(file: &Attachment, content: &str) -> String {
         (false, false) => ("file", "path"),
     };
     let lines = match file.lines {
-        Some(lines) => format!(" lines=\"{}\"", span(lines)),
+        Some((first, last)) if first == last => format!(" lines=\"{first}\""),
+        Some((first, last)) => format!(" lines=\"{first}-{last}\""),
         None => String::new(),
     };
     let content = content.trim_end_matches('\n');
     format!("<{tag} {key}=\"{path}\"{lines}>\n{content}\n</{tag}>")
-}
-
-fn span((first, last): (u32, u32)) -> String {
-    match first == last {
-        true => first.to_string(),
-        false => format!("{first}-{last}"),
-    }
 }
 
 pub(crate) fn result(printed: Option<&str>, viewed: &[(String, Media)]) -> Vec<Part> {
@@ -423,26 +436,29 @@ pub(crate) fn cut(count: usize) -> String {
 }
 
 /// Cut-off replies are never sent back, so the model cannot see the last reply this mentions
-const CUT: &str =
+const REPLY_CUT: &str =
     "Your last reply was too long and was discarded, so nothing ran: write less per reply";
 const NO_CODE: &str = "not run: the call had no code";
-pub(crate) const STOPPED: &str = "interrupted by the user";
+pub(crate) const INTERRUPTED_BY_USER: &str = "interrupted by the user";
 const UNRUN: &str = "not run: interrupted by the user";
 pub(crate) const SKIPPED: &str = "not run: an earlier call failed";
-const INTERRUPTED: &str = "The user interrupted you";
+const REPLY_INTERRUPTED: &str = "The user interrupted you";
 
-/// A step with calls reports this in their replies instead
-pub(crate) fn step_reason(step: &AgentStep) -> Option<String> {
+/// A step whose calls the model sees reports this in their replies instead
+pub(crate) fn step_reason(step: &AgentStep) -> Option<&'static str> {
+    let (_, calls) = step.seen();
+    if !calls.is_empty() {
+        return None;
+    }
+
     let error = step.error.as_ref()?;
-    let text = match error {
-        StepError::Cut => CUT,
-        StepError::Interrupted => INTERRUPTED,
-        StepError::Model(_) => return Some(error.to_string()),
-    };
-    Some(text.to_owned())
+    match error {
+        StepError::Cut => Some(REPLY_CUT),
+        StepError::Interrupted => Some(REPLY_INTERRUPTED),
+    }
 }
 
-pub(crate) fn error(step: &AgentStep) -> Option<String> {
+pub(crate) fn step_error(step: &AgentStep) -> Option<String> {
     let reason = step_reason(step)?;
     Some(format!("[{reason}]"))
 }
@@ -455,7 +471,7 @@ pub(crate) fn call_reason(step: &AgentStep, call: &Call) -> Option<String> {
             format!("not run: no tool named \"{name}\", only {TOOL}")
         }
         (Some(CallError::NoCode), _) => NO_CODE.to_owned(),
-        (Some(CallError::Interrupted), Some(_)) => STOPPED.to_owned(),
+        (Some(CallError::Interrupted), Some(_)) => INTERRUPTED_BY_USER.to_owned(),
         (Some(CallError::Interrupted), None) => UNRUN.to_owned(),
         (Some(CallError::Execution(text)), _) => text.clone(),
         (None, Some(_)) => return None,
@@ -501,7 +517,7 @@ fn ended(end: &Exit) -> String {
             format!("exited with code {code}")
         }
         Exit::Signaled(signal) => format!("ended with signal {signal}"),
-        Exit::Interrupted => STOPPED.to_owned(),
+        Exit::Interrupted => INTERRUPTED_BY_USER.to_owned(),
         Exit::Unstarted(reason) => format!("did not start: {reason}"),
     }
 }
@@ -566,11 +582,7 @@ pub(crate) fn python(reason: &str) -> String {
 
 pub(crate) fn exited(end: Option<&Exit>) -> String {
     match end {
-        Some(Exit::Exited(code)) => {
-            let code = exit_code(*code);
-            format!("exited with code {code}")
-        }
-        Some(Exit::Signaled(signal)) => format!("ended with signal {signal}"),
+        Some(end @ (Exit::Exited(_) | Exit::Signaled(_))) => ended(end),
         _ => "exited".to_owned(),
     }
 }
@@ -662,7 +674,7 @@ pub(crate) fn media_too_large(word: &str, size: u64, limit: u64) -> String {
 pub(crate) const IRREGULAR: &str = "not a regular file";
 
 pub(crate) fn too_many(limit: usize) -> String {
-    format!("grep: more than {limit} MiB of matches, narrow the pattern or the path")
+    format!("more than {limit} MiB of matches, narrow the pattern or the path")
 }
 
 pub(crate) fn unfetchable(url: &str, mime: &str) -> String {
@@ -736,16 +748,11 @@ pub(crate) fn transcript(steps: &[&MemoryStep], max: usize) -> String {
             MemoryStep::Task(task) => ("Task", task),
             MemoryStep::Update(task) => (UPDATE, task),
             MemoryStep::Action(step) => {
-                let shown = !step.dropped();
-                let text = step.text.trim();
-                if shown && !text.is_empty() {
+                let (text, calls) = step.seen();
+                if !text.is_empty() {
                     let said = format!("[Agent]\n{text}");
                     entries.push(said);
                 }
-                let calls = match shown {
-                    true => step.calls.as_slice(),
-                    false => &[],
-                };
                 for call in calls {
                     if !call.unread() {
                         let code = format!("[Code]\n{}", call.code);
@@ -773,9 +780,8 @@ pub(crate) fn transcript(steps: &[&MemoryStep], max: usize) -> String {
                         entries.push(error);
                     }
                 }
-                let reason = step_reason(step).filter(|_| calls.is_empty());
-                if let Some(reason) = reason {
-                    let reason = truncated(&reason, max);
+                if let Some(reason) = step_reason(step) {
+                    let reason = truncated(reason, max);
                     let error = format!("[Error]\n{reason}");
                     entries.push(error);
                 }
@@ -794,8 +800,7 @@ pub(crate) fn transcript(steps: &[&MemoryStep], max: usize) -> String {
                 continue;
             }
             MemoryStep::Done { agents } => {
-                let names = agents.join("\n");
-                let entry = format!("[{DONE}]\n{names}");
+                let entry = done(agents);
                 entries.push(entry);
                 continue;
             }
@@ -849,10 +854,8 @@ mod tests {
     use crate::agent::{Brief, Place};
     use crate::config::{Role, Skill};
     use crate::model::tests::png;
-    use crate::model::Media;
-    use crate::prompt::{
-        call_error, error, media_tag, shell, system, transcript, unseen, view_summary,
-    };
+    use crate::model::{Media, MediaKind};
+    use crate::prompt::{call_error, media_tag, shell, step_error, system, transcript, unseen};
     use crate::steps::{
         AgentStep, Call, CallError, CodeResult, Exit, MemoryStep, ShellStep, StepError,
     };
@@ -894,7 +897,7 @@ mod tests {
         ];
 
         let main = main_place(Vec::new());
-        let text = system(&functions, &[], &brief, cwd, None, &main);
+        let text = system(&functions, &[], &brief, cwd, None, &main, &|_| false);
 
         let built_in = "## Built-in\n\n```python\n\
                         ls(path) -> list[str]\n    # Sorted paths.\n    # The café/ folder ends with /.\n\n\
@@ -917,7 +920,7 @@ mod tests {
              When a task matches a skill, read and follow its `SKILL.md`; paths in it are relative to its folder.\n\n\
              - `weekly`: Write the weekly report (`/home/zoë/.smol/skills/weekly/SKILL.md`)\n\n# Sub-agents\n\n";
         assert!(text.contains(skill), "{text}");
-        let files = "`agent([part1, part2, ...])`.\n\n# Instructions\n\n\
+        let files = "`remember()` the correct one.\n\n# Instructions\n\n\
                      Follow these instructions:\n\n\
                      <instructions>\nReply in French\n</instructions>\n\n\
                      <instructions>\nIndent with tabs\n</instructions>\n\n# Environment\n\n";
@@ -927,7 +930,8 @@ mod tests {
         assert!(text.ends_with(" (UTC)."), "{text}");
 
         let empty = Brief::default();
-        let plain = system(&[], &[], &empty, cwd, Some(&[]), &main);
+        let delegated = Place::Delegated(None);
+        let plain = system(&[], &[], &empty, cwd, Some(&[]), &delegated, &|_| false);
         assert!(!plain.contains("<instructions"), "{plain}");
         assert!(!plain.contains("# Skills"), "{plain}");
         assert!(!plain.contains("# Roles"), "{plain}");
@@ -938,7 +942,7 @@ mod tests {
         assert!(plain.contains(sandbox), "{plain}");
 
         let registry = [PathBuf::from("/home/zoë/.cargo/registry")];
-        let allowed = system(&[], &[], &empty, cwd, Some(&registry), &main);
+        let allowed = system(&[], &[], &empty, cwd, Some(&registry), &main, &|_| false);
         let sandbox =
             "writing outside `/home/zoë/work`, `/home/zoë/.cargo/registry`, the venv and `$TMPDIR` (used by `tempfile`), ";
         assert!(allowed.contains(sandbox), "{allowed}");
@@ -968,7 +972,7 @@ mod tests {
         };
 
         let functions = [remember];
-        let text = system(&functions, &[], &brief, cwd, None, &main);
+        let text = system(&functions, &[], &brief, cwd, None, &main, &|_| false);
         let section = "`agent([part1, part2, ...])`.\n\n# Memories\n\n\
                        Global memories:\n\
                        - [7] Writes résumés in French\n\
@@ -989,14 +993,14 @@ mod tests {
             listed,
             ..Brief::default()
         };
-        let text = system(&functions, &[], &more, cwd, None, &main);
+        let text = system(&functions, &[], &more, cwd, None, &main, &|_| false);
         let heading = "# Memories\n\n\
                        Global memories, the newest 2 of 14 (`recall()` finds the rest):\n\
                        - [7] Writes résumés in French\n";
         assert!(text.contains(heading), "{text}");
 
         let empty = Brief::default();
-        let bare = system(&functions, &[], &empty, cwd, None, &main);
+        let bare = system(&functions, &[], &empty, cwd, None, &main, &|_| false);
         let rules =
             "`agent([part1, part2, ...])`.\n\n# Memories\n\n## Rules\n\n- `remember()` what";
         assert!(bare.contains(rules), "{bare}");
@@ -1009,7 +1013,8 @@ mod tests {
             listed,
             ..Brief::default()
         };
-        let helper = system(&[], &[], &counted, cwd, None, &Place::Delegated(None));
+        let delegated = Place::Delegated(None);
+        let helper = system(&[], &[], &counted, cwd, None, &delegated, &|_| false);
         let section =
             "`help()` prints the rest.\n\n## Built-in\n\n```python\n\n```\n\n# Memories\n\n\
                        This project has 1 memory of its own, not listed here; \
@@ -1025,31 +1030,34 @@ mod tests {
             description: description.to_owned(),
             model: None,
         };
-        let reviewer = role("reviewer", "Reviews the café's code");
+        let checklist = "Reviews the café's code.\n\n# Checklist\n- real bugs only";
+        let reviewer = role("reviewer", checklist);
         let roles = vec![reviewer.clone(), role("tester", "Writes naïve tests")];
         let cwd = Path::new("/home/zoë/work");
 
         let place = main_place(roles);
         let empty = Brief::default();
-        let main = system(&[], &[], &empty, cwd, None, &place);
+        let main = system(&[], &[], &empty, cwd, None, &place, &|_| false);
         let listed = "\n\n## Roles\n\n\
                       To give a task to an agent in one of these roles, call `agent(task, role=\"reviewer\")`. \
                       For a list of tasks, `role` is one role for all of them or a list with one role per task.\n\n\
-                      - `reviewer`: Reviews the café's code\n\
-                      - `tester`: Writes naïve tests\n\n# Environment\n\n";
+                      - `reviewer`: Reviews the café's code. # Checklist - real bugs only\n\
+                      - `tester`: Writes naïve tests\n\n# Memories\n\n## Rules\n\n";
         assert!(main.contains(listed), "{main}");
         assert!(!main.contains("# Role\n"), "{main}");
         assert!(main.contains("- Your answer goes to the user;"), "{main}");
 
         let played = Place::Delegated(Some(reviewer));
-        let helper = system(&[], &[], &empty, cwd, None, &played);
+        let helper = system(&[], &[], &empty, cwd, None, &played, &|_| false);
         let own = "with the `eval` tool.\n\n# Role\n\n\
-                   Your role is `reviewer`: Reviews the café's code\n\n# How to reply\n\n";
+                   Your role is `reviewer`: Reviews the café's code.\n\n# Checklist\n- real bugs only\n\n\
+                   # How to reply\n\n";
         assert!(helper.contains(own), "{helper}");
         assert!(!helper.contains("# Roles"), "{helper}");
         let reader = "- Your answer goes to the agent that assigned this task;";
         assert!(helper.contains(reader), "{helper}");
-        let plain = system(&[], &[], &empty, cwd, None, &Place::Delegated(None));
+        let delegated = Place::Delegated(None);
+        let plain = system(&[], &[], &empty, cwd, None, &delegated, &|_| false);
         assert!(!plain.contains("# Role"), "{plain}");
     }
 
@@ -1058,20 +1066,22 @@ mod tests {
     fn images_shown() {
         let cwd = Path::new("/home/zoë/work");
         let main = main_place(Vec::new());
-        let plain = system(&[], &[], &Brief::default(), cwd, None, &main);
+        let empty = Brief::default();
+        let plain = system(&[], &[], &empty, cwd, None, &main, &|_| false);
         assert!(!plain.contains("![alt]"), "{plain}");
 
         let brief = Brief {
             images_shown: true,
             ..Brief::default()
         };
-        let text = system(&[], &[], &brief, cwd, None, &main);
+        let text = system(&[], &[], &brief, cwd, None, &main, &|_| false);
         let shown = "no code is needed.\n\n\
                      To show the user an image, such as a chart you saved, put `![alt](path)` on a line of its own.\n\n\
                      A message starting with `[The user wrote";
         assert!(text.contains(shown), "{text}");
 
-        let helper = system(&[], &[], &brief, cwd, None, &Place::Delegated(None));
+        let delegated = Place::Delegated(None);
+        let helper = system(&[], &[], &brief, cwd, None, &delegated, &|_| false);
         let shown = "no code is needed.\n\n\
                      To show the user an image, such as a chart you saved, put `![alt](path)` on a line of its own.\n\n\
                      Only your answer is returned";
@@ -1079,14 +1089,24 @@ mod tests {
     }
 
     #[test]
-    fn view_summaries() {
-        let both = Some("Shows you an image or video file by adding it to this call's result.");
-        assert_eq!(view_summary(true, true), both);
-        let images = Some("Shows you an image file by adding it to this call's result.");
-        assert_eq!(view_summary(true, false), images);
-        let videos = Some("Shows you a video file by adding it to this call's result.");
-        assert_eq!(view_summary(false, true), videos);
-        assert_eq!(view_summary(false, false), None);
+    fn view_adapted() {
+        let view = Function {
+            name: "view".to_owned(),
+            header: "view(path) -> None".to_owned(),
+            summary: "Adds the café photo.".to_owned(),
+        };
+        let functions = [view];
+        let cwd = Path::new("/home/zoë/work");
+        let empty = Brief::default();
+        let delegated = Place::Delegated(None);
+
+        let images = |kind: MediaKind| kind == MediaKind::Image;
+        let shown = system(&functions, &[], &empty, cwd, None, &delegated, &images);
+        let stub = "\nview(path) -> None\n    # Shows you an image file by adding it to this call's result.\n```";
+        assert!(shown.contains(stub), "{shown}");
+
+        let hidden = system(&functions, &[], &empty, cwd, None, &delegated, &|_| false);
+        assert!(!hidden.contains("view(path)"), "{hidden}");
     }
 
     /// The model cannot tell from the record how far it got before the interrupt
@@ -1100,11 +1120,11 @@ mod tests {
         };
         let interrupted = "[The user interrupted you]";
         assert_eq!(
-            error(&stopped("", Vec::new())).as_deref(),
+            step_error(&stopped("", Vec::new())).as_deref(),
             Some(interrupted)
         );
         let prose = stopped("Roses are red", Vec::new());
-        assert_eq!(error(&prose).as_deref(), Some(interrupted));
+        assert_eq!(step_error(&prose).as_deref(), Some(interrupted));
         let plain = "[interrupted by the user]";
 
         let written = Call {

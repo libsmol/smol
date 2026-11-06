@@ -10,6 +10,7 @@ use agent_client_protocol_schema::v1::{
 };
 use agent_client_protocol_schema::ProtocolVersion;
 use anyhow::{anyhow, bail, Result};
+use reaper::wire::{ENQUEUED, FORGET, IMAGES, MCP, MEMORIES, NOTICE, QUEUED, SHELL};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -33,20 +34,6 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 
 const EXITED: &str = "agent: exited";
-
-const QUEUED: &str = "_smol/queued";
-/// Declared only when the terminal draws Kitty images
-const IMAGES: &str = "_smol/images";
-const ENQUEUED: &str = "_smol/enqueued";
-const NOTICE: &str = "_smol/notice";
-const MCP: &str = "_smol/mcp";
-pub(crate) const UPDATE: &str = "_smol/update";
-/// Also set in the `_meta` of the tool calls it produces
-pub(crate) const SHELL: &str = "_smol/shell";
-/// Marks the tool calls of agents the code starts
-pub(crate) const AGENT: &str = "_smol/agent";
-const MEMORIES: &str = "_smol/memories";
-const FORGET: &str = "_smol/forget";
 
 const MAX_STDERR_LINES: usize = 20;
 const STDERR_WAIT: Duration = Duration::from_millis(200);
@@ -84,6 +71,12 @@ pub(crate) struct McpStatus {
     pub(crate) state: McpState,
 }
 
+impl fmt::Display for McpStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "mcp: {}: {}", self.name, self.state)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub(crate) enum McpState {
@@ -115,26 +108,20 @@ pub(crate) fn tool_count(tools: usize) -> String {
 }
 
 #[derive(Debug)]
-pub(crate) struct Refused(String);
+pub(crate) enum Refusal {
+    InvalidParams(String),
+    AuthRequired(String),
+}
 
-impl fmt::Display for Refused {
+impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Refusal::InvalidParams(text) | Refusal::AuthRequired(text) => f.write_str(text),
+        }
     }
 }
 
-impl error::Error for Refused {}
-
-#[derive(Debug)]
-pub(crate) struct AuthRequired(String);
-
-impl fmt::Display for AuthRequired {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl error::Error for AuthRequired {}
+impl error::Error for Refusal {}
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Memory {
@@ -149,12 +136,12 @@ struct Memories {
     memories: Vec<Memory>,
 }
 
-#[derive(Clone)]
-pub(crate) struct Pick {
-    /// What goes in the command
+/// One choice of the model option
+pub(crate) struct Model {
+    /// What the agent takes to switch to it
     pub(crate) value: String,
-    pub(crate) label: String,
-    pub(crate) description: String,
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
     pub(crate) current: bool,
 }
 
@@ -394,9 +381,10 @@ impl Client {
                         let result = match message.get("error") {
                             Some(error) => {
                                 let text = error["message"].as_str().unwrap_or("unknown error");
+                                let text = text.to_owned();
                                 let error = match error["code"].as_i64() {
-                                    Some(INVALID_PARAMS) => Refused(text.to_owned()).into(),
-                                    Some(AUTH_REQUIRED) => AuthRequired(text.to_owned()).into(),
+                                    Some(INVALID_PARAMS) => Refusal::InvalidParams(text).into(),
+                                    Some(AUTH_REQUIRED) => Refusal::AuthRequired(text).into(),
                                     _ => anyhow!("{text}"),
                                 };
                                 Err(error)
@@ -649,7 +637,7 @@ impl Client {
     }
 
     /// Tells the agent that a message is queued for the running turn, which it then asks for
-    pub(crate) fn enqueued(&self, session: &str) {
+    pub(crate) fn notify_queued(&self, session: &str) {
         let params = json!({ "sessionId": session });
         self.connection.notify(ENQUEUED, params);
     }
@@ -676,13 +664,13 @@ pub(crate) fn model_of(options: &[SessionConfigOption]) -> Option<String> {
     let current = models(options).into_iter().find(|choice| choice.current);
 
     let name = match current {
-        Some(choice) => choice.label,
+        Some(choice) => choice.name,
         None => select.current_value.0.to_string(),
     };
     Some(name)
 }
 
-pub(crate) fn models(options: &[SessionConfigOption]) -> Vec<Pick> {
+pub(crate) fn models(options: &[SessionConfigOption]) -> Vec<Model> {
     let Some(select) = model_select(options) else {
         return Vec::new();
     };
@@ -695,17 +683,16 @@ pub(crate) fn models(options: &[SessionConfigOption]) -> Vec<Pick> {
         _ => Vec::new(),
     };
 
-    let mut picks = Vec::new();
+    let mut models = Vec::new();
     for choice in choices {
-        let description = choice.description.clone().unwrap_or_default();
-        picks.push(Pick {
+        models.push(Model {
             value: choice.value.0.to_string(),
-            label: choice.name.clone(),
-            description,
+            name: choice.name.clone(),
+            description: choice.description.clone(),
             current: choice.value == select.current_value,
         });
     }
-    picks
+    models
 }
 
 fn model_option(options: &[SessionConfigOption]) -> Option<&SessionConfigOption> {
@@ -817,5 +804,6 @@ cat >/dev/null"#,
             states,
             ["off", "connected, 3 tools", "failed: connection refused"]
         );
+        assert_eq!(servers[1].to_string(), "mcp: web: connected, 3 tools");
     }
 }

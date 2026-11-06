@@ -52,26 +52,74 @@ pub struct Group {
 }
 
 impl Group {
-    /// On error the child is still suspended and the caller must end it
+    /// On error the child is killed with the job or still suspended, and the caller must end it
     pub fn new(pid: u32, _mark: Mark) -> io::Result<Group> {
+        // SAFETY: Null pointers mean default security attributes and no name
+        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // Dropped on an error below, which kills what the job holds and closes it
+        let group = Group {
+            job: job as usize,
+            released: AtomicBool::new(false),
+        };
+        limit(job, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
+
         let access = PROCESS_SET_QUOTA | PROCESS_TERMINATE;
         // SAFETY: Only opens our own child, which the caller holds, so its pid can't be reused
         let process = unsafe { OpenProcess(access, 0, pid) };
         if process.is_null() {
             return Err(io::Error::last_os_error());
         }
-
-        let adopted = adopt(process, pid);
+        // Read before closing the handle, which may replace the last error
+        // SAFETY: Both handles were just opened
+        let assigned = match unsafe { AssignProcessToJobObject(job, process) } {
+            0 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        };
         // SAFETY: The handle was just opened and is not used again
         unsafe { CloseHandle(process) };
-        let job = adopted? as usize;
+        assigned?;
 
-        JOBS.lock().expect("jobs lock").push(job);
+        // SAFETY: Only takes a snapshot of threads
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
 
-        Ok(Group {
-            job,
-            released: AtomicBool::new(false),
-        })
+        let mut entry = THREADENTRY32 {
+            dwSize: mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut resumed = 0;
+        // SAFETY: entry has its dwSize filled in
+        let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+        while more {
+            if entry.th32OwnerProcessID == pid {
+                // SAFETY: Only opens this thread to resume it
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if !thread.is_null() {
+                    // SAFETY: The handle was just opened and is closed right after
+                    unsafe {
+                        ResumeThread(thread);
+                        CloseHandle(thread);
+                    }
+                    resumed += 1;
+                }
+            }
+            // SAFETY: Keeps reading the same snapshot
+            more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+        }
+
+        // SAFETY: The snapshot is no longer used
+        unsafe { CloseHandle(snapshot) };
+        if resumed == 0 {
+            return Err(io::Error::other("no thread to resume"));
+        }
+
+        JOBS.lock().expect("jobs lock").push(group.job);
+        Ok(group)
     }
 
     pub fn alive(&self) -> bool {
@@ -136,27 +184,21 @@ pub fn kill_all() {
     }
 }
 
-fn adopt(process: HANDLE, pid: u32) -> io::Result<HANDLE> {
-    // SAFETY: Null pointers mean default security attributes and no name
-    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-    if job.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-
-    let close = |error: io::Error| {
-        // SAFETY: The job was just created and has not been handed out
-        unsafe { CloseHandle(job) };
-        error
+/// The command line after the program's name, which Windows reads by rules of its own:
+/// the name ends at its closing quote, or else at the first space or tab
+pub fn command_tail(line: &[u16]) -> &[u16] {
+    let quote = u16::from(b'"');
+    let blank = |c: &u16| *c == u16::from(b' ') || *c == u16::from(b'\t');
+    let end = match line.first() == Some(&quote) {
+        true => {
+            let closing = line[1..].iter().position(|c| *c == quote);
+            closing.map_or(line.len(), |at| at + 2)
+        }
+        false => line.iter().position(blank).unwrap_or(line.len()),
     };
-    limit(job, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE).map_err(close)?;
-    // SAFETY: Both handles were just opened
-    if unsafe { AssignProcessToJobObject(job, process) } == 0 {
-        let error = io::Error::last_os_error();
-        return Err(close(error));
-    }
-    resume(pid).map_err(close)?;
-
-    Ok(job)
+    let rest = &line[end..];
+    let start = rest.iter().position(|c| !blank(c)).unwrap_or(rest.len());
+    &rest[start..]
 }
 
 fn limit(job: HANDLE, flags: JOB_OBJECT_LIMIT) -> io::Result<()> {
@@ -173,46 +215,6 @@ fn limit(job: HANDLE, flags: JOB_OBJECT_LIMIT) -> io::Result<()> {
     }
 }
 
-fn resume(pid: u32) -> io::Result<()> {
-    // SAFETY: Only takes a snapshot of threads
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mut entry = THREADENTRY32 {
-        dwSize: mem::size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-    let mut resumed = 0;
-    // SAFETY: entry has its dwSize filled in
-    let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
-    while more {
-        if entry.th32OwnerProcessID == pid {
-            // SAFETY: Only opens this thread to resume it
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if !thread.is_null() {
-                // SAFETY: The handle was just opened and is closed right after
-                unsafe {
-                    ResumeThread(thread);
-                    CloseHandle(thread);
-                }
-                resumed += 1;
-            }
-        }
-        // SAFETY: Keeps reading the same snapshot
-        more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
-    }
-
-    // SAFETY: The snapshot is no longer used
-    unsafe { CloseHandle(snapshot) };
-
-    match resumed {
-        0 => Err(io::Error::other("no thread to resume")),
-        _ => Ok(()),
-    }
-}
-
 fn forget(job: usize) {
     let mut jobs = JOBS.lock().expect("jobs lock");
     jobs.retain(|known| *known != job);
@@ -220,7 +222,7 @@ fn forget(job: usize) {
 
 #[cfg(test)]
 mod tests {
-    use crate::windows::{prepare, Group};
+    use crate::windows::{command_tail, prepare, Group};
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -275,5 +277,27 @@ mod tests {
         assert!(running(child.id()));
         child.kill().ok();
         child.wait().ok();
+    }
+
+    #[test]
+    fn tail_kept() {
+        let cases = [
+            (
+                r#""C:\Program Files\café\python.exe" -c "print('naïve')""#,
+                r#"-c "print('naïve')""#,
+            ),
+            (
+                "python.exe  \t-m pip install résumé",
+                "-m pip install résumé",
+            ),
+            ("python.exe", ""),
+            (r#""C:\café\python.exe""#, ""),
+            (r#""C:\café\python.exe"-c pass"#, "-c pass"),
+        ];
+        for (line, expected) in cases {
+            let line: Vec<u16> = line.encode_utf16().collect();
+            let tail = String::from_utf16(command_tail(&line)).expect("utf-16");
+            assert_eq!(tail, expected);
+        }
     }
 }

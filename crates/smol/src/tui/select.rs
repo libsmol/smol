@@ -220,13 +220,17 @@ pub(crate) fn copy(text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use crate::conversation::{Call, Conversation, Entry, Helper, Item, Step};
     use crate::tui::select::*;
     use crate::tui::tests::helper;
-    use crate::tui::transcript::{Call, Entry, Helper, Item, Step, Transcript};
+    use crate::tui::transcript::Transcript;
     use agent_client_protocol_schema::v1::ToolCallStatus;
 
-    fn rows(transcript: &mut Transcript) -> Rows<'_> {
-        transcript.rows(12, false)
+    /// The rows of a conversation holding only `entry`
+    fn laid_out(transcript: &mut Transcript, entry: Entry, width: u16) -> Rows<'_> {
+        let mut talk = Conversation::default();
+        talk.push(entry);
+        transcript.rows(&talk, width, false)
     }
 
     fn select(from: (usize, usize), to: (usize, usize)) -> Selection {
@@ -241,9 +245,7 @@ mod tests {
     fn copy_skips_marks() {
         let mut transcript = Transcript::default();
         let failure = "division by zero\nline 2".to_owned();
-        transcript.push(Entry::Failure(failure));
-
-        let rows = rows(&mut transcript);
+        let rows = laid_out(&mut transcript, Entry::Failure(failure), 12);
         let all = select((1, 0), (3, 40)).text(rows);
         assert_eq!(all, "division by zero\nline 2");
         assert_eq!(select((1, 4), (2, 3)).text(rows), "vision by");
@@ -253,9 +255,8 @@ mod tests {
     #[test]
     fn double_click_word() {
         let mut transcript = Transcript::default();
-        transcript.push(Entry::Failure("MAX_LEN crème_brûlée x.rs".to_owned()));
-
-        let rows = rows(&mut transcript);
+        let failure = Entry::Failure("MAX_LEN crème_brûlée x.rs".to_owned());
+        let rows = laid_out(&mut transcript, failure, 12);
         let word = |row, col| Selection::word(rows, Point { row, col }).map(|word| word.text(rows));
         assert_eq!(word(1, 5).as_deref(), Some("MAX_LEN"));
         assert_eq!(word(1, 2).as_deref(), Some("MAX_LEN"));
@@ -270,9 +271,8 @@ mod tests {
     fn emoji_columns() {
         for text in ["✔️ done", "👨‍💻 done", "👍🏽 done"] {
             let mut transcript = Transcript::default();
-            transcript.push(Entry::Failure(text.to_owned()));
-
-            let rows = rows(&mut transcript);
+            let failure = Entry::Failure(text.to_owned());
+            let rows = laid_out(&mut transcript, failure, 12);
             assert_eq!(select((1, 5), (1, 6)).text(rows), "do", "{text}");
             let word = Selection::word(rows, Point { row: 1, col: 5 });
             let word = word.map(|word| word.text(rows));
@@ -291,9 +291,7 @@ mod tests {
             ..Step::default()
         };
         let mut transcript = Transcript::default();
-        transcript.push(Entry::Step(step));
-
-        let rows = rows(&mut transcript);
+        let rows = laid_out(&mut transcript, Entry::Step(step), 12);
         assert_eq!(select((1, 0), (3, 40)).text(rows), "first\n\nsecond");
     }
 
@@ -308,9 +306,7 @@ mod tests {
             ..Step::default()
         };
         let mut transcript = Transcript::default();
-        transcript.push(Entry::Step(step));
-
-        let rows = rows(&mut transcript);
+        let rows = laid_out(&mut transcript, Entry::Step(step), 12);
         assert_eq!(rows.len(), 3);
         assert_eq!(select((1, 0), (2, 40)).text(rows), "• 🍕🍕 🚀🚀 🎉🎉");
     }
@@ -319,9 +315,8 @@ mod tests {
     fn fold_hint_skipped() {
         let lines: Vec<String> = (1..=10).map(|n| format!("café {n}")).collect();
         let mut transcript = Transcript::default();
-        transcript.push(Entry::Task(lines.join("\n")));
-
-        let rows = transcript.rows(40, false);
+        let task = Entry::Task(lines.join("\n"));
+        let rows = laid_out(&mut transcript, task, 40);
         let all = select((0, 0), (rows.len(), 40)).text(rows);
         assert_eq!(all, "\ncafé 1\ncafé 2\ncafé 3\ncafé 4\ncafé 9\ncafé 10");
     }
@@ -348,15 +343,14 @@ mod tests {
                     "It has a diaeresis.",
                 ),
             ],
+            revision: 0,
         };
         let step = Step {
             items: vec![Item::Call(call)],
             ..Step::default()
         };
         let mut transcript = Transcript::default();
-        transcript.push(Entry::Step(step));
-
-        let rows = transcript.rows(40, false);
+        let rows = laid_out(&mut transcript, Entry::Step(step), 40);
         let all = select((0, 0), (rows.len(), 40)).text(rows);
         let expected = "\nagent(tasks)\nCount the cafés\nprint(len(cafés))\nSpell naïve";
         assert_eq!(all, expected);
@@ -383,15 +377,14 @@ mod tests {
             attachments: Vec::new(),
             retries: Vec::new(),
             helpers: vec![reviewing],
+            revision: 0,
         };
         let step = Step {
             items: vec![Item::Call(call)],
             ..Step::default()
         };
         let mut transcript = Transcript::default();
-        transcript.push(Entry::Step(step));
-
-        let rows = transcript.rows(32, false);
+        let rows = laid_out(&mut transcript, Entry::Step(step), 32);
         let all = select((3, 0), (4, 40)).text(rows);
         assert_eq!(all, "Review the café menu and résumé");
     }
@@ -399,9 +392,8 @@ mod tests {
     #[test]
     fn highlight_stops_text() {
         let mut transcript = Transcript::default();
-        transcript.push(Entry::Failure("café\nrésumé 🐍".to_owned()));
-
-        let rows = rows(&mut transcript);
+        let failure = Entry::Failure("café\nrésumé 🐍".to_owned());
+        let rows = laid_out(&mut transcript, failure, 12);
         let area = Rect::new(0, 0, 12, 4);
         let mut buf = Buffer::empty(area);
         select((1, 0), (2, 40)).highlight(rows, 0, area, &mut buf);

@@ -5,8 +5,8 @@ use crate::model::{
 };
 use crate::prompt;
 use crate::steps::{
-    bytes, estimate, AgentMemory, AgentStep, Call, Ending, Helper, MemoryStep, StepError,
-    SummaryStep, TaskStep, Usage,
+    bytes, estimate, AgentMemory, AgentStep, Call, Helper, MemoryStep, StepError, SummaryStep,
+    TaskStep, Usage,
 };
 use crate::tools::attach::{attach, Mention};
 use crate::tools::memories::{Listed, Memories};
@@ -34,7 +34,6 @@ use crate::agent::delegate::{Records, Team};
 
 pub use crate::agent::delegate::MAX_PARALLEL_AGENTS;
 
-const VIEW: &str = "view";
 const MAX_NAMING_CHARS: usize = 2000;
 const MAX_RETRIES: u32 = 3;
 const RETRY_WAIT: Duration = match cfg!(test) {
@@ -51,18 +50,21 @@ pub(crate) enum Event<'a> {
     Code(usize, Streamed<'a>),
     /// A call with no readable code, shown as soon as it arrives
     Unread(usize, &'a Call),
-    Execute(usize, &'a Call),
+    Run(usize, &'a Call),
     /// Clipped output so far of the call at this index
     Output(usize, &'a Call, &'a str),
-    Ran(usize, &'a Call),
+    /// A call ended, also one with no readable code that never ran
+    RunEnd(usize, &'a Call),
     Restarted,
     Retry {
         reason: &'a str,
         wait: Duration,
     },
     StepEnd(&'a AgentStep),
+    /// A step whose request the model failed, which memory never holds
+    StepFailed(&'a AgentStep),
     Compact,
-    CompactEnd(Result<&'a SummaryStep, &'a StepError>),
+    CompactEnd(Result<&'a SummaryStep, &'a Failure>),
 }
 
 /// What arrived since the last event for it, and all of it so far in this reply
@@ -118,8 +120,6 @@ pub(crate) struct Status {
     pub(crate) usage: Usage,
     /// When it got a slot to run in
     pub(crate) since: Option<Instant>,
-    /// How it ends when `stop()` or the end of the turn rather than the user stopped it
-    pub(crate) stopped: Option<Ending>,
 }
 
 pub(crate) struct Unseen;
@@ -142,30 +142,26 @@ struct Logged<'a>(&'a mut dyn Sink);
 impl Sink for Logged<'_> {
     fn event(&mut self, event: Event) {
         // Code errors contain task content and are not logged
-        // A model error fails the turn and is logged only by the turn failure line
         match event {
-            Event::Retry { reason, wait } => {
-                let wait = wait.as_secs_f64();
-                warn!("model: retrying in {wait:.1}s, {reason}");
-            }
             Event::StepEnd(step) => {
-                let calls = step.calls.len();
-                let seconds = step.usage.duration;
-                let tokens = logged_tokens(&step.usage);
-                let counted = format!("[calls={calls}, tokens={tokens}, elapsed={seconds:.1}s]");
+                let counted = step_counts(step);
                 match &step.error {
                     None => info!("step: done {counted}"),
                     Some(StepError::Interrupted) => info!("step: interrupted {counted}"),
-                    Some(StepError::Model(_)) => warn!("step: failed {counted}"),
                     Some(error) => warn!("step: failed, {error} {counted}"),
                 }
+            }
+            // A model error is logged only by the line that ends the turn or the agent
+            Event::StepFailed(step) => {
+                let counted = step_counts(step);
+                warn!("step: failed {counted}");
             }
             Event::CompactEnd(Ok(summary)) => {
                 let kept = summary.kept;
                 let seconds = summary.usage.duration;
                 info!("compact: done [kept={kept}, elapsed={seconds:.1}s]");
             }
-            Event::CompactEnd(Err(StepError::Interrupted)) => info!("compact: interrupted"),
+            Event::CompactEnd(Err(Failure::Interrupted)) => info!("compact: interrupted"),
             Event::CompactEnd(Err(_)) => warn!("compact: failed"),
             Event::Restarted => warn!("python: restarted"),
             _ => {}
@@ -188,6 +184,14 @@ fn logged_tokens(usage: &Usage) -> String {
         Some(tokens) => format!("{}/{}", tokens.input_tokens, tokens.output_tokens),
         None => "-".to_owned(),
     }
+}
+
+/// What a step's log line ends with
+fn step_counts(step: &AgentStep) -> String {
+    let calls = step.calls.len();
+    let seconds = step.usage.duration;
+    let tokens = logged_tokens(&step.usage);
+    format!("[calls={calls}, tokens={tokens}, elapsed={seconds:.1}s]")
 }
 
 pub(crate) struct Task {
@@ -254,6 +258,11 @@ impl Place {
             Place::Delegated(_) => Delegation::Off,
         }
     }
+
+    /// The worker offers `remember()` and `forget()` exactly when it offers `agent()`
+    pub(crate) fn remembers(&self) -> bool {
+        self.delegation() != Delegation::Off
+    }
 }
 
 struct Turn<'a> {
@@ -275,27 +284,15 @@ impl Agent {
         task: Task,
         sink: &mut dyn Sink,
     ) -> Result<Option<String>> {
-        let image = self.model.takes(MediaKind::Image);
-        let video = self.model.takes(MediaKind::Video);
-        let mut functions = Vec::new();
-        for function in worker.functions() {
-            let mut function = function.clone();
-            if function.name == VIEW {
-                let Some(summary) = prompt::view_summary(image, video) else {
-                    continue;
-                };
-                function.summary = summary.to_owned();
-            }
-            functions.push(function);
-        }
-
+        let takes = |kind| self.model.takes(kind);
         let system = prompt::system(
-            &functions,
+            worker.functions(),
             servers,
             &self.brief,
             &self.workplace.cwd,
             self.workplace.writable(),
             &self.place,
+            &takes,
         );
 
         let mut logged = Logged(sink);
@@ -319,11 +316,10 @@ impl Agent {
         &'a self,
         servers: &'a [&'a Added],
         views: Box<dyn Helpers>,
-        records: &Records,
+        records: &Arc<Records>,
     ) -> Box<Serving<'a>> {
         let mut delegate = self.delegate(servers, views, records);
-        // Agents that agent() starts only recall
-        let writable = matches!(self.place, Place::Main { .. });
+        let writable = self.place.remembers();
         let serving =
             move |service: Service| serve(service, &mut *delegate, &self.memories, writable);
         Box::new(serving)
@@ -394,23 +390,8 @@ impl Turn<'_> {
         }
 
         // A task whose turn hit a model error stays in the record, so resending it replaces it
-        let steps = &mut self.memory.steps;
-        let last = steps
-            .iter()
-            .rposition(|step| !matches!(step, MemoryStep::Restarted | MemoryStep::Summary(_)));
-        if let Some(at) = last {
-            if let MemoryStep::Task(old) = &steps[at] {
-                if old.text == task.text {
-                    discard(old, copies);
-                    steps.remove(at);
-                    // Summaries after it count it among their `kept` steps
-                    for step in &mut steps[at..] {
-                        if let MemoryStep::Summary(summary) = step {
-                            summary.kept = summary.kept.saturating_sub(1);
-                        }
-                    }
-                }
-            }
+        if let Some(old) = self.memory.withdraw(&task.text) {
+            discard(&old, copies);
         }
 
         self.memory.steps.push(MemoryStep::Task(task));
@@ -420,18 +401,13 @@ impl Turn<'_> {
             self.compact().await?;
 
             // Pushed after compaction or it would be summarized away
-            if self.worker.restarted() {
+            if self.worker.take_restarted() {
                 self.memory.steps.push(MemoryStep::Restarted);
                 self.sink.event(Event::Restarted);
                 self.sink.saved(self.memory);
             }
 
-            let step = self.step().await;
-            if let Some(StepError::Model(error)) = &step.error {
-                self.sink.event(Event::StepEnd(&step));
-                return Err(error.clone().into());
-            }
-
+            let step = self.step().await?;
             let answer = step.answer().map(str::to_owned);
             self.memory.steps.push(MemoryStep::Action(step));
 
@@ -510,22 +486,25 @@ fn discard(task: &TaskStep, copies: &Path) {
     }
 }
 
-/// Reports a retryable error to `sink` and waits, returning true early on interrupt
+/// Reports a retryable failure to `sink` and waits, returning true early on interrupt
 async fn retry(
     tries: &mut u32,
-    error: &StepError,
+    failure: &Failure,
     interrupt: &Interrupt,
     sink: &mut dyn Sink,
 ) -> bool {
-    let wait = match error {
-        StepError::Model(model) if model.transient && *tries < MAX_RETRIES => {
+    let (error, wait) = match failure {
+        Failure::Model(error) if error.transient && *tries < MAX_RETRIES => {
             let backoff = RETRY_WAIT * 2u32.pow(*tries);
-            model.retry_after.unwrap_or(backoff)
+            let wait = error.retry_after.unwrap_or(backoff);
+            (error, wait)
         }
         _ => return false,
     };
 
-    let reason = error.to_string();
+    let seconds = wait.as_secs_f64();
+    warn!("model: retrying in {seconds:.1}s, {error}");
+    let reason = failure.to_string();
     sink.event(Event::Retry {
         reason: &reason,
         wait,
@@ -539,6 +518,15 @@ async fn retry(
     true
 }
 
+/// Why a request to the model brought no reply to use
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum Failure {
+    #[error("interrupted")]
+    Interrupted,
+    #[error("model: {0}")]
+    Model(ModelError),
+}
+
 /// Once `enough` fires the stream is not read to the end, which leaves usage unknown
 async fn generate(
     model: &dyn Model,
@@ -548,7 +536,7 @@ async fn generate(
     purpose: Purpose,
     usage: &mut Usage,
     on_delta: &mut (dyn FnMut(StreamDelta) + Send),
-) -> Result<Finish, StepError> {
+) -> Result<Finish, Failure> {
     let mut first = None;
     let mut blank = true;
     let mut reasoned = false;
@@ -578,17 +566,17 @@ async fn generate(
 
     usage.decode_duration = first.map(|at: Instant| at.elapsed().as_secs_f64());
     let Some(generated) = generated else {
-        return Err(StepError::Interrupted);
+        return Err(Failure::Interrupted);
     };
     if let Ok(finished) = &generated {
         usage.tokens = finished.usage;
     }
 
     if interrupt.triggered() {
-        return Err(StepError::Interrupted);
+        return Err(Failure::Interrupted);
     }
 
-    let finished = generated.map_err(StepError::Model)?;
+    let finished = generated.map_err(Failure::Model)?;
     let error = match finished.finish {
         Finish::Stop if blank && reasoned => {
             ModelError::transient("stopped after reasoning without replying")
@@ -601,7 +589,7 @@ async fn generate(
         }
         finish => return Ok(finish),
     };
-    Err(StepError::Model(error))
+    Err(Failure::Model(error))
 }
 
 async fn text_reply(
@@ -609,7 +597,7 @@ async fn text_reply(
     interrupt: &Interrupt,
     request: &[ChatMessage],
     purpose: Purpose,
-) -> (Result<String, StepError>, Usage) {
+) -> (Result<String, Failure>, Usage) {
     let started = Instant::now();
     let mut usage = Usage::default();
     let mut text = String::new();
@@ -1099,24 +1087,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn resent_task_replaced() {
-        let failed = Err(ModelError::new("http 401: wrong key"));
-        let replies = vec![failed, Ok(reply("Counted them."))];
-        let mut run = recorded(replies, None, "", Box::new(|_| {}));
-
-        let mut memory = AgentMemory::default();
-        let failed = run.agent.turn(&mut memory, "Count lines");
-        failed.expect_err("401");
-        let answer = run.agent.turn(&mut memory, "Count lines").expect("run");
-        assert_eq!(answer.as_deref(), Some("Counted them."));
-
-        let requests = run.requests.lock().expect("requests");
-        let second: Vec<String> = requests[1][1..].iter().map(content).collect();
-        assert_eq!(second, ["Count lines"]);
-        assert_eq!(memory.steps.len(), 2, "{:?}", memory.steps);
-    }
-
-    #[test]
     fn retry_after_waited() {
         let waits = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&waits);
@@ -1203,7 +1173,7 @@ pub(crate) mod tests {
             ..tested.agent.clone()
         };
         let asked = |agent: &Agent, call: MemoryCall| {
-            let records = Records::default();
+            let records = Arc::new(Records::new(0, 0));
             let mut serving = agent.serving(&[], Box::new(Unseen), &records);
             let calling = serving(Service::Memory(call));
             block_on(calling).result

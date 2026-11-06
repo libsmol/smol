@@ -71,11 +71,21 @@
         Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    $user = [Environment]::GetEnvironmentVariable("Path", "User")
-    $paths = if ($user) { $user -split ";" } else { @() }
-    if ($paths -notcontains $bin) {
-        $joined = (@($paths) + $bin | Where-Object { $_ }) -join ";"
-        [Environment]::SetEnvironmentVariable("Path", $joined, "User")
-        Write-Output "added $bin to your PATH; open a new terminal to run smol"
+    # [Environment] expands entries such as %USERPROFILE%\... and stores the Path as REG_SZ, losing them for good
+    # Opened for writing, and made first in a profile that lacks it
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment")
+    try {
+        $user = $key.GetValue("Path", "", "DoNotExpandEnvironmentNames")
+        $paths = @($user -split ";" | Where-Object { $_ })
+        $expanded = $paths | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd("\") }
+        if ($expanded -notcontains $bin.TrimEnd("\")) {
+            $joined = ($paths + $bin) -join ";"
+            $key.SetValue("Path", $joined, "ExpandString")
+            # Removing a variable that isn't set changes nothing but tells running programs to reload the environment
+            [Environment]::SetEnvironmentVariable("SMOL_PATH_CHANGED", $null, "User")
+            Write-Output "added $bin to your PATH; open a new terminal to run smol"
+        }
+    } finally {
+        $key.Dispose()
     }
 }

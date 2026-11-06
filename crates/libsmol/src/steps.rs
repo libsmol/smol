@@ -1,12 +1,10 @@
-use crate::model::{ChatMessage, Media, MediaKind, ModelError, Part, TokenUsage, ToolCall};
+use crate::model::{ChatMessage, Media, MediaKind, Part, TokenUsage, ToolCall};
 use crate::prompt;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::Not;
 
 pub(crate) const MAX_OBSERVATION_CHARS: usize = 16_384;
-/// The worker cuts each `print()` to it
-pub const MAX_PRINT_CHARS: usize = 8192;
 /// Errs toward overestimating
 const BYTES_PER_TOKEN: usize = 3;
 /// Providers count differently, so this takes the high end
@@ -20,10 +18,6 @@ const KEPT_MEDIA: usize = 8;
 pub(crate) enum StepError {
     #[error("reply: cut off at the output limit, nothing ran")]
     Cut,
-    /// A step with this error never enters memory and is never saved
-    #[serde(skip)]
-    #[error("model: {0}")]
-    Model(ModelError),
     #[error("interrupted")]
     Interrupted,
 }
@@ -44,7 +38,7 @@ pub(crate) enum CallError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub(crate) struct Usage {
-    /// Seconds since the request was sent
+    /// Seconds from the first request to its end, waits to retry and code that ran included
     pub(crate) duration: f64,
     /// Seconds since the first token
     pub(crate) decode_duration: Option<f64>,
@@ -159,6 +153,19 @@ impl Helper {
     }
 }
 
+impl Ending {
+    /// The answer, or the error the code gets instead
+    pub(crate) fn outcome(&self) -> Result<&str, &str> {
+        match self {
+            Ending::Answer(answer) => Ok(answer),
+            Ending::Error(error) => Err(error),
+            Ending::Interrupted {} => Err(prompt::INTERRUPTED_BY_USER),
+            Ending::Stopped {} => Err(prompt::STOPPED_BY_CODE),
+            Ending::Unfinished {} | Ending::Running {} => Err(prompt::UNFINISHED),
+        }
+    }
+}
+
 impl AgentStep {
     pub(crate) fn answer(&self) -> Option<&str> {
         let text = self.text.trim();
@@ -166,9 +173,13 @@ impl AgentStep {
         replied.then_some(text)
     }
 
-    /// A reply cut off at the output limit is never sent to the model and only shows on replay
-    pub(crate) fn dropped(&self) -> bool {
-        self.error == Some(StepError::Cut)
+    /// The text and calls the model sees again,
+    /// none of either for a reply cut off at the output limit
+    pub(crate) fn seen(&self) -> (&str, &[Call]) {
+        match self.error == Some(StepError::Cut) {
+            true => ("", &[]),
+            false => (self.text.trim(), &self.calls),
+        }
     }
 }
 
@@ -293,34 +304,32 @@ impl MemoryStep {
 
         let mut messages = Vec::new();
 
-        let shown = !step.dropped();
-        let text = step.text.trim();
+        let (text, shown) = step.seen();
         let mut sent = Vec::new();
-        if shown {
-            for call in &step.calls {
-                *calls += 1;
-                let id = format!("call_{calls}");
-                // Unread calls don't echo their arguments because the model would copy the mistake
-                let called = match &call.error {
-                    Some(CallError::NoTool(name)) => ToolCall::unread(id, name),
-                    Some(CallError::NoCode) => ToolCall::unread(id, prompt::TOOL),
-                    _ => ToolCall::eval(id, &call.code),
-                };
-                sent.push(called);
-            }
+        let mut ids = Vec::new();
+        for call in shown {
+            *calls += 1;
+            let id = format!("call_{calls}");
+            ids.push(id.clone());
+            // Unread calls don't echo their arguments because the model would copy the mistake
+            let called = match &call.error {
+                Some(CallError::NoTool(name)) => ToolCall::unread(id, name),
+                Some(CallError::NoCode) => ToolCall::unread(id, prompt::TOOL),
+                _ => ToolCall::eval(id, &call.code),
+            };
+            sent.push(called);
         }
-        let called = !sent.is_empty();
-        if shown && (called || !text.is_empty()) {
+        if !sent.is_empty() || !text.is_empty() {
             let reply = ChatMessage::Assistant {
                 text: text.to_owned(),
                 reasoning: step.reasoning.clone(),
-                calls: sent.clone(),
+                calls: sent,
             };
             messages.push(reply);
         }
 
         // Every call needs a reply, and one that didn't run says why
-        for (call, ToolCall { id, .. }) in step.calls.iter().zip(sent) {
+        for (call, id) in shown.iter().zip(ids) {
             let mut parts = Vec::new();
             if let Some(result) = &call.result {
                 let printed = result.printed.as_deref();
@@ -336,10 +345,8 @@ impl MemoryStep {
             messages.push(ChatMessage::Tool { id, parts });
         }
 
-        if !called {
-            if let Some(text) = prompt::error(step) {
-                messages.push(ChatMessage::user(text));
-            }
+        if let Some(text) = prompt::step_error(step) {
+            messages.push(ChatMessage::user(text));
         }
 
         messages
@@ -387,6 +394,30 @@ impl AgentMemory {
         visible
     }
 
+    /// Takes out the last task if it asked `text` and only restarts and summaries follow it
+    pub(crate) fn withdraw(&mut self, text: &str) -> Option<TaskStep> {
+        let last = self
+            .steps
+            .iter()
+            .rposition(|step| !matches!(step, MemoryStep::Restarted | MemoryStep::Summary(_)))?;
+        let resent = matches!(&self.steps[last], MemoryStep::Task(task) if task.text == text);
+        if !resent {
+            return None;
+        }
+
+        let MemoryStep::Task(task) = self.steps.remove(last) else {
+            panic!("task");
+        };
+        // Summaries after it count it among their `kept` steps
+        for step in &mut self.steps[last..] {
+            if let MemoryStep::Summary(summary) = step {
+                summary.kept = summary.kept.saturating_sub(1);
+            }
+        }
+
+        Some(task)
+    }
+
     pub(crate) fn conversation(
         &self,
         system: &str,
@@ -397,7 +428,31 @@ impl AgentMemory {
         let message = ChatMessage::System(system.to_owned());
         let mut messages = vec![message];
 
-        if let Some(text) = visible.summarized(window) {
+        if let Some(summary) = visible.summary {
+            let tasked = visible
+                .steps
+                .iter()
+                .any(|step| matches!(step, MemoryStep::Task(_)));
+            let task = visible.task.filter(|_| !tasked);
+            let task = task.map(|task| task.text.as_str());
+
+            // Updates aren't refused when oversized like tasks are,
+            // so once they and the task pass half the window only the latest that fit come back
+            let mut kept = visible.updates.len();
+            if let Some(window) = window {
+                let mut size = task.map_or(0, text_bytes);
+                kept = 0;
+                for update in visible.updates.iter().rev() {
+                    size += text_bytes(update);
+                    if estimate(size) > window / 2 {
+                        break;
+                    }
+                    kept += 1;
+                }
+            }
+            let updates = &visible.updates[visible.updates.len() - kept..];
+
+            let text = prompt::summarized(&summary.summary, task, updates);
             messages.push(ChatMessage::user(text));
         }
 
@@ -438,7 +493,7 @@ impl AgentMemory {
         takes: &dyn Fn(MediaKind) -> bool,
         window: Option<u64>,
     ) -> u64 {
-        let mut unmeasured = 0;
+        let mut unmeasured = Vec::new();
         for step in self.steps.iter().rev() {
             let measured = match step {
                 MemoryStep::Task(_)
@@ -447,8 +502,8 @@ impl AgentMemory {
                 | MemoryStep::Restarted
                 | MemoryStep::Done { .. } => None,
                 MemoryStep::Action(action) => {
-                    let said = !action.text.is_empty() || !action.calls.is_empty();
-                    let shown = said && !action.dropped();
+                    let (text, calls) = action.seen();
+                    let shown = !text.is_empty() || !calls.is_empty();
                     match (action.usage.tokens, shown) {
                         (Some(tokens), true) => Some(tokens.input_tokens + tokens.output_tokens),
                         // A dropped reply and its reasoning count in the measured output
@@ -460,17 +515,22 @@ impl AgentMemory {
                 MemoryStep::Summary(_) => break,
             };
 
-            let messages = step.messages(&mut 0);
             let Some(measured) = measured else {
-                unmeasured += bytes(&messages, takes);
+                unmeasured.push(step);
                 continue;
             };
 
+            let mut added = 0;
+            for step in unmeasured {
+                let messages = step.messages(&mut 0);
+                added += bytes(&messages, takes);
+            }
+
             // The measurement omits this step's results and errors, which may hold viewed images
-            let mut after = messages;
+            let mut after = step.messages(&mut 0);
             after.retain(|message| !matches!(message, ChatMessage::Assistant { .. }));
             let after = bytes(&after, takes);
-            return measured + estimate(unmeasured + after);
+            return measured + estimate(added + after);
         }
 
         let conversation = self.conversation(system, takes, window);
@@ -493,29 +553,6 @@ impl AgentMemory {
             }
         }
         (total, steps)
-    }
-
-    /// The earliest record since the last task of an agent started in the background with this name
-    /// that still runs
-    pub(crate) fn running_record(&mut self, name: &str) -> Option<&mut Helper> {
-        let tasked = |step: &MemoryStep| matches!(step, MemoryStep::Task(_));
-        let start = self.steps.iter().rposition(tasked).unwrap_or(0);
-        for step in &mut self.steps[start..] {
-            let MemoryStep::Action(action) = step else {
-                continue;
-            };
-            for call in &mut action.calls {
-                let Some(result) = &mut call.result else {
-                    continue;
-                };
-                for helper in &mut result.agents {
-                    if helper.running() && helper.name.as_deref() == Some(name) {
-                        return Some(helper);
-                    }
-                }
-            }
-        }
-        None
     }
 
     /// Only looks at steps since the last restart
@@ -543,38 +580,6 @@ pub(crate) struct Visible<'a> {
     /// Updates after that task that were summarized too
     updates: Vec<&'a str>,
     pub(crate) steps: Vec<&'a MemoryStep>,
-}
-
-impl Visible<'_> {
-    /// The message that replaces the earlier conversation
-    pub(crate) fn summarized(&self, window: Option<u64>) -> Option<String> {
-        let summary = self.summary?;
-        let tasked = self
-            .steps
-            .iter()
-            .any(|step| matches!(step, MemoryStep::Task(_)));
-        let task = self.task.filter(|_| !tasked);
-        let task = task.map(|task| task.text.as_str());
-
-        // Updates aren't refused when oversized like tasks are,
-        // so once they and the task pass half the window only the latest that fit come back
-        let mut kept = self.updates.len();
-        if let Some(window) = window {
-            let mut size = task.map_or(0, text_bytes);
-            kept = 0;
-            for update in self.updates.iter().rev() {
-                size += text_bytes(update);
-                if estimate(size) > window / 2 {
-                    break;
-                }
-                kept += 1;
-            }
-        }
-        let updates = &self.updates[self.updates.len() - kept..];
-
-        let text = prompt::summarized(&summary.summary, task, updates);
-        Some(text)
-    }
 }
 
 /// Reasoning goes back as `reasoning_content` too,
@@ -824,6 +829,59 @@ pub(crate) mod tests {
         let skipped =
             "[Task]\nRead the orders again\n\n[Code]\nprint(orders)\n\n[Observation]\nOrders loaded";
         assert_eq!(transcript, skipped);
+    }
+
+    #[test]
+    fn task_withdrawn() {
+        let mut memory = AgentMemory {
+            steps: vec![
+                task("Read the menu"),
+                action("a1"),
+                task("Count the cafés"),
+                MemoryStep::Restarted,
+                summary("s1", 3),
+            ],
+        };
+        assert_eq!(memory.withdraw("Spell naïve"), None);
+        let withdrawn = memory.withdraw("Count the cafés");
+        assert_eq!(withdrawn, Some(asked("Count the cafés")));
+        assert_eq!(memory.steps.len(), 4, "{:?}", memory.steps);
+        let Some(MemoryStep::Summary(summary)) = memory.steps.last() else {
+            panic!("{:?}", memory.steps);
+        };
+        assert_eq!(summary.kept, 2);
+
+        // A task the model replied to stays
+        assert_eq!(memory.withdraw("Read the menu"), None);
+        assert_eq!(memory.steps.len(), 4, "{:?}", memory.steps);
+    }
+
+    /// A reply cut off at the output limit shows only its error,
+    /// and a step whose calls show reports its interrupt in their replies
+    #[test]
+    fn dropped_seen() {
+        let cut = AgentStep {
+            text: "Reading the résumé first.".to_owned(),
+            error: Some(StepError::Cut),
+            ..coded("print('half", None)
+        };
+        let cut = MemoryStep::Action(Box::new(cut));
+        let sent: Vec<String> = cut.messages(&mut 0).iter().map(content).collect();
+        let reason =
+            "Your last reply was too long and was discarded, so nothing ran: write less per reply";
+        assert_eq!(sent, [format!("[{reason}]")]);
+        let transcript = prompt::transcript(&[&cut], usize::MAX);
+        assert_eq!(transcript, format!("[Error]\n{reason}"));
+
+        let stopped = AgentStep {
+            error: Some(StepError::Interrupted),
+            ..coded("print('café')", Some("café".to_owned()))
+        };
+        let stopped = MemoryStep::Action(Box::new(stopped));
+        let sent: Vec<String> = stopped.messages(&mut 0).iter().map(content).collect();
+        assert_eq!(sent, ["eval:\nprint('café')", "café"]);
+        let transcript = prompt::transcript(&[&stopped], usize::MAX);
+        assert_eq!(transcript, "[Code]\nprint('café')\n\n[Observation]\ncafé");
     }
 
     /// The agents a call started keep the saved format, with their answer or error beside the task

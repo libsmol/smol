@@ -265,7 +265,7 @@ impl Memories {
         let shown = tilde(&self.db);
         let failed = |e: rusqlite::Error| {
             let reason = cause(&e);
-            format!("memory: {shown}: {reason}")
+            format!("{shown}: {reason}")
         };
         done.map_err(failed)
     }
@@ -370,6 +370,7 @@ mod tests {
     use crate::tools::memories::{matched, terms, Kept, Listed, Memories};
     use crate::utils::block_on;
     use crate::worker::MemoryCall;
+    use reaper::tilde;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
@@ -670,6 +671,25 @@ mod tests {
         assert_eq!(blank, Err(EMPTY_MEMORY.to_owned()));
         assert!(kept.is_ok(), "{kept:?}");
         assert_eq!(refused, Err(prompt::long_memory(301)));
+    }
+
+    #[test]
+    fn open_failure() {
+        let dir = temp_dir("unopened");
+        let db = dir.join("memory.db");
+        fs::create_dir_all(&db).expect("dir");
+        let here = opened(&dir, "/home/zoë/café");
+        let recall = MemoryCall::Recall {
+            query: "café".to_owned(),
+        };
+        let answering = here.answer(recall, true);
+        let failed = block_on(answering);
+        fs::remove_dir_all(&dir).ok();
+
+        let failed = failed.expect_err("opened");
+        let shown = tilde(&db);
+        let expected = format!("{shown}: unable to open database file");
+        assert!(failed.starts_with(&expected), "{failed}");
     }
 
     /// Sessions of several libsmol write the same database at once

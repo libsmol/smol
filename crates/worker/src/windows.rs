@@ -1,6 +1,6 @@
 use crate::executable;
 use pyo3::ffi;
-use reaper::{cause, tilde, Group};
+use reaper::{cause, command_tail, tilde, Group};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
@@ -40,7 +40,7 @@ unsafe extern "C" {
 }
 
 /// Builds in the extension modules CPython's own table leaves out, before the interpreter starts
-pub(crate) fn prepare() {
+pub(crate) fn install() {
     // SAFETY: Runs once, before the interpreter starts and with no other thread in it
     unsafe {
         PyWin_DLLhModule = GetModuleHandleW(ptr::null());
@@ -228,50 +228,6 @@ pub(crate) fn sweep(path: &Path) {
         let left = name.ends_with(".old") || name.ends_with(".new");
         if name.starts_with(&prefix) && left {
             fs::remove_file(entry.path()).ok();
-        }
-    }
-}
-
-/// The command line after the program's name, which Windows reads by rules of its own:
-/// the name ends at its closing quote, or else at the first space or tab
-fn command_tail(line: &[u16]) -> &[u16] {
-    let quote = u16::from(b'"');
-    let blank = |c: &u16| *c == u16::from(b' ') || *c == u16::from(b'\t');
-    let end = match line.first() == Some(&quote) {
-        true => {
-            let closing = line[1..].iter().position(|c| *c == quote);
-            closing.map_or(line.len(), |at| at + 2)
-        }
-        false => line.iter().position(blank).unwrap_or(line.len()),
-    };
-    let rest = &line[end..];
-    let start = rest.iter().position(|c| !blank(c)).unwrap_or(rest.len());
-    &rest[start..]
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::windows::command_tail;
-
-    #[test]
-    fn tail_kept() {
-        let cases = [
-            (
-                r#""C:\Program Files\café\python.exe" -c "print('naïve')""#,
-                r#"-c "print('naïve')""#,
-            ),
-            (
-                "python.exe  \t-m pip install résumé",
-                "-m pip install résumé",
-            ),
-            ("python.exe", ""),
-            (r#""C:\café\python.exe""#, ""),
-            (r#""C:\café\python.exe"-c pass"#, "-c pass"),
-        ];
-        for (line, expected) in cases {
-            let line: Vec<u16> = line.encode_utf16().collect();
-            let tail = String::from_utf16(command_tail(&line)).expect("utf-16");
-            assert_eq!(tail, expected);
         }
     }
 }

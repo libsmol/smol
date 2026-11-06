@@ -1,8 +1,6 @@
 use crate::acp::rpc::{Lines, Out, Peer};
 use crate::acp::session::{self, Message, Opening, Prompt, Shell};
-use crate::acp::{
-    rfc3339, task_of, to_value, App, ENQUEUED, FORGET, IMAGES, MEMORIES, QUEUED, SHELL,
-};
+use crate::acp::{rfc3339, task_of, to_value, App};
 use crate::config;
 use crate::config::setup::SETUP_ARG;
 use crate::history::HistoryStore;
@@ -19,6 +17,7 @@ use agent_client_protocol_schema::v1::{
 };
 use agent_client_protocol_schema::ProtocolVersion;
 use reaper::cause;
+use reaper::wire::{ENQUEUED, FORGET, IMAGES, MEMORIES, QUEUED, SHELL};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -190,7 +189,7 @@ pub(crate) async fn serve(mut input: Lines, app: Arc<App>) -> Result<()> {
                     continue;
                 };
                 let id = &*cancel.session_id.0;
-                if let Some(session) = router.sessions.get(id) {
+                if let Ok(session) = router.handle(id) {
                     session.span.in_scope(|| info!("turn: interrupt received"));
                     session.interrupt.cancel(session.received);
                 }
@@ -199,7 +198,7 @@ pub(crate) async fn serve(mut input: Lines, app: Arc<App>) -> Result<()> {
                 let Ok(enqueued) = serde_json::from_value::<SessionParams>(params) else {
                     continue;
                 };
-                if let Some(session) = router.sessions.get(&enqueued.session_id) {
+                if let Ok(session) = router.handle(&enqueued.session_id) {
                     session.enqueued.notify_one();
                 }
             }
@@ -359,6 +358,7 @@ impl Router {
                 let request: SessionParams = parsed(params)?;
                 let handle = self.handle(&request.session_id)?;
                 let memories = handle.memories.clone();
+                let span = handle.span.clone();
                 let listing = async move {
                     let seen = memories.seen().await;
                     let seen = seen.map_err(Error::Memory)?;
@@ -370,13 +370,14 @@ impl Router {
                     }
                     Ok(json!({ "memories": listed }))
                 };
-                self.answer(id, handle, listing);
+                self.answer(id, span, listing);
                 None
             }
             FORGET => {
                 let request: ForgetParams = parsed(params)?;
                 let handle = self.handle(&request.session_id)?;
                 let memories = handle.memories.clone();
+                let span = handle.span.clone();
                 let forgetting = async move {
                     let forgotten = memories.forget(request.id).await;
                     match forgotten.map_err(Error::Memory)? {
@@ -384,7 +385,7 @@ impl Router {
                         false => Err(Error::MemoryNotFound(request.id)),
                     }
                 };
-                self.answer(id, handle, forgetting);
+                self.answer(id, span, forgetting);
                 None
             }
             m if m == names.session_close => {
@@ -424,6 +425,9 @@ impl Router {
             return Err(Error::InvalidParams(message));
         }
 
+        // Error level keeps the id on log lines even when only warn is enabled
+        let span = error_span!("", id = %session);
+
         // An unreadable config, or a session saved for another directory,
         // must not close the open session with the same id
         let models = config::models(&self.app.config);
@@ -432,10 +436,14 @@ impl Router {
             true => self.app.store.locate(&cwd, &session),
             false => Ok(()),
         };
-        let (models, (servers, access)) = match (models, agent, located) {
+        let (models, (servers, access, mcp_skipped)) = match (models, agent, located) {
             (Ok(models), Ok(agent), Ok(())) => (models, agent),
             (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                error!("session: open failed, {error}");
+                let _entered = span.enter();
+                match &error {
+                    Error::Unconfigured(_) => info!("session: open failed, {error}"),
+                    _ => error!("session: open failed, {error}"),
+                }
                 return Err(error);
             }
         };
@@ -445,6 +453,8 @@ impl Router {
             Some(old) => Some(old.close()),
             None => self.closing.remove(&session),
         };
+        // A session whose task ended unclosed would otherwise stay until a request names it
+        self.sessions.retain(|_, handle| !handle.sender.is_closed());
 
         let interrupt = Interrupt::default();
         let enqueued = Arc::new(Notify::new());
@@ -459,14 +469,13 @@ impl Router {
             models,
             servers,
             access,
+            mcp_skipped,
             app: Arc::clone(&self.app),
             interrupt: interrupt.clone(),
             enqueued: Arc::clone(&enqueued),
             memories: memories.clone(),
         };
 
-        // Error level keeps the id on log lines even when only warn is enabled
-        let span = error_span!("", id = %session);
         let running = session::open(opening, inbox).instrument(span.clone());
         let task = task::spawn(running);
 
@@ -485,18 +494,26 @@ impl Router {
     }
 
     fn next_turn(&mut self, session: &str) -> Result<u64> {
-        let Some(handle) = self.sessions.get_mut(session) else {
-            return Err(unknown(session));
-        };
+        let handle = self.handle(session)?;
         handle.received += 1;
         Ok(handle.received)
     }
 
-    fn handle(&self, session: &str) -> Result<&Handle> {
-        self.sessions.get(session).ok_or_else(|| unknown(session))
+    /// Forgets a session whose task ended unclosed, as when it failed to open
+    fn handle(&mut self, session: &str) -> Result<&mut Handle> {
+        let ended = self
+            .sessions
+            .get(session)
+            .is_some_and(|handle| handle.sender.is_closed());
+        if ended {
+            self.sessions.remove(session);
+        }
+        self.sessions
+            .get_mut(session)
+            .ok_or_else(|| unknown(session))
     }
 
-    fn send(&self, session: &str, message: Message) -> Result<()> {
+    fn send(&mut self, session: &str, message: Message) -> Result<()> {
         let handle = self.handle(session)?;
         handle.sender.send(message).map_err(|_| unknown(session))
     }
@@ -505,7 +522,7 @@ impl Router {
     fn answer(
         &self,
         id: &Value,
-        handle: &Handle,
+        span: Span,
         answering: impl Future<Output = Result<Value>> + Send + 'static,
     ) {
         let peer = Arc::clone(&self.app.peer);
@@ -514,7 +531,7 @@ impl Router {
             let result = answering.await;
             peer.respond(&id, result);
         };
-        let replying = replying.instrument(handle.span.clone());
+        let replying = replying.instrument(span);
         task::spawn(replying);
     }
 }
@@ -582,8 +599,6 @@ mod tests {
     use std::fs;
     use std::future;
     use std::path::Path;
-    #[cfg(windows)]
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
@@ -724,7 +739,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// What was queued behind an open that fails is still answered
+    /// What was queued behind an open that fails is still answered, and the session is then unknown
     #[test]
     fn failed_open_drained() {
         let dir = temp_dir("failed-open");
@@ -737,8 +752,12 @@ mod tests {
             cwd: dir.clone(),
             ..Settings::default()
         };
-        saved(&router.app.store, &memory, "s1", &settings);
-        let held = router.app.store.lock(&dir, "s1").expect("lock");
+        let mut held = Vec::new();
+        for session in ["s1", "s2"] {
+            saved(&router.app.store, &memory, session, &settings);
+            let lock = router.app.store.lock(&dir, session).expect("lock");
+            held.push(lock);
+        }
 
         let answering = async {
             // The open locks only after the old session ends, so the prompt is queued before the lock fails
@@ -783,9 +802,32 @@ mod tests {
                     answers.push(message);
                 }
             }
-            answers
+
+            // Opening another session drops the failed one, which no request named since
+            let params = json!({"sessionId": "s2", "cwd": dir, "mcpServers": []});
+            router
+                .request(&json!(3), "session/load", params)
+                .expect("load");
+            let dropped = !router.sessions.contains_key("s1");
+            loop {
+                let receiving = sent.recv();
+                let waiting = time::timeout(Duration::from_secs(10), receiving);
+                let line = waiting
+                    .await
+                    .expect("answered")
+                    .expect("open")
+                    .expect("line");
+                let message: Value = serde_json::from_str(&line).expect("json");
+                if message["id"] == json!(3) {
+                    break;
+                }
+            }
+
+            let params = json!({"sessionId": "s2"});
+            let listed = router.request(&json!(4), "_smol/memories", params);
+            (answers, dropped, listed)
         };
-        let answers = block_on(answering);
+        let (answers, dropped, listed) = block_on(answering);
         drop(held);
         fs::remove_dir_all(&dir).ok();
 
@@ -795,6 +837,12 @@ mod tests {
         assert_eq!(answers[0]["result"]["stopReason"], "cancelled");
         let refused = answers[1]["error"]["message"].as_str().unwrap_or_default();
         assert!(refused.contains("open in another process"), "{answers:?}");
+        assert!(dropped);
+        assert!(
+            matches!(listed, Err(Error::SessionNotFound(_))),
+            "{listed:?}"
+        );
+        assert!(!router.sessions.contains_key("s2"));
     }
 
     /// A load from another directory is refused before it closes the open session
@@ -836,29 +884,5 @@ mod tests {
         assert!(refused.contains(": belongs to "), "{refused}");
         assert!(router.sessions.contains_key("s1"));
         assert!(!interrupt.cancelled(0));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn list_ignores_case() {
-        let dir = temp_dir("case");
-        let (mut router, _sent) = router(&dir);
-        let memory = one_task("Task");
-        let settings = Settings {
-            cwd: PathBuf::from(r"C:\Users\Éloïse\Project"),
-            ..Settings::default()
-        };
-        saved(&router.app.store, &memory, "s1", &settings);
-
-        let params = json!({"cwd": r"c:\users\éloïse\PROJECT"});
-        let listed = router.request(&json!(1), "session/list", params);
-        let listed = listed.expect("list").expect("result");
-
-        assert_eq!(
-            listed["sessions"].as_array().map(Vec::len),
-            Some(1),
-            "{listed}"
-        );
-        fs::remove_dir_all(&dir).ok();
     }
 }

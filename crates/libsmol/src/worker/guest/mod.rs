@@ -1,13 +1,12 @@
 use crate::agent::MAX_PARALLEL_AGENTS;
 use crate::prompt::{DONE, NO_AGENT, NO_MEMORY, SURROGATE};
-use crate::steps::MAX_PRINT_CHARS;
 use crate::tools::memories::{MAX_MEMORY_CHARS, MAX_RECALLED};
 use crate::tools::ToolError;
 use crate::utils::{block_on, Waiting};
 use crate::worker::guest::builtins::{builtins, value_error};
 use crate::worker::{
     end_marker, greeting, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
-    WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, WORKER_ARG,
+    WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, MAX_PRINT_CHARS, WORKER_ARG,
 };
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
 use pyo3::prelude::*;

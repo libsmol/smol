@@ -1,7 +1,7 @@
 use crate::history::VENV;
-use reaper::{cause, tilde};
 #[cfg(test)]
-use std::env;
+use crate::tests::profile_dir;
+use reaper::{cause, tilde};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -64,10 +64,7 @@ fn venv_in(project: &Path) -> PathBuf {
 /// Tests share one venv in the profile folder
 #[cfg(test)]
 fn venv_in(_: &Path) -> PathBuf {
-    let exe = env::current_exe().expect("test binary");
-    let deps = exe.parent().expect("deps");
-    let built = deps.parent().expect("profile");
-    built.join(VENV)
+    profile_dir().join(VENV)
 }
 
 /// Removes the venvs of the projects whose working directories are gone,

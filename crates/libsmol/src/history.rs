@@ -32,6 +32,9 @@ pub(crate) struct SessionMeta {
     pub(crate) title: String,
     #[serde(flatten)]
     pub(crate) settings: Settings,
+    /// The title the model chose, empty to use the first task or command
+    #[serde(rename = "name", default, skip_serializing_if = "String::is_empty")]
+    pub(crate) model_title: String,
     created_at: f64,
     pub(crate) updated_at: f64,
 }
@@ -45,6 +48,7 @@ impl SessionMeta {
             id,
             title: String::new(),
             settings,
+            model_title: String::new(),
             created_at: now,
             updated_at: now,
         }
@@ -58,9 +62,6 @@ pub(crate) struct Settings {
     pub(crate) model: String,
     /// Only servers whose switch differs from `enabled` in agent.toml
     pub(crate) mcp: BTreeMap<String, bool>,
-    /// The title the model chose, empty to use the first task or command
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub(crate) name: String,
 }
 
 impl Settings {
@@ -97,8 +98,9 @@ pub(crate) struct Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        // Keep the lock file on Windows because the next holder can't detect a replaced file there
-        if cfg!(windows) {
+        // Windows can't tell a replaced lock file,
+        // so it goes only while no other process can know the session
+        if cfg!(windows) && self.path.with_extension("json").exists() {
             return;
         }
         // Delete before the lock is released,
@@ -142,9 +144,9 @@ impl HistoryStore {
             }
         }
 
-        let name = &meta.settings.name;
-        meta.title = match (name.is_empty(), tasked.or(typed)) {
-            (false, _) => name.clone(),
+        let chosen = &meta.model_title;
+        meta.title = match (chosen.is_empty(), tasked.or(typed)) {
+            (false, _) => chosen.clone(),
             (true, Some(text)) => text.chars().take(MAX_TITLE_CHARS).collect(),
             (true, None) => "(empty)".to_owned(),
         };
@@ -417,7 +419,6 @@ pub(crate) mod tests {
             cwd: cwd.to_owned(),
             model: "tiny".to_owned(),
             mcp: BTreeMap::from([("fake".to_owned(), false)]),
-            name: String::new(),
         };
 
         saved(&store, &memory, "a1", &settings);
@@ -433,11 +434,15 @@ pub(crate) mod tests {
         let leftover = names.filter(|entry| entry.path().to_string_lossy().ends_with(".tmp"));
         assert_eq!(leftover.count(), 0);
 
-        let named = Settings {
-            name: "Clean up the date helpers".to_owned(),
-            ..settings.clone()
-        };
-        saved(&store, &memory, "a1", &named);
+        // The chosen title is saved under `name` among the settings, as 0.7.0 saved it
+        let mut named = SessionMeta::new("a1".to_owned(), settings.clone());
+        named.model_title = "Clean up the date helpers".to_owned();
+        store.save(&memory, &mut named).expect("save");
+        let raw = fs::read_to_string(project.join("a1.json")).expect("read");
+        let kept = r#""mcp":{"fake":false},"name":"Clean up the date helpers","created_at""#;
+        assert!(raw.contains(kept), "{raw}");
+        let (meta, _) = store.load(cwd, "a1").expect("load");
+        assert_eq!(meta.model_title, "Clean up the date helpers");
         let listed = store.list(Some(cwd)).expect("list");
         let titles: Vec<&str> = listed.iter().map(|meta| meta.title.as_str()).collect();
         assert!(titles.contains(&"Clean up the date helpers"), "{titles:?}");
@@ -542,10 +547,21 @@ pub(crate) mod tests {
 
         drop(held);
         let lock = store.project(cwd).join("s1.lock");
-        assert_eq!(lock.exists(), cfg!(windows));
+        assert!(!lock.exists());
         let again = store.lock(cwd, "s1").expect("relock");
         assert!(again.is_some());
         assert!(store.list(Some(cwd)).expect("list").is_empty());
+
+        // Windows keeps the lock of a saved session, which another process may be opening
+        let settings = Settings {
+            cwd: cwd.to_owned(),
+            ..Settings::default()
+        };
+        saved(&store, &one_task("Fix the café menu"), "s2", &settings);
+        let held = store.lock(cwd, "s2").expect("lock");
+        drop(held);
+        let lock = store.project(cwd).join("s2.lock");
+        assert_eq!(lock.exists(), cfg!(windows));
 
         let file = dir.join("file");
         fs::write(&file, "").expect("write");

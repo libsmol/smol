@@ -11,6 +11,7 @@ use crate::worker::AgentCall;
 use serde_json::{json, Value};
 use std::future::{self, Future};
 use std::mem;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::select;
@@ -22,12 +23,45 @@ use tracing::{error_span, info, warn, Instrument};
 pub const MAX_PARALLEL_AGENTS: usize = 8;
 const MAX_PREVIEW_LINES: usize = 4;
 const MAX_PREVIEW_CHARS: usize = 800;
+const MAX_LINE_CHARS: usize = 100;
 /// Agents get this long to stop by themselves on an interrupt, and a worker of theirs may take `STOP_WAIT`
 const HELPERS_WAIT: Duration = Duration::from_secs(5);
 
 /// The records of the agents the code of one call started, in the order their views opened,
 /// which numbers them on replay too
-pub(crate) type Records = Arc<Mutex<Vec<Helper>>>;
+pub(crate) struct Records {
+    pub(crate) helpers: Mutex<Vec<Helper>>,
+    /// Where the call's step lands in memory,
+    /// which only grows at the end until the turn has filed its agents' records
+    step: usize,
+    call: usize,
+}
+
+impl Records {
+    pub(crate) fn new(step: usize, call: usize) -> Self {
+        Self {
+            helpers: Mutex::default(),
+            step,
+            call,
+        }
+    }
+}
+
+/// Where the record of an agent started in the background sits in memory
+#[derive(Clone, Copy)]
+struct Seat {
+    step: usize,
+    call: usize,
+    agent: usize,
+}
+
+/// What an agent at work shares with its handle
+#[derive(Default)]
+struct Activity {
+    status: Status,
+    /// How it ends when `stop()` or the end of the turn rather than the user stopped it
+    stopped: Option<Ending>,
+}
 
 impl Agent {
     /// Runs the calls that the code of one call makes to `agent()` and to the handles it returned,
@@ -36,7 +70,7 @@ impl Agent {
         &'a self,
         servers: &'a [&'a Added],
         views: Box<dyn Helpers>,
-        records: &Records,
+        records: &Arc<Records>,
     ) -> Box<Delegating<'a>> {
         let Place::Main { roles, team, .. } = &self.place else {
             let refused = |_: AgentCall| -> Calling {
@@ -76,8 +110,8 @@ impl Agent {
                     let members = team.members.lock().expect("members");
                     let reply = match members.get(id) {
                         Some(member) => {
-                            let status = member.status.lock().expect("status");
-                            let text = prompt::agent_status(&status, &member.helper.end);
+                            let live = member.live.lock().expect("live");
+                            let text = prompt::agent_status(&live.status, &member.helper.end);
                             Ok(Value::String(text))
                         }
                         None => Err(prompt::NO_AGENT.to_owned()),
@@ -89,7 +123,7 @@ impl Agent {
                     let mut members = team.members.lock().expect("members");
                     let running = members.get_mut(id).filter(|member| member.helper.running());
                     if let Some(member) = running {
-                        member.status.lock().expect("status").stopped = Some(Ending::Stopped {});
+                        member.live.lock().expect("live").stopped = Some(Ending::Stopped {});
                         member.stop.cancel(u64::MAX);
                     }
                     drop(members);
@@ -139,22 +173,119 @@ impl Agent {
                 views: Arc::clone(&views),
                 records: Arc::clone(&records),
                 servers,
-                slots: Arc::clone(&team.slots),
+                team: Arc::clone(team),
             };
             if background {
-                let called = team.start(assigned, &launcher);
+                let mut members = team.members.lock().expect("members");
+                for (record, _) in &assigned {
+                    let named = |member: &Member| {
+                        member.helper.running() && member.helper.name == record.name
+                    };
+                    if members.iter().any(named) {
+                        let name = record.name.as_deref().unwrap_or_default();
+                        let refused = prompt::name_running(name);
+                        let called = Called::from(Err(refused));
+                        return Box::pin(future::ready(called));
+                    }
+                }
+
+                let mut handles = Vec::new();
+                for (record, mut agent) in assigned {
+                    let id = members.len();
+                    let entry = handle(id, &record);
+                    handles.push(entry);
+                    // Its own interrupt stops it alone, and the session's is passed on at once
+                    let session = mem::take(&mut agent.interrupt);
+                    let stop = agent.interrupt.clone();
+                    let (index, helping, live) = launcher.launch(agent, record.clone());
+                    let mut helping = task::spawn(helping);
+                    let abort = helping.abort_handle();
+
+                    // One that panics or is aborted ends with the record its dropped view showed
+                    let unfinished = Helper {
+                        end: Ending::Unfinished {},
+                        ..record.clone()
+                    };
+                    let passed = stop.clone();
+                    let team = Arc::clone(team);
+                    let finishing = async move {
+                        let joined = select! {
+                            joined = &mut helping => joined,
+                            () = session.wait() => {
+                                passed.cancel(u64::MAX);
+                                helping.await
+                            }
+                        };
+                        let helper = joined.unwrap_or(unfinished);
+
+                        let mut members = team.members.lock().expect("members");
+                        members[id].helper = helper;
+                        drop(members);
+                        team.ended.send_modify(|count| *count += 1);
+                    };
+                    task::spawn(finishing);
+
+                    let seat = Seat {
+                        step: records.step,
+                        call: records.call,
+                        agent: index,
+                    };
+                    members.push(Member {
+                        helper: record,
+                        live,
+                        stop,
+                        taken: false,
+                        seat: Some(seat),
+                        abort,
+                    });
+                }
+
+                let called = Called::from(Ok(Value::Array(handles)));
                 return Box::pin(future::ready(called));
             }
 
             // Views open in task order before any agent waits for a free slot, the order replay uses
             let mut launched = Vec::new();
             for (record, agent) in assigned {
-                let (slot, helping, _) = launcher.launch(agent, record);
-                launched.push((slot, helping));
+                let (index, helping, _) = launcher.launch(agent, record);
+                launched.push((index, helping));
             }
+            let records = launcher.records;
             let interrupt = self.interrupt.clone();
-            let helping = helped(launched, launcher.records, interrupt);
-            Box::pin(helping)
+            Box::pin(async move {
+                let mut running = JoinSet::new();
+                let mut indices = Vec::new();
+                for (index, helping) in launched {
+                    running.spawn(async move { (index, helping.await) });
+                    indices.push(index);
+                }
+
+                {
+                    let joining = async {
+                        while let Some(joined) = running.join_next().await {
+                            // One that panicked keeps the record its dropped view showed
+                            if let Ok((index, helper)) = joined {
+                                records.helpers.lock().expect("records")[index] = helper;
+                            }
+                        }
+                    };
+                    let stopping = async {
+                        interrupt.wait().await;
+                        time::sleep(HELPERS_WAIT).await;
+                    };
+                    select! {
+                        () = joining => {}
+                        () = stopping => {}
+                    }
+                }
+                // Those still running keep the records their dropped views showed
+                running.abort_all();
+
+                let helpers = records.helpers.lock().expect("records");
+                let results = indices.iter().map(|index| handed(&helpers[*index].end));
+                let results = results.collect();
+                Called::from(Ok(Value::Array(results)))
+            })
         };
         Box::new(delegate)
     }
@@ -188,9 +319,9 @@ impl Agent {
                     false => info!("agent: started [{}]", keys.join(", ")),
                 }
                 {
-                    let mut status = watched.status.lock().expect("status");
-                    status.since = Some(Instant::now());
-                    status.doing = prompt::STARTING.to_owned();
+                    let mut live = watched.live.lock().expect("live");
+                    live.status.since = Some(Instant::now());
+                    live.status.doing = prompt::STARTING.to_owned();
                 }
                 watched.show(false);
 
@@ -226,7 +357,7 @@ impl Agent {
             }
             // Its own interrupt can't tell the user from `stop()` or the turn ending
             Ok(None) => {
-                let stopped = watched.status.lock().expect("status").stopped.clone();
+                let stopped = watched.live.lock().expect("live").stopped.clone();
                 match stopped {
                     Some(end) => {
                         info!("agent: stopped {counted}");
@@ -256,12 +387,9 @@ impl Agent {
 
 /// What the code gets for an agent that ended
 fn handed(end: &Ending) -> Value {
-    match end {
-        Ending::Answer(answer) => json!({ "answer": answer }),
-        Ending::Error(error) => json!({ "error": error }),
-        Ending::Interrupted {} => json!({ "error": prompt::STOPPED }),
-        Ending::Stopped {} => json!({ "error": prompt::STOPPED_BY_CODE }),
-        Ending::Unfinished {} | Ending::Running {} => json!({ "error": prompt::UNFINISHED }),
+    match end.outcome() {
+        Ok(answer) => json!({ "answer": answer }),
+        Err(error) => json!({ "error": error }),
     }
 }
 
@@ -270,58 +398,17 @@ fn handle(id: usize, helper: &Helper) -> Value {
     json!({ "id": id, "name": helper.name, "task": helper.task, "role": helper.role })
 }
 
-/// Waits for the agents of one call to end and answers with what each one handed back, in order,
-/// and an interrupt gives them `HELPERS_WAIT` to stop by themselves before the rest are aborted
-async fn helped(
-    launched: Vec<(usize, impl Future<Output = Helper> + Send + 'static)>,
-    records: Records,
-    interrupt: Interrupt,
-) -> Called {
-    let mut running = JoinSet::new();
-    let mut slots = Vec::new();
-    for (slot, helping) in launched {
-        running.spawn(async move { (slot, helping.await) });
-        slots.push(slot);
-    }
-
-    {
-        let joining = async {
-            while let Some(joined) = running.join_next().await {
-                // One that panicked keeps the record its dropped view showed
-                if let Ok((slot, helper)) = joined {
-                    records.lock().expect("records")[slot] = helper;
-                }
-            }
-        };
-        let stopping = async {
-            interrupt.wait().await;
-            time::sleep(HELPERS_WAIT).await;
-        };
-        select! {
-            () = joining => {}
-            () = stopping => {}
-        }
-    }
-    // Those still running keep the records their dropped views showed
-    running.abort_all();
-
-    let records = records.lock().expect("records");
-    let results = slots.iter().map(|slot| handed(&records[*slot].end));
-    let results = results.collect();
-    Called::from(Ok(Value::Array(results)))
-}
-
 /// What the agents that the code of one call starts share
 struct Launcher {
     views: Arc<dyn Helpers>,
-    records: Records,
+    records: Arc<Records>,
     servers: Arc<[Added]>,
-    slots: Arc<Semaphore>,
+    team: Arc<Team>,
 }
 
 impl Launcher {
     /// Keeps the record of the agent and opens its view, numbered by the record's place,
-    /// and returns that place, the agent at work and what it is doing
+    /// and returns that place, the agent at work and what it shares
     fn launch(
         &self,
         agent: Agent,
@@ -329,23 +416,24 @@ impl Launcher {
     ) -> (
         usize,
         impl Future<Output = Helper> + Send + 'static,
-        Arc<Mutex<Status>>,
+        Arc<Mutex<Activity>>,
     ) {
-        let slot = {
-            let mut records = self.records.lock().expect("records");
-            records.push(record.clone());
-            records.len() - 1
+        let index = {
+            let mut helpers = self.records.helpers.lock().expect("records");
+            helpers.push(record.clone());
+            helpers.len() - 1
         };
-        let number = slot + 1;
+        let number = index + 1;
         let view = self.views.open(number, &record);
         let watched = Watched::new(view);
-        let status = Arc::clone(&watched.status);
+        let live = Arc::clone(&watched.live);
 
         let servers = Arc::clone(&self.servers);
-        let slots = Arc::clone(&self.slots);
-        let span = error_span!("", agent = number);
+        let slots = Arc::clone(&self.team.slots);
+        let id = self.team.launched.fetch_add(1, Ordering::Relaxed) + 1;
+        let span = error_span!("", agent = id);
         let helping = agent.help(record, watched, servers, slots);
-        (slot, helping.instrument(span), status)
+        (index, helping.instrument(span), live)
     }
 }
 
@@ -356,24 +444,26 @@ pub(crate) struct Team {
     ended: watch::Sender<usize>,
     /// Shared by all agents the session's code starts
     slots: Arc<Semaphore>,
+    /// Counts all agents the session's code started, which numbers them in the log
+    launched: AtomicUsize,
 }
 
 struct Member {
     /// Its record, which says it is running until it ends
     helper: Helper,
-    status: Arc<Mutex<Status>>,
+    live: Arc<Mutex<Activity>>,
     /// Stops it alone
     stop: Interrupt,
     /// The code got its result or stopped it, so it is not announced
     taken: bool,
-    /// The turn has saved its final record
-    filed: bool,
+    /// Where the turn files its final record, taken once it has
+    seat: Option<Seat>,
     abort: AbortHandle,
 }
 
 impl Member {
     fn unfiled(&self) -> bool {
-        !self.helper.running() && !self.filed
+        !self.helper.running() && self.seat.is_some()
     }
 }
 
@@ -384,72 +474,12 @@ impl Default for Team {
             members: Mutex::default(),
             ended,
             slots: Arc::new(Semaphore::new(MAX_PARALLEL_AGENTS)),
+            launched: AtomicUsize::default(),
         }
     }
 }
 
 impl Team {
-    /// Starts each agent with the record it keeps while running, and answers with their handles
-    fn start(self: &Arc<Self>, assigned: Vec<(Helper, Agent)>, launcher: &Launcher) -> Called {
-        let mut members = self.members.lock().expect("members");
-        for (record, _) in &assigned {
-            let named =
-                |member: &Member| member.helper.running() && member.helper.name == record.name;
-            if members.iter().any(named) {
-                let name = record.name.as_deref().unwrap_or_default();
-                let refused = prompt::name_running(name);
-                return Called::from(Err(refused));
-            }
-        }
-
-        let mut handles = Vec::new();
-        for (record, mut agent) in assigned {
-            let id = members.len();
-            handles.push(handle(id, &record));
-            // Its own interrupt stops it alone, and an interrupt of the session's is passed on at once
-            let session = mem::take(&mut agent.interrupt);
-            let stop = agent.interrupt.clone();
-            let (_, helping, status) = launcher.launch(agent, record.clone());
-            let mut helping = task::spawn(helping);
-            let abort = helping.abort_handle();
-
-            // One that panics or is aborted keeps a record that says what its dropped view showed
-            let unfinished = Helper {
-                end: Ending::Unfinished {},
-                ..record.clone()
-            };
-            let passed = stop.clone();
-            let team = Arc::clone(self);
-            let finishing = async move {
-                let joined = select! {
-                    joined = &mut helping => joined,
-                    () = session.wait() => {
-                        passed.cancel(u64::MAX);
-                        helping.await
-                    }
-                };
-                let helper = joined.unwrap_or(unfinished);
-
-                let mut members = team.members.lock().expect("members");
-                members[id].helper = helper;
-                drop(members);
-                team.ended.send_modify(|count| *count += 1);
-            };
-            task::spawn(finishing);
-
-            members.push(Member {
-                helper: record,
-                status,
-                stop,
-                taken: false,
-                filed: false,
-                abort,
-            });
-        }
-
-        Called::from(Ok(Value::Array(handles)))
-    }
-
     /// Takes the result of the agent once it ends, or answers null after `timeout` seconds
     async fn wait(&self, id: usize, timeout: Option<f64>) -> Reply {
         let ended = |members: &[Member]| {
@@ -504,7 +534,7 @@ impl Team {
 
 impl Turn<'_> {
     /// Saves the records of agents started in the background that ended,
-    /// and returns the names of those whose results the code hasn't taken
+    /// and returns the names of those whose results the code hasn't taken and the user didn't interrupt
     pub(crate) fn ended(&mut self) -> Vec<String> {
         let Some(team) = self.agent.place.team() else {
             return Vec::new();
@@ -513,29 +543,39 @@ impl Turn<'_> {
         let mut records = Vec::new();
         let mut untaken = Vec::new();
         let mut members = team.members.lock().expect("members");
-        for member in members.iter_mut().filter(|member| member.unfiled()) {
-            member.filed = true;
+        for member in members.iter_mut().filter(|member| !member.helper.running()) {
+            let Some(seat) = member.seat.take() else {
+                continue;
+            };
             let memory = mem::take(&mut member.helper.memory);
             let record = Helper {
                 memory,
                 ..member.helper.clone()
             };
-            if !member.taken {
+            // The user's interrupt reaches them at once, so some end before `stopped()` stops the rest
+            let interrupted = matches!(record.end, Ending::Interrupted {});
+            if !member.taken && !interrupted {
                 let name = record.name.clone().unwrap_or_default();
                 untaken.push(name);
             }
-            records.push(record);
+            records.push((seat, record));
         }
         drop(members);
         if records.is_empty() {
             return untaken;
         }
 
-        // Agents with one name run one after another, every one of them ends within its turn,
-        // and the records come in the order they started
-        for record in records {
-            let name = record.name.clone().unwrap_or_default();
-            if let Some(kept) = self.memory.running_record(&name) {
+        for (seat, record) in records {
+            let Some(MemoryStep::Action(step)) = self.memory.steps.get_mut(seat.step) else {
+                continue;
+            };
+            let Some(call) = step.calls.get_mut(seat.call) else {
+                continue;
+            };
+            let Some(result) = &mut call.result else {
+                continue;
+            };
+            if let Some(kept) = result.agents.get_mut(seat.agent) {
                 *kept = record;
             }
         }
@@ -583,11 +623,11 @@ impl Turn<'_> {
             {
                 let members = team.members.lock().expect("members");
                 for member in members.iter().filter(|member| member.helper.running()) {
-                    let mut status = member.status.lock().expect("status");
-                    if !user && status.stopped.is_none() {
-                        status.stopped = Some(Ending::Unfinished {});
+                    let mut live = member.live.lock().expect("live");
+                    if !user && live.stopped.is_none() {
+                        live.stopped = Some(Ending::Unfinished {});
                     }
-                    drop(status);
+                    drop(live);
                     member.stop.cancel(u64::MAX);
                 }
             }
@@ -614,7 +654,7 @@ impl Turn<'_> {
 /// Follows the events of an agent `agent()` started and shows its status,
 /// at most every `SHOWN_EVERY` while text streams
 struct Watched {
-    status: Arc<Mutex<Status>>,
+    live: Arc<Mutex<Activity>>,
     /// The status last shown and when
     shown: Option<(Status, Instant)>,
     view: Box<dyn HelperView>,
@@ -623,7 +663,7 @@ struct Watched {
 impl Watched {
     fn new(view: Box<dyn HelperView>) -> Self {
         Self {
-            status: Arc::default(),
+            live: Arc::default(),
             shown: None,
             view,
         }
@@ -631,7 +671,8 @@ impl Watched {
 
     /// Only streams are throttled, as an update such as starting to run may be the last for a while
     fn show(&mut self, streamed: bool) {
-        let status = self.status.lock().expect("status");
+        let live = self.live.lock().expect("live");
+        let status = &live.status;
         if let Some((last, at)) = &self.shown {
             let early = streamed && at.elapsed() < SHOWN_EVERY;
             let same = last.doing == status.doing
@@ -641,7 +682,7 @@ impl Watched {
                 return;
             }
         }
-        self.view.shown(&status);
+        self.view.shown(status);
         self.shown = Some((status.clone(), Instant::now()));
     }
 }
@@ -652,7 +693,8 @@ impl Sink for Watched {
             event,
             Event::Thought(_) | Event::Text(_) | Event::Code(..) | Event::Output(..)
         );
-        let mut status = self.status.lock().expect("status");
+        let mut live = self.live.lock().expect("live");
+        let status = &mut live.status;
         status.preview = match event {
             Event::Thought(text) => {
                 status.doing = prompt::THINKING.to_owned();
@@ -667,7 +709,7 @@ impl Sink for Watched {
                 status.doing = format!("{} {line}", prompt::WRITING);
                 tail(code.whole)
             }
-            Event::Execute(_, call) => {
+            Event::Run(_, call) => {
                 let line = first_line(&call.code);
                 status.doing = format!("{} {line}", prompt::RUNNING);
                 tail(&call.code)
@@ -685,9 +727,13 @@ impl Sink for Watched {
                 status.doing = prompt::COMPACTING.to_owned();
                 String::new()
             }
-            Event::Unread(..) | Event::Ran(..) | Event::StepEnd(_) | Event::CompactEnd(_) => return,
+            Event::Unread(..)
+            | Event::RunEnd(..)
+            | Event::StepEnd(_)
+            | Event::StepFailed(_)
+            | Event::CompactEnd(_) => return,
         };
-        drop(status);
+        drop(live);
 
         self.show(streamed);
     }
@@ -697,9 +743,9 @@ impl Sink for Watched {
     fn saved(&mut self, memory: &AgentMemory) {
         let (usage, steps) = memory.spent();
         {
-            let mut status = self.status.lock().expect("status");
-            status.usage = usage;
-            status.steps = steps;
+            let mut live = self.live.lock().expect("live");
+            live.status.usage = usage;
+            live.status.steps = steps;
         }
         self.show(false);
     }
@@ -709,9 +755,13 @@ impl Sink for Watched {
     }
 }
 
-fn first_line(code: &str) -> &str {
+fn first_line(code: &str) -> String {
     let mut lines = code.lines().map(str::trim);
-    lines.find(|line| !line.is_empty()).unwrap_or_default()
+    let line = lines.find(|line| !line.is_empty()).unwrap_or_default();
+    let Some((cut, _)) = line.char_indices().nth(MAX_LINE_CHARS) else {
+        return line.to_owned();
+    };
+    format!("{}…", &line[..cut])
 }
 
 /// The last lines of `text` that aren't blank, read from its end since a stream can grow long
@@ -728,7 +778,9 @@ fn tail(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::delegate::{tail, Records, Watched, MAX_PREVIEW_CHARS};
+    use crate::agent::delegate::{
+        first_line, tail, Records, Watched, MAX_LINE_CHARS, MAX_PREVIEW_CHARS,
+    };
     use crate::agent::tests::{scripted, streamed, with_roles};
     use crate::agent::{Event, HelperView, Helpers, Sink, Status, Task, Unseen};
     use crate::config::Role;
@@ -952,7 +1004,7 @@ mod tests {
         let adding = tested.worker.add_server(fake(), &[]);
         let added = block_on(adding).expect("add server");
 
-        let records = Records::default();
+        let records = Arc::new(Records::new(0, 0));
         let servers = [&added];
         let mut delegate = tested.agent.delegate(&servers, Box::new(Unseen), &records);
         let asked = Asked {
@@ -966,8 +1018,8 @@ mod tests {
         let calling = delegate(call);
         block_on(calling);
 
-        let records = records.lock().expect("records");
-        assert_eq!(records[0].end, Ending::Answer("5".to_owned()));
+        let helpers = records.helpers.lock().expect("records");
+        assert_eq!(helpers[0].end, Ending::Answer("5".to_owned()));
     }
 
     /// One still waiting for a slot ends on an interrupt without starting a worker
@@ -995,7 +1047,8 @@ mod tests {
         assert!(helper.memory.steps.is_empty(), "{helper:?}");
     }
 
-    /// The main agent runs each of the codes in turn and then answers with the number of its reply,
+    /// The main agent runs each of the codes in turn, split into calls at lines `#---`,
+    /// and then answers with the number of its reply,
     /// and agents answer with their task after the seconds that follow "after" in it
     struct Background(Vec<&'static str>, Requests);
 
@@ -1028,8 +1081,10 @@ mod tests {
                     // Stands for a request the server refuses
                     Some("refused") => return Err(ModelError::new("http 400: bad request")),
                     Some(code) => {
-                        on_delta(StreamDelta::CallCode(code));
-                        on_delta(StreamDelta::CallEnd(Ok(())));
+                        for part in code.split("\n#---\n") {
+                            on_delta(StreamDelta::CallCode(part));
+                            on_delta(StreamDelta::CallEnd(Ok(())));
+                        }
                     }
                     None => on_delta(StreamDelta::Content(&text)),
                 }
@@ -1091,6 +1146,25 @@ mod tests {
         let last = requests.last().and_then(|request| request.last());
         let told = last.map(content).unwrap_or_default();
         assert_eq!(told, "[Agent done]\nnaïve");
+    }
+
+    /// The final record of an agent started in the background goes to the call that started it
+    #[test]
+    fn seat_kept() {
+        let code = "print('first')\n#---\nagent('Spell naïve after 0.5', name='naïve')";
+        let model = Background(vec![code], Requests::default());
+        let mut agent = scripted(model, Box::new(|_| {}));
+
+        let mut memory = AgentMemory::default();
+        let answer = agent.turn(&mut memory, "Spell it").expect("run");
+        assert_eq!(answer.as_deref(), Some("Answer 2"));
+
+        let MemoryStep::Action(step) = &memory.steps[1] else {
+            panic!("{:?}", memory.steps);
+        };
+        assert_eq!(ends(&step.calls[0]), []);
+        let naïve = Ending::Answer("Answer: Spell naïve after 0.5".to_owned());
+        assert_eq!(ends(&step.calls[1]), [(Some("naïve"), &naïve)]);
     }
 
     /// While the turn waits for an agent, a message the client queues arrives as a task update
@@ -1215,7 +1289,10 @@ mod tests {
     /// An interrupt ends the turn and the agents running in the background with it
     #[test]
     fn interrupt_stops_all() {
-        let code = "agent('Wait after 30', name='slow')";
+        // The code outlasts the agent, which the interrupt reaches at once
+        let code = "import time\n\
+            agent('Wait after 30', name='slow')\n\
+            try:\n    time.sleep(30)\nexcept KeyboardInterrupt:\n    time.sleep(1)";
         let model = Background(vec![code], Requests::default());
         let mut agent = scripted(model, Box::new(|_| {}));
         cancel_soon(&agent.agent.interrupt, 0);
@@ -1227,6 +1304,8 @@ mod tests {
             ends(ran(&memory, 1)),
             [(Some("slow"), &Ending::Interrupted {})]
         );
+        let done = |step: &MemoryStep| matches!(step, MemoryStep::Done { .. });
+        assert!(!memory.steps.iter().any(done), "{:?}", memory.steps);
     }
 
     /// An agent still running when a model error ends the turn ends unfinished,
@@ -1305,7 +1384,7 @@ mod tests {
         let tested = scripted(model, Box::new(|_| {}));
         let ends = Arc::<Mutex<Vec<Ending>>>::default();
         let views = Box::new(Closed(Arc::clone(&ends)));
-        let records = Records::default();
+        let records = Arc::new(Records::new(0, 0));
         let mut delegate = tested.agent.delegate(&[], views, &records);
 
         let asked = Asked {
@@ -1366,7 +1445,7 @@ mod tests {
             code: "print(len(cafés))".to_owned(),
             ..Call::default()
         };
-        watched.event(Event::Execute(0, &call));
+        watched.event(Event::Run(0, &call));
         watched.event(Event::Output(0, &call, "3\n"));
 
         // A saved step shows the tokens so far, and one without any shows nothing new
@@ -1397,8 +1476,8 @@ mod tests {
         assert_eq!(seen, expected);
         let tokens = shown.last().and_then(|status| status.usage.tokens);
         assert_eq!(tokens, Some(TokenUsage::new(100, 20)));
-        let status = watched.status.lock().expect("status");
-        assert_eq!(status.steps, 2);
+        let live = watched.live.lock().expect("live");
+        assert_eq!(live.status.steps, 2);
     }
 
     #[test]
@@ -1410,5 +1489,13 @@ mod tests {
         let kept = tail(&long);
         assert_eq!(kept.chars().count(), MAX_PREVIEW_CHARS);
         assert!(long.ends_with(&kept), "{kept}");
+    }
+
+    #[test]
+    fn line_clipped() {
+        let long = "café = 1; ".repeat(20);
+        let kept: String = long.chars().take(MAX_LINE_CHARS).collect();
+        assert_eq!(first_line(&long), format!("{kept}…"));
+        assert_eq!(first_line("\n  print('naïve')\nx = 1"), "print('naïve')");
     }
 }

@@ -191,9 +191,12 @@ def _tool(server, spec, used):
         arguments = {keys[ident]: value for ident, value in bound.items() if value is not None or ident not in unset}
         try:
             # The agent finds the connection by the name used in the code
-            return _call(server, spec["name"], arguments, called)
+            result = _call(server, spec["name"], arguments, called)
         except (TypeError, ValueError) as exc:
             raise type(exc)(f"{called}: {exc}") from None
+        if output and "structured" in result:
+            return result["structured"]
+        return result["text"]
 
     function.__name__ = function.__qualname__ = name
     function.__signature__ = signature

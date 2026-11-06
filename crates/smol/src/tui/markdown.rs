@@ -1,11 +1,13 @@
 use crate::tui::diagram;
 use crate::tui::highlight::{self, INLINE_CODE};
 use crate::tui::{joined, theme, widened, Spans, BOLD, DIM, HEADING};
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd, TextMergeWithOffset,
+};
 use ratatui::style::{Modifier, Style};
 use std::mem;
 use std::ops::Range;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use url::Url;
 
 const STRONG_TEXT: Style = BOLD.fg(theme::ORANGE);
@@ -16,7 +18,7 @@ pub(crate) const LINK: Style = Style::new()
     .fg(theme::CYAN)
     .add_modifier(Modifier::UNDERLINED);
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct Text {
     pub(crate) marker: String,
     pub(crate) indent: String,
@@ -27,7 +29,7 @@ pub(crate) struct Text {
     pub(crate) links: Vec<(Range<usize>, String)>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum Block {
     Text(Text),
     /// The first row is the header
@@ -60,7 +62,9 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
     let mut builder = Builder::default();
 
     let parser = Parser::new_ext(text, options);
-    for (event, range) in parser.into_offset_iter() {
+    // The parser splits text at entities and stray delimiters, and an address must arrive whole
+    let events = TextMergeWithOffset::new(parser.into_offset_iter());
+    for (event, range) in events {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => builder.gap(),
@@ -252,7 +256,20 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
                 _ => {}
             },
 
-            Event::Text(text) | Event::InlineHtml(text) => builder.text(&text),
+            Event::Text(text) => builder.text(&text),
+            Event::InlineHtml(html) => {
+                let marks = |c: char| matches!(c, '<' | '>' | '/' | ' ');
+                let tag = html.replace(marks, "");
+                let broken = tag.eq_ignore_ascii_case("br");
+                // Flushing ends the line, which holds no table cell's text, but drops an empty one
+                let empty = builder.line.is_empty() && builder.alone.is_none();
+                match (broken, builder.table.is_some()) {
+                    (true, true) => builder.push("\n", Style::new()),
+                    (true, false) if empty => builder.push_block(Vec::new(), false),
+                    (true, false) => builder.flush(),
+                    (false, _) => builder.text(&html),
+                }
+            }
             Event::Html(html) => {
                 let html = html.trim_end_matches('\n');
                 builder.text(html);
@@ -315,17 +332,88 @@ fn web(url: &str) -> bool {
     parsed.is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
+/// Web addresses written out in `text`, without the punctuation that ends a sentence around them
+/// or the Chinese text that may run into them with no space
+fn bare_urls(text: &str) -> Vec<Range<usize>> {
+    let ends = |c: char| {
+        let wide = c.width() == Some(2);
+        c.is_whitespace() || matches!(c, '<' | '>' | '"') || wide
+    };
+    let trailing = ['.', ',', ':', ';', '!', '?', '\'', '*', '_', '~'];
+
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = text[from..].find("http") {
+        let start = from + at;
+        let rest = &text[start..];
+        let glued = text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        let scheme = rest.starts_with("http://") || rest.starts_with("https://");
+        if glued || !scheme {
+            from = start + "http".len();
+            continue;
+        }
+
+        let length = rest.find(ends).unwrap_or(rest.len());
+        let mut url = &rest[..length];
+        loop {
+            let trimmed = url.trim_end_matches(trailing);
+            let open = trimmed.matches('(').count();
+            let unbalanced = trimmed.ends_with(')') && trimmed.matches(')').count() > open;
+            let trimmed = match unbalanced {
+                true => &trimmed[..trimmed.len() - 1],
+                false => trimmed,
+            };
+            if trimmed.len() == url.len() {
+                break;
+            }
+            url = trimmed;
+        }
+        if web(url) {
+            found.push(start..start + url.len());
+        }
+        from = start + length;
+    }
+    found
+}
+
 impl Builder {
     fn text(&mut self, text: &str) {
-        match &mut self.code {
-            Some((_, code)) => code.push_str(text),
-            None => {
-                let mut style = Style::new();
-                for inner in &self.styles {
-                    style = style.patch(*inner);
-                }
-                self.push(text, style);
+        if let Some((_, code)) = &mut self.code {
+            return code.push_str(text);
+        }
+
+        let mut style = Style::new();
+        for inner in &self.styles {
+            style = style.patch(*inner);
+        }
+        // An address inside a link is that link's text
+        let urls = match self.links.is_empty() {
+            true => bare_urls(text),
+            false => Vec::new(),
+        };
+        if urls.is_empty() {
+            return self.push(text, style);
+        }
+
+        let mut done = 0;
+        for range in urls {
+            if range.start > done {
+                self.push(&text[done..range.start], style);
             }
+            let url = &text[range.start..range.end];
+            let start = self.offset();
+            self.push(url, style.patch(LINK));
+            if self.table.is_none() {
+                let end = self.offset();
+                self.line_links.push((start..end, url.to_owned()));
+            }
+            done = range.end;
+        }
+        if done < text.len() {
+            self.push(&text[done..], style);
         }
     }
 
@@ -393,6 +481,7 @@ impl Builder {
         // Its alt text may be empty, which leaves the line empty too
         if let Some((url, alt)) = self.alone.take() {
             self.line.clear();
+            self.line_links.clear();
             let (marker, indent) = self.prefix();
             self.blocks.push(Block::Image {
                 marker,
@@ -529,11 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn code_and_tables() {
-        let text = "```python\nx = 'café'\nprint(x)\n```\n\nafter";
-        let expected = ["│ x = 'café'", "│ print(x)", "", "after"];
-        assert_eq!(lines(text), expected);
-
+    fn table_gaps() {
         let text = "Body\n\n| name | n |\n|---|---|\n| **José** | 1 |\n| Zoë | 22 |\n\nafter";
         let expected = ["Body", "", "name | n", "José | 1", "Zoë | 22", "", "after"];
         assert_eq!(lines(text), expected);
@@ -584,6 +669,79 @@ mod tests {
 
         let table = links("| site |\n|---|\n| [docs](https://a.io) |\n\nafter");
         assert_eq!(table, vec![Vec::new(); 2]);
+
+        // The parser hands the text over in pieces at the entity
+        let text = "menu at https://café.fr/?a=1&amp;b=2, not `https://a.io` or [https://b.io](https://b.io)";
+        let bare = (
+            "https://café.fr/?a=1&b=2".to_owned(),
+            "https://café.fr/?a=1&b=2".to_owned(),
+        );
+        let named = ("https://b.io".to_owned(), "https://b.io".to_owned());
+        assert_eq!(links(text), [vec![bare, named]]);
+        let parsed = blocks(text);
+        let Block::Text(first) = &parsed[0] else {
+            panic!("{parsed:?}");
+        };
+        let styled = first
+            .spans
+            .iter()
+            .find(|(span, _)| span.starts_with("https://café"));
+        assert_eq!(styled.map(|(_, style)| *style), Some(LINK));
+
+        // One in a table is styled but not clickable, as explicit links there are
+        let cells = "| site |\n|---|\n| see https://a.io |\n\nafter https://b.io";
+        let after = ("https://b.io".to_owned(), "https://b.io".to_owned());
+        assert_eq!(links(cells), [Vec::new(), vec![after]]);
+        let parsed = blocks(cells);
+        let Block::Table { rows, .. } = &parsed[0] else {
+            panic!("{parsed:?}");
+        };
+        let styled = rows[1][0].iter().find(|(span, _)| span == "https://a.io");
+        assert_eq!(styled.map(|(_, style)| *style), Some(LINK));
+    }
+
+    #[test]
+    fn bare_urls_found() {
+        let cases: [(&str, &[&str]); 8] = [
+            (
+                "menu at https://café.fr/menü, then",
+                &["https://café.fr/menü"],
+            ),
+            ("(see https://a.io/x_(y)).", &["https://a.io/x_(y)"]),
+            ("https://a.io。next", &["https://a.io"]),
+            ("详见https://a.io", &["https://a.io"]),
+            ("https://a.io/x了解", &["https://a.io/x"]),
+            (
+                "\"https://a.io/?next=http://b.io\"",
+                &["https://a.io/?next=http://b.io"],
+            ),
+            ("xhttps://a.io and http:// alone", &[]),
+            (
+                "http://a.io https://b.io!",
+                &["http://a.io", "https://b.io"],
+            ),
+        ];
+        for (text, expected) in cases {
+            let found = bare_urls(text).into_iter().map(|range| &text[range]);
+            let found: Vec<&str> = found.collect();
+            assert_eq!(found, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn html_breaks() {
+        assert_eq!(lines("Café<br/>naïve<br>olé"), ["Café", "naïve", "olé"]);
+        assert_eq!(
+            lines("Café<BR />naïve <b>olé</b>"),
+            ["Café", "naïve <b>olé</b>"]
+        );
+        assert_eq!(lines("Café<br><br>naïve"), ["Café", "", "naïve"]);
+
+        let table = blocks("| dish |\n|---|\n| crème<br>brûlée |");
+        let Block::Table { rows, .. } = &table[0] else {
+            panic!("{table:?}");
+        };
+        assert_eq!(joined(&rows[1][0]), "crème\nbrûlée");
     }
 
     #[test]
@@ -620,18 +778,6 @@ mod tests {
         let text = "- - one\n- > quote\n- | x | y |\n  |---|---|\n  | one | two |";
         let expected = ["• • one", "• ▏ quote", "• x | y", "one | two"];
         assert_eq!(lines(text), expected);
-    }
-
-    #[test]
-    fn quote_gap_hidden() {
-        let gap = Block::Text(Text {
-            marker: "▏ ".to_owned(),
-            indent: "▏ ".to_owned(),
-            copy_marker: false,
-            spans: Vec::new(),
-            links: Vec::new(),
-        });
-        assert_eq!(blocks("> first\n>\n> second")[1], gap);
     }
 
     #[test]

@@ -1,4 +1,6 @@
 use crate::config::{Access, Skill};
+#[cfg(test)]
+use crate::tests::profile_dir;
 use crate::worker::sandbox::{Rules, Sandbox};
 use crate::worker::venv::Venv;
 use reaper::{cause, tilde};
@@ -167,10 +169,7 @@ fn home_of(config: &Path) -> PathBuf {
 /// Tests share a venv, whose pyvenv.cfg must name a home that outlives each test's config folder
 #[cfg(test)]
 fn home_of(_: &Path) -> PathBuf {
-    let exe = env::current_exe().expect("test binary");
-    let deps = exe.parent().expect("deps");
-    let built = deps.parent().expect("profile");
-    built.to_owned()
+    profile_dir()
 }
 
 #[cfg(test)]

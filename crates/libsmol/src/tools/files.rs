@@ -147,7 +147,8 @@ pub fn grep(
         }
         if bytes > MAX_GREP_BYTES {
             let limit = MAX_GREP_BYTES >> 20;
-            let message = prompt::too_many(limit);
+            let reason = prompt::too_many(limit);
+            let message = prompt::failure("grep", &shown, &reason);
             return Err(ToolError::Failed(message));
         }
     }

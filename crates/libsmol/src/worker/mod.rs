@@ -16,6 +16,8 @@ pub const COPIES_ENV: &str = "SMOL_COPIES";
 pub const AGENTS_ENV: &str = "SMOL_AGENTS";
 /// Starts libsmol's executable as a session's worker, followed by the venv it runs as
 pub(crate) const WORKER_ARG: &str = "--worker";
+/// The worker cuts each `print()` to it
+pub(crate) const MAX_PRINT_CHARS: usize = 8192;
 
 /// The marker the worker writes after each snippet's output,
 /// made from the token because the output may hold any fixed marker
@@ -94,7 +96,8 @@ pub enum HostNote {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum WorkerCall {
-    /// `called` is the `server.function` as written in the code
+    /// `called` is the `server.function` as written in the code, and the answer is `{"text"}`,
+    /// with `"structured"` too when the result holds structured content
     Tool {
         server: String,
         tool: String,

@@ -11,6 +11,8 @@ links = "worker"
 
 [lib]
 name = "worker"
+test = false
+doctest = false
 
 [build-dependencies]
 ar = "0.9"

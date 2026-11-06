@@ -10,9 +10,6 @@ import types as _types
 import weakref as _weakref
 from multiprocessing.reduction import ForkingPickler as _ForkingPickler
 
-_FILENAME = "<smolcode>"
-_BOOTSTRAP = (lambda: None).__code__.co_filename
-
 # pickle finds functions and classes defined in the code by module name
 _MAIN = _types.ModuleType("__main__")
 _sys.modules["__main__"] = _MAIN

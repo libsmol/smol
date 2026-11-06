@@ -11,6 +11,8 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::env;
 #[cfg(target_os = "linux")]
+use std::error::Error;
+#[cfg(target_os = "linux")]
 use std::ffi::c_void;
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -136,11 +138,23 @@ impl Sandbox {
             }
         }
 
-        let mut hidden = rules.hidden.clone();
-        for path in &mut hidden {
-            if let Ok(resolved) = fs::canonicalize(&path) {
-                *path = resolved;
+        // A missing path goes below the real path of the nearest folder above it that exists
+        let mut hidden = Vec::new();
+        for path in &rules.hidden {
+            let mut placed = path.clone();
+            for above in path.ancestors() {
+                let Ok(resolved) = fs::canonicalize(above) else {
+                    continue;
+                };
+                let rest = path.strip_prefix(above).expect("ancestor");
+                placed = resolved;
+                // Joining an empty path would add a trailing separator, which Seatbelt rules keep
+                if !rest.as_os_str().is_empty() {
+                    placed.push(rest);
+                }
+                break;
             }
+            hidden.push(placed);
         }
 
         sandbox.isolation = isolated(&real, &hidden);
@@ -210,19 +224,25 @@ impl Drop for Sandbox {
 
 #[cfg(target_os = "linux")]
 fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation> {
-    // A missing path would only get more folders granted entry by entry
-    let hidden: Vec<PathBuf> = hidden
-        .iter()
-        .filter(|path| path.exists())
-        .cloned()
-        .collect();
+    // A missing path still spreads the folders above it, so one made later stays hidden,
+    // except below a folder the code writes, whose top level would lose new entries
+    let mut kept = Vec::new();
+    for path in hidden {
+        let written = granted
+            .iter()
+            .any(|(folder, write)| *write && path.starts_with(folder));
+        if path.exists() || !written {
+            kept.push(path.clone());
+        }
+    }
+
     let mut allowed = Vec::new();
     for (path, write) in granted {
         let grant = match write {
             true => Grant::Write,
             false => Grant::Read,
         };
-        spread(path, grant, &hidden, &mut allowed);
+        spread(path, grant, &kept, &mut allowed);
     }
 
     // A kernel drops the rights and scopes it doesn't know, and the rest still holds
@@ -230,10 +250,15 @@ fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation
     let all = AccessFs::from_all(abi);
     // Connecting to a Unix socket is a write right, so only writable folders allow it
     let read = AccessFs::from_read(abi);
-    let mut rules = Vec::new();
-    for (path, grant) in allowed {
-        let Ok(fd) = PathFd::new(&path) else {
-            continue;
+    let ruled = |(path, grant): (PathBuf, Grant)| {
+        let fd = match PathFd::new(&path) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let reason = e.source().map(cause).unwrap_or_default();
+                let shown = tilde(&path);
+                warn!("sandbox: rule skipped, {reason} [path={shown}]");
+                return None;
+            }
         };
         let mut access = match grant {
             Grant::Write => all,
@@ -244,10 +269,12 @@ fn isolated(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> Option<Isolation
         if !path.is_dir() {
             access &= AccessFs::from_file(abi);
         }
-        rules.push(PathBeneath::new(fd, access));
-    }
-
-    let rules = rules.into_iter().map(Ok);
+        let rule = PathBeneath::new(fd, access);
+        Some(Ok(rule))
+    };
+    // Opened one at a time as the ruleset takes them, as spread folders may hold more entries
+    // than files can be open
+    let rules = allowed.into_iter().filter_map(ruled);
     let created = Ruleset::default()
         .handle_access(all)
         .and_then(|ruleset| ruleset.scope(Scope::Signal | Scope::AbstractUnixSocket))
@@ -486,11 +513,17 @@ pub(crate) mod tests {
         write_file(&home.join(".gitconfig"), b"[user]");
         write_file(&home.join("café/main.rs"), b"fn main() {}");
         write_file(&outside.join("notes.md"), b"notes");
+        fs::create_dir_all(home.join(".cargo/registry")).expect("dir");
         symlink(home.join(".ssh"), home.join("keys")).expect("link");
         symlink(home.join(".config"), home.join("settings")).expect("link");
         symlink(&outside, home.join("data")).expect("link");
         let home = fs::canonicalize(&home).expect("real");
-        let hidden = [home.join(".ssh"), home.join(".config/gh")];
+        // The last one is missing
+        let hidden = [
+            home.join(".ssh"),
+            home.join(".config/gh"),
+            home.join(".cargo/credentials.toml"),
+        ];
 
         let mut allowed = Vec::new();
         spread(&home, Grant::Read, &hidden, &mut allowed);
@@ -501,6 +534,8 @@ pub(crate) mod tests {
 
         let expected = [
             (home.clone(), Grant::List),
+            (home.join(".cargo"), Grant::List),
+            (home.join(".cargo/registry"), Grant::Read),
             (home.join(".config"), Grant::List),
             (home.join(".config/git"), Grant::Read),
             (home.join(".gitconfig"), Grant::Read),
@@ -600,6 +635,38 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(logs, "['denied', 'denied']\n");
+    }
+
+    /// A hidden path made after the session opened stays hidden,
+    /// and a missing one in the working directory leaves the code making files there
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn later_hidden_kept() {
+        let dir = temp_dir("later");
+        let cwd = dir.join("café");
+        fs::create_dir_all(&cwd).expect("dir");
+        write_file(&dir.join("a/b/notes.md"), b"notes");
+        let access = Access {
+            hidden: vec![dir.join("a/b/secret"), cwd.join("later")],
+            ..Access::default()
+        };
+        let workplace = opened(&cwd, &dir.join("config"), &access);
+        #[cfg(target_os = "macos")]
+        assert!(workplace.sandbox.enforced());
+        if !workplace.sandbox.enforced() {
+            fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        write_file(&dir.join("a/b/secret"), b"key");
+        write_file(&cwd.join("later"), b"key");
+
+        let code = "def tried(act):\n    try:\n        act()\n        return 'ok'\n    except PermissionError:\n        return 'denied'\n\
+            [tried(lambda: open('../a/b/secret').read()), tried(lambda: open('../a/b/notes.md').read()),\n \
+             tried(lambda: open('naïve.txt', 'w').write('x'))]";
+        let logs = evaluated(workplace, code);
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(logs, "['denied', 'ok', 'ok']\n");
     }
 
     /// A link in a writable folder that holds a hidden path doesn't make where it leads writable

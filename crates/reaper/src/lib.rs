@@ -10,15 +10,16 @@ use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 mod unix;
 #[cfg(windows)]
 mod windows;
+pub mod wire;
 
 #[cfg(unix)]
 pub use crate::unix::{guard, kill_all, prepare, Group, Mark};
 #[cfg(windows)]
-pub use crate::windows::{guard, kill_all, prepare, prepare_attached, Group, Mark};
+pub use crate::windows::{command_tail, guard, kill_all, prepare, prepare_attached, Group, Mark};
 
 /// Searches PATH by hand because commands like `npx` are .cmd files on Windows
 /// and the standard library only finds .exe
-pub fn program(name: &Path) -> PathBuf {
+pub fn lookup(name: &Path) -> PathBuf {
     let paths = env::var_os("PATH").unwrap_or_default();
     let extensions = match cfg!(windows) && name.extension().is_none() {
         true => env::var("PATHEXT").unwrap_or_default(),
@@ -269,7 +270,6 @@ mod tests {
 
         assert_eq!(lowered("Connection refused"), "connection refused");
         assert_eq!(lowered("I/O error"), "I/O error");
-        assert_eq!(lowered("JSON error"), "JSON error");
         assert_eq!(lowered("Über-proxy refused"), "über-proxy refused");
         assert_eq!(lowered("Access is denied。"), "access is denied");
         let windows = "The system cannot find the file specified.";

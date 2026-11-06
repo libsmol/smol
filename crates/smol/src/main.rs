@@ -9,11 +9,12 @@ use std::process::ExitCode;
 
 mod chat;
 mod client;
+mod conversation;
 mod tui;
 
 const AGENT: &str = "libsmol";
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "smol", version, about)]
 struct Cli {
     /// first task, optional
@@ -46,7 +47,7 @@ fn run() -> Result<()> {
     let exe = env::current_exe().ok();
     let beside = exe.as_ref().map(|exe| exe.with_file_name(installed));
     // Returns the name unchanged when nothing is found
-    let searched = reaper::program(Path::new(AGENT));
+    let searched = reaper::lookup(Path::new(AGENT));
     let program = match beside {
         Some(beside) if beside.is_file() => beside,
         _ if searched != Path::new(AGENT) => searched,
@@ -64,9 +65,13 @@ fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::Cli;
-    use clap::error::ErrorKind;
-    use clap::Parser;
+    use crate::client::Notice;
+    use crate::conversation::Conversation;
+    use agent_client_protocol_schema::v1::{
+        ContentBlock, ContentChunk, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
+        ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
+    };
+    use serde_json::json;
 
     const FAKE_AGENT: &str = r#"
 model() {
@@ -146,20 +151,70 @@ done
         shell(FAKE_AGENT)
     }
 
-    #[test]
-    fn version_shown() {
-        let shown = Cli::try_parse_from(["smol", "--version"]).expect_err("version");
-        assert_eq!(shown.kind(), ErrorKind::DisplayVersion);
-        let version = env!("CARGO_PKG_VERSION");
-        assert_eq!(shown.to_string(), format!("smol {version}\n"));
+    pub(crate) fn chunk(text: &str) -> ContentChunk {
+        let block = ContentBlock::from(text);
+        ContentChunk::new(block)
     }
 
-    #[test]
-    fn empty_resume_refused() {
-        let empty = Cli::try_parse_from(["smol", "--resume", ""]);
-        assert!(empty.is_err());
+    pub(crate) fn content(text: &str) -> ToolCallContent {
+        let block = ContentBlock::from(text);
+        ToolCallContent::from(block)
+    }
 
-        let named = Cli::try_parse_from(["smol", "--resume", "old session"]).expect("parse");
-        assert_eq!(named.resume.as_deref(), Some("old session"));
+    pub(crate) fn message(text: &str) -> SessionUpdate {
+        let chunk = chunk(text);
+        SessionUpdate::AgentMessageChunk(chunk)
+    }
+
+    pub(crate) fn end_step(talk: &mut Conversation, input: u64, output: u64) {
+        let meta = json!({
+            "inputTokens": input,
+            "outputTokens": output,
+            "decodeDuration": 0.5,
+            "duration": 0.25,
+        });
+        let meta = meta.as_object().cloned();
+        let usage = UsageUpdate::new(input + output, 100).meta(meta);
+        let ended = talk.update(&SessionUpdate::UsageUpdate(usage));
+        assert!(ended);
+    }
+
+    pub(crate) fn told(text: &str) -> Notice {
+        Notice {
+            text: text.to_owned(),
+            retry_in: None,
+            step: false,
+            unsaved: false,
+        }
+    }
+
+    pub(crate) fn retrying(text: &str) -> Notice {
+        Notice {
+            retry_in: Some(2.0),
+            ..told(text)
+        }
+    }
+
+    /// Starts a call that starts `count` agents, the first of them named
+    pub(crate) fn started(talk: &mut Conversation, count: usize) {
+        let code = ToolCall::new("call_1", "eval").status(ToolCallStatus::InProgress);
+        talk.update(&SessionUpdate::ToolCall(code));
+        for n in 1..=count {
+            let marked = json!({ "_smol/agent": true, "parent": "call_1" });
+            let task = format!("Count the cafés in menu {n}");
+            let name = (n == 1).then_some("cafés");
+            let asked = json!({ "task": task, "role": null, "name": name });
+            let id = format!("call_1.{n}");
+            let opened = ToolCall::new(id, format!("agent: {task}"))
+                .raw_input(asked)
+                .meta(marked.as_object().cloned());
+            talk.update(&SessionUpdate::ToolCall(opened));
+        }
+    }
+
+    pub(crate) fn moved(talk: &mut Conversation, n: usize, status: ToolCallStatus) {
+        let fields = ToolCallUpdateFields::new().status(status);
+        let update = ToolCallUpdate::new(format!("call_1.{n}"), fields);
+        talk.update(&SessionUpdate::ToolCallUpdate(update));
     }
 }

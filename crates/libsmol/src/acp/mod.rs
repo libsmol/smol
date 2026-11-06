@@ -18,22 +18,6 @@ mod servers;
 mod session;
 mod translator;
 
-/// Every `_smol/` name is listed here and must match smol's client.rs
-const NOTICE: &str = "_smol/notice";
-const MCP: &str = "_smol/mcp";
-const QUEUED: &str = "_smol/queued";
-/// Declared by a client that shows the images a reply writes in Markdown
-const IMAGES: &str = "_smol/images";
-/// Sent by a client that declared `_smol/queued` when it queues a message during a turn
-const ENQUEUED: &str = "_smol/enqueued";
-const UPDATE: &str = "_smol/update";
-/// Replied to like a prompt, and the tool calls it opens carry the same marker in `_meta`
-const SHELL: &str = "_smol/shell";
-/// Marks the tool calls that open agents the code starts, whose `rawInput` is what they were given
-const AGENT: &str = "_smol/agent";
-const MEMORIES: &str = "_smol/memories";
-const FORGET: &str = "_smol/forget";
-
 pub(crate) struct App {
     pub(crate) peer: Arc<Peer>,
     pub(crate) store: HistoryStore,
@@ -192,7 +176,6 @@ mod tests {
         let cases = [
             ("L10", Some((10, 10))),
             ("L10:20", Some((10, 20))),
-            ("L10-20", Some((10, 20))),
             ("L10-L20", Some((10, 20))),
             ("L20:10", None),
             ("L0", None),

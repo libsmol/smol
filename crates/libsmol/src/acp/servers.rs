@@ -1,5 +1,4 @@
-use crate::acp::rpc::Peer;
-use crate::acp::MCP;
+use crate::acp::rpc::SessionPeer;
 use crate::config::McpConfig;
 use crate::history::Settings;
 use crate::prompt;
@@ -8,7 +7,6 @@ use crate::worker::host::{Added, Worker};
 use serde_json::json;
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task;
@@ -27,8 +25,7 @@ pub(crate) struct McpPool {
     outbox: UnboundedSender<McpEvent>,
     cwd: PathBuf,
     copies: PathBuf,
-    peer: Arc<Peer>,
-    session: String,
+    peer: SessionPeer,
 }
 
 struct Mcp {
@@ -71,8 +68,7 @@ impl McpPool {
         configs: Vec<McpConfig>,
         settings: &Settings,
         copies: &Path,
-        peer: Arc<Peer>,
-        session: String,
+        peer: SessionPeer,
     ) -> Self {
         let (outbox, events) = mpsc::unbounded_channel();
         let mut pool = Self {
@@ -83,7 +79,6 @@ impl McpPool {
             cwd: settings.cwd.clone(),
             copies: copies.to_owned(),
             peer,
-            session,
         };
 
         for config in configs {
@@ -92,7 +87,7 @@ impl McpPool {
             pool.servers.push(Mcp { config, state });
             if on {
                 let index = pool.servers.len() - 1;
-                pool.connect(index, None);
+                pool.attempt(index, None);
             }
         }
 
@@ -124,11 +119,8 @@ impl McpPool {
             .position(|server| server.config.name == name)
     }
 
-    pub(crate) fn configs(&self) -> Vec<McpConfig> {
-        self.servers
-            .iter()
-            .map(|server| server.config.clone())
-            .collect()
+    pub(crate) fn configs(&self) -> impl Iterator<Item = &McpConfig> {
+        self.servers.iter().map(|server| &server.config)
     }
 
     /// Turning on a server that is already on reconnects it
@@ -141,7 +133,7 @@ impl McpPool {
 
         let name = &self.servers[index].config.name;
         match on {
-            true => self.connect(index, None),
+            true => self.attempt(index, None),
             false => info!("mcp[{name}]: turned off"),
         }
         self.report();
@@ -187,7 +179,8 @@ impl McpPool {
                         }
                     }
                     Err(error) => {
-                        warn!("mcp[{name}]: connect failed, {error}");
+                        let logged = error.replace('\n', " | ");
+                        warn!("mcp[{name}]: connect failed, {logged}");
                         let error = match dropped {
                             Some(dropped) => format!("{dropped}\n{error}"),
                             None => error,
@@ -219,13 +212,14 @@ impl McpPool {
                     false => format!("{disconnected}\n{said}"),
                 };
                 let name = &self.servers[index].config.name;
+                let logged = error.replace('\n', " | ");
                 match at - since >= MIN_UPTIME {
                     true => {
-                        warn!("mcp[{name}]: disconnected (reconnecting), {error}");
-                        self.connect(index, Some(error));
+                        warn!("mcp[{name}]: disconnected, {logged} [reconnect=true]");
+                        self.attempt(index, Some(error));
                     }
                     false => {
-                        warn!("mcp[{name}]: disconnected (not reconnecting), {error}");
+                        warn!("mcp[{name}]: disconnected, {logged} [reconnect=false]");
                         self.servers[index].state = McpState::Failed { error };
                     }
                 }
@@ -253,11 +247,10 @@ impl McpPool {
             listed.push(entry);
         }
 
-        let status = json!({ "sessionId": self.session, "servers": listed });
-        self.peer.notify(MCP, status);
+        self.peer.servers(listed);
     }
 
-    fn connect(&mut self, index: usize, dropped: Option<String>) {
+    fn attempt(&mut self, index: usize, dropped: Option<String>) {
         self.attempts += 1;
         let attempt = self.attempts;
         let config = self.servers[index].config.clone();

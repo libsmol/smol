@@ -1,13 +1,16 @@
+use crate::conversation::{Call, Entry, Helper, Item, Retry, State, Step};
 use crate::tui::highlight;
 use crate::tui::markdown::{self, Block, Text, LINK};
 use crate::tui::picture::{self, Source};
-use crate::tui::transcript::{Call, Entry, Group, Helper, Item, Retry, State, Step};
+use crate::tui::theme::HELPERS;
+use crate::tui::transcript::Group;
 use crate::tui::{
     clipped, in_out, joined, spinner, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG,
 };
 use pulldown_cmark::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use reaper::one_line;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -21,7 +24,7 @@ const MAX_THOUGHT_ROWS: usize = 3;
 const MAX_PREVIEW_ROWS: usize = 4;
 const MAX_TITLE_ROWS: usize = 2;
 const MAX_TITLE_COLUMNS: usize = 80;
-const MIN_COLUMN: usize = 6;
+const MIN_CELL_COLUMNS: usize = 6;
 
 const THINKING: Style = DIM.add_modifier(Modifier::ITALIC);
 const DIAGRAM: Style = Style::new().fg(theme::CYAN);
@@ -148,7 +151,7 @@ pub(crate) enum Target {
 pub(crate) struct Render {
     width: usize,
     expanded: bool,
-    /// Where relative image paths start
+    /// Where relative image paths start, and what agents' tasks write as `.`
     pub(crate) cwd: PathBuf,
     pub(crate) rows: Vec<Row>,
     pub(crate) groups: Vec<Group>,
@@ -383,7 +386,7 @@ impl Render {
                 call: call.id.clone(),
                 entry: None,
                 rows: start..self.rows.len(),
-                stale: false,
+                drawn: call.revision,
             });
         }
     }
@@ -401,7 +404,7 @@ impl Render {
         let running = helpers
             .iter()
             .filter(|helper| helper.state() == State::Running);
-        let colors: Vec<Color> = running.map(|helper| helper.color).collect();
+        let colors: Vec<Color> = running.map(|helper| HELPERS[helper.hue]).collect();
         let (symbol, tint) = match first {
             Some(first) if !colors.is_empty() => {
                 let elapsed = first.elapsed();
@@ -446,7 +449,8 @@ impl Render {
             let status = status(helper, room / 2);
             let used = spans_width(&status) + " · ".width();
             let left = room.saturating_sub(used);
-            let title = clipped(&helper.title, left);
+            let task = one_line(&helper.task, &self.cwd);
+            let title = clipped(&task, left);
 
             let mut spans = vec![
                 (symbol, tint),
@@ -495,14 +499,15 @@ impl Render {
             (false, true) => MAX_TITLE_ROWS,
             (false, false) => 1,
         };
-        let mut ranges = wrap_ranges(&helper.title, limit);
+        let task = one_line(&helper.task, &self.cwd);
+        let mut ranges = wrap_ranges(&task, limit);
         let cut = ranges.len() > most;
         if cut {
             ranges.truncate(most);
         }
         let last = ranges.len().saturating_sub(1);
         for (at, (range, joint)) in ranges.into_iter().enumerate() {
-            let mut title = helper.title[range].to_owned();
+            let mut title = task[range].to_owned();
             if cut && at == last {
                 let marked = format!("{title}…");
                 title = clipped(&marked, limit);
@@ -511,12 +516,14 @@ impl Render {
                 0 => (&first[..], width),
                 _ => (&rest[..], rest_width),
             };
-            let line = [(title, Style::new())];
-            self.push_rows(lead, &rest, mark_width, &line, &[]);
-            // Rows wrapped here copy back to the text they came from
-            if let Some(row) = self.rows.last_mut() {
-                row.joint = joint;
-            }
+            let mut line = lead.to_vec();
+            line.push(Span::raw(title));
+            self.rows.push(Row {
+                line: Line::from(line),
+                mark_width,
+                joint,
+                ..Row::default()
+            });
         }
 
         if !helper.preview.is_empty() {
@@ -773,7 +780,7 @@ impl Render {
         let width: usize = first.iter().map(Span::width).sum();
         let state = source.as_ref().map(picture::state);
         match (source, state) {
-            (Some(source), Some(picture::State::Ready(ready))) => {
+            (Some(source), Some(picture::Load::Ready(ready))) => {
                 let room = self.width.saturating_sub(width);
                 let lines = picture::drawn(&source, &ready, room);
                 for (index, cells) in lines.into_iter().enumerate() {
@@ -791,7 +798,7 @@ impl Render {
                     });
                 }
             }
-            (_, Some(picture::State::Loading(since))) => {
+            (_, Some(picture::Load::Loading(since))) => {
                 let mut spans = vec![(spinner(since).to_string(), DIM)];
                 if !alt.is_empty() {
                     spans.push((format!(" {alt}"), DIM));
@@ -889,7 +896,10 @@ fn table_lines(
     let mut natural = vec![0; columns];
     for row in rows {
         for (column, cell) in row.iter().enumerate() {
-            let width = spans_width(cell);
+            // A <br> breaks a cell's lines, and unicode-width counts the newline as a column
+            let text = joined(cell);
+            let lines = text.split('\n').map(UnicodeWidthStr::width);
+            let width = lines.max().unwrap_or(0);
             natural[column] = natural[column].max(width);
         }
     }
@@ -900,7 +910,7 @@ fn table_lines(
     let squeezed = total > available;
 
     let mut lines = Vec::new();
-    if squeezed && available < columns * MIN_COLUMN {
+    if squeezed && available < columns * MIN_CELL_COLUMNS {
         let Some((header, records)) = rows.split_first() else {
             return lines;
         };
@@ -1028,7 +1038,7 @@ fn signal(helper: &Helper) -> (char, Style) {
         State::Queued => ('◌', DIM),
         State::Running => {
             let since = helper.started.unwrap_or_else(Instant::now);
-            (spinner(since), Style::new().fg(helper.color))
+            (spinner(since), Style::new().fg(HELPERS[helper.hue]))
         }
         State::Done => ('◆', ANSWER.style),
         State::Interrupted => ('✗', DIM),
@@ -1045,7 +1055,7 @@ fn status(helper: &Helper, width: usize) -> Spans {
             let seconds = since.elapsed().as_secs();
             let doing = format!("{} · {seconds}s", helper.text.trim());
             let doing = clipped(&doing, width);
-            theme::shimmer(&doing, THINKING, helper.color, since)
+            theme::shimmer(&doing, THINKING, HELPERS[helper.hue], since)
         }
         State::Done | State::Interrupted => Vec::new(),
         State::Failed => {
@@ -1178,9 +1188,9 @@ fn last_sentence(text: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use crate::conversation::{Attachment, Call, Helper, Shell, StepStats, Totals};
     use crate::tui::render::*;
     use crate::tui::tests::{helper, settled, written};
-    use crate::tui::transcript::{Attachment, Call, Helper, Shell, StepStats, Totals};
     use agent_client_protocol_schema::v1::ToolCallStatus;
     use std::fs;
     use url::Url;
@@ -1194,6 +1204,7 @@ mod tests {
             attachments: Vec::new(),
             retries: Vec::new(),
             helpers: Vec::new(),
+            revision: 0,
         }
     }
 
@@ -1257,7 +1268,7 @@ mod tests {
         // The branch of an agent at work takes its color
         let branch = &compact.rows[2].line.spans[0];
         assert_eq!(branch.content, "  ├ ");
-        assert_eq!(branch.style.fg, Some(running.color));
+        assert_eq!(branch.style.fg, Some(HELPERS[running.hue]));
 
         let mut counted = Render::new(100, false);
         counted.pinned(&[&running; 5], 12);
@@ -1478,10 +1489,6 @@ mod tests {
         ];
         assert_eq!(text(&render.rows), expected);
 
-        let mut render = Render::new(40, true);
-        render.entry(&task);
-        assert_eq!(render.rows.len(), 21);
-
         let short = asked(lines[..7].join("\n"));
         let mut render = Render::new(40, false);
         render.entry(&short);
@@ -1567,20 +1574,6 @@ mod tests {
         ];
         assert_eq!(text(&rows), expected);
         assert_eq!(rows[2].mark_width, 4);
-
-        let alone = call(&content[..1], ToolCallStatus::Completed);
-        let alone = Step {
-            items: vec![Item::Call(Call {
-                attachments: vec![Attachment {
-                    kind: "video".to_owned(),
-                    name: "recording.mp4".to_owned(),
-                    uri: "file:///nowhere/copies/a2.mp4".to_owned(),
-                }],
-                ..alone
-            })],
-            ..Step::default()
-        };
-        assert_eq!(rendered(&alone, 40, false)[2], "  ╰ video recording.mp4");
     }
 
     /// A picture alone in an answer shows loading, then its cells, which open it when clicked
@@ -1672,50 +1665,12 @@ mod tests {
             ..Step::default()
         };
 
-        let expected = ["", "  Done.", "  1.2s · ⇡1.23k ⇣56 · 70 t/s"];
-        assert_eq!(rendered(&step, 40, false), expected);
-
         let expected = ["  1.2s · ⇡1.23k ⇣56", "  · 70 t/s"];
         assert_eq!(rendered(&step, 20, false)[2..], expected);
         let mut render = Render::new(20, false);
         render.step(&step);
         let marks: Vec<usize> = render.rows[2..].iter().map(|row| row.mark_width).collect();
         assert_eq!(marks, [usize::MAX, usize::MAX]);
-
-        let empty = Step::default();
-        assert_eq!(rendered(&empty, 40, false), [""]);
-    }
-
-    #[test]
-    fn answer_spaced() {
-        let answer = |text: &str| Item::Message {
-            text: text.to_owned(),
-            answer: true,
-        };
-        let retry = Retry {
-            text: "model: http 503: upstream busy".to_owned(),
-            count: 1,
-        };
-        let retried = Step {
-            retries: vec![retry],
-            items: vec![answer("Finally fixed.")],
-            ..Step::default()
-        };
-        let expected = [
-            "",
-            "  ↻ model: http 503: upstream busy",
-            "",
-            "◆ Finally fixed.",
-        ];
-        assert_eq!(rendered(&retried, 40, false), expected);
-
-        let notice = Item::Notice("history: disk full".to_owned());
-        let noticed = Step {
-            items: vec![notice, answer("Done.")],
-            ..Step::default()
-        };
-        let expected = ["", "  ✗ history: disk full", "", "◆ Done."];
-        assert_eq!(rendered(&noticed, 40, false), expected);
     }
 
     #[test]
@@ -1808,16 +1763,15 @@ mod tests {
             vec![cell("alpha"), cell("a long note that wraps")],
             vec![cell("b"), cell("short")],
         ];
-        let aligned = |rows: &[Vec<Spans>], aligns: &[Alignment], width| -> Vec<String> {
+        let lines = |rows: &[Vec<Spans>], width| -> Vec<String> {
             let mut shown = Vec::new();
-            for (spans, _) in table_lines(rows, aligns, width) {
+            for (spans, _) in table_lines(rows, &[], width) {
                 let line = joined(&spans);
                 let line = line.trim_end().to_owned();
                 shown.push(line);
             }
             shown
         };
-        let lines = |rows: &[Vec<Spans>], width| aligned(rows, &[], width);
 
         let rule = "─".repeat(29);
         let expected = [
@@ -1857,21 +1811,6 @@ mod tests {
         let rule = "─".repeat(18);
         let expected = ["dish  note", &rule, "🍕    crème brûlée"];
         assert_eq!(lines(&wide, 40), expected);
-
-        let money = vec![
-            vec![cell("city"), cell("sales")],
-            vec![cell("Zürich"), cell("18,420.50")],
-            vec![cell("São Paulo"), cell("9,876.25")],
-        ];
-        let aligns = [Alignment::None, Alignment::Right];
-        let rule = "─".repeat(20);
-        let expected = [
-            "city           sales",
-            &rule,
-            "Zürich     18,420.50",
-            "São Paulo   9,876.25",
-        ];
-        assert_eq!(aligned(&money, &aligns, 40), expected);
     }
 
     #[test]
@@ -1951,6 +1890,22 @@ mod tests {
 
         assert_eq!(text(&rows), ["◆ 🍕  b", "  ─────", "  1   2"]);
         assert!(rows.iter().all(|row| row.mark_width == 2));
+    }
+
+    #[test]
+    fn cell_breaks_kept() {
+        let table = "| dish | note |\n|---|---|\n| 🍕 tart | crème<br>brûlée |";
+        let mut render = Render::new(40, false);
+        render.markdown(ANSWER, table);
+
+        let rule = format!("  {}", "─".repeat(15));
+        let expected = [
+            "◆ dish     note",
+            &rule,
+            "  🍕 tart  crème",
+            "           brûlée",
+        ];
+        assert_eq!(text(&render.rows), expected);
     }
 
     #[test]

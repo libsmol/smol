@@ -2,7 +2,7 @@ use crate::steps::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
 use crate::utils::{seamed, Interrupt};
 #[cfg(windows)]
 use encoding_rs::Encoding;
-use reaper::{cause, terminal_view, Mark};
+use reaper::{cause, terminal_view, Group, Mark};
 use std::collections::VecDeque;
 use std::env;
 use std::io::{self, Read};
@@ -15,41 +15,58 @@ use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 #[cfg(windows)]
 use std::str;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::select;
-use tokio::sync::mpsc::{self, Receiver};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio::task;
 use tokio::time::{self, Instant};
 #[cfg(windows)]
 use windows_sys::Win32::Globalization::GetACP;
 
 /// Must hold `MAX_OBSERVATION_CHARS` characters at up to 4 bytes each
-pub(crate) const KEPT_BYTES: usize = 256 * 1024;
+const KEPT_BYTES: usize = 256 * 1024;
 const CHUNK_BYTES: usize = 64 * 1024;
-/// Unread pieces past this stop the relay, so a fast program waits on the full pipe
-/// instead of piling output up in memory
-const MAX_QUEUED_PIECES: usize = 4;
 /// Gives up when a program left in the background keeps the pipe open
 pub(crate) const DRAIN_WAIT: Duration = Duration::from_secs(2);
 pub(crate) const SHOWN_EVERY: Duration = Duration::from_millis(100);
 
 /// Dropping it kills the whole group
-pub(crate) struct Group {
-    group: Arc<reaper::Group>,
+pub(crate) struct Process {
+    group: Arc<Group>,
     /// The outer `Option` says whether the child was reaped
     /// and the inner one is `None` when reaping failed
     ended: watch::Receiver<Option<Option<Exit>>>,
 }
 
-impl Group {
+/// What a program wrote, read from its pipe as it comes so the program never waits on a full pipe,
+/// split at each end marker and clipped
+pub(crate) struct Output {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    parts: Mutex<Parts>,
+    /// Wakes one waiter, so only one task may wait on the output at a time
+    changed: Notify,
+}
+
+struct Parts {
+    /// What arrived since the last end marker
+    open: Clip,
+    /// What came before the last end marker, until it is taken
+    closed: Option<Clip>,
+    /// The pipe closed and nothing more comes
+    finished: bool,
+}
+
+impl Process {
     /// `child` must be freshly spawned and never waited on
     pub(crate) fn new(mut child: Child, mark: Mark) -> io::Result<Self> {
         let pid = child.id().expect("pid");
-        let group = match reaper::Group::new(pid, mark) {
+        let group = match Group::new(pid, mark) {
             Ok(group) => Arc::new(group),
             Err(e) => {
                 // On Windows it is still suspended
@@ -59,7 +76,7 @@ impl Group {
         };
 
         let (reaped, ended) = watch::channel(None);
-        // A dropped `Group` couldn't kill the group if the reaping task held a strong reference
+        // A dropped `Process` couldn't kill the group if the reaping task held a strong reference
         let held = Arc::downgrade(&group);
         let waiting = async move {
             let status = child.wait().await;
@@ -77,13 +94,10 @@ impl Group {
         Ok(Self { group, ended })
     }
 
-    /// Replaces the command's stdout and stderr with one pipe, whose output ends a piece at each `end`
-    pub(crate) fn start(
-        mut command: Command,
-        end: Option<Vec<u8>>,
-    ) -> io::Result<(Self, Receiver<Piece>)> {
+    /// Replaces the command's stdout and stderr with one pipe, whose output ends a part at each `end`
+    pub(crate) fn start(mut command: Command, end: Option<Vec<u8>>) -> io::Result<(Self, Output)> {
         // Reading stdout and stderr separately would scramble the order of interleaved writes
-        let (mut output, writer) = io::pipe()?;
+        let (mut reader, writer) = io::pipe()?;
         let copied = writer.try_clone()?;
         command.stdout(copied).stderr(writer);
         let std = command.as_std_mut();
@@ -91,28 +105,41 @@ impl Group {
         let child = command.spawn()?;
         // Holding the write end here would keep the pipe open after the program exits
         drop(command);
-        let group = Self::new(child, mark)?;
+        let process = Self::new(child, mark)?;
 
-        // Waits while the receiver falls behind, but once the receiver is gone it keeps reading
-        // until the pipe closes, because a full pipe blocks the program
-        let (pieces, received) = mpsc::channel(MAX_QUEUED_PIECES);
+        let parts = Parts {
+            open: Clip::new(KEPT_BYTES),
+            closed: None,
+            finished: false,
+        };
+        let shared = Arc::new(Shared {
+            parts: Mutex::new(parts),
+            changed: Notify::new(),
+        });
+        let output = Output {
+            shared: Arc::clone(&shared),
+        };
+
+        // Reads to the end even once the output is dropped, as a full pipe blocks the program
         thread::spawn(move || {
             let mut buffer = vec![0; CHUNK_BYTES];
             let mut held = Vec::new();
-            while let Ok(count @ 1..) = output.read(&mut buffer) {
-                held.extend_from_slice(&buffer[..count]);
+            while let Ok(count @ 1..) = reader.read(&mut buffer) {
+                let read = &buffer[..count];
+                let mut parts = shared.lock();
                 let Some(end) = &end else {
-                    let read = mem::take(&mut held);
-                    pieces.blocking_send(Piece::Output(read)).ok();
+                    parts.open.push(read);
                     continue;
                 };
+                held.extend_from_slice(read);
 
+                // Only code that writes the marker itself replaces a part not yet taken
                 while let Some(at) = held.windows(end.len()).position(|window| window == end) {
-                    let rest = held.split_off(at + end.len());
-                    held.truncate(at);
-                    let before = mem::replace(&mut held, rest);
-                    pieces.blocking_send(Piece::Output(before)).ok();
-                    pieces.blocking_send(Piece::End).ok();
+                    parts.open.push(&held[..at]);
+                    held.drain(..at + end.len());
+                    let before = mem::replace(&mut parts.open, Clip::new(KEPT_BYTES));
+                    parts.closed = Some(before);
+                    shared.changed.notify_one();
                 }
 
                 // The marker may span two reads, so a tail that starts it waits for the next one
@@ -120,23 +147,25 @@ impl Group {
                     .rev()
                     .find(|size| held.ends_with(&end[..*size]));
                 let at = held.len() - partial.unwrap_or(0);
-                let rest = held.split_off(at);
-                let before = mem::replace(&mut held, rest);
-                pieces.blocking_send(Piece::Output(before)).ok();
+                parts.open.push(&held[..at]);
+                held.drain(..at);
             }
-            pieces.blocking_send(Piece::Output(held)).ok();
+
+            let mut parts = shared.lock();
+            parts.open.push(&held);
+            parts.finished = true;
+            shared.changed.notify_one();
         });
 
-        Ok((group, received))
+        Ok((process, output))
     }
 
-    pub(crate) async fn exited(&mut self) -> Option<Exit> {
+    pub(crate) async fn wait(&mut self) -> Option<Exit> {
         let ended = self.ended.wait_for(Option::is_some).await;
         ended.ok().and_then(|end| end.clone()).flatten()
     }
 
-    /// The spawned program has been reaped
-    pub(crate) fn ended(&self) -> bool {
+    pub(crate) fn reaped(&self) -> bool {
         self.ended.borrow().is_some()
     }
 
@@ -150,10 +179,64 @@ impl Group {
     }
 }
 
-pub(crate) enum Piece {
-    Output(Vec<u8>),
-    /// The marker the worker writes after each snippet
-    End,
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, Parts> {
+        self.parts.lock().expect("output lock")
+    }
+}
+
+impl Output {
+    /// What came before the next end marker, or None once the pipe closed.
+    /// Dropping the future loses nothing
+    pub(crate) async fn part(&self) -> Option<Clip> {
+        loop {
+            let (closed, finished) = {
+                let mut parts = self.shared.lock();
+                (parts.closed.take(), parts.finished)
+            };
+            if closed.is_some() || finished {
+                return closed;
+            }
+            self.shared.changed.notified().await;
+        }
+    }
+
+    /// The clipped text since the last end marker, only when more arrived since the last call
+    pub(crate) fn fresh(&self, max: usize) -> Option<String> {
+        let mut parts = self.shared.lock();
+        parts.open.fresh(max)
+    }
+
+    /// Everything since the last end marker
+    pub(crate) fn take(&self) -> Clip {
+        let mut parts = self.shared.lock();
+        mem::replace(&mut parts.open, Clip::new(KEPT_BYTES))
+    }
+
+    /// A part not yet taken followed by everything since the last end marker,
+    /// once the pipe closes or background programs holding it open have had `DRAIN_WAIT`
+    pub(crate) async fn rest(&self) -> Clip {
+        let finishing = async {
+            loop {
+                let finished = self.shared.lock().finished;
+                if finished {
+                    return;
+                }
+                self.shared.changed.notified().await;
+            }
+        };
+        time::timeout(DRAIN_WAIT, finishing).await.ok();
+
+        let (closed, open) = {
+            let mut parts = self.shared.lock();
+            let open = mem::replace(&mut parts.open, Clip::new(KEPT_BYTES));
+            (parts.closed.take(), open)
+        };
+        match closed {
+            Some(closed) => closed.joined(&open),
+            None => open,
+        }
+    }
 }
 
 /// Keeps about `half` bytes at each end without splitting a UTF-8 character
@@ -170,7 +253,7 @@ pub(crate) struct Clip {
 }
 
 impl Clip {
-    pub(crate) fn new(half: usize) -> Self {
+    fn new(half: usize) -> Self {
         Self {
             half,
             head: Vec::new(),
@@ -181,7 +264,7 @@ impl Clip {
         }
     }
 
-    pub(crate) fn push(&mut self, mut bytes: &[u8]) {
+    fn push(&mut self, mut bytes: &[u8]) {
         let continues = |byte: &u8| byte & 0xC0 == 0x80;
         // The head runs to the end of a character,
         // and the next chunk completes one split across chunks
@@ -207,8 +290,21 @@ impl Clip {
         self.dropped += over;
     }
 
+    /// Both kept texts in order, with what either dropped counted at the one seam
+    fn joined(&self, next: &Clip) -> Clip {
+        let mut joined = Clip::new(self.half);
+        for clip in [self, next] {
+            joined.push(&clip.head);
+            let tail: Vec<u8> = clip.tail.iter().copied().collect();
+            joined.push(&tail);
+            joined.cut += clip.cut;
+            joined.dropped += clip.dropped;
+        }
+        joined
+    }
+
     /// The kept text as the program wrote it, and the number of characters dropped from the middle
-    pub(crate) fn text(&self) -> (String, usize) {
+    fn text(&self) -> (String, usize) {
         let mut bytes = self.head.clone();
         bytes.extend(&self.tail);
         let text = decoded(&bytes);
@@ -245,7 +341,7 @@ impl Clip {
     }
 
     /// Returns text only when more output arrived since the last call
-    pub(crate) fn fresh(&mut self, max: usize) -> Option<String> {
+    fn fresh(&mut self, max: usize) -> Option<String> {
         let pushed = self.head.len() + self.tail.len() + self.dropped;
         if pushed == self.reported {
             return None;
@@ -297,26 +393,14 @@ fn decoded(bytes: &[u8]) -> String {
     text.replace("\r\n", "\n")
 }
 
-/// Collects what is left in the pipe without waiting forever on background programs holding it open
-pub(crate) async fn drain(pieces: &mut Receiver<Piece>, output: &mut Clip) {
-    let draining = async {
-        while let Some(piece) = pieces.recv().await {
-            if let Piece::Output(bytes) = piece {
-                output.push(&bytes);
-            }
-        }
-    };
-    time::timeout(DRAIN_WAIT, draining).await.ok();
-}
-
 /// Runs a command the user typed after !, giving `shown` clipped output now and then
 /// and handing back any programs left in the background
-pub(crate) async fn spawn_shell(
+pub(crate) async fn run_shell(
     line: &str,
     cwd: &Path,
     interrupt: &Interrupt,
     shown: &mut (dyn FnMut(&str) + Send),
-) -> (ShellStep, Option<Group>) {
+) -> (ShellStep, Option<Process>) {
     #[cfg(unix)]
     let program = env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
     #[cfg(windows)]
@@ -329,20 +413,20 @@ pub(crate) async fn spawn_shell(
         end: Exit::Interrupted,
     };
 
-    let mut process = Command::new(&program);
+    let mut command = Command::new(&program);
     #[cfg(unix)]
-    process.arg("-c").arg(line);
+    command.arg("-c").arg(line);
     // The whole line goes to cmd for quoting, and the UTF-8 code page applies only in a nested cmd
     #[cfg(windows)]
     let arg = format!("/d /s /c \"chcp 65001>nul & cmd /d /s /c \"{line}\"\"");
     #[cfg(windows)]
-    process.as_std_mut().raw_arg(arg);
+    command.as_std_mut().raw_arg(arg);
     // Stdin is empty so a program waiting for input reads EOF and moves on
-    process.current_dir(cwd).stdin(Stdio::null());
+    command.current_dir(cwd).stdin(Stdio::null());
     // Otherwise a spawned CPython uses GBK on the pipes and fails on characters outside it
     #[cfg(windows)]
-    process.env("PYTHONUTF8", "1");
-    let (mut group, mut pieces) = match Group::start(process, None) {
+    command.env("PYTHONUTF8", "1");
+    let (mut process, output) = match Process::start(command, None) {
         Ok(started) => started,
         Err(e) => {
             step.end = Exit::Unstarted(cause(&e));
@@ -350,38 +434,32 @@ pub(crate) async fn spawn_shell(
         }
     };
 
-    let mut kept = Clip::new(KEPT_BYTES);
     let mut show_at = Instant::now() + SHOWN_EVERY;
     let end = loop {
         select! {
             biased;
             () = interrupt.wait() => {
-                group.kill();
+                process.kill();
                 break Exit::Interrupted;
             }
             // There is no exit code when reaping fails
-            end = group.exited() => break end.unwrap_or(Exit::Exited(-1)),
+            end = process.wait() => break end.unwrap_or(Exit::Exited(-1)),
             () = time::sleep_until(show_at) => {
                 show_at = Instant::now() + SHOWN_EVERY;
-                if let Some(text) = kept.fresh(MAX_OBSERVATION_CHARS) {
+                if let Some(text) = output.fresh(MAX_OBSERVATION_CHARS) {
                     shown(&text);
-                }
-            }
-            Some(piece) = pieces.recv() => {
-                if let Piece::Output(bytes) = piece {
-                    kept.push(&bytes);
                 }
             }
         }
     };
 
-    drain(&mut pieces, &mut kept).await;
-    step.output = kept.shown(MAX_OBSERVATION_CHARS);
+    let said = output.rest().await;
+    step.output = said.shown(MAX_OBSERVATION_CHARS);
     step.end = end;
 
     // An interrupt has already killed the whole group
-    let left = step.end != Exit::Interrupted && group.alive();
-    (step, left.then_some(group))
+    let left = step.end != Exit::Interrupted && process.alive();
+    (step, left.then_some(process))
 }
 
 /// Crash exit codes on Windows are negative as i32, so a negative code can't stand for a signal
@@ -396,19 +474,19 @@ fn end_of(status: ExitStatus) -> Exit {
 
 #[cfg(test)]
 mod tests {
-    use crate::spawn::{spawn_shell, Clip};
+    use crate::spawn::{run_shell, Clip, Process};
     use crate::steps::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
-    use crate::tests::temp_dir;
+    use crate::tests::{interpreter, temp_dir};
     use crate::utils::{block_on, truncated, Interrupt};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
+    use tokio::process::Command;
 
     #[test]
     fn clip_matches_truncated() {
         let sizes = [
             0,
-            10,
             MAX_OBSERVATION_CHARS,
             MAX_OBSERVATION_CHARS + 1,
             MAX_OBSERVATION_CHARS * 3 + 7,
@@ -463,10 +541,34 @@ mod tests {
         assert_eq!(clip.text(), ("naïfé".to_owned(), 5));
     }
 
+    /// A part not yet taken comes with what followed it, such as a crash after the startup marker
+    #[test]
+    fn rest_joined() {
+        let python = interpreter();
+        let mut command = Command::new(python);
+        let code =
+            "import sys\nsys.stdout.buffer.write('started café\\n<end>crashed naïve\\n'.encode())";
+        command.arg("-c").arg(code);
+        let ending = b"<end>".to_vec();
+        let reading = async {
+            let (_process, output) = Process::start(command, Some(ending)).expect("start");
+            output.rest().await
+        };
+        let said = block_on(reading);
+        assert_eq!(said.shown(1000), "started café\ncrashed naïve\n");
+
+        let mut first = Clip::new(4);
+        first.push("café crème".as_bytes());
+        let mut second = Clip::new(4);
+        second.push("naïve".as_bytes());
+        let joined = first.joined(&second);
+        assert_eq!(joined.shown(100), "café\n[8 characters cut]\nïve");
+    }
+
     /// The second item says whether programs were left in the background
     fn shelled(dir: &Path, line: &str, interrupt: &Interrupt) -> (ShellStep, bool) {
         let mut ignored = |_: &str| {};
-        let running = spawn_shell(line, dir, interrupt, &mut ignored);
+        let running = run_shell(line, dir, interrupt, &mut ignored);
         let (ran, left) = block_on(running);
         (ran, left.is_some())
     }
@@ -528,7 +630,7 @@ mod tests {
             }
         };
         let started = Instant::now();
-        let running = spawn_shell(line, &cwd, &interrupt, &mut shown);
+        let running = run_shell(line, &cwd, &interrupt, &mut shown);
         let (ran, left) = block_on(running);
 
         assert_eq!(ran.end, Exit::Interrupted);

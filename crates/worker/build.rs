@@ -76,7 +76,9 @@ fn main() {
     let tagged = out
         .ancestors()
         .filter(|dir| dir.join("CACHEDIR.TAG").exists());
-    let root = tagged.last().expect("target dir");
+    // Cargo tags only folders it made, and OUT_DIR is <profile>/build/<package>/out below the target folder
+    let untagged = out.ancestors().nth(4).expect("target dir");
+    let root = tagged.last().unwrap_or(untagged);
     let cache = root.join("pbs");
     let named = format!("cpython-{VERSION}+{RELEASE}-{target}");
     let folder = cache.join(&named);
@@ -356,10 +358,7 @@ fn main() {
         };
         println!("cargo:rustc-link-lib={kind}={library}");
     }
-    // A dependency's link arguments don't reach a binary, so libsmol's build script repeats them
-    for argument in &arguments {
-        println!("cargo:rustc-link-arg={argument}");
-    }
+    // A dependency's link arguments don't reach a binary, so libsmol's build script passes them on
     println!("cargo:link_args={}", arguments.join(";"));
 
     let (interpreter, stdlib) = match windows {

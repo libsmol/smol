@@ -1,18 +1,18 @@
 use crate::config::{McpConfig, McpKind};
 use crate::prompt;
-use crate::spawn::Group;
-use crate::tools::attach::kept;
-use crate::utils::{http_cause, http_client};
+use crate::spawn::Process;
+use crate::tools::attach::returned;
+use crate::utils::{excerpt, http_cause, http_client};
 use crate::worker::host::{Called, Calling};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use reaper::cause;
+use reaper::{cause, terminal_view};
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::Client;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
-    ClientNotification, ClientRequest, ContentBlock, PaginatedRequestParams, RequestId,
-    ResourceContents, ServerResult,
+    ClientNotification, ClientRequest, ContentBlock, ImageContent, PaginatedRequestParams,
+    RequestId, ResourceContents, ServerResult,
 };
 use rmcp::service::{
     serve_client, ClientInitializeError, Peer, PeerRequestOptions, RunningService,
@@ -24,23 +24,25 @@ use rmcp::transport::streamable_http_client::{
 use rmcp::transport::WorkerTransport;
 use rmcp::RoleClient;
 use serde_json::{Map, Value};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::error;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::{self, JoinHandle};
 use tokio::time;
 
-const CONNECT_WAIT: Duration = match cfg!(test) {
+const HANDSHAKE_WAIT: Duration = match cfg!(test) {
     true => Duration::from_secs(5),
     false => Duration::from_secs(30),
 };
 const MAX_STDERR_LINES: usize = 5;
+/// Progress redrawn with `\r` can run for megabytes without a newline
+const MAX_STDERR_BYTES: usize = 16 * 1024;
 /// The server may still be writing stderr when the connection drops
 const STDERR_WAIT: Duration = Duration::from_secs(1);
 const CLOSED_EARLY: &str = "connection closed during the handshake";
@@ -78,7 +80,7 @@ impl Link {
 struct Connection {
     peer: Peer<RoleClient>,
     token: Option<RunningServiceCancellationToken>,
-    _group: Option<Group>,
+    _process: Option<Process>,
 }
 
 impl Drop for Connection {
@@ -118,57 +120,62 @@ pub(crate) async fn connect(
     cwd: &Path,
     copies: PathBuf,
 ) -> Result<(Server, Link), String> {
-    let mut group = None;
+    let mut process = None;
     let mut said = None;
     let handshake = async {
         let service = match &server.kind {
-            McpKind::Stdio { command, args, env } => {
-                let program = reaper::program(command);
-                let mut process = Command::new(program);
-                process
+            McpKind::Stdio {
+                command: program,
+                args,
+                env,
+            } => {
+                let path = reaper::lookup(program);
+                let mut command = Command::new(path);
+                command
                     .args(args)
                     .envs(env)
                     .current_dir(cwd)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
-                let std = process.as_std_mut();
+                let std = command.as_std_mut();
                 let mark = reaper::prepare(std);
 
                 let unstarted = |e: io::Error| {
-                    let command = command.display();
+                    let shown = program.display();
                     let reason = cause(&e);
-                    format!("start: {command}: {reason}")
+                    format!("start: {shown}: {reason}")
                 };
-                let spawned = process.spawn();
+                let spawned = command.spawn();
                 let mut child = spawned.map_err(unstarted)?;
                 let stdout = child.stdout.take().expect("piped stdout");
                 let stdin = child.stdin.take().expect("piped stdin");
-                let stderr = child.stderr.take().expect("piped stderr");
+                let mut stderr = child.stderr.take().expect("piped stderr");
 
                 // Read until it exits because the server blocks once the pipe fills up
                 let reading = async move {
-                    let mut stderr = BufReader::new(stderr);
-                    let mut kept = VecDeque::new();
-                    let mut line = Vec::new();
-                    while let Ok(1..) = stderr.read_until(b'\n', &mut line).await {
-                        let text = String::from_utf8_lossy(&line).trim_end().to_owned();
-                        line.clear();
-                        if text.is_empty() {
-                            continue;
-                        }
-                        kept.push_back(text);
-                        if kept.len() > MAX_STDERR_LINES {
-                            kept.pop_front();
-                        }
+                    let mut chunk = [0; 4096];
+                    let mut tail = Vec::new();
+                    let mut cut = false;
+                    while let Ok(read @ 1..) = stderr.read(&mut chunk).await {
+                        tail.extend_from_slice(&chunk[..read]);
+                        let over = tail.len().saturating_sub(MAX_STDERR_BYTES);
+                        tail.drain(..over);
+                        cut |= over > 0;
                     }
-                    Vec::from(kept).join("\n")
+
+                    // A cut tail may start inside a character or an escape sequence, up to its first line break
+                    let broken = tail.iter().position(|byte| matches!(byte, b'\n' | b'\r'));
+                    if let Some(at) = broken.filter(|_| cut) {
+                        tail.drain(..at);
+                    }
+                    said_lines(&tail)
                 };
                 said = Some(task::spawn(reading));
 
-                let grouped = Group::new(child, mark);
-                let grouped = grouped.map_err(unstarted)?;
-                group = Some(grouped);
+                let started = Process::new(child, mark);
+                let started = started.map_err(unstarted)?;
+                process = Some(started);
                 serve_client((), (stdout, stdin)).await
             }
             McpKind::Http { url, headers } => {
@@ -226,11 +233,11 @@ pub(crate) async fn connect(
         Ok((service, listed))
     };
 
-    let timed = time::timeout(CONNECT_WAIT, handshake).await;
+    let timed = time::timeout(HANDSHAKE_WAIT, handshake).await;
     let connected = match timed {
         Ok(connected) => connected,
         Err(_) => {
-            let seconds = CONNECT_WAIT.as_secs();
+            let seconds = HANDSHAKE_WAIT.as_secs();
             Err(format!("connect: timed out after {seconds}s"))
         }
     };
@@ -238,7 +245,7 @@ pub(crate) async fn connect(
         Ok(connected) => connected,
         Err(reason) => {
             // The reason is usually in its stderr, which only ends once a hung server is killed
-            drop(group.take());
+            drop(process.take());
             let reading = said.take();
             let lines = last_lines(reading).await;
             let message = match lines.is_empty() {
@@ -252,13 +259,7 @@ pub(crate) async fn connect(
     let description = server.description.clone().unwrap_or_default();
 
     let mut tools = Vec::new();
-    // As in mcp.py, only a tool with a non-empty output schema returns a dict
-    let mut typed = HashSet::new();
     for tool in &listed {
-        let declared = tool.output_schema.as_ref();
-        if declared.is_some_and(|schema| !schema.is_empty()) {
-            typed.insert(tool.name.to_string());
-        }
         let tool = serde_json::to_value(tool).expect("serialize");
         tools.push(tool);
     }
@@ -268,12 +269,11 @@ pub(crate) async fn connect(
     let connection = Arc::new(Connection {
         peer,
         token: Some(token),
-        _group: group,
+        _process: process,
     });
     let call = move |function: String, arguments: Map<String, Value>, label: String| -> Calling {
         let connection = Arc::clone(&connection);
         let copies = copies.clone();
-        let structured = typed.contains(&function);
         Box::pin(async move {
             let mut media = Vec::new();
             let calling = async {
@@ -302,15 +302,19 @@ pub(crate) async fn connect(
 
                 let bytes = |base64: &str| base64.len() * 3 / 4;
                 let mut texts = Vec::new();
-                for block in &result.content {
+                for block in result.content {
                     let text = match block {
-                        ContentBlock::Text(text) => text.text.clone(),
-                        ContentBlock::Image(image) => {
-                            let decoded = STANDARD.decode(&image.data);
-                            let copied = match decoded {
-                                Ok(data) => kept(&copies, &data),
-                                Err(_) => None,
+                        ContentBlock::Text(text) => text.text,
+                        ContentBlock::Image(ImageContent {
+                            data, mime_type, ..
+                        }) => {
+                            let size = bytes(&data);
+                            let copies = copies.clone();
+                            let copying = move || {
+                                let decoded = STANDARD.decode(&data).ok()?;
+                                returned(&copies, &decoded)
                             };
+                            let copied = task::spawn_blocking(copying).await.expect("copy");
                             match copied {
                                 // The `<image>` tag in the observation already reports it
                                 Some(Ok(copy)) => {
@@ -318,18 +322,15 @@ pub(crate) async fn connect(
                                     continue;
                                 }
                                 Some(Err(reason)) => prompt::unkept(&label, &reason),
-                                None => {
-                                    let size = bytes(&image.data);
-                                    prompt::unshown("image", &label, &image.mime_type, size)
-                                }
+                                None => prompt::unshown("image", &label, &mime_type, size),
                             }
                         }
                         ContentBlock::Audio(audio) => {
                             let size = bytes(&audio.data);
                             prompt::unshown("audio", &label, &audio.mime_type, size)
                         }
-                        ContentBlock::Resource(embedded) => match &embedded.resource {
-                            ResourceContents::TextResourceContents { text, .. } => text.clone(),
+                        ContentBlock::Resource(embedded) => match embedded.resource {
+                            ResourceContents::TextResourceContents { text, .. } => text,
                             ResourceContents::BlobResourceContents {
                                 uri,
                                 mime_type,
@@ -337,7 +338,7 @@ pub(crate) async fn connect(
                                 ..
                             } => {
                                 let mime = mime_type.as_deref().unwrap_or("binary");
-                                let size = bytes(blob);
+                                let size = bytes(&blob);
                                 let resource = format!("resource {uri}");
                                 prompt::unshown(&resource, &label, mime, size)
                             }
@@ -357,18 +358,16 @@ pub(crate) async fn connect(
                     return Err(message);
                 }
 
-                // Other tools are declared `-> str`, so their structured content stands in only for missing text
-                match (structured, result.structured_content) {
-                    (true, Some(content)) => Ok(content),
-                    (false, Some(content)) if texts.is_empty() => {
-                        let text = content.to_string();
-                        Ok(Value::String(text))
-                    }
-                    _ => {
-                        let text = texts.join("\n");
-                        Ok(Value::String(text))
-                    }
+                let text = match (texts.is_empty(), &result.structured_content) {
+                    (true, Some(content)) => content.to_string(),
+                    _ => texts.join("\n"),
+                };
+                let mut reply = Map::new();
+                reply.insert("text".to_owned(), Value::String(text));
+                if let Some(content) = result.structured_content {
+                    reply.insert("structured".to_owned(), content);
                 }
+                Ok(Value::Object(reply))
             };
 
             let result = calling.await;
@@ -395,6 +394,23 @@ async fn last_lines(said: Option<JoinHandle<String>>) -> String {
         Ok(Ok(lines)) => lines,
         _ => String::new(),
     }
+}
+
+/// The last lines of `tail` as a terminal shows them, each cut short
+fn said_lines(tail: &[u8]) -> String {
+    let text = String::from_utf8_lossy(tail);
+    let text = terminal_view(&text);
+
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let line = excerpt(line);
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+
+    let start = lines.len().saturating_sub(MAX_STDERR_LINES);
+    lines[start..].join("\n")
 }
 
 /// Follows rmcp errors by type where they lack `source` and returns `closed` when the peer hung up
@@ -442,9 +458,9 @@ fn root_cause(top: &(dyn error::Error + 'static), closed: &str) -> String {
 pub(crate) mod tests {
     use crate::config::{McpConfig, McpKind};
     use crate::tests::{interpreter, temp_dir};
-    use crate::tools::mcp::{connect, Link, Server};
+    use crate::tools::mcp::{connect, said_lines, Link, Server};
     use crate::utils::block_on;
-    use serde_json::{json, Map, Value};
+    use serde_json::{json, Map};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -527,9 +543,8 @@ pub(crate) mod tests {
         assert_eq!(names, expected);
     }
 
-    /// Structured content is a dict only for a tool whose output schema says so, as its signature does
     #[test]
-    fn structured_typed() {
+    fn structured_sent() {
         let server = fake();
         let called = |tool: &str| {
             let label = format!("fake.{tool}");
@@ -537,9 +552,10 @@ pub(crate) mod tests {
             block_on(calling).result
         };
 
-        assert_eq!(called("stats"), Ok(json!({"count": 3})));
-        assert_eq!(called("counts"), Ok(json!("3 cafés counted")));
-        assert_eq!(called("bare"), Ok(json!("{\"count\":3}")));
+        let stats = json!({"text": "3 cafés counted", "structured": {"count": 3}});
+        assert_eq!(called("stats"), Ok(stats));
+        let bare = json!({"text": "{\"count\":3}", "structured": {"count": 3}});
+        assert_eq!(called("bare"), Ok(bare));
     }
 
     #[test]
@@ -550,7 +566,7 @@ pub(crate) mod tests {
         let label = "fake.cancelled".to_owned();
         let counting = (server.call)("cancelled".to_owned(), Map::new(), label);
         let counted = block_on(counting).result.expect("call");
-        assert_eq!(counted, json!("0"));
+        assert_eq!(counted, json!({"text": "0"}));
 
         let mut arguments = Map::new();
         arguments.insert("seconds".to_owned(), json!(1));
@@ -568,7 +584,7 @@ pub(crate) mod tests {
         let label = "fake.cancelled".to_owned();
         let counting = (server.call)("cancelled".to_owned(), Map::new(), label);
         let counted = block_on(counting).result.expect("call");
-        assert_eq!(counted, json!("1"));
+        assert_eq!(counted, json!({"text": "1"}));
     }
 
     #[test]
@@ -586,6 +602,38 @@ pub(crate) mod tests {
         let silent = stdio("broken", args);
         let expected = "connect: timed out after 5s\nwaiting for authorization in the browser…";
         assert_eq!(connect_error(&silent), expected);
+
+        // Progress redrawn on one line for longer than the kept tail
+        let script = "import sys\n\
+            progress = '\\r'.join(f'{i}% café' for i in range(50000))\n\
+            sys.stderr.buffer.write(progress.encode())\n\
+            sys.stderr.buffer.write('\\n\\x1b[31mmissing API_TOKEN\\x1b[0m\\n'.encode())\n\
+            sys.exit(1)";
+        let args = vec!["-c".to_owned(), script.to_owned()];
+        let drawn = stdio("broken", args);
+        let expected =
+            "connect: connection closed during the handshake\n49999% café\nmissing API_TOKEN";
+        assert_eq!(connect_error(&drawn), expected);
+
+        // A line the kept tail starts inside, here in the middle of a character
+        let script = "import sys\n\
+            sys.stderr.buffer.write(('é' * 10000 + '\\nmissing API_TOKEN\\n').encode())\n\
+            sys.exit(1)";
+        let args = vec!["-c".to_owned(), script.to_owned()];
+        let long = stdio("broken", args);
+        let expected = "connect: connection closed during the handshake\nmissing API_TOKEN";
+        assert_eq!(connect_error(&long), expected);
+    }
+
+    #[test]
+    fn stderr_cleaned() {
+        let long = "é".repeat(400);
+        let said = format!(
+            "zeroth\nfirst\n\x1b[33mwarning\x1b[0m: café\r\n10%\r55%\r100%\n\n{long}\nlast naïve line"
+        );
+        let cut = "é".repeat(300);
+        let expected = format!("first\nwarning: café\n100%\n{cut}…\nlast naïve line");
+        assert_eq!(said_lines(said.as_bytes()), expected);
     }
 
     #[test]
@@ -603,7 +651,7 @@ pub(crate) mod tests {
 
         let expected = "Intro\nembedded content\n[resource link: file:///big.bin]";
         let result = called.result.expect("call");
-        assert_eq!(result, Value::String(expected.to_owned()));
+        assert_eq!(result, json!({"text": expected}));
 
         let entries = fs::read_dir(&copies).expect("copies");
         let names: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();

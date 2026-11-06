@@ -1,10 +1,14 @@
-use crate::chat::{opens_mention, resolved, List, Output, Session};
-use crate::client::{models, McpState, Pick};
+use crate::chat::{opens_mention, resolved, Output, Session};
+use crate::client::McpState;
+use crate::conversation::{Entry, Outcome};
+use crate::tui::picture::Source;
 use crate::tui::render::Target;
 use crate::tui::select::{self, Point, Selection};
-use crate::tui::transcript::{Entry, Outcome, Transcript};
+use crate::tui::transcript::Transcript;
 use crate::tui::ui::input_box;
-use crate::tui::{browser, diagram, picture};
+use crate::tui::{desktop, diagram, picture};
+use anyhow::Result;
+use chrono::{DateTime, Local};
 use ignore::WalkBuilder;
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -12,23 +16,20 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 use ratatui_textarea::{CursorMove, DataCursor, TextArea};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::mem;
-use std::path::{is_separator, MAIN_SEPARATOR};
+use std::path::{is_separator, Path, PathBuf, MAIN_SEPARATOR};
 use std::time::{Duration, Instant};
 
 const FLASH_WAIT: Duration = Duration::from_secs(2);
 const DOUBLE_CLICK_WAIT: Duration = Duration::from_millis(500);
 const ANIMATE_EVERY: Duration = Duration::from_millis(100);
 
-const RESUME_PREFIX: &str = ":resume ";
-const MEMORY_PREFIX: &str = ":memory ";
-const MODEL_PREFIX: &str = ":model ";
-const MCP_PREFIX: &str = ":mcp ";
 const SHELL_USAGE: &str = "!<command>";
 
 const MAX_UNFOLDED_LINES: usize = 5;
+const MAX_UNFOLDED_CHARS: usize = 1000;
 /// On Windows, characters typed with AltGr carry Ctrl and Alt
 const ALTGR: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::ALT);
 
@@ -39,7 +40,6 @@ const MAX_MATCHES: usize = 200;
 pub(crate) struct App {
     pub(crate) session: Session,
     pub(crate) transcript: Transcript,
-    pub(crate) run: Option<Run>,
     pub(crate) queued: VecDeque<String>,
     pub(crate) input: TextArea<'static>,
     /// The leading ! is not in `input`, and `draft()` gives the whole text
@@ -55,14 +55,14 @@ pub(crate) struct App {
     pub(crate) marquee: Option<(String, Instant)>,
     /// When the highlighted label, too long for the list, moves on next
     pub(crate) scroll_at: Option<Instant>,
-    /// The value of the memory row Delete marked, which the next event clears unless it is Enter
-    forgetting: Option<String>,
+    /// The memory Delete marked, which the next event clears unless it is Enter
+    forgetting: Option<i64>,
     choices_closed: bool,
     pub(crate) choices_area: Rect,
-    /// A list asked of the agent once while its prefix stays typed
-    fetched: Option<(List, Vec<Pick>)>,
-    /// The first item is the listed directory, or empty for the whole cwd
-    paths: Option<(String, Vec<String>)>,
+    /// The list a command opened, asked of the agent once while its prefix stays typed
+    opened: Option<(List, Vec<Pick>)>,
+    /// Paths offered after an @ until the next submit, by listed directory or empty for the cwd
+    paths: HashMap<String, Vec<String>>,
     pub(crate) expanded: bool,
     pub(crate) animating: bool,
     drawn: Instant,
@@ -74,6 +74,8 @@ pub(crate) struct App {
     pub(crate) messages_area: Rect,
     pub(crate) pinned_area: Rect,
     pub(crate) scrollbar: Rect,
+    /// The pictures the last frame drew
+    pub(crate) shown: Vec<Source>,
     pub(crate) selection: Option<Selection>,
     pressed: Option<Point>,
     dragging: bool,
@@ -84,9 +86,23 @@ pub(crate) struct App {
     dirty: bool,
 }
 
-pub(crate) struct Run {
-    pub(crate) step_started: Instant,
-    pub(crate) interrupting: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum List {
+    Sessions,
+    Models,
+    Servers,
+    Memories,
+}
+
+/// A row of a list, which takes exactly one line
+#[derive(Clone)]
+struct Pick {
+    /// What `listed` writes first and the query matches
+    value: String,
+    label: String,
+    detail: String,
+    current: bool,
+    completion: Completion,
 }
 
 #[derive(Clone)]
@@ -104,8 +120,8 @@ enum Completion {
         typed: usize,
         text: String,
     },
-    /// A memory's row value, which fills in nothing
-    Memory(String),
+    /// A memory's id, which fills in nothing
+    Memory(i64),
 }
 
 impl Choice {
@@ -142,7 +158,7 @@ impl Choice {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     New,
     List(List),
@@ -164,82 +180,100 @@ impl Command {
             };
             return Some(parsed);
         }
-        if !line.starts_with(':') {
+
+        // Only `:` and letters name a command, and other lines starting with `:` are messages
+        let (name, arg) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let word = name.strip_prefix(':').unwrap_or_default();
+        if word.is_empty() || !word.chars().all(|c| c.is_ascii_alphabetic()) {
             return None;
         }
 
-        let (name, arg) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        let parsed = match (name, arg.trim()) {
-            (":new", "") => Some(Self::New),
-            (":resume", "") => Some(Self::List(List::Sessions)),
-            (":resume", id) => Some(Self::Resume(id.to_owned())),
-            (":model", "") => Some(Self::List(List::Models)),
-            (":model", model) => Some(Self::Model(model.to_owned())),
-            (":mcp", "") => Some(Self::List(List::Servers)),
-            (":mcp", arg) => match arg.split_once(char::is_whitespace) {
+        let Some(spec) = COMMANDS.iter().find(|spec| spec.name == name) else {
+            let mut usages: Vec<String> = COMMANDS.iter().map(Spec::usage).collect();
+            usages.push(SHELL_USAGE.to_owned());
+            let commands = usages.join(", ");
+            let text = format!("command: {name}: unknown (commands: {commands})");
+            return Some(Self::Invalid(text));
+        };
+
+        // An argument is picked from the list the bare command opens
+        let parsed = match (&spec.bare, arg.trim()) {
+            (bare, "") => Some(bare.clone()),
+            (Self::List(List::Sessions), id) => Some(Self::Resume(id.to_owned())),
+            (Self::List(List::Models), model) => Some(Self::Model(model.to_owned())),
+            (Self::List(List::Servers), arg) => match arg.split_once(char::is_whitespace) {
                 Some((switch @ ("on" | "off"), server)) => {
                     let server = server.trim().to_owned();
                     Some(Self::Mcp(switch == "on", server))
                 }
                 _ => None,
             },
-            (":memory", "") => Some(Self::List(List::Memories)),
-            (":quit", "") => Some(Self::Quit),
             _ => None,
         };
         if parsed.is_some() {
             return parsed;
         }
 
-        let known = HINTS.iter().find(|hint| hint.name() == name);
-        let text = match known {
-            Some(hint) => format!("usage: {}", hint.usage),
-            None => {
-                let mut usages: Vec<&str> = HINTS.iter().map(|hint| hint.usage).collect();
-                usages.push(SHELL_USAGE);
-                let commands = usages.join(", ");
-                format!("command: {name}: unknown (commands: {commands})")
-            }
-        };
-        Some(Self::Invalid(text))
+        let usage = spec.usage();
+        Some(Self::Invalid(format!("usage: {usage}")))
     }
 }
 
-struct Hint {
-    usage: &'static str,
+struct Spec {
+    name: &'static str,
+    args: &'static str,
     summary: &'static str,
+    /// What the command means without an argument
+    bare: Command,
 }
 
-impl Hint {
-    fn name(&self) -> &'static str {
-        self.usage.split(' ').next().unwrap_or(self.usage)
+impl Spec {
+    fn usage(&self) -> String {
+        format!("{}{}", self.name, self.args)
+    }
+
+    /// The command with the space before its argument
+    fn prefix(&self) -> String {
+        format!("{} ", self.name)
     }
 }
 
-const HINTS: [Hint; 6] = [
-    Hint {
-        usage: ":new",
+static COMMANDS: [Spec; 6] = [
+    Spec {
+        name: ":new",
+        args: "",
         summary: "start a new session",
+        bare: Command::New,
     },
-    Hint {
-        usage: ":resume <session>",
+    Spec {
+        name: ":resume",
+        args: " <session>",
         summary: "resume an earlier session",
+        bare: Command::List(List::Sessions),
     },
-    Hint {
-        usage: ":model <name>",
+    Spec {
+        name: ":model",
+        args: " <name>",
         summary: "switch the model",
+        bare: Command::List(List::Models),
     },
-    Hint {
-        usage: ":mcp <on|off> <server>",
+    Spec {
+        name: ":mcp",
+        args: " <on|off> <server>",
         summary: "turn an MCP server on (again) or off",
+        bare: Command::List(List::Servers),
     },
-    Hint {
-        usage: ":memory",
+    Spec {
+        name: ":memory",
+        args: "",
         summary: "list the memories, and forget one with del then enter",
+        bare: Command::List(List::Memories),
     },
-    Hint {
-        usage: ":quit",
+    Spec {
+        name: ":quit",
+        args: "",
         summary: "quit smol",
+        bare: Command::Quit,
     },
 ];
 
@@ -249,7 +283,6 @@ impl App {
         Self {
             session,
             transcript: Transcript::new(cwd),
-            run: None,
             queued: VecDeque::new(),
             input: input_box(""),
             shell: false,
@@ -263,8 +296,8 @@ impl App {
             forgetting: None,
             choices_closed: false,
             choices_area: Rect::default(),
-            fetched: None,
-            paths: None,
+            opened: None,
+            paths: HashMap::new(),
             expanded: false,
             animating: false,
             drawn: Instant::now(),
@@ -274,6 +307,7 @@ impl App {
             messages_area: Rect::default(),
             pinned_area: Rect::default(),
             scrollbar: Rect::default(),
+            shown: Vec::new(),
             selection: None,
             pressed: None,
             dragging: false,
@@ -299,15 +333,12 @@ impl App {
 
         let animated = self.animating && self.drawn.elapsed() >= ANIMATE_EVERY;
         let scrolled = self.scroll_at.is_some_and(|at| at <= Instant::now());
-        let dirty = mem::take(&mut self.dirty) || self.run.is_some() || animated || scrolled;
+        let busy = self.session.run.is_some();
+        let dirty = mem::take(&mut self.dirty) || busy || animated || scrolled;
         if dirty {
             self.drawn = Instant::now();
         }
         dirty
-    }
-
-    pub(crate) fn running(&self) -> bool {
-        self.run.as_ref().is_some_and(|run| !run.interrupting)
     }
 
     pub(crate) fn draft(&self) -> String {
@@ -334,16 +365,15 @@ impl App {
             return false;
         };
         let choice = &self.choices[index];
-        match (&self.forgetting, &choice.completion) {
-            (Some(marked), Completion::Memory(value)) => marked == value,
+        match (self.forgetting, &choice.completion) {
+            (Some(marked), Completion::Memory(id)) => marked == *id,
             _ => false,
         }
     }
 
     pub(crate) fn submit_text(&mut self, text: &str) {
         let Some(command) = Command::parse(text) else {
-            self.transcript.task(text);
-            self.begin();
+            self.scrolled_back = 0;
             self.session.prompt(text);
             return;
         };
@@ -353,29 +383,33 @@ impl App {
         let drafting = !self.draft().is_empty();
         let result = match &command {
             Command::List(list) if drafting => {
-                let rows = self.session.rows(*list);
-                rows.map(|rows| listed(*list, rows))
+                let picks = self.picks(*list);
+                picks.map(|picks| listed(*list, picks))
             }
-            Command::List(List::Sessions) => return self.complete(RESUME_PREFIX),
-            Command::List(List::Models) if models(&self.session.options).is_empty() => {
-                return self.info(empty_text(List::Models))
+            Command::List(list) => {
+                if self.open_list(*list) {
+                    let prefix = prefix(*list);
+                    self.complete(&prefix);
+                }
+                return;
             }
-            Command::List(List::Models) => return self.complete(MODEL_PREFIX),
-            Command::List(List::Servers) if self.session.mcp.is_empty() => {
-                return self.info(empty_text(List::Servers))
-            }
-            Command::List(List::Servers) => return self.complete(MCP_PREFIX),
-            Command::List(List::Memories) => return self.complete(MEMORY_PREFIX),
             Command::Quit => {
                 self.quit = true;
                 return;
             }
             Command::New => return self.open(None),
             Command::Resume(id) => return self.open(Some(id)),
-            Command::Model(name) => self.session.set_model(name),
-            Command::Mcp(on, name) => self.session.set_mcp(*on, name),
+            Command::Model(name) => {
+                let switched = self.session.set_model(name);
+                let model = switched.map(|()| self.session.model());
+                model.map(|model| format!("model: {model}"))
+            }
+            Command::Mcp(on, name) => {
+                let switched = self.session.set_mcp(*on, name);
+                switched.map(|status| status.to_string())
+            }
             Command::Shell(command) => {
-                self.begin();
+                self.scrolled_back = 0;
                 return self.session.shell(command);
             }
             Command::Invalid(text) => return self.failure(text),
@@ -398,7 +432,9 @@ impl App {
 
         let cwd = self.session.client.cwd.clone();
         self.transcript = Transcript::new(cwd);
+        picture::clear();
         self.history = History::default();
+        self.paths.clear();
         // A queued command runs with no key press to clear the selection,
         // which would land on the new transcript by row number
         self.selection = None;
@@ -407,14 +443,6 @@ impl App {
         if resume.is_some() {
             self.show_session();
         }
-    }
-
-    fn begin(&mut self) {
-        self.scrolled_back = 0;
-        self.run = Some(Run {
-            step_started: Instant::now(),
-            interrupting: false,
-        });
     }
 
     pub(crate) fn on_event(&mut self, event: Event) {
@@ -439,8 +467,8 @@ impl App {
 
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 let plain = key.modifiers.is_empty();
-                let running = self.running();
-                let idle = self.run.is_none() && self.draft().is_empty();
+                let running = self.session.running();
+                let idle = self.session.run.is_none() && self.draft().is_empty();
                 let page = usize::from(self.messages_area.height);
                 // The input box wraps, so this counts screen rows
                 let top = self.input.screen_cursor().row == 0;
@@ -460,20 +488,25 @@ impl App {
                     (Some(choice), KeyCode::Tab) => self.fill(&choice.completion),
                     (
                         Some(Choice {
-                            completion: Completion::Memory(value),
+                            completion: Completion::Memory(id),
                             ..
                         }),
                         KeyCode::Enter,
-                    ) if plain && forgetting.as_ref() == Some(&value) => {
-                        match self.session.forget(&value) {
-                            Ok(text) => self.info(text),
+                    ) if plain && forgetting == Some(id) => {
+                        match self.session.forget(id) {
+                            Ok(()) => {
+                                let text = format!(
+                                    "forgot memory {id}; the system prompt drops it next session"
+                                );
+                                self.info(text);
+                            }
                             Err(error) => {
                                 let text = format!("{error:#}");
                                 self.failure(text);
                             }
                         }
                         // Asked again on the refresh below, without the memory
-                        self.fetched = None;
+                        self.opened = None;
                     }
                     (Some(choice), KeyCode::Enter) if plain => {
                         self.fill(&choice.completion);
@@ -486,14 +519,14 @@ impl App {
                     (Some(_), KeyCode::Esc) => self.choices_closed = true,
                     (
                         Some(Choice {
-                            completion: Completion::Memory(value),
+                            completion: Completion::Memory(id),
                             ..
                         }),
                         KeyCode::Delete,
-                    ) if plain && last => self.forgetting = Some(value),
+                    ) if plain && last => self.forgetting = Some(id),
 
-                    (_, KeyCode::Char('c')) if ctrl => match self.run {
-                        Some(_) if running => self.interrupt(),
+                    (_, KeyCode::Char('c')) if ctrl => match self.session.run {
+                        Some(_) if running => self.session.cancel(),
                         // The way out when an interrupt is stuck
                         Some(_) => self.quit = true,
                         None => {
@@ -511,7 +544,7 @@ impl App {
                         self.edit(|input| input.insert_str("\n"));
                     }
                     (_, KeyCode::Esc) if self.scrolled_back > 0 => self.scrolled_back = 0,
-                    (_, KeyCode::Esc) if running => self.interrupt(),
+                    (_, KeyCode::Esc) if running => self.session.cancel(),
                     // An invisible ! sits before the cursor
                     (_, KeyCode::Backspace) if self.shell && first => self.shell = false,
                     (_, KeyCode::PageUp) => self.scroll_up(page),
@@ -533,7 +566,7 @@ impl App {
                     }
                     (_, KeyCode::Up) if top => {
                         let current = self.draft();
-                        let sent = self.transcript.sent();
+                        let sent = self.session.conversation.sent();
                         if let Some(text) = self.history.back(&sent, current) {
                             let text = self.folded(text);
                             self.set_input(&text);
@@ -545,7 +578,7 @@ impl App {
                         self.input.move_cursor(CursorMove::Down);
                         // Only a cursor that can't move down is on the last screen row
                         if self.input.screen_cursor().row == before {
-                            let sent = self.transcript.sent();
+                            let sent = self.session.conversation.sent();
                             if let Some((text, draft)) = self.history.forward(&sent) {
                                 // The user's own draft comes back exactly as typed
                                 let text = match draft {
@@ -626,7 +659,8 @@ impl App {
                         self.selection = None;
 
                         if let Some(point) = point.filter(|_| double) {
-                            let rows = self.transcript.rows(area.width, self.expanded);
+                            let talk = &self.session.conversation;
+                            let rows = self.transcript.rows(talk, area.width, self.expanded);
                             self.selection = Selection::word(rows, point);
                         }
                     }
@@ -647,9 +681,10 @@ impl App {
 
                     MouseEventKind::Up(MouseButton::Left) => {
                         let pressed = self.pressed.take();
+                        let talk = &self.session.conversation;
                         let Some(selection) = self.selection else {
                             // No drag means it was a click
-                            let rows = self.transcript.rows(area.width, self.expanded);
+                            let rows = self.transcript.rows(talk, area.width, self.expanded);
                             let Some(point) = pressed else {
                                 return;
                             };
@@ -662,7 +697,7 @@ impl App {
 
                             let told = match target {
                                 Target::Url(url) => {
-                                    let opened = browser::open(&url);
+                                    let opened = desktop::open(&url);
                                     opened.map(|()| "opening the link in a browser".to_owned())
                                 }
                                 Target::Diagram(code) => {
@@ -678,7 +713,7 @@ impl App {
                             return;
                         };
 
-                        let rows = self.transcript.rows(area.width, self.expanded);
+                        let rows = self.transcript.rows(talk, area.width, self.expanded);
                         let text = selection.text(rows);
                         if !text.trim().is_empty() {
                             select::copy(&text);
@@ -713,51 +748,32 @@ impl App {
         let mut changed = false;
         // Queued messages go out only once every output is drained
         let mut finished = false;
-        while let Some(outputs) = self.session.poll() {
+        while let Some(output) = self.session.poll() {
             self.dirty = true;
 
-            for output in outputs {
-                match output {
-                    Output::Update(update) => {
-                        let ended = self.transcript.update(&update);
-                        if let Some(run) = self.run.as_mut().filter(|_| ended) {
-                            run.step_started = Instant::now();
-                        }
-                    }
+            match output {
+                Output::Shown => {}
+                Output::Servers => changed = true,
 
-                    Output::Notice(notice) => self.transcript.notice(&notice),
-                    Output::Info(text) => self.info(text),
-                    Output::Failure(text) => self.failure(text),
-                    Output::Status => changed = true,
+                // A command waits for the turn to end, and so does everything queued behind it
+                Output::Queued(asked) => {
+                    let count = match self.session.running() {
+                        true => self.queued.iter().take_while(|text| plain(text)).count(),
+                        false => 0,
+                    };
+                    let texts = self.queued.drain(..count);
+                    self.session.answer(asked, texts);
+                }
 
-                    // A command waits for the turn to end, and so does everything queued behind it
-                    Output::Queued(asked) => {
-                        let count = match self.running() {
-                            true => self.queued.iter().take_while(|text| plain(text)).count(),
-                            false => 0,
-                        };
-
-                        let mut prompts = Vec::new();
-                        for text in self.queued.drain(..count) {
-                            self.transcript.amend(&text);
-                            let blocks = self.session.blocks(&text);
-                            prompts.push(blocks);
-                        }
-                        asked.answer(prompts);
-                    }
-
-                    Output::Done(stop) => {
-                        self.run = None;
-                        self.transcript.done(stop);
-                        finished = true;
-                        changed = true;
-                    }
+                Output::Done => {
+                    finished = true;
+                    changed = true;
                 }
             }
         }
 
         if finished {
-            while self.run.is_none() && !self.quit {
+            while self.session.run.is_none() && !self.quit {
                 let Some(next) = self.queued.pop_front() else {
                     break;
                 };
@@ -773,7 +789,7 @@ impl App {
     pub(crate) fn show_session(&mut self) {
         self.scrolled_back = 0;
         self.pump();
-        self.transcript.finish_turn(Outcome::Answered);
+        self.session.conversation.finish_turn(Outcome::Answered);
 
         let text = format!("resumed session {}", self.session.id);
         self.info(text);
@@ -786,40 +802,26 @@ impl App {
             return;
         }
 
-        let lists = [
-            (RESUME_PREFIX, List::Sessions),
-            (MODEL_PREFIX, List::Models),
-            (MEMORY_PREFIX, List::Memories),
-        ];
-        let listing = match self.input.lines() {
-            [line] => lists
-                .into_iter()
-                .find(|(prefix, _)| line.starts_with(prefix)),
-            _ => None,
-        };
-
-        // Sessions and memories come from the agent and are asked for once when the prefix is typed
-        let asking = match listing {
-            Some((_, list @ (List::Sessions | List::Memories))) => Some(list),
-            _ => None,
-        };
-        let cached = self.fetched.as_ref().map(|(list, _)| *list);
-        if asking.is_none() {
-            self.fetched = None;
-        }
-        if let Some(list) = asking.filter(|_| cached != asking) {
-            let asked = self.session.rows(list);
-            match &asked {
-                Ok(rows) if rows.is_empty() => self.info(empty_text(list)),
-                Ok(_) => {}
-                Err(error) => {
-                    let text = format!("{error:#}");
-                    self.failure(text);
+        let mut listing = None;
+        if let [line] = self.input.lines() {
+            for spec in &COMMANDS {
+                let Command::List(list) = spec.bare else {
+                    continue;
+                };
+                if line.starts_with(&spec.prefix()) {
+                    listing = Some(list);
+                    break;
                 }
             }
+        }
 
-            let rows = asked.unwrap_or_default();
-            self.fetched = Some((list, rows));
+        // A list opens once its prefix is typed, which is when sessions and memories are asked for
+        let opened = self.opened.as_ref().map(|(list, _)| *list);
+        if listing.is_none() {
+            self.opened = None;
+        }
+        if let Some(list) = listing.filter(|_| opened != listing) {
+            self.open_list(list);
         }
 
         let DataCursor(row, col) = self.input.cursor();
@@ -828,35 +830,14 @@ impl App {
         let mention = typing_mention(&before);
         let query = mention.map_or("", |(_, query)| query);
         let scope = outside_dir(query).unwrap_or_default();
-        let cached = self.paths.as_ref().map(|(dir, _)| dir.as_str());
-        if mention.is_none() {
-            self.paths = None;
-        } else if cached != Some(scope) {
+        if mention.is_some() && !self.paths.contains_key(scope) {
             let cwd = &self.session.client.cwd;
-            let mut paths = Vec::new();
-            if scope.is_empty() {
-                let mut walk = WalkBuilder::new(cwd);
-                walk.hidden(false)
-                    .require_git(false)
-                    .filter_entry(|entry| entry.file_name() != ".git");
-
-                for entry in walk.build().flatten().take(MAX_PATHS) {
-                    let full = entry.path();
-                    let relative = full.strip_prefix(cwd).unwrap_or(full);
-                    if relative.as_os_str().is_empty() {
-                        continue;
-                    }
-
-                    // Completions always use /, which Windows accepts too
-                    let mut path = relative.to_string_lossy().replace(MAIN_SEPARATOR, "/");
-                    if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-                        path.push('/');
-                    }
-                    paths.push(path);
-                }
+            let paths = if scope.is_empty() {
+                walk(cwd, MAX_PATHS)
             } else {
                 // Outside the cwd only one level is listed,
                 // which stays fast even in the home or root directory
+                let mut paths = Vec::new();
                 let dir = resolved(scope, cwd);
                 if let Ok(entries) = fs::read_dir(dir) {
                     for entry in entries.flatten().take(MAX_PATHS) {
@@ -872,9 +853,9 @@ impl App {
                         paths.push(path);
                     }
                 }
-            }
-
-            self.paths = Some((scope.to_owned(), paths));
+                paths
+            };
+            self.paths.insert(scope.to_owned(), paths);
         }
 
         self.choices.clear();
@@ -882,7 +863,7 @@ impl App {
             return;
         }
 
-        if let (Some((typed, query)), Some((_, paths))) = (mention, &self.paths) {
+        if let (Some((typed, query)), Some(paths)) = (mention, self.paths.get(scope)) {
             // Directories outside the cwd list hidden entries only after a typed .,
             // and they must go before sorting and truncation
             let name = query.rsplit(is_separator).next().unwrap_or_default();
@@ -902,8 +883,24 @@ impl App {
         let [line] = self.input.lines() else {
             return;
         };
+        let Some(list) = listing else {
+            for spec in hints(line) {
+                // A trailing space makes Enter fill without submitting,
+                // and only commands that open a list get one
+                let completion = match spec.bare {
+                    Command::List(_) => spec.prefix(),
+                    _ => spec.name.to_owned(),
+                };
+                let label = spec.usage();
+                let choice = Choice::input(label, spec.summary, completion);
+                self.choices.push(choice);
+            }
+            return;
+        };
 
-        if let Some(arg) = line.strip_prefix(MCP_PREFIX) {
+        let prefix = prefix(list);
+        let arg = &line[prefix.len()..];
+        if list == List::Servers {
             let mut offers = Vec::new();
             for server in &self.session.mcp {
                 let switches: &[(&str, &str)] = match server.state {
@@ -924,7 +921,7 @@ impl App {
                         continue;
                     }
 
-                    let completion = format!("{MCP_PREFIX}{switch} ");
+                    let completion = format!("{prefix}{switch} ");
                     let label = switch.to_owned();
                     let choice = Choice::input(label, detail, completion);
                     self.choices.push(choice);
@@ -939,7 +936,7 @@ impl App {
                     continue;
                 }
 
-                let completion = format!("{MCP_PREFIX}{switch} {name}");
+                let completion = format!("{prefix}{switch} {name}");
                 let label = name.clone();
                 let choice = Choice::input(label, effect, completion);
                 offer(&mut self.choices, choice, lower == query);
@@ -947,55 +944,124 @@ impl App {
             return;
         }
 
-        let Some((prefix, list)) = listing else {
-            for hint in hints(line) {
-                let name = hint.name();
-                // A trailing space makes Enter fill without submitting,
-                // and only commands that open a list get one
-                let spaced = format!("{name} ");
-                let prefixes = [RESUME_PREFIX, MODEL_PREFIX, MCP_PREFIX, MEMORY_PREFIX];
-                let opens = prefixes.contains(&spaced.as_str());
-                let completion = match opens {
-                    true => spaced,
-                    false => name.to_owned(),
-                };
-                let label = hint.usage.to_owned();
-                let choice = Choice::input(label, hint.summary, completion);
-                self.choices.push(choice);
-            }
-            return;
+        // Lists from the agent use only what was asked when the list opened, since asking again
+        // here would freeze the UI, while models are read live to keep the current one marked
+        let picks = match &self.opened {
+            Some((_, picks)) if list != List::Models => picks.clone(),
+            _ => self.picks(list).unwrap_or_default(),
         };
-
-        // Lists from the agent use only what was already fetched, since asking again here would freeze the UI
-        let rows = match &self.fetched {
-            Some((_, rows)) => Some(rows.clone()),
-            None => self.session.rows(list).ok(),
-        };
-        let query = line[prefix.len()..].trim().to_lowercase();
-        for row in rows.unwrap_or_default() {
-            let label = row.label.to_lowercase();
-            let value = row.value.to_lowercase();
+        let query = arg.trim().to_lowercase();
+        for pick in picks {
+            let label = pick.label.to_lowercase();
+            let value = pick.value.to_lowercase();
             if !label.contains(&query) && !value.contains(&query) {
                 continue;
             }
 
             let exact = label == query || value == query;
-            let current = row.current && query.is_empty() && list == List::Models;
-            let detail = match row.current {
+            let current = pick.current && query.is_empty() && list == List::Models;
+            let detail = match pick.current {
                 true => "current",
-                false => &row.description,
-            };
-            let completion = match list {
-                List::Memories => Completion::Memory(row.value),
-                _ => Completion::Input(format!("{prefix}{}", row.value)),
+                false => &pick.detail,
             };
             let choice = Choice {
-                label: row.label,
+                label: pick.label,
                 detail: detail.to_owned(),
-                completion,
+                completion: pick.completion,
             };
             offer(&mut self.choices, choice, exact || current);
         }
+    }
+
+    /// Reports a list that is empty or failed to arrive, and returns whether it has rows
+    fn open_list(&mut self, list: List) -> bool {
+        let asked = self.picks(list);
+        match &asked {
+            Ok(picks) if picks.is_empty() => self.info(empty_text(list)),
+            Ok(_) => {}
+            Err(error) => {
+                let text = format!("{error:#}");
+                self.failure(text);
+            }
+        }
+
+        let picks = asked.unwrap_or_default();
+        let filled = !picks.is_empty();
+        self.opened = Some((list, picks));
+        filled
+    }
+
+    fn picks(&self, list: List) -> Result<Vec<Pick>> {
+        let prefix = prefix(list);
+        let mut picks = Vec::new();
+        match list {
+            List::Sessions => {
+                for info in self.session.sessions()? {
+                    let id = info.session_id.0.to_string();
+                    let title = info.title.unwrap_or_default();
+                    let words: Vec<&str> = title.split_whitespace().collect();
+                    let label = match words.is_empty() {
+                        true => id.clone(),
+                        false => words.join(" "),
+                    };
+                    let updated = info.updated_at.as_deref().map(stamp);
+                    let updated = updated.unwrap_or_default();
+                    let completion = Completion::Input(format!("{prefix}{id}"));
+                    picks.push(Pick {
+                        value: id,
+                        label,
+                        detail: updated,
+                        current: false,
+                        completion,
+                    });
+                }
+            }
+
+            List::Models => {
+                for model in self.session.models() {
+                    let completion = Completion::Input(format!("{prefix}{}", model.value));
+                    picks.push(Pick {
+                        value: model.value,
+                        label: model.name,
+                        detail: model.description.unwrap_or_default(),
+                        current: model.current,
+                        completion,
+                    });
+                }
+            }
+
+            List::Servers => {
+                for server in &self.session.mcp {
+                    let state = server.state.to_string();
+                    let completion = Completion::Input(format!("{prefix}{}", server.name));
+                    picks.push(Pick {
+                        value: server.name.clone(),
+                        label: server.name.clone(),
+                        detail: state,
+                        current: false,
+                        completion,
+                    });
+                }
+            }
+
+            List::Memories => {
+                for memory in self.session.memories()? {
+                    let words: Vec<&str> = memory.text.split_whitespace().collect();
+                    let scope = match memory.project {
+                        true => "project",
+                        false => "global",
+                    };
+                    picks.push(Pick {
+                        value: memory.id.to_string(),
+                        label: words.join(" "),
+                        detail: format!("{scope} #{}", memory.id),
+                        current: false,
+                        completion: Completion::Memory(memory.id),
+                    });
+                }
+            }
+        }
+        Ok(picks)
     }
 
     /// Sticks to the edge when a drag leaves the messages area
@@ -1103,7 +1169,8 @@ impl App {
     }
 
     fn folded(&mut self, text: String) -> String {
-        if text.lines().count() <= MAX_UNFOLDED_LINES {
+        let short = text.chars().count() <= MAX_UNFOLDED_CHARS;
+        if short && text.lines().count() <= MAX_UNFOLDED_LINES {
             return text;
         }
 
@@ -1139,14 +1206,15 @@ impl App {
         self.history = History::default();
         self.set_input("");
         self.pastes.clear();
+        self.paths.clear();
 
-        if self.run.is_none() {
+        if self.session.run.is_none() {
             return self.submit_text(&text);
         }
         self.queued.push_back(text);
         // A turn waiting on agents takes it now, unless a command ahead of it waits for the turn to end
         if self.queued.iter().all(|text| plain(text)) {
-            self.session.enqueued();
+            self.session.notify_queued();
         }
     }
 
@@ -1167,21 +1235,14 @@ impl App {
         self.scrolled_back = self.scrolled_back.saturating_sub(lines);
     }
 
-    fn interrupt(&mut self) {
-        if let Some(run) = &mut self.run {
-            run.interrupting = true;
-            self.session.cancel();
-        }
-    }
-
     fn info(&mut self, text: impl Into<String>) {
         let text = text.into();
-        self.transcript.push(Entry::Info(text));
+        self.session.conversation.push(Entry::Info(text));
     }
 
     fn failure(&mut self, text: impl Into<String>) {
         let text = text.into();
-        self.transcript.push(Entry::Failure(text));
+        self.session.conversation.push(Entry::Failure(text));
     }
 }
 
@@ -1244,9 +1305,12 @@ pub(crate) fn pasted(events: &[Event], stalled: bool) -> Option<String> {
         }
     }
 
-    let burst = text.chars().count() > 1;
+    // A long line is a paste too, since typing it in key by key diffs the input each time
+    let count = text.chars().count();
+    let burst = count > 1;
+    let long = count > MAX_UNFOLDED_CHARS;
     let typed = stalled && text.ends_with('\n') && text.matches('\n').count() == 1;
-    match burst && text.contains('\n') && !typed {
+    match burst && (text.contains('\n') || long) && !typed {
         true => Some(text),
         false => None,
     }
@@ -1254,7 +1318,12 @@ pub(crate) fn pasted(events: &[Event], stalled: bool) -> Option<String> {
 
 fn placeholder(number: usize, text: &str) -> String {
     let lines = text.lines().count();
-    format!("[paste #{number}: {lines} lines]")
+    if lines > 1 {
+        return format!("[paste #{number}: {lines} lines]");
+    }
+
+    let chars = text.chars().count();
+    format!("[paste #{number}: {chars} characters]")
 }
 
 /// Queued text the running turn can take, as commands wait for it to end
@@ -1301,6 +1370,46 @@ fn typing_mention(before: &str) -> Option<(usize, &str)> {
 
     let count = before[at..].chars().count();
     Some((count, path))
+}
+
+/// At most `limit` paths in `cwd` that its ignore files leave, a level at a time,
+/// so every level above the last one listed is complete
+fn walk(cwd: &Path, limit: usize) -> Vec<String> {
+    let mut builder = WalkBuilder::new(cwd);
+    builder.hidden(false).require_git(false);
+    let mut matchers = builder.build_matchers();
+    let Some(matcher) = matchers.first_mut() else {
+        return Vec::new();
+    };
+
+    let mut paths = Vec::new();
+    let mut folders = VecDeque::from([PathBuf::new()]);
+    while let Some(folder) = folders.pop_front() {
+        let Ok(entries) = fs::read_dir(cwd.join(&folder)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let relative = folder.join(&name);
+            // `file_type` doesn't follow links, which keeps a link to a folder above from looping
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            if name == ".git" || matcher.matched(&relative, is_dir).is_ignore() {
+                continue;
+            }
+
+            // Completions always use /, which Windows accepts too
+            let mut path = relative.to_string_lossy().replace(MAIN_SEPARATOR, "/");
+            if is_dir {
+                path.push('/');
+                folders.push_back(relative);
+            }
+            paths.push(path);
+            if paths.len() == limit {
+                return paths;
+            }
+        }
+    }
+    paths
 }
 
 /// A path outside the working directory, cut after its last separator
@@ -1364,18 +1473,25 @@ fn offer(choices: &mut Vec<Choice>, choice: Choice, exact: bool) {
     }
 }
 
-fn hints(input: &str) -> Vec<&'static Hint> {
+fn hints(input: &str) -> Vec<&'static Spec> {
     if !input.starts_with(':') || input.contains(char::is_whitespace) {
         return Vec::new();
     }
 
     let mut found = Vec::new();
-    for hint in &HINTS {
-        if hint.name().starts_with(input) {
-            found.push(hint);
+    for spec in &COMMANDS {
+        if spec.name.starts_with(input) {
+            found.push(spec);
         }
     }
     found
+}
+
+/// The command that opens `list`, with the space before its argument
+fn prefix(list: List) -> String {
+    let opens = |spec: &&Spec| spec.bare == Command::List(list);
+    let spec = COMMANDS.iter().find(opens).expect("command");
+    spec.prefix()
 }
 
 fn empty_text(list: List) -> &'static str {
@@ -1387,26 +1503,35 @@ fn empty_text(list: List) -> &'static str {
     }
 }
 
-fn listed(list: List, rows: Vec<Pick>) -> String {
-    if rows.is_empty() {
+fn listed(list: List, picks: Vec<Pick>) -> String {
+    if picks.is_empty() {
         return empty_text(list).to_owned();
     }
 
     let mut lines = Vec::new();
-    for row in rows {
-        let mut line = row.value;
-        if row.label != line {
-            line += &format!("  {}", row.label);
+    for pick in picks {
+        let mut line = pick.value;
+        if pick.label != line {
+            line += &format!("  {}", pick.label);
         }
-        if !row.description.is_empty() {
-            line += &format!("  {}", row.description);
+        if !pick.detail.is_empty() {
+            line += &format!("  {}", pick.detail);
         }
-        if row.current {
+        if pick.current {
             line += "  (current)";
         }
         lines.push(line);
     }
     lines.join("\n")
+}
+
+fn stamp(rfc3339: &str) -> String {
+    let Ok(time) = DateTime::parse_from_rfc3339(rfc3339) else {
+        let spaced = rfc3339.replacen('T', " ", 1);
+        return spaced.chars().take(16).collect();
+    };
+    let local = time.with_timezone(&Local);
+    local.format("%Y-%m-%d %H:%M").to_string()
 }
 
 #[cfg(test)]
@@ -1432,7 +1557,7 @@ mod tests {
     }
 
     fn shown(app: &mut App) -> Vec<String> {
-        let rows = app.transcript.rows(60, false);
+        let rows = app.transcript.rows(&app.session.conversation, 60, false);
         rows.iter().map(|row| row.line.to_string()).collect()
     }
 
@@ -1464,7 +1589,9 @@ mod tests {
         app.submit_text("first task");
         app.queued
             .extend(["! ls docs", "second task"].map(str::to_owned));
-        settle(&mut app, |app| app.queued.is_empty() && app.run.is_none());
+        settle(&mut app, |app| {
+            app.queued.is_empty() && app.session.run.is_none()
+        });
 
         let expected = [
             "",
@@ -1479,7 +1606,7 @@ mod tests {
         ];
         assert_eq!(shown(&mut app), expected);
         assert_eq!(
-            app.transcript.sent(),
+            app.session.conversation.sent(),
             ["first task", "! ls docs", "second task"]
         );
     }
@@ -1490,7 +1617,9 @@ mod tests {
         app.submit_text("queue");
         app.queued
             .extend(["update", ":mcp", "later"].map(str::to_owned));
-        settle(&mut app, |app| app.queued.is_empty() && app.run.is_none());
+        settle(&mut app, |app| {
+            app.queued.is_empty() && app.session.run.is_none()
+        });
 
         let expected = [
             "",
@@ -1503,7 +1632,7 @@ mod tests {
             "❯ later",
         ];
         assert_eq!(shown(&mut app), expected);
-        assert_eq!(app.transcript.stats().turns, 2);
+        assert_eq!(app.session.conversation.stats().turns, 2);
     }
 
     #[test]
@@ -1544,7 +1673,7 @@ mod tests {
     fn resume_failure_kept() {
         let mut app = app();
         app.submit_text("first task");
-        settle(&mut app, |app| app.run.is_none());
+        settle(&mut app, |app| app.session.run.is_none());
 
         app.submit_text(":resume nope");
         let expected = ["", "❯ first task", "", "✗ unknown session"];
@@ -1556,33 +1685,11 @@ mod tests {
     }
 
     #[test]
-    fn resume_lists_cwd() {
-        let mut app = app();
-        app.session.open(None).expect("open");
-        app.submit_text(":resume");
-
-        let labels: Vec<&str> = app
-            .choices
-            .iter()
-            .map(|choice| choice.label.as_str())
-            .collect();
-        assert_eq!(labels, ["old session"]);
-    }
-
-    #[test]
-    fn no_models_shown() {
-        let mut app = app();
-        app.session.options.clear();
-        app.submit_text(":model");
-        assert_eq!(shown(&mut app), ["", "  no models"]);
-    }
-
-    #[test]
     fn lists_formatted() {
         let mut app = app();
         let list = |app: &App, list: List| {
-            let rows = app.session.rows(list).expect("list");
-            listed(list, rows)
+            let picks = app.picks(list).expect("list");
+            listed(list, picks)
         };
 
         assert_eq!(list(&app, List::Models), "m1  (current)\nm2-café");
@@ -1660,6 +1767,11 @@ mod tests {
     }
 
     #[test]
+    fn short_stamp() {
+        assert_eq!(stamp("2026-10-04T08:09:10"), "2026-10-04 08:09");
+    }
+
+    #[test]
     fn current_model_first() {
         let mut app = app();
         app.session.set_model("m2-café").expect("switch");
@@ -1671,9 +1783,9 @@ mod tests {
     fn refused_not_counted() {
         let mut app = app();
         app.submit_text("huge");
-        settle(&mut app, |app| app.run.is_none());
+        settle(&mut app, |app| app.session.run.is_none());
 
-        assert_eq!(app.transcript.stats().turns, 0);
+        assert_eq!(app.session.conversation.stats().turns, 0);
         assert_eq!(shown(&mut app), ["", "❯ huge", "", "✗ task: too large"]);
     }
 
@@ -1843,10 +1955,11 @@ mod tests {
 
         key(&mut app, KeyCode::Esc);
         assert_eq!(app.scrolled_back, 0);
-        assert!(!app.run.as_ref().is_some_and(|run| run.interrupting));
+        assert!(app.session.running());
 
         key(&mut app, KeyCode::Esc);
-        assert!(app.run.as_ref().is_some_and(|run| run.interrupting));
+        let run = app.session.run.as_ref();
+        assert!(run.is_some_and(|run| run.interrupting));
     }
 
     #[test]
@@ -1863,7 +1976,7 @@ mod tests {
         key(&mut app, KeyCode::Up);
         key(&mut app, KeyCode::Up);
         assert_eq!(app.input.lines(), ["one", "two", "draft"]);
-        assert!(app.queued.is_empty() && app.running());
+        assert!(app.queued.is_empty() && app.session.running());
     }
 
     #[test]
@@ -1882,12 +1995,22 @@ mod tests {
         app.on_event(Event::Paste("\nshort".to_owned()));
         assert_eq!(app.input.lines(), ["Résumé: [paste #2: 7 lines]", "short"]);
         key(&mut app, KeyCode::Enter);
-        let sent = app.transcript.sent();
+        let sent = app.session.conversation.sent();
         let expected = format!("Résumé: {pasted}\nshort");
         assert_eq!(sent.last(), Some(&expected));
 
         key(&mut app, KeyCode::Up);
         assert_eq!(app.input.lines(), ["[paste #1: 8 lines]"]);
+
+        // One long line folds too, counted in characters rather than bytes
+        settle(&mut app, |app| app.session.run.is_none());
+        app.set_input("");
+        let line = "café 🐍 ".repeat(200);
+        app.on_event(Event::Paste(line.clone()));
+        assert_eq!(app.input.lines(), ["[paste #2: 1400 characters]"]);
+        key(&mut app, KeyCode::Enter);
+        let sent = app.session.conversation.sent();
+        assert_eq!(sent.last().map(String::as_str), Some(line.trim()));
     }
 
     #[test]
@@ -1969,8 +2092,10 @@ mod tests {
         key(&mut app, KeyCode::Enter);
 
         key(&mut app, KeyCode::Esc);
-        settle(&mut app, |app| app.queued.is_empty() && app.run.is_none());
-        assert_eq!(app.transcript.sent(), ["wait", "try another way"]);
+        settle(&mut app, |app| {
+            app.queued.is_empty() && app.session.run.is_none()
+        });
+        assert_eq!(app.session.conversation.sent(), ["wait", "try another way"]);
     }
 
     #[test]
@@ -1980,26 +2105,27 @@ mod tests {
         app.queued.extend([":quit", "later"].map(str::to_owned));
         settle(&mut app, |app| app.quit);
 
-        assert!(app.run.is_none());
+        assert!(app.session.run.is_none());
         assert_eq!(app.queued, ["later"]);
     }
 
     #[test]
     fn invalid_command_kept() {
         let mut app = app();
+        app.set_input(":undo");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.input.lines(), [":undo"]);
+        assert!(app.session.run.is_none());
+        let rows = shown(&mut app);
+        assert!(rows[1].starts_with("✗ command: :undo: unknown"), "{rows:?}");
+
         app.set_input(": what does this mean");
         key(&mut app, KeyCode::Enter);
-        assert_eq!(app.input.lines(), [": what does this mean"]);
-
-        app.submit_text(":undo");
-        assert!(app.run.is_none());
-        let shown = shown(&mut app);
-        let failed: Vec<&String> = shown.iter().filter(|row| row.starts_with('✗')).collect();
-        assert_eq!(failed.len(), 2, "{shown:?}");
-        assert!(failed[0].starts_with("✗ command: :: unknown"), "{shown:?}");
+        assert_eq!(app.input.lines(), [""]);
+        let rows = shown(&mut app);
         assert!(
-            failed[1].starts_with("✗ command: :undo: unknown"),
-            "{shown:?}"
+            rows.contains(&"❯ : what does this mean".to_owned()),
+            "{rows:?}"
         );
     }
 
@@ -2061,6 +2187,12 @@ mod tests {
         let line = [first.clone(), second.clone(), enter.clone()];
         assert_eq!(pasted(&line, true), None);
         assert_eq!(pasted(&line, false).as_deref(), Some("éñ\n"));
+
+        // One long line too, which then folds
+        let long = vec![first.clone(); MAX_UNFOLDED_CHARS + 1];
+        let text = "é".repeat(MAX_UNFOLDED_CHARS + 1);
+        assert_eq!(pasted(&long, true), Some(text));
+        assert_eq!(pasted(&long[1..], false), None);
 
         let up = pressed(KeyCode::Up);
         let typed = [
@@ -2158,6 +2290,34 @@ mod tests {
     }
 
     #[test]
+    fn walk_breadth_first() {
+        let name = format!("smol-walk-{}", process::id());
+        let dir = env::temp_dir().join(name);
+        for folder in ["piñatas", "ignored", ".git"] {
+            fs::create_dir_all(dir.join(folder)).expect("mkdir");
+        }
+        for n in 1..=10 {
+            let file = format!("piñatas/{n}.txt");
+            fs::write(dir.join(file), "").expect("write");
+        }
+        for file in ["résumé.md", ".env", "ignored/café.md", ".git/HEAD"] {
+            fs::write(dir.join(file), "").expect("write");
+        }
+        fs::write(dir.join(".gitignore"), "ignored/\n").expect("write");
+        fs::write(dir.join("piñatas/.gitignore"), "3.txt\n").expect("write");
+
+        let mut walked = walk(&dir, 4);
+        walked.sort();
+        assert_eq!(walked, [".env", ".gitignore", "piñatas/", "résumé.md"]);
+        let all = walk(&dir, 100);
+        assert_eq!(all.len(), 14, "{all:?}");
+        assert!(all.contains(&"piñatas/10.txt".to_owned()), "{all:?}");
+        assert!(!all.contains(&"piñatas/3.txt".to_owned()), "{all:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn paths_ranked() {
         let paths = [
             "README.md",
@@ -2193,62 +2353,46 @@ mod tests {
 
     #[test]
     fn commands_parse() {
-        assert_eq!(Command::parse(":new"), Some(Command::New));
         let shell = Command::parse("! ls docs\n");
         assert_eq!(shell, Some(Command::Shell("ls docs".to_owned())));
         let usage = Some(Command::Invalid("usage: !<command>".to_owned()));
         assert_eq!(Command::parse("!  "), usage);
-        let sessions = Some(Command::List(List::Sessions));
-        assert_eq!(Command::parse(":resume"), sessions);
 
         let resume = Command::parse(":resume  abc-123 ");
         assert_eq!(resume, Some(Command::Resume("abc-123".to_owned())));
-        assert_eq!(Command::parse(":quit"), Some(Command::Quit));
-
-        let models = Some(Command::List(List::Models));
-        assert_eq!(Command::parse(":model"), models);
         let model = Command::parse(":model tiny");
         assert_eq!(model, Some(Command::Model("tiny".to_owned())));
 
-        let servers = Some(Command::List(List::Servers));
-        assert_eq!(Command::parse(":mcp"), servers);
         let on = Command::parse(":mcp on fake");
         assert_eq!(on, Some(Command::Mcp(true, "fake".to_owned())));
         let off = Command::parse(":mcp off  fake ");
         assert_eq!(off, Some(Command::Mcp(false, "fake".to_owned())));
         let wide = Command::parse(":mcp on\u{3000}web");
         assert_eq!(wide, Some(Command::Mcp(true, "web".to_owned())));
-        let memories = Some(Command::List(List::Memories));
-        assert_eq!(Command::parse(":memory"), memories);
 
-        for line in ["hello", "quit", "q", "", " :new"] {
+        let messages = ["hello", " :new", ":", ":)", ":) thanks", "::1", ":Résumé"];
+        for line in messages {
             assert_eq!(Command::parse(line), None, "{line}");
         }
 
         let usage = |text: &str| Some(Command::Invalid(text.to_owned()));
         assert_eq!(Command::parse(":new please"), usage("usage: :new"));
         let mcp = usage("usage: :mcp <on|off> <server>");
-        for line in [":mcp fake", ":mcp toggle fake", ":mcp on"] {
+        for line in [":mcp toggle fake", ":mcp on"] {
             assert_eq!(Command::parse(line), mcp, "{line}");
         }
-        assert_eq!(Command::parse(":memory café"), usage("usage: :memory"));
 
         let commands =
             ":new, :resume <session>, :model <name>, :mcp <on|off> <server>, :memory, :quit, !<command>";
-        for name in [":help", ":", ":)"] {
-            let unknown = format!("command: {name}: unknown (commands: {commands})");
-            assert_eq!(Command::parse(name), usage(&unknown), "{name}");
-        }
-        let goal = format!("command: :goal: unknown (commands: {commands})");
-        let parsed = Command::parse(":goal fix the café parser");
-        assert_eq!(parsed, usage(&goal));
+        let unknown = format!("command: :help: unknown (commands: {commands})");
+        assert_eq!(Command::parse(":help"), usage(&unknown));
     }
 
     #[test]
     fn hints_match_prefix() {
         let names = |input| {
             let found = hints(input);
-            found.iter().map(|hint| hint.name()).collect::<Vec<_>>()
+            found.iter().map(|spec| spec.name).collect::<Vec<_>>()
         };
 
         let all = [":new", ":resume", ":model", ":mcp", ":memory", ":quit"];
@@ -2257,16 +2401,31 @@ mod tests {
         assert_eq!(names(":m"), [":model", ":mcp", ":memory"]);
         assert!(names(":resume abc").is_empty() && names("new").is_empty());
 
-        for hint in &HINTS {
-            let parsed = Command::parse(hint.name());
-            assert!(!matches!(parsed, Some(Command::Invalid(_))), "{parsed:?}");
+        for spec in &COMMANDS {
+            let parsed = Command::parse(spec.name);
+            assert_eq!(parsed.as_ref(), Some(&spec.bare));
         }
 
-        for prefix in [RESUME_PREFIX, MODEL_PREFIX, MCP_PREFIX, MEMORY_PREFIX] {
-            let named = HINTS
-                .iter()
-                .any(|hint| format!("{} ", hint.name()) == prefix);
-            assert!(named, "{prefix}");
+        let lists = [List::Sessions, List::Models, List::Servers, List::Memories];
+        let prefixes = lists.map(prefix);
+        assert_eq!(prefixes, [":resume ", ":model ", ":mcp ", ":memory "]);
+    }
+
+    /// A command whose list is empty says so once and leaves the input empty
+    #[test]
+    fn empty_list_closed() {
+        let mut app = app();
+        app.submit_text(":resume");
+        assert_eq!(app.input.lines(), [""]);
+        assert_eq!(shown(&mut app), ["", "  no other sessions"]);
+
+        app.session.options.clear();
+        for typed in ":model ".chars() {
+            key(&mut app, KeyCode::Char(typed));
         }
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.input.lines(), [":model m"]);
+        let expected = ["", "  no other sessions", "", "  no models"];
+        assert_eq!(shown(&mut app), expected);
     }
 }

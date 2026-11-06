@@ -1,15 +1,17 @@
 use crate::client::{
-    model_of, models, Asked, AuthRequired, Client, Incoming, McpState, McpStatus, Notice, Pick,
+    model_of, models, Asked, Client, Incoming, McpState, McpStatus, Memory, Model, Refusal,
 };
+use crate::conversation::{Conversation, Entry};
 use agent_client_protocol_schema::v1::{
-    ContentBlock, ResourceLink, SessionConfigOption, SessionUpdate, StopReason,
+    ContentBlock, ResourceLink, SessionConfigOption, SessionInfo, SessionUpdate,
 };
 use agent_client_protocol_schema::MaybeUndefined;
 use anyhow::Result;
-use chrono::{DateTime, Local};
+use reaper::wire::MCP_PREFIX;
 use std::env;
 use std::path::{is_separator, Path, PathBuf};
 use std::sync::mpsc::Receiver;
+use std::time::Instant;
 use url::Url;
 
 /// No file name or path is longer than these
@@ -18,22 +20,27 @@ const MAX_PATH_BYTES: usize = 4096;
 
 const MAX_PROBES: usize = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum List {
-    Sessions,
-    Models,
+pub(crate) enum Output {
+    /// Nothing beyond the conversation or the session changed, which only needs drawing
+    Shown,
+    /// The states of the MCP servers changed
     Servers,
-    Memories,
+    Queued(Asked),
+    Done,
 }
 
-pub(crate) enum Output {
-    Update(Box<SessionUpdate>),
-    Notice(Notice),
-    Info(String),
-    Failure(String),
-    Status,
-    Queued(Asked),
-    Done(Result<StopReason>),
+pub(crate) struct Run {
+    pub(crate) step_started: Instant,
+    pub(crate) interrupting: bool,
+}
+
+impl Run {
+    fn new() -> Self {
+        Self {
+            step_started: Instant::now(),
+            interrupting: false,
+        }
+    }
 }
 
 pub(crate) struct Session {
@@ -43,8 +50,11 @@ pub(crate) struct Session {
     pub(crate) title: String,
     pub(crate) options: Vec<SessionConfigOption>,
     pub(crate) mcp: Vec<McpStatus>,
+    pub(crate) conversation: Conversation,
+    /// The turn in progress
+    pub(crate) run: Option<Run>,
     /// Servers turned on with `:mcp on`, reported once when they connect or fail
-    asked: Vec<String>,
+    switched_on: Vec<String>,
     /// Servers that dropped while running and are reconnecting, reported if they fail
     dropped: Vec<String>,
     /// Set only once the agent reports a save time,
@@ -63,7 +73,7 @@ impl Session {
         let (client, inbox) = Client::start(command, images_shown)?;
         let opened = client.open(resume, None);
         let opened = match opened {
-            Err(e) if e.is::<AuthRequired>() => {
+            Err(e) if matches!(e.downcast_ref::<Refusal>(), Some(Refusal::AuthRequired(_))) => {
                 if !client.authenticate()? {
                     return Err(e);
                 }
@@ -84,20 +94,24 @@ impl Session {
             title: String::new(),
             options,
             mcp: Vec::new(),
-            asked: Vec::new(),
+            conversation: Conversation::default(),
+            run: None,
+            switched_on: Vec::new(),
             dropped: Vec::new(),
             saved: resume.is_some(),
             unsaved: false,
         })
     }
 
-    /// Takes one message at a time because later ones must be read after earlier ones are handled
-    pub(crate) fn poll(&mut self) -> Option<Vec<Output>> {
+    /// Takes one message at a time because later ones must be read after earlier ones are handled,
+    /// and is None when none has arrived
+    pub(crate) fn poll(&mut self) -> Option<Output> {
         let message = self.inbox.try_recv().ok()?;
-        let outputs = self.receive(message);
-        Some(outputs)
+        let output = self.receive(message);
+        Some(output)
     }
 
+    /// Only between turns, since a prompt's reply names no session
     pub(crate) fn open(&mut self, resume: Option<&str>) -> Result<()> {
         let opened = self.client.open(resume, Some(&self.id))?;
         if self.id != opened.id {
@@ -106,7 +120,7 @@ impl Session {
 
         // The chosen model may be gone from the config,
         // so keep the new session's default if switching fails
-        let current = models(&self.options).into_iter().find(|pick| pick.current);
+        let current = self.models().into_iter().find(|model| model.current);
         let mut options = opened.options;
         if let (Some(model), None) = (current, resume) {
             let switched = self.client.set_model(&opened.id, &options, &model.value);
@@ -119,7 +133,8 @@ impl Session {
         self.options = options;
         self.title.clear();
         self.mcp.clear();
-        self.asked.clear();
+        self.conversation = Conversation::default();
+        self.switched_on.clear();
         self.dropped.clear();
         self.saved = resume.is_some();
         self.unsaved = false;
@@ -127,72 +142,19 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) fn rows(&self, list: List) -> Result<Vec<Pick>> {
-        let rows = match list {
-            List::Sessions => {
-                let mut rows = Vec::new();
-                for info in self.client.sessions()? {
-                    let id = info.session_id.0.to_string();
-                    // Reopening the current session would restart Python
-                    if id == self.id {
-                        continue;
-                    }
+    /// Leaves this session out, since reopening it would restart Python
+    pub(crate) fn sessions(&self) -> Result<Vec<SessionInfo>> {
+        let mut sessions = self.client.sessions()?;
+        sessions.retain(|info| *info.session_id.0 != self.id);
+        Ok(sessions)
+    }
 
-                    // Each session takes exactly one line
-                    let title = info.title.unwrap_or_default();
-                    let words: Vec<&str> = title.split_whitespace().collect();
-                    let label = match words.is_empty() {
-                        true => id.clone(),
-                        false => words.join(" "),
-                    };
-                    let updated = info.updated_at.as_deref().map(stamp);
-                    let updated = updated.unwrap_or_default();
-                    rows.push(Pick {
-                        value: id,
-                        label,
-                        description: updated,
-                        current: false,
-                    });
-                }
-                rows
-            }
+    pub(crate) fn models(&self) -> Vec<Model> {
+        models(&self.options)
+    }
 
-            List::Models => models(&self.options),
-
-            List::Servers => {
-                let mut rows = Vec::new();
-                for server in &self.mcp {
-                    let state = server.state.to_string();
-                    rows.push(Pick {
-                        value: server.name.clone(),
-                        label: server.name.clone(),
-                        description: state,
-                        current: false,
-                    });
-                }
-                rows
-            }
-
-            List::Memories => {
-                let mut rows = Vec::new();
-                for memory in self.client.memories(&self.id)? {
-                    // Each memory takes exactly one line
-                    let words: Vec<&str> = memory.text.split_whitespace().collect();
-                    let scope = match memory.project {
-                        true => "project",
-                        false => "global",
-                    };
-                    rows.push(Pick {
-                        value: memory.id.to_string(),
-                        label: words.join(" "),
-                        description: format!("{scope} #{}", memory.id),
-                        current: false,
-                    });
-                }
-                rows
-            }
-        };
-        Ok(rows)
+    pub(crate) fn memories(&self) -> Result<Vec<Memory>> {
+        self.client.memories(&self.id)
     }
 
     pub(crate) fn model(&self) -> String {
@@ -200,23 +162,23 @@ impl Session {
         model_of(&self.options).unwrap_or_else(named)
     }
 
-    pub(crate) fn set_model(&mut self, name: &str) -> Result<String> {
+    pub(crate) fn set_model(&mut self, name: &str) -> Result<()> {
         self.options = self.client.set_model(&self.id, &self.options, name)?;
-        let model = self.model();
-        Ok(format!("model: {model}"))
+        Ok(())
     }
 
-    pub(crate) fn set_mcp(&mut self, on: bool, name: &str) -> Result<String> {
-        let option = format!("mcp.{name}");
+    /// Returns the server in the state it was switched to
+    pub(crate) fn set_mcp(&mut self, on: bool, name: &str) -> Result<McpStatus> {
+        let option = format!("{MCP_PREFIX}{name}");
         self.options = self.client.set_option(&self.id, &option, on)?;
 
         let state = match on {
             true => {
-                self.asked.push(name.to_owned());
+                self.switched_on.push(name.to_owned());
                 McpState::Connecting
             }
             false => {
-                self.asked.retain(|asked| asked != name);
+                self.switched_on.retain(|switched| switched != name);
                 McpState::Off
             }
         };
@@ -226,51 +188,66 @@ impl Session {
             server.state = state.clone();
         }
 
-        Ok(format!("mcp: {name}: {state}"))
+        let name = name.to_owned();
+        Ok(McpStatus { name, state })
     }
 
-    /// Takes the `value` of a memory's row
-    pub(crate) fn forget(&self, value: &str) -> Result<String> {
-        let id: i64 = value.parse()?;
-        self.client.forget(&self.id, id)?;
-        Ok(format!(
-            "forgot memory {id}; the system prompt drops it next session"
-        ))
+    pub(crate) fn forget(&self, id: i64) -> Result<()> {
+        self.client.forget(&self.id, id)
     }
 
+    /// Called before the client drops, so an exited agent ended on its own
     pub(crate) fn parting(&self) -> Option<String> {
-        if self.client.exited() {
-            return None;
-        }
-
         let id = &self.id;
-        let line = match (self.saved, self.unsaved) {
-            (true, false) => format!("session {id}: saved; resume with `smol --resume {id}`"),
-            (true, true) => format!("session {id}: the last save failed; `smol --resume {id}` restores the last saved state"),
-            (false, true) => format!("session {id}: not saved"),
-            (false, false) => return None,
+        let line = match (self.saved, self.unsaved, self.client.exited()) {
+            (true, _, true) => format!("session {id}: the agent exited; `smol --resume {id}` restores the last saved state"),
+            (true, false, false) => format!("session {id}: saved; resume with `smol --resume {id}`"),
+            (true, true, false) => format!("session {id}: the last save failed; `smol --resume {id}` restores the last saved state"),
+            (false, true, _) => format!("session {id}: not saved"),
+            (false, false, _) => return None,
         };
         Some(line)
     }
 
-    pub(crate) fn prompt(&self, text: &str) {
+    pub(crate) fn running(&self) -> bool {
+        self.run.as_ref().is_some_and(|run| !run.interrupting)
+    }
+
+    pub(crate) fn prompt(&mut self, text: &str) {
+        self.conversation.task(text);
+        self.run = Some(Run::new());
         let blocks = self.blocks(text);
         self.client.prompt(&self.id, blocks);
     }
 
-    pub(crate) fn enqueued(&self) {
-        self.client.enqueued(&self.id);
+    pub(crate) fn notify_queued(&self) {
+        self.client.notify_queued(&self.id);
     }
 
-    pub(crate) fn shell(&self, command: &str) {
+    /// Gives the running turn the messages queued for it, which may be none
+    pub(crate) fn answer(&mut self, asked: Asked, texts: impl IntoIterator<Item = String>) {
+        let mut prompts = Vec::new();
+        for text in texts {
+            self.conversation.amend(&text);
+            let blocks = self.blocks(&text);
+            prompts.push(blocks);
+        }
+        asked.answer(prompts);
+    }
+
+    pub(crate) fn shell(&mut self, command: &str) {
+        self.run = Some(Run::new());
         self.client.shell(&self.id, command);
     }
 
-    pub(crate) fn cancel(&self) {
-        self.client.cancel(&self.id);
+    pub(crate) fn cancel(&mut self) {
+        if let Some(run) = &mut self.run {
+            run.interrupting = true;
+            self.client.cancel(&self.id);
+        }
     }
 
-    pub(crate) fn blocks(&self, text: &str) -> Vec<ContentBlock> {
+    fn blocks(&self, text: &str) -> Vec<ContentBlock> {
         let cwd = &self.client.cwd;
         let exists = |path: &str| {
             let misread = cfg!(windows) && dotted(path);
@@ -290,31 +267,36 @@ impl Session {
         blocks
     }
 
-    fn receive(&mut self, message: Incoming) -> Vec<Output> {
+    fn receive(&mut self, message: Incoming) -> Output {
         match message {
             Incoming::Update(session, update) if session == self.id => {
-                let SessionUpdate::SessionInfoUpdate(info) = &*update else {
-                    return vec![Output::Update(update)];
-                };
-                if let MaybeUndefined::Value(title) = &info.title {
-                    self.title = title.clone();
+                if let SessionUpdate::SessionInfoUpdate(info) = &*update {
+                    if let MaybeUndefined::Value(title) = &info.title {
+                        self.title = title.clone();
+                    }
+                    if let MaybeUndefined::Value(_) = &info.updated_at {
+                        self.saved = true;
+                        self.unsaved = false;
+                    }
+                    return Output::Shown;
                 }
-                if let MaybeUndefined::Value(_) = &info.updated_at {
-                    self.saved = true;
-                    self.unsaved = false;
+
+                let ended = self.conversation.update(&update);
+                if let Some(run) = self.run.as_mut().filter(|_| ended) {
+                    run.step_started = Instant::now();
                 }
-                vec![Output::Status]
+                Output::Shown
             }
 
             Incoming::Notice(session, notice) if session == self.id => {
                 self.unsaved |= notice.unsaved;
-                vec![Output::Notice(notice)]
+                self.conversation.notice(&notice);
+                Output::Shown
             }
 
-            Incoming::Queued(session, asked) if session == self.id => vec![Output::Queued(asked)],
+            Incoming::Queued(session, asked) if session == self.id => Output::Queued(asked),
 
             Incoming::Mcp(session, servers) if session == self.id => {
-                let mut outputs = Vec::new();
                 for server in &servers {
                     let old = self.mcp.iter().find(|old| old.name == server.name);
                     let old = old.map(|old| &old.state);
@@ -323,49 +305,46 @@ impl Session {
                     }
 
                     let name = &server.name;
-                    let asked = self.asked.contains(name);
+                    let switched_on = self.switched_on.contains(name);
                     let connected = matches!(old, Some(McpState::Connected { .. }));
                     let dropped = connected || self.dropped.contains(name);
                     self.dropped.retain(|dropped| dropped != name);
                     // The agent first tries to reconnect a server that drops after connecting
-                    if connected && !asked && server.state == McpState::Connecting {
+                    if connected && !switched_on && server.state == McpState::Connecting {
                         self.dropped.push(name.clone());
                     }
 
-                    let text = format!("mcp: {name}: {}", server.state);
-                    let output = match &server.state {
-                        McpState::Connected { .. } if asked => Output::Info(text),
-                        McpState::Failed { .. } if asked || dropped => Output::Failure(text),
+                    let text = server.to_string();
+                    let entry = match &server.state {
+                        McpState::Connected { .. } if switched_on => Entry::Info(text),
+                        McpState::Failed { .. } if switched_on || dropped => Entry::Failure(text),
                         // States sent before the switch still show it off,
                         // so wait for this connection's result
                         _ => continue,
                     };
 
-                    self.asked.retain(|asked| asked != name);
-                    outputs.push(output);
+                    self.switched_on.retain(|switched| switched != name);
+                    self.conversation.push(entry);
                 }
 
                 self.mcp = servers;
-                outputs.push(Output::Status);
-                outputs
+                Output::Servers
             }
 
-            Incoming::Exited(text) => vec![Output::Failure(text)],
+            Incoming::Exited(text) => {
+                self.conversation.push(Entry::Failure(text));
+                Output::Shown
+            }
 
-            Incoming::Done(stop) => vec![Output::Done(stop)],
+            Incoming::Done(stop) => {
+                self.run = None;
+                self.conversation.done(stop);
+                Output::Done
+            }
 
-            _ => Vec::new(),
+            _ => Output::Shown,
         }
     }
-}
-
-fn stamp(rfc3339: &str) -> String {
-    let Ok(time) = DateTime::parse_from_rfc3339(rfc3339) else {
-        let spaced = rfc3339.replacen('T', " ", 1);
-        return spaced.chars().take(16).collect();
-    };
-    let local = time.with_timezone(&Local);
-    local.format("%Y-%m-%d %H:%M").to_string()
 }
 
 pub(crate) fn opens_mention(before: &str) -> bool {
@@ -459,6 +438,7 @@ fn mentions(text: &str, exists: impl Fn(&str) -> bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use crate::chat::*;
+    use crate::client::Notice;
     use crate::tests::{fake, shell};
     use agent_client_protocol_schema::v1::SessionInfoUpdate;
     use std::cell::Cell;
@@ -479,12 +459,16 @@ mod tests {
         Incoming::Update(session.to_owned(), update)
     }
 
-    fn shown(outputs: Vec<Output>) -> Vec<String> {
+    /// The infos and failures that receiving `message` added
+    fn shown(session: &mut Session, message: Incoming) -> Vec<String> {
+        let before = session.conversation.entries().len();
+        session.receive(message);
+
         let mut shown = Vec::new();
-        for output in outputs {
-            match output {
-                Output::Info(text) => shown.push(text),
-                Output::Failure(text) => shown.push(format!("✗ {text}")),
+        for entry in &session.conversation.entries()[before..] {
+            match entry {
+                Entry::Info(text) => shown.push(text.clone()),
+                Entry::Failure(text) => shown.push(format!("✗ {text}")),
                 _ => {}
             }
         }
@@ -492,48 +476,45 @@ mod tests {
     }
 
     #[test]
-    fn asked_until_settled() {
+    fn switched_until_settled() {
         let agent = fake();
         let mut session = Session::start(&agent, None, None, false).expect("start");
 
         let switched = session.set_mcp(true, "web").expect("switch");
-        assert_eq!(switched, "mcp: web: connecting");
+        assert_eq!(switched.to_string(), "mcp: web: connecting");
 
         let stale = status("s1", McpState::Off);
-        let stale = session.receive(stale);
-        assert!(shown(stale).is_empty());
+        assert!(shown(&mut session, stale).is_empty());
         let other = status("s9", McpState::Connected { tools: 1 });
-        let other = session.receive(other);
-        assert!(other.is_empty());
+        assert!(matches!(session.receive(other), Output::Shown));
 
         let connected = status("s1", McpState::Connected { tools: 2 });
-        let connected = session.receive(connected);
-        assert_eq!(shown(connected), ["mcp: web: connected, 2 tools"]);
+        let connected = shown(&mut session, connected);
+        assert_eq!(connected, ["mcp: web: connected, 2 tools"]);
         let off = status("s1", McpState::Off);
-        let off = session.receive(off);
+        let off = shown(&mut session, off);
         let again = status("s1", McpState::Connected { tools: 2 });
-        let again = session.receive(again);
-        assert!(shown(off).is_empty() && shown(again).is_empty());
+        let again = shown(&mut session, again);
+        assert!(off.is_empty() && again.is_empty());
 
         let error = "disconnected".to_owned();
         let dropped = status("s1", McpState::Failed { error });
-        let dropped = session.receive(dropped);
-        assert_eq!(shown(dropped), ["✗ mcp: web: failed: disconnected"]);
+        let dropped = shown(&mut session, dropped);
+        assert_eq!(dropped, ["✗ mcp: web: failed: disconnected"]);
         let connecting = status("s1", McpState::Connecting);
         session.receive(connecting);
         let error = "connection refused".to_owned();
         let failed = status("s1", McpState::Failed { error });
-        let failed = session.receive(failed);
-        assert!(shown(failed).is_empty());
+        assert!(shown(&mut session, failed).is_empty());
 
         session.set_mcp(true, "web").expect("switch");
         let error = "refused again".to_owned();
         let failed = status("s1", McpState::Failed { error });
-        let failed = session.receive(failed);
-        assert_eq!(shown(failed), ["✗ mcp: web: failed: refused again"]);
+        let failed = shown(&mut session, failed);
+        assert_eq!(failed, ["✗ mcp: web: failed: refused again"]);
 
         let switched = session.set_mcp(false, "web").expect("switch");
-        assert_eq!(switched, "mcp: web: off");
+        assert_eq!(switched.to_string(), "mcp: web: off");
         assert_eq!(session.mcp[0].state, McpState::Off);
     }
 
@@ -543,8 +524,7 @@ mod tests {
         let mut session = Session::start(&agent, None, None, false).expect("start");
         let mut seen = |state: McpState| {
             let message = status("s1", state);
-            let outputs = session.receive(message);
-            shown(outputs)
+            shown(&mut session, message)
         };
 
         assert!(seen(McpState::Connected { tools: 2 }).is_empty());
@@ -589,8 +569,7 @@ mod tests {
         assert!(session.saved);
 
         let connected = status("s1", McpState::Connected { tools: 1 });
-        let connected = session.receive(connected);
-        assert!(shown(connected).is_empty());
+        assert!(shown(&mut session, connected).is_empty());
         let missing = session.open(Some("nope"));
         assert!(missing.is_err());
         assert_eq!(session.id, "s1");
@@ -624,26 +603,45 @@ mod tests {
     }
 
     #[test]
+    fn parting_after_exit() {
+        let agent = fake();
+        let mut session = Session::start(&agent, None, None, false).expect("start");
+        let stamped = SessionInfoUpdate::new().updated_at("2026-10-18T00:00:00Z".to_owned());
+        let stamped = info("s1", stamped);
+        session.receive(stamped);
+
+        session.prompt("exit");
+        for _ in 0..500 {
+            while session.poll().is_some() {}
+            if session.run.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let exited =
+            "session s1: the agent exited; `smol --resume s1` restores the last saved state";
+        assert_eq!(session.parting().as_deref(), Some(exited));
+    }
+
+    #[test]
     fn dropped_ask_answered() {
         let agent = fake();
         let mut session = Session::start(&agent, None, None, false).expect("start");
         session.prompt("queue");
 
-        let mut stops = Vec::new();
+        let mut done = false;
         for _ in 0..500 {
-            while let Some(outputs) = session.poll() {
-                for output in outputs {
-                    if let Output::Done(stop) = output {
-                        stops.push(stop.ok());
-                    }
-                }
+            while let Some(output) = session.poll() {
+                done |= matches!(output, Output::Done);
             }
-            if !stops.is_empty() {
+            if done {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(stops, [Some(StopReason::Cancelled)]);
+        assert!(done && session.run.is_none());
+        let failed = |entry: &Entry| matches!(entry, Entry::Failure(_));
+        assert!(!session.conversation.entries().iter().any(failed));
     }
 
     #[test]
@@ -711,16 +709,6 @@ done
         let reopened = session.open(Some("latest"));
         let error = reopened.expect_err("latest");
         assert!(error.to_string().ends_with("nothing to resume"), "{error}");
-    }
-
-    #[test]
-    fn short_stamp() {
-        let utc = "2026-10-04T08:09:10+00:00";
-        let time = DateTime::parse_from_rfc3339(utc).expect("time");
-        let local = time.with_timezone(&Local);
-        let expected = local.format("%Y-%m-%d %H:%M").to_string();
-        assert_eq!(stamp(utc), expected);
-        assert_eq!(stamp("2026-10-04T08:09:10"), "2026-10-04 08:09");
     }
 
     #[test]

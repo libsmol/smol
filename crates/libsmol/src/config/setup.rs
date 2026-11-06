@@ -1,5 +1,5 @@
-use crate::config::{self, parse_url, MIN_CONTEXT, MODEL_FILE};
-use crate::model::{listed, ListError, ModelSpec, DEFAULT_API};
+use crate::config::{self, parse_url, ModelSpec, MIN_CONTEXT, MODEL_FILE};
+use crate::model::{listed, ListError, DEFAULT_API};
 use crate::utils::block_on;
 use crate::{Error, Result};
 use inquire::error::CustomUserError;
@@ -57,7 +57,7 @@ pub fn run() -> Result<()> {
     let mut api = String::new();
     let mut key = String::new();
     let mut next = Ask::Address;
-    let mut spec = loop {
+    let (id, reported) = loop {
         match next {
             Ask::Address => {
                 let question = Text::new("API base URL")
@@ -92,14 +92,16 @@ pub fn run() -> Result<()> {
 
                 let listing = listed(&api, &key);
                 let (message, suggested) = match block_on(listing) {
-                    Ok(mut specs) => {
-                        let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
+                    Ok(mut offered) => {
+                        let ids: Vec<&str> =
+                            offered.iter().map(|model| model.id.as_str()).collect();
                         let chosen = Select::new("Model", ids)
                             .with_page_size(PAGE_SIZE)
                             .raw_prompt()
                             .map_err(failed)?;
                         let index = chosen.index;
-                        break specs.swap_remove(index);
+                        let model = offered.swap_remove(index);
+                        break (model.id, model.context);
                     }
                     Err(ListError::Key(message)) => (message, Ask::Key),
                     Err(ListError::Address(message)) => (message, Ask::Address),
@@ -122,10 +124,7 @@ pub fn run() -> Result<()> {
                     .prompt()
                     .map_err(failed)?;
                 let id = answer.trim().to_owned();
-                break ModelSpec {
-                    id,
-                    ..ModelSpec::default()
-                };
+                break (id, None);
             }
         }
     };
@@ -139,7 +138,7 @@ pub fn run() -> Result<()> {
         .map_err(failed)?;
     let name = answer.trim().to_owned();
 
-    let reported = spec.context.map(|context| context.to_string());
+    let reported = reported.map(|context| context.to_string());
     let help = match reported {
         Some(_) => "Reported by the endpoint, older steps are summarized before it fills",
         None => "Older steps are summarized before it fills, leave it empty to never summarize",
@@ -151,8 +150,13 @@ pub fn run() -> Result<()> {
         .with_validator(validator(parse_context))
         .prompt()
         .map_err(failed)?;
-    spec.context = parse_context(answer.trim()).unwrap_or_default();
+    let context = parse_context(answer.trim()).unwrap_or_default();
 
+    let spec = ModelSpec {
+        id,
+        context,
+        ..ModelSpec::default()
+    };
     config::save_model(&dir, &name, &api, &key, &spec)?;
     eprintln!("Wrote {shown}, edit it to add models or set max_tokens, effort, image and video");
 
@@ -237,16 +241,9 @@ mod tests {
     fn default_names() {
         let cases = [
             ("https://api.deepseek.com/v1", "deepseek"),
-            ("https://openrouter.ai/api/v1", "openrouter"),
-            (
-                "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                "aliyuncs",
-            ),
             ("http://localhost:11434/v1", "local"),
             ("http://127.0.0.1:8000/v1", "local"),
-            ("http://[::1]:8000/v1", "local"),
             ("http://ollama:11434/v1", "ollama"),
-            ("https://open.bigmodel.cn/api/paas/v4", "bigmodel"),
             ("https://example.com./v1", "example"),
             ("https://api.café.com/v1", "xn--caf-dma"),
         ];

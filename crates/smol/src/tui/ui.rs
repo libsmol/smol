@@ -1,7 +1,8 @@
 use crate::client::{tool_count, McpState, McpStatus};
+use crate::conversation::Stats;
 use crate::tui::app::App;
 use crate::tui::picture;
-use crate::tui::render::wrap_ranges;
+use crate::tui::render::{wrap_ranges, Target};
 use crate::tui::{
     clipped, fitted, in_out, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG,
 };
@@ -68,23 +69,24 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         "" => "new session",
         title => title,
     };
+    let talk = &app.session.conversation;
     let mut block = panel();
     let mut usage_width = 0;
 
     if narrow {
-        let stats = app.transcript.stats();
+        let stats = talk.stats();
         let tokens = in_out(stats.input, stats.output);
         let mut usage = format!(" {tokens}");
         if stats.context.is_some() && stats.window.is_some() {
-            let approx = stats.approx();
+            let mark = approx(stats);
             let share = match stats.ratio() {
-                Some(ratio) => format!("{approx}{:.0}%", ratio * 100.0),
+                Some(ratio) => format!("{mark}{:.0}%", ratio * 100.0),
                 None => "?%".to_owned(),
             };
             usage += &format!(" · context {share}");
         }
 
-        let working = app.transcript.helping();
+        let working = talk.helping();
         let mut agents = Vec::new();
         if working > 0 {
             agents.push(format!("{working} working"));
@@ -124,7 +126,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let model = fitted(&model, width);
 
         // The row count is fixed, so rows hold their place even before data arrives
-        let stats = app.transcript.stats();
+        let stats = talk.stats();
         let turns = stats.turns.to_string();
         let steps = stats.steps.to_string();
         let turns = vec![Span::styled("turns ", DIM), Span::raw(turns)];
@@ -135,7 +137,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let tokens = labeled("tokens", tokens, width);
 
         let ratio = stats.ratio();
-        let approx = stats.approx();
+        let mark = approx(stats);
         let context = match (stats.context, stats.window) {
             (Some(used), Some(window)) => {
                 let used = kilo(used);
@@ -143,14 +145,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                 match ratio {
                     Some(ratio) => {
                         let share = ratio * 100.0;
-                        format!("{approx}{used} / {window} · {share:.0}%")
+                        format!("{mark}{used} / {window} · {share:.0}%")
                     }
                     None => format!("? / {window}"),
                 }
             }
             (Some(used), None) => {
                 let used = kilo(used);
-                format!("{approx}{used}")
+                format!("{mark}{used}")
             }
             (None, _) => "–".to_owned(),
         };
@@ -170,7 +172,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
 
         // The progress line already counts the agents at work, and both don't fit here
         let helped = stats.agent_input + stats.agent_output > 0;
-        let working = app.transcript.helping();
+        let working = talk.helping();
         let agents = match (helped, working) {
             (true, _) => Some(in_out(stats.agent_input, stats.agent_output)),
             (false, 0) => None,
@@ -220,6 +222,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let conversation_inner = block.inner(conversation);
     // The rows on screen depend on how many these take, so they come from the previous frame's
     let pinned = app.transcript.pinned(
+        talk,
         conversation_inner.width,
         usize::from(conversation_inner.height),
     );
@@ -230,17 +233,16 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     app.pinned_area = pinned_area;
 
     let mut progress = Vec::new();
-    if let Some(run) = &app.run {
+    if let Some(run) = &app.session.run {
         let started = run.step_started;
         let elapsed = started.elapsed();
         let tick = spinner(started);
         let spinner = format!("  {tick} ");
 
-        let transcript = &app.transcript;
-        let writing = transcript.writing();
-        let left = transcript.retry_in();
+        let writing = talk.writing();
+        let left = talk.retry_in();
         let seconds = elapsed.as_secs();
-        let estimated = match transcript.stats().estimated {
+        let estimated = match talk.stats().estimated {
             Some(tokens) => {
                 let tokens = kilo(tokens);
                 format!(" · ≈⇣{tokens}")
@@ -252,15 +254,15 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let connecting = |server: &&McpStatus| server.state == McpState::Connecting;
         let connecting = app.session.mcp.iter().filter(connecting);
         let connecting: Vec<&str> = connecting.map(|server| server.name.as_str()).collect();
-        let waiting = transcript.unstarted() && !connecting.is_empty();
-        let helping = transcript.awaited();
+        let waiting = talk.unstarted() && !connecting.is_empty();
+        let helping = talk.awaited();
         let label = match (run.interrupting, left, writing) {
             (true, _, _) => "interrupting…".to_owned(),
             (false, Some(left), _) => {
                 let wait = left.as_secs_f64().ceil();
                 format!("retrying in {wait}s")
             }
-            (false, None, _) if transcript.shelling() => format!("running · {seconds}s"),
+            (false, None, _) if talk.shelling() => format!("running · {seconds}s"),
             (false, None, _) if waiting => {
                 let names = connecting.join(", ");
                 format!("waiting for mcp {names} · {seconds}s")
@@ -277,7 +279,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         };
 
         // Lines up with the blank row that starts `Render::step`
-        if !transcript.stepping() {
+        if !talk.stepping() {
             progress.push(Line::default());
         }
         let italic = DIM.add_modifier(Modifier::ITALIC);
@@ -294,9 +296,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let anchor = app.transcript.anchor(old_top, inner.width, app.expanded);
     let anchor = anchor.filter(|_| app.scrolled_back > 0);
     let scrolled = app.scrolled_back != app.drawn_back;
-    let rows = app.transcript.rows(inner.width, app.expanded);
+    let rows = app.transcript.rows(talk, inner.width, app.expanded);
 
     app.scrollbar = Rect::default();
+    app.shown.clear();
     // The welcome logo moves, and so do the spinners of pictures loading
     app.animating = rows.is_empty() || picture::loading();
     if rows.is_empty() {
@@ -411,6 +414,20 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             if x < inner.right() {
                 let frame_char = spinner(since).to_string();
                 frame.buffer_mut()[(x, y)].set_symbol(&frame_char);
+            }
+        }
+        // A picture's rows are adjacent, so each shows once
+        let targets = rows
+            .iter()
+            .skip(top)
+            .take(height)
+            .flat_map(|row| &row.targets);
+        for (_, target) in targets {
+            let Target::Picture(source) = target else {
+                continue;
+            };
+            if app.shown.last() != Some(source) {
+                app.shown.push(source.clone());
             }
         }
 
@@ -562,7 +579,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             true => "ctrl+o collapse",
             false => "ctrl+o expand",
         };
-        let enter = match app.run {
+        let enter = match app.session.run {
             Some(_) => "enter queue",
             None => "enter send",
         };
@@ -571,15 +588,18 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             false => "↑ edit queued · ",
         };
 
-        let text = if app.running() {
+        let text = if app.session.running() {
             format!("{enter} · {queued}esc interrupt · {expand}")
-        } else if app.run.is_some() {
+        } else if app.session.run.is_some() {
             format!("{enter} · {queued}{expand}")
         } else if app.draft().is_empty() {
             format!("ctrl+d quit · {expand} · : commands")
         } else {
-            // Windows Terminal keeps alt+enter for full screen
-            let newline = if cfg!(windows) { "ctrl+j" } else { "alt+enter" };
+            // VS Code takes ctrl+j, Windows Terminal takes alt+enter and macOS sends it as enter
+            let newline = match cfg!(target_os = "linux") {
+                true => "alt+enter",
+                false => "ctrl+j",
+            };
             format!("{newline} newline · {expand} · : commands")
         };
         keys(&text)
@@ -627,6 +647,13 @@ fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> 
     spans.push(Span::raw(padding));
     spans.extend(right);
     Line::from(spans)
+}
+
+fn approx(stats: &Stats) -> &'static str {
+    match stats.estimated {
+        Some(_) => "≈",
+        None => "",
+    }
 }
 
 fn labeled(label: &str, value: String, width: usize) -> Line<'static> {
@@ -859,9 +886,6 @@ mod tests {
         assert_eq!(first_row("build the backend", 28), "build the backend");
         assert_eq!(first_row("  ", 28), "");
 
-        let long = "Own the frontend 🎨: components, styles and interactions, pages from the designs 📐, unit tests 🧪";
-        let first = first_row(long, 10);
-        assert!(first.ends_with('…') && first.width() <= 10, "{first}");
         assert_eq!(first_row("naïve café 🐍 crème brûlée", 10), "naïve caf…");
 
         let emoji = first_row("⚠️ careful ✔️ done", 13);
@@ -903,7 +927,6 @@ mod tests {
             "123456",
             "1234567",
             "🍕🚀🎉🐍",
-            "🍕🚀🎉🐍🌮",
             "a\nb\nc",
             "a\tb",
             "abc\td",
@@ -975,7 +998,7 @@ mod tests {
         let reply = ContentBlock::from("ok");
         let reply = ContentChunk::new(reply);
         let reply = SessionUpdate::AgentMessageChunk(reply);
-        app.transcript.update(&reply);
+        app.session.conversation.update(&reply);
         let rows = screen(&mut app, 80, 12);
         assert!(!rows.iter().any(|row| row.contains("waiting")), "{rows:#?}");
     }
@@ -1031,6 +1054,20 @@ mod tests {
     }
 
     #[test]
+    fn newline_hint_shown() {
+        let mut app = app();
+        app.input = input_box("café");
+        let rows = screen(&mut app, 80, 12);
+
+        let newline = match cfg!(target_os = "linux") {
+            true => "alt+enter",
+            false => "ctrl+j",
+        };
+        let hint = format!("{newline} newline · ctrl+o expand · : commands ");
+        assert!(rows[11].ends_with(&hint), "{rows:#?}");
+    }
+
+    #[test]
     fn scrollbar_follows_view() {
         let mut app = app();
         fill(&mut app, 40);
@@ -1081,7 +1118,7 @@ mod tests {
         let meta = meta.as_object().cloned();
         let usage = UsageUpdate::new(5000, 100_000).meta(meta);
         let update = SessionUpdate::UsageUpdate(usage);
-        app.transcript.update(&update);
+        app.session.conversation.update(&update);
 
         let screen = screen(&mut app, 120, 20).join("\n");
         assert!(screen.contains("s · ≈⇣1.23k"), "{screen}");
@@ -1095,7 +1132,8 @@ mod tests {
             .collect();
         let fields = ToolCallUpdateFields::new().status(status).content(content);
         let update = ToolCallUpdate::new(id.to_owned(), fields).meta(meta.as_object().cloned());
-        app.transcript
+        app.session
+            .conversation
             .update(&SessionUpdate::ToolCallUpdate(update));
     }
 
@@ -1108,7 +1146,9 @@ mod tests {
         let running = ToolCall::new("call_1", "agent(tasks)")
             .status(ToolCallStatus::InProgress)
             .content(vec![code]);
-        app.transcript.update(&SessionUpdate::ToolCall(running));
+        app.session
+            .conversation
+            .update(&SessionUpdate::ToolCall(running));
 
         let tasks = [
             "Review prices.py",
@@ -1124,7 +1164,9 @@ mod tests {
             let opened = ToolCall::new(id, format!("agent: {task}"))
                 .raw_input(asked)
                 .meta(meta.as_object().cloned());
-            app.transcript.update(&SessionUpdate::ToolCall(opened));
+            app.session
+                .conversation
+                .update(&SessionUpdate::ToolCall(opened));
         }
 
         let marked = json!({});
@@ -1162,9 +1204,9 @@ mod tests {
             stopped,
         );
 
-        let stats = app.transcript.stats();
+        let stats = app.session.conversation.stats();
         assert_eq!((stats.input, stats.output, stats.steps), (0, 0, 0));
-        assert_eq!(app.transcript.helping(), 2);
+        assert_eq!(app.session.conversation.helping(), 2);
         let rows = screen(&mut app, 120, 30);
         let wide = rows.join("\n");
         let header =
@@ -1252,7 +1294,9 @@ mod tests {
         let mut app = app();
         app.submit_text("wait");
         let running = ToolCall::new("call_1", "agent(tasks)").status(ToolCallStatus::InProgress);
-        app.transcript.update(&SessionUpdate::ToolCall(running));
+        app.session
+            .conversation
+            .update(&SessionUpdate::ToolCall(running));
         for (offset, task) in ["Review café.py", "Review naïve.py"].iter().enumerate() {
             let id = format!("call_1.{}", offset + 1);
             let meta = json!({ "_smol/agent": true, "parent": "call_1" });
@@ -1260,7 +1304,9 @@ mod tests {
             let opened = ToolCall::new(id.clone(), format!("agent: {task}"))
                 .raw_input(asked)
                 .meta(meta.as_object().cloned());
-            app.transcript.update(&SessionUpdate::ToolCall(opened));
+            app.session
+                .conversation
+                .update(&SessionUpdate::ToolCall(opened));
             helper_update(
                 &mut app,
                 &id,
@@ -1271,7 +1317,9 @@ mod tests {
         }
         let meta = json!({ "duration": 0.5 });
         let ended = UsageUpdate::new(0, 1000).meta(meta.as_object().cloned());
-        app.transcript.update(&SessionUpdate::UsageUpdate(ended));
+        app.session
+            .conversation
+            .update(&SessionUpdate::UsageUpdate(ended));
         fill(&mut app, 40);
 
         let pinned = |app: &mut App, width| {

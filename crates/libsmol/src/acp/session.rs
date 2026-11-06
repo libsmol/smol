@@ -1,13 +1,13 @@
-use crate::acp::rpc::{Notice, Peer};
+use crate::acp::rpc::{Notice, Peer, SessionPeer};
 use crate::acp::servers::McpPool;
 use crate::acp::translator::Translator;
-use crate::acp::{rfc3339, task_of, to_value, App, QUEUED};
+use crate::acp::{rfc3339, task_of, to_value, App};
 use crate::agent::{
     title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Sink, Task,
 };
-use crate::config::{self, Access, McpConfig, Models};
+use crate::config::{self, Access, McpConfig, Models, Skipped};
 use crate::history::{Lock, SessionMeta, Settings};
-use crate::spawn::{spawn_shell, Group};
+use crate::spawn::{run_shell, Process};
 use crate::steps::{AgentMemory, Exit, MemoryStep};
 use crate::tools::memories::{Listed, Memories};
 use crate::utils::Interrupt;
@@ -22,8 +22,9 @@ use agent_client_protocol_schema::v1::{
     SetSessionConfigOptionResponse, StopReason,
 };
 use reaper::tilde;
+use reaper::wire::MCP_PREFIX;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,10 +37,9 @@ use tokio::task::{self, AbortHandle, JoinHandle};
 use tokio::time;
 use tracing::{error, info, warn};
 
-/// Must stay under the 5 seconds serve waits for sessions on exit
+/// Starts once the closing turn is saved, and only the title is lost past serve's SAVE_WAIT
 const NAME_WAIT: Duration = Duration::from_secs(3);
 const MODEL_OPTION: &str = "model";
-const MCP_OPTION: &str = "mcp.";
 
 /// All of these wait in the channel while a turn is running
 pub(crate) enum Message {
@@ -73,6 +73,7 @@ pub(crate) struct Opening {
     pub(crate) models: Models,
     pub(crate) servers: Vec<McpConfig>,
     pub(crate) access: Access,
+    pub(crate) mcp_skipped: Vec<Skipped>,
     pub(crate) app: Arc<App>,
     pub(crate) interrupt: Interrupt,
     pub(crate) enqueued: Arc<Notify>,
@@ -85,7 +86,6 @@ struct Queued {
 }
 
 struct Session {
-    interrupt: Interrupt,
     memory: AgentMemory,
     models: Models,
     agent: Agent,
@@ -93,7 +93,7 @@ struct Session {
     worker: Worker,
     servers: McpPool,
     /// Programs that user commands left in the background, which end with the session
-    background: Vec<Group>,
+    background: Vec<Process>,
     keeper: Keeper,
     _lock: Option<Lock>,
 }
@@ -106,12 +106,12 @@ struct Keeper {
     titling: Option<(oneshot::Receiver<Option<String>>, AbortHandle)>,
     unsaved: Unsaved,
     translator: Translator,
+    peer: SessionPeer,
 }
 
 /// The messages the client queues during a turn, which the session's agent takes as task updates
 struct ClientQueue {
-    peer: Arc<Peer>,
-    session: String,
+    peer: SessionPeer,
     enqueued: Arc<Notify>,
 }
 
@@ -129,23 +129,6 @@ impl Unsaved {
 
 /// Only `Router` holds the sender of `inbox`, and dropping it closes the session
 pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>) {
-    let id = opening.id.clone();
-    let session = opening.session.clone();
-    let app = Arc::clone(&opening.app);
-    let started = start(opening, &inbox).await;
-    match started {
-        Ok(opened) => opened.run(inbox).await,
-        Err(error) => {
-            error!("session: open failed, {error}");
-            // A request that came in after the queue was answered would be lost
-            inbox.close();
-            refuse_queued(&mut inbox, &app.peer, &session);
-            app.peer.respond(&id, Err(error));
-        }
-    }
-}
-
-async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<Session> {
     let Opening {
         id,
         session,
@@ -155,190 +138,210 @@ async fn start(opening: Opening, inbox: &UnboundedReceiver<Message>) -> Result<S
         models,
         servers,
         access,
+        mcp_skipped,
         app,
         interrupt,
         enqueued,
         memories,
     } = opening;
-    let peer = &app.peer;
 
-    if let Some(previous) = previous {
-        previous.await.ok();
-    }
-    if inbox.is_closed() {
-        return Err(Error::SessionNotFound(session));
-    }
-
-    // Read the saved session only after locking because another process
-    // saves its last step before releasing the lock
-    let lock = app.store.lock(&cwd, &session)?;
-    let (mut meta, memory) = match loading {
-        true => app.store.load(&cwd, &session)?,
-        false => {
-            let meta = SessionMeta::new(session, Settings::default());
-            (meta, AgentMemory::default())
+    let starting = async {
+        if let Some(previous) = previous {
+            previous.await.ok();
         }
-    };
-
-    let mut notices = Vec::new();
-    let previously = &meta.settings;
-    let names = models.names();
-    let model = match names.contains(&previously.model) {
-        true => previously.model.clone(),
-        false => names.first().cloned().unwrap_or_default(),
-    };
-    if !previously.model.is_empty() && model != previously.model {
-        let gone = &previously.model;
-        let notice = format!("model: {gone}: not in model.toml, using {model}");
-        notices.push(notice);
-    }
-
-    let (instructions, skipped) = config::instructions(&app.config, &cwd);
-    for problem in skipped {
-        let notice = problem.to_string();
-        notices.push(notice);
-    }
-    let (skills, skipped) = config::skills(&app.config, &cwd);
-    for problem in skipped {
-        let notice = problem.to_string();
-        notices.push(notice);
-    }
-    let (roles, skipped) = config::roles(&app.config, &cwd, &models);
-    for problem in skipped {
-        let notice = problem.to_string();
-        notices.push(notice);
-    }
-    let listed = match memories.listed().await {
-        Ok(listed) => listed,
-        Err(problem) => {
-            notices.push(problem);
-            Listed::default()
+        if inbox.is_closed() {
+            return Err(Error::SessionNotFound(session.clone()));
         }
-    };
 
-    let mut settings = Settings {
-        cwd: cwd.clone(),
-        model,
-        name: previously.name.clone(),
-        ..Settings::default()
+        // Read the saved session only after locking because another process
+        // saves its last step before releasing the lock
+        let lock = app.store.lock(&cwd, &session)?;
+        let (mut meta, memory) = match loading {
+            true => app.store.load(&cwd, &session)?,
+            false => {
+                let meta = SessionMeta::new(session.clone(), Settings::default());
+                (meta, AgentMemory::default())
+            }
+        };
+        let peer = SessionPeer::new(Arc::clone(&app.peer), &meta.id);
+
+        let mut notices = Vec::new();
+        let previously = &meta.settings;
+        let names = models.names();
+        let model = match names.contains(&previously.model) {
+            true => previously.model.clone(),
+            false => names.first().cloned().unwrap_or_default(),
+        };
+        if !previously.model.is_empty() && model != previously.model {
+            let gone = &previously.model;
+            let notice = format!("model: {gone}: not in model.toml, using {model}");
+            notices.push(notice);
+        }
+
+        let (instructions, skipped) = config::instructions(&app.config, &cwd);
+        for problem in skipped {
+            let notice = problem.to_string();
+            notices.push(notice);
+        }
+        let (skills, skipped) = config::skills(&app.config, &cwd);
+        for problem in skipped {
+            let notice = problem.to_string();
+            notices.push(notice);
+        }
+        let (roles, skipped) = config::roles(&app.config, &cwd, &models);
+        for problem in skipped {
+            let notice = problem.to_string();
+            notices.push(notice);
+        }
+        for entry in &mcp_skipped {
+            let notice = entry.problem.to_string();
+            notices.push(notice);
+        }
+        let listed = match memories.listed().await {
+            Ok(listed) => listed,
+            Err(problem) => {
+                let notice = Error::Memory(problem).to_string();
+                notices.push(notice);
+                Listed::default()
+            }
+        };
+
+        let mut settings = Settings {
+            cwd: cwd.clone(),
+            model,
+            ..Settings::default()
+        };
+        for server in &servers {
+            if let Some(on) = previously.mcp.get(&server.name) {
+                settings.set_mcp(server, *on);
+            }
+        }
+        // A skipped entry keeps its saved switch, which the next save would otherwise drop
+        for entry in &mcp_skipped {
+            if let Some(on) = previously.mcp.get(&entry.name) {
+                settings.mcp.insert(entry.name.clone(), *on);
+            }
+        }
+        meta.settings = settings;
+        let built = models.make(&meta.settings.model)?;
+        let options = options(&models, &meta.settings, &servers);
+
+        let copies = app.store.copies(&cwd, &meta.id)?;
+        let window = built.context_window();
+        let mut translator = Translator::new(peer.clone(), window, cwd.clone(), copies.clone());
+        translator.replay(&memory);
+
+        let project = app.store.project(&cwd);
+        let venv = Venv::open(&project, &cwd).await;
+        let venv = venv.map_err(Error::Python)?;
+        if inbox.is_closed() {
+            return Err(Error::SessionNotFound(meta.id));
+        }
+        let opening = Workplace::open(
+            cwd.clone(),
+            copies.clone(),
+            venv,
+            &app.config,
+            &skills,
+            &access,
+        );
+        let workplace = opening.map_err(Error::Python)?;
+        let workplace = Arc::new(workplace);
+
+        let queue = ClientQueue {
+            peer: peer.clone(),
+            enqueued,
+        };
+        let place = Place::Main {
+            roles,
+            team: Arc::default(),
+            queue: Arc::new(queue),
+        };
+
+        // No restart notice again when no code has run since the last restart
+        let ran = memory.ran_code();
+        let delegation = place.delegation();
+        let launching = Worker::new(&interrupt, Arc::clone(&workplace), &[], delegation, ran);
+        let worker = launching.await?;
+
+        let response = match loading {
+            true => {
+                update_session(&peer, &meta);
+                let response = LoadSessionResponse::new().config_options(options);
+                to_value(response)
+            }
+            false => {
+                let response = NewSessionResponse::new(meta.id.clone()).config_options(options);
+                to_value(response)
+            }
+        };
+        app.peer.respond(&id, Ok(response));
+
+        let opened = match loading {
+            true => "resumed",
+            false => "opened",
+        };
+        let shown = tilde(&cwd);
+        let model = &meta.settings.model;
+        info!("session: {opened} [cwd={shown}, model={model}]");
+        // The client only knows a new session once it has the reply
+        for notice in &notices {
+            warn!("session: open issue, {notice}");
+            peer.notice(notice, Notice::Session);
+        }
+
+        let pool = McpPool::new(servers, &meta.settings, &copies, peer.clone());
+        pool.report();
+
+        let brief = Brief {
+            instructions,
+            skills,
+            listed,
+            images_shown: app.peer.images(),
+        };
+        let agent = Agent {
+            model: Arc::from(built),
+            brief,
+            interrupt,
+            workplace,
+            memories,
+            place,
+        };
+        let keeper = Keeper {
+            meta,
+            app: Arc::clone(&app),
+            titling: None,
+            unsaved: Unsaved::default(),
+            translator,
+            peer,
+        };
+
+        Ok(Session {
+            memory,
+            models,
+            agent,
+            worker,
+            servers: pool,
+            background: Vec::new(),
+            keeper,
+            _lock: lock,
+        })
     };
-    for server in &servers {
-        if let Some(on) = previously.mcp.get(&server.name) {
-            settings.set_mcp(server, *on);
+    let started: Result<Session> = starting.await;
+
+    match started {
+        Ok(opened) => opened.run(inbox).await,
+        Err(error) => {
+            match matches!(error, Error::SessionNotFound(_)) && inbox.is_closed() {
+                true => info!("session: closed while opening"),
+                false => error!("session: open failed, {error}"),
+            }
+            // A request that came in after the queue was answered would be lost
+            inbox.close();
+            refuse_queued(&mut inbox, &app.peer, &session);
+            app.peer.respond(&id, Err(error));
         }
     }
-    meta.settings = settings;
-    let built = models.make(&meta.settings.model)?;
-    let options = options(&models, &meta.settings, &servers);
-
-    let copies = app.store.copies(&cwd, &meta.id)?;
-    let window = built.context_window();
-    let mut translator = Translator::new(
-        meta.id.clone(),
-        Arc::clone(peer),
-        window,
-        cwd.clone(),
-        copies.clone(),
-    );
-    translator.replay(&memory);
-
-    let project = app.store.project(&cwd);
-    let venv = Venv::open(&project, &cwd).await;
-    let venv = venv.map_err(Error::Python)?;
-    if inbox.is_closed() {
-        return Err(Error::SessionNotFound(meta.id));
-    }
-    let opening = Workplace::open(
-        cwd.clone(),
-        copies.clone(),
-        venv,
-        &app.config,
-        &skills,
-        &access,
-    );
-    let workplace = opening.map_err(Error::Python)?;
-    let workplace = Arc::new(workplace);
-
-    let queue = ClientQueue {
-        peer: Arc::clone(&app.peer),
-        session: meta.id.clone(),
-        enqueued,
-    };
-    let place = Place::Main {
-        roles,
-        team: Arc::default(),
-        queue: Arc::new(queue),
-    };
-
-    // No restart notice again when no code has run since the last restart
-    let ran = memory.ran_code();
-    let delegation = place.delegation();
-    let starting = Worker::new(&interrupt, Arc::clone(&workplace), &[], delegation, ran);
-    let worker = starting.await?;
-
-    let response = match loading {
-        true => {
-            update_session(peer, &meta);
-            let response = LoadSessionResponse::new().config_options(options);
-            to_value(response)
-        }
-        false => {
-            let response = NewSessionResponse::new(meta.id.clone()).config_options(options);
-            to_value(response)
-        }
-    };
-    peer.respond(&id, Ok(response));
-
-    let opened = match loading {
-        true => "resumed",
-        false => "opened",
-    };
-    let shown = tilde(&cwd);
-    let model = &meta.settings.model;
-    info!("session: {opened} [cwd={shown}, model={model}]");
-    // The client only knows a new session once it has the reply
-    for notice in &notices {
-        warn!("session: open issue, {notice}");
-        peer.notice(&meta.id, notice, Notice::Session);
-    }
-
-    let peer = Arc::clone(&app.peer);
-    let pool = McpPool::new(servers, &meta.settings, &copies, peer, meta.id.clone());
-    pool.report();
-
-    let brief = Brief {
-        instructions,
-        skills,
-        listed,
-        images_shown: app.peer.images(),
-    };
-    let agent = Agent {
-        model: Arc::from(built),
-        brief,
-        interrupt: interrupt.clone(),
-        workplace,
-        memories,
-        place,
-    };
-    let keeper = Keeper {
-        meta,
-        app,
-        titling: None,
-        unsaved: Unsaved::default(),
-        translator,
-    };
-
-    Ok(Session {
-        interrupt,
-        memory,
-        models,
-        agent,
-        worker,
-        servers: pool,
-        background: Vec::new(),
-        keeper,
-        _lock: lock,
-    })
 }
 
 impl Session {
@@ -390,8 +393,9 @@ impl Session {
         }
 
         // When a turn finishes before its title, wait a little for the title before closing
-        if let Some((receiver, _)) = self.keeper.titling.take() {
+        if let Some((receiver, naming)) = self.keeper.titling.take() {
             let title = time::timeout(NAME_WAIT, receiver).await;
+            naming.abort();
             if let Ok(Ok(Some(name))) = title {
                 self.keeper.rename(name, &self.memory);
             }
@@ -401,21 +405,21 @@ impl Session {
 
     async fn prompt(&mut self, prompt: Prompt) {
         // One the user interrupted before it started is still recorded and ends as interrupted
-        self.interrupt.begin(prompt.turn);
+        self.agent.interrupt.begin(prompt.turn);
 
         // Requests stay in the channel while MCP servers connect,
         // and only an interrupt ends the wait
-        while self.servers.connecting() && !self.interrupt.triggered() {
+        while self.servers.connecting() && !self.agent.interrupt.triggered() {
             select! {
                 Some(event) = self.servers.recv() => {
                     self.servers.handle(event, &mut self.worker).await;
                 }
-                () = self.interrupt.wait() => {}
+                () = self.agent.interrupt.wait() => {}
             }
         }
 
         // A session with no task yet gets its title from the model without waiting for it
-        let untitled = self.keeper.meta.settings.name.is_empty();
+        let untitled = self.keeper.meta.model_title.is_empty();
         let worded = !prompt.task.text.trim().is_empty();
         let tasked = |step: &MemoryStep| matches!(step, MemoryStep::Task(_));
         let first = !self.memory.steps.iter().any(tasked);
@@ -450,6 +454,10 @@ impl Session {
         let peer = &self.keeper.app.peer;
         let answer = match answer {
             Ok(answer) => answer,
+            Err(error @ Error::Refused(_)) => {
+                info!("turn: refused, {error}");
+                return peer.respond(&prompt.id, Err(error));
+            }
             Err(error) => {
                 error!("turn: failed, {error}");
                 return peer.respond(&prompt.id, Err(error));
@@ -464,22 +472,26 @@ impl Session {
     }
 
     async fn shell(&mut self, shell: Shell) {
-        if self.interrupt.cancelled(shell.turn) {
+        let interrupt = &self.agent.interrupt;
+        if interrupt.cancelled(shell.turn) {
             return finish(&self.keeper.app.peer, &shell.id, StopReason::Cancelled);
         }
 
-        self.interrupt.begin(shell.turn);
+        interrupt.begin(shell.turn);
         let translator = &mut self.keeper.translator;
         translator.shell(&shell.command);
         let mut shown = |output: &str| translator.shell_output(output);
         let cwd = &self.agent.workplace.cwd;
-        let (ran, left) = spawn_shell(&shell.command, cwd, &self.interrupt, &mut shown).await;
+        let (ran, left) = run_shell(&shell.command, cwd, interrupt, &mut shown).await;
         self.background.extend(left);
 
         self.keeper.translator.shell_end(&ran);
         // Log only how the command ended because it may contain secrets
-        let end = &ran.end;
-        info!("shell: finished ({end})");
+        match &ran.end {
+            Exit::Exited(0) => info!("shell: done"),
+            Exit::Interrupted => info!("shell: interrupted"),
+            end => info!("shell: failed, {end}"),
+        }
         let stop = match ran.end {
             Exit::Interrupted => StopReason::Cancelled,
             _ => StopReason::EndTurn,
@@ -494,7 +506,7 @@ impl Session {
     fn option(&mut self, request: SetSessionConfigOptionRequest) -> Result<Value> {
         let keeper = &mut self.keeper;
         let option = &*request.config_id.0;
-        let named = option.strip_prefix(MCP_OPTION);
+        let named = option.strip_prefix(MCP_PREFIX);
         let server = named.and_then(|name| self.servers.find(name));
         match (option, server, request.value) {
             // An unchanged value does nothing, while switching models clears the shown usage
@@ -534,7 +546,7 @@ impl Session {
         }
 
         let configs = self.servers.configs();
-        let options = options(&self.models, &keeper.meta.settings, &configs);
+        let options = options(&self.models, &keeper.meta.settings, configs);
         let response = SetSessionConfigOptionResponse::new(options);
         Ok(to_value(response))
     }
@@ -553,24 +565,23 @@ impl Keeper {
                 self.titling = None;
             }
             if let Ok(Some(name)) = title {
-                self.meta.settings.name = name;
+                self.meta.model_title = name;
             }
         }
 
         let stored = self.app.store.save(memory, &mut self.meta);
         let error = stored.as_ref().err().map(Error::to_string);
-        let peer = &self.app.peer;
         if let Some(text) = self.unsaved.report(error) {
             error!("session: save failed, {text}");
-            peer.notice(&self.meta.id, &text, Notice::Unsaved);
+            self.peer.notice(&text, Notice::Unsaved);
         }
         if stored.is_ok() {
-            update_session(peer, &self.meta);
+            update_session(&self.peer, &self.meta);
         }
     }
 
-    fn rename(&mut self, name: String, memory: &AgentMemory) {
-        self.meta.settings.name = name;
+    fn rename(&mut self, title: String, memory: &AgentMemory) {
+        self.meta.model_title = title;
         self.save(memory);
     }
 }
@@ -591,14 +602,8 @@ impl Sink for Keeper {
 
 impl Queue for ClientQueue {
     fn queued(&self) -> Asking<'_> {
-        let peer = &self.peer;
-        let session = &self.session;
         Box::pin(async move {
-            if !peer.queued() {
-                return Vec::new();
-            }
-            let params = json!({ "sessionId": session });
-            let Some(result) = peer.call(QUEUED, params).await else {
+            let Some(result) = self.peer.queued().await else {
                 return Vec::new();
             };
             let Ok(queued) = serde_json::from_value::<Queued>(result) else {
@@ -645,10 +650,10 @@ fn finish(peer: &Peer, id: &Value, reason: StopReason) {
     peer.respond(id, Ok(response));
 }
 
-fn options(
+fn options<'a>(
     models: &Models,
     settings: &Settings,
-    servers: &[McpConfig],
+    servers: impl IntoIterator<Item = &'a McpConfig>,
 ) -> Vec<SessionConfigOption> {
     let mut choices = Vec::new();
     for name in models.names() {
@@ -662,7 +667,7 @@ fn options(
     let mut options = vec![model];
 
     for server in servers {
-        let id = format!("{MCP_OPTION}{}", server.name);
+        let id = format!("{MCP_PREFIX}{}", server.name);
         let label = format!("MCP {}", server.name);
         let on = settings.mcp_on(server);
         let option = SessionConfigOption::boolean(id, label, on);
@@ -672,12 +677,11 @@ fn options(
     options
 }
 
-fn update_session(peer: &Peer, meta: &SessionMeta) {
+fn update_session(peer: &SessionPeer, meta: &SessionMeta) {
     let updated = rfc3339(meta.updated_at);
     let title = meta.title.clone();
     let info = SessionInfoUpdate::new().title(title).updated_at(updated);
-    let update = SessionUpdate::SessionInfoUpdate(info);
-    peer.update(&meta.id, update);
+    peer.update(SessionUpdate::SessionInfoUpdate(info));
 }
 
 #[cfg(test)]
@@ -700,6 +704,7 @@ mod tests {
     use crate::Error;
     use reaper::tilde;
     use serde_json::{json, Value};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -910,7 +915,7 @@ mod tests {
         let store = HistoryStore::new(&dir);
         let (meta, _) = store.load(Path::new(CWD), &session).expect("load");
         assert_eq!(meta.title, "Snake game");
-        assert_eq!(meta.settings.name, "Snake game");
+        assert_eq!(meta.model_title, "Snake game");
 
         // The client tells the user the session is saved only once it gets a save time
         let mut infos = Vec::new();
@@ -1326,8 +1331,10 @@ mod tests {
     fn opening_noticed() {
         let dir = temp_dir("open-notices");
         fs::create_dir_all(&dir).expect("dir");
-        // An unreadable instructions file is skipped and the session still opens
+        // An unreadable instructions file and an unusable MCP entry are skipped
+        // and the session still opens
         fs::write(dir.join("AGENTS.md"), b"\xff\xfe").expect("write");
+        fs::write(dir.join("agent.toml"), "[mcp.\"café\"]\ntype = \"sse\"\n").expect("write");
         let memory = AgentMemory {
             steps: vec![MemoryStep::Task(asked("Read the orders"))],
         };
@@ -1356,11 +1363,43 @@ mod tests {
             }
         }
         let shown = tilde(&dir.join("AGENTS.md"));
+        let servers = tilde(&dir.join("agent.toml"));
         let expected = [
             "model: mock/old-model: not in model.toml, using mock/m1".to_owned(),
             format!("config: {shown}: not UTF-8 text, skipped"),
+            format!("config: {servers}: [mcp.café]: unknown variant `sse`, expected `stdio` or `http`, skipped"),
         ];
         assert_eq!(notices, expected);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn skipped_switch_kept() {
+        let dir = temp_dir("skipped-switch");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("agent.toml"), "[mcp.fake]\ntype = \"sse\"\n").expect("write");
+        let memory = one_task("Read the café orders");
+        let settings = Settings {
+            mcp: BTreeMap::from([("fake".to_owned(), false)]),
+            ..here()
+        };
+        saved(&HistoryStore::new(&dir), &memory, "s1", &settings);
+
+        let running = async {
+            let mut connection = Connection::open(&dir, "http://127.0.0.1:1/v1", "");
+            let load = json!({"sessionId": "s1", "cwd": CWD, "mcpServers": []});
+            connection.request("session/load", load).await;
+            // A command saves the session
+            let typed = json!({"sessionId": "s1", "command": "echo naïve"});
+            connection.request("_smol/shell", typed).await;
+            connection.close().await;
+        };
+        block_on(running);
+
+        let store = HistoryStore::new(&dir);
+        let (meta, saved) = store.load(Path::new(CWD), "s1").expect("load");
+        assert!(matches!(saved.steps.last(), Some(MemoryStep::Shell(_))));
+        assert_eq!(meta.settings.mcp.get("fake"), Some(&false));
         fs::remove_dir_all(&dir).ok();
     }
 

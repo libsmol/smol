@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use std::env;
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -9,17 +10,22 @@ use std::os::fd::{FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
-use std::process::{self, Command};
+#[cfg(target_os = "linux")]
+use std::process;
+use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+#[cfg(target_os = "linux")]
 use std::thread;
 #[cfg(target_os = "linux")]
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Processes that started a new session left the group and are found by this inherited variable
+#[cfg(target_os = "linux")]
 const MARK_ENV: &str = "SMOL_REAPER";
 /// A process killed a moment ago may already have forked children
 #[cfg(target_os = "linux")]
@@ -28,13 +34,20 @@ const MAX_SWEEPS: usize = 3;
 const SWEEP_EVERY: Duration = Duration::from_millis(50);
 
 static GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+#[cfg(target_os = "linux")]
 static NEXT_MARK: AtomicU64 = AtomicU64::new(1);
+#[cfg(target_os = "linux")]
 static INSTANCE: OnceLock<String> = OnceLock::new();
 /// Pipe to the watchdog, closed however this process dies
 static GUARD: OnceLock<PipeWriter> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 pub struct Mark(u64);
+/// Only Linux finds the processes that left the group, in /proc
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Copy)]
+pub struct Mark(());
 
 /// Must be called before any thread starts, because the forked watchdog keeps running Rust
 pub fn guard() {
@@ -43,6 +56,7 @@ pub fn guard() {
     };
 
     // The watchdog sweeps by this prefix, so it has to exist before the fork
+    #[cfg(target_os = "linux")]
     instance();
 
     // SAFETY: No other thread exists yet
@@ -85,8 +99,11 @@ pub fn guard() {
     for group in groups {
         kill(group);
     }
-    let prefix = instance();
-    kill_marked(prefix);
+    #[cfg(target_os = "linux")]
+    {
+        let prefix = instance();
+        kill_marked(prefix);
+    }
 
     // SAFETY: Skips the exit handlers inherited from the parent
     unsafe { libc::_exit(0) }
@@ -94,15 +111,20 @@ pub fn guard() {
 
 /// PDEATHSIG tracks the thread that forked the child, so that thread must outlive the child
 pub fn prepare(command: &mut Command) -> Mark {
-    let mark = NEXT_MARK.fetch_add(1, Ordering::Relaxed);
-
-    // Outer marks are kept so an enclosing agent still recognizes nested programs
-    let own = mark_text(mark);
-    let value = match env::var(MARK_ENV) {
-        Ok(outer) => format!("{outer} {own}"),
-        Err(_) => own,
+    #[cfg(target_os = "linux")]
+    let mark = {
+        let number = NEXT_MARK.fetch_add(1, Ordering::Relaxed);
+        // Outer marks are kept so an enclosing agent still recognizes nested programs
+        let own = mark_text(number);
+        let value = match env::var(MARK_ENV) {
+            Ok(outer) => format!("{outer} {own}"),
+            Err(_) => own,
+        };
+        command.env(MARK_ENV, value);
+        Mark(number)
     };
-    command.env(MARK_ENV, value);
+    #[cfg(not(target_os = "linux"))]
+    let mark = Mark(());
 
     // The group id is the child's pid
     // SAFETY: Only the async-signal-safe setsid runs after fork
@@ -133,7 +155,7 @@ pub fn prepare(command: &mut Command) -> Mark {
         }
     }
 
-    Mark(mark)
+    mark
 }
 
 /// Dropping it kills the whole group, including processes that started a new session
@@ -201,6 +223,7 @@ pub fn kill_all() {
     }
 
     // Nothing to sweep in /proc if no program was ever started
+    #[cfg(target_os = "linux")]
     if NEXT_MARK.load(Ordering::Relaxed) > 1 {
         let prefix = instance();
         kill_marked(prefix);
@@ -213,6 +236,7 @@ fn forget(group: i32) {
     tell(-group);
 }
 
+#[cfg(target_os = "linux")]
 fn sweep(mark: Mark) {
     // Reading /proc can hang, so it must not hold up the caller's thread
     let text = mark_text(mark.0);
@@ -223,6 +247,9 @@ fn sweep(mark: Mark) {
         kill_marked(&text);
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn sweep(_: Mark) {}
 
 fn kill(group: i32) {
     // SAFETY: Only sends a signal and touches no memory
@@ -239,6 +266,7 @@ fn tell(group: i32) {
 }
 
 /// Pids get reused, so the start time goes in too
+#[cfg(target_os = "linux")]
 fn instance() -> &'static str {
     INSTANCE.get_or_init(|| {
         let started = SystemTime::now().duration_since(UNIX_EPOCH);
@@ -248,13 +276,11 @@ fn instance() -> &'static str {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn mark_text(mark: u64) -> String {
     let instance = instance();
     format!("{instance}.{mark}")
 }
-
-#[cfg(not(target_os = "linux"))]
-fn kill_marked(_text: &str) {}
 
 /// `text` is a single mark or this process's prefix
 #[cfg(target_os = "linux")]

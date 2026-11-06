@@ -1,5 +1,6 @@
 import ast as _ast
 import io as _io
+import itertools as _itertools
 import linecache as _linecache
 import re as _re
 import site as _site
@@ -8,8 +9,13 @@ import textwrap as _textwrap
 import threading as _threading
 import time as _time
 import tokenize as _tokenize
-import types as _types
 import unicodedata as _unicodedata
+
+_SNIPPET = "<smolcode-"
+_RUNS = _itertools.count(1)
+_BOOTSTRAP = (lambda: None).__code__.co_filename
+_MAX_LEAVES = 3
+_MAX_LINKS = 2
 
 _DEFINITIONS = (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)
 _SCOPES = (*_DEFINITIONS, _ast.Lambda, _ast.ListComp, _ast.SetComp, _ast.DictComp, _ast.GeneratorExp)
@@ -27,7 +33,7 @@ _LEAD = _re.compile(r"(?:\s*<[^<>\n]*>)+")
 _LITERALS = {"STRING", "COMMENT", "FSTRING_MIDDLE", "TSTRING_MIDDLE"}
 
 # Tags inside strings and comments stay, and code that still won't parse is cut before the first tag
-def _untagged(code):
+def _untagged(code, filename):
     readline = _io.StringIO(code).readline
     try:
         generated = _tokenize.generate_tokens(readline)
@@ -77,7 +83,7 @@ def _untagged(code):
 
     for candidate in candidates:
         try:
-            _ast.parse(candidate, _FILENAME)
+            _ast.parse(candidate, filename)
         except SyntaxError:
             continue
         if candidate.strip():
@@ -107,6 +113,55 @@ def _flushed(opened):
     except Exception:
         pass
 
+def _message(exc):
+    try:
+        return str(exc)
+    except Exception:
+        return ""
+
+def _described(exc):
+    message = _message(exc)
+    kind = type(exc).__name__
+    text = f"{kind}: {message}" if message else kind
+    notes = getattr(exc, "__notes__", None)
+    if isinstance(notes, list):
+        for note in notes:
+            if isinstance(note, str):
+                text += f"\n{note}"
+    return text
+
+def _located(exc, filename):
+    own = model = last = None
+    tb = exc.__traceback__
+    while tb is not None:
+        name = tb.tb_frame.f_code.co_filename
+        if name == filename:
+            own = tb
+        if name.startswith(_SNIPPET):
+            model = tb
+        if name != _BOOTSTRAP:
+            last = tb
+        tb = tb.tb_next
+
+    lines, shown = [], []
+    for tb in (own, model, last):
+        # Instructions without a line number give None
+        if tb is None or tb.tb_lineno is None or tb in shown:
+            continue
+        shown.append(tb)
+
+        code = tb.tb_frame.f_code
+        if code.co_filename == filename:
+            where = f"line {tb.tb_lineno}"
+        elif code.co_filename.startswith(_SNIPPET):
+            where = f"an earlier call, line {tb.tb_lineno}, in {code.co_name}"
+        else:
+            where = f"{code.co_filename}, line {tb.tb_lineno}, in {code.co_name}"
+        # The module's loader gives the source of what isn't a file, like the stdlib in its zip
+        source = _linecache.getline(code.co_filename, tb.tb_lineno, tb.tb_frame.f_globals).strip()
+        lines.append(f"  {where}: {source}" if source else f"  {where}")
+    return lines
+
 def _run(code):
     global _SHOWN, _STDOUT, _STDERR
     # Streams the previous snippet swapped in are not kept
@@ -129,27 +184,31 @@ def _run(code):
         _PTHS.add((folder, name))
         _site.addpackage(folder, name, None)
 
+    filename = f"{_SNIPPET}{next(_RUNS)}>"
     error = repaired = None
     blocks = []
     defined = {}
     try:
         try:
             try:
-                parsed = _ast.parse(code, _FILENAME)
+                parsed = _ast.parse(code, filename)
             except SyntaxError:
                 # The repaired code goes back to be saved, and line numbers and errors refer to it
-                repaired = _untagged(code)
+                repaired = _untagged(code, filename)
                 if repaired is None:
                     raise
                 code = repaired
-                parsed = _ast.parse(code, _FILENAME)
+                parsed = _ast.parse(code, filename)
             for node in parsed.body:
                 if isinstance(node, _ast.Expr):
                     tree, mode = _ast.Expression(node.value), "eval"
                 else:
                     tree, mode = _ast.Module([node], []), "exec"
-                block = compile(tree, _FILENAME, mode)
+                block = compile(tree, filename, mode)
                 blocks.append(block)
+            # Without an mtime, checkcache keeps the entry instead of looking for a file
+            cached = [line + "\n" for line in code.split("\n")]
+            _linecache.cache[filename] = (len(code), None, cached, filename)
         except SyntaxError as exc:
             blocks = []
             source = exc.text
@@ -230,40 +289,47 @@ def _run(code):
                 print(text, limit=None)
 
     except BaseException as exc:
-        message = str(exc)
-        kind = type(exc).__name__
-        error = f"{kind}: {message}" if message else kind
+        # Source lines are left out of what links are checked against, as their numbers would match short messages
+        said = _described(exc)
+        parts = [said, *_located(exc, filename)]
 
-        # Functions from earlier snippets also have the <smolcode> file name but other line numbers
-        codes, pending = set(), list(blocks)
-        while pending:
-            compiled = pending.pop()
-            identity = id(compiled)
-            codes.add(identity)
-            nested = [const for const in compiled.co_consts if isinstance(const, _types.CodeType)]
-            pending.extend(nested)
+        if isinstance(exc, BaseExceptionGroup):
+            leaves, pending = [], list(reversed(exc.exceptions))
+            while pending and len(leaves) < _MAX_LEAVES:
+                member = pending.pop()
+                if isinstance(member, BaseExceptionGroup):
+                    pending.extend(reversed(member.exceptions))
+                else:
+                    leaves.append(member)
+            for leaf in leaves:
+                described = _described(leaf)
+                said += f"\n{described}"
+                parts.append(f"Sub-exception {described}")
+                parts.extend(_located(leaf, filename))
 
-        line, last, tb = None, None, exc.__traceback__
-        while tb is not None:
-            filename = tb.tb_frame.f_code.co_filename
-            if id(tb.tb_frame.f_code) in codes:
-                line = tb.tb_lineno
-            if filename != _BOOTSTRAP:
-                last = tb
-            tb = tb.tb_next
+        # A chain the code made may loop back, and skipped links don't stop the walk
+        seen, link, linked = {id(exc)}, exc, 0
+        while linked < _MAX_LINKS:
+            if link.__cause__ is not None:
+                label, link = "Caused by", link.__cause__
+            elif link.__context__ is not None and not link.__suppress_context__:
+                label, link = "Raised while handling", link.__context__
+            else:
+                break
+            if id(link) in seen:
+                break
+            seen.add(id(link))
 
-        lines = code.split("\n")
-        if line is not None and 0 < line <= len(lines):
-            text = lines[line - 1].strip()
-            error += f"\n  line {line}: {text}"
+            message = _message(link)
+            if message and f": {message}" in said:
+                continue
+            described = _described(link)
+            said += f"\n{described}"
+            parts.append(f"{label} {described}")
+            parts.extend(_located(link, filename))
+            linked += 1
 
-        if last is not None and last.tb_frame.f_code.co_filename != _FILENAME:
-            where = last.tb_frame.f_code
-            error += f"\n  {where.co_filename}, line {last.tb_lineno}, in {where.co_name}"
-            # The module's loader gives the source of what isn't a file, like the stdlib in its zip
-            source = _linecache.getline(where.co_filename, last.tb_lineno, last.tb_frame.f_globals).strip()
-            if source:
-                error += f": {source}"
+        error = "\n".join(parts)
 
     finally:
         _SHOWN = None

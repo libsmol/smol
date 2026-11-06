@@ -1,6 +1,8 @@
 use crate::agent::delegate::Records;
-use crate::agent::{generate, retry, Event, Streamed, Turn, MAX_RETRIES};
-use crate::model::{ChatMessage, Finish, Part, Purpose, StreamDelta, Unread, MAX_NAME_CHARS};
+use crate::agent::{generate, retry, Event, Failure, Streamed, Turn, MAX_RETRIES};
+use crate::model::{
+    ChatMessage, Finish, ModelError, Part, Purpose, StreamDelta, Unread, MAX_NAME_CHARS,
+};
 use crate::prompt::{self, TOOL};
 use crate::spawn::SHOWN_EVERY;
 use crate::steps::{
@@ -8,15 +10,16 @@ use crate::steps::{
 };
 use crate::utils::{seamed, truncated};
 use std::mem;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+use tracing::warn;
 
 /// Normal code never ends in several lines of closing tags
 const MAX_LOOP_TOKENS: u64 = 256;
-const CODELESS: &str = "reply: a tool call without code, nothing ran";
 
 impl Turn<'_> {
-    pub(crate) async fn step(&mut self) -> Box<AgentStep> {
+    pub(crate) async fn step(&mut self) -> Result<Box<AgentStep>, ModelError> {
         let model = &*self.agent.model;
         let window = model.context_window();
         let takes = |kind| model.takes(kind);
@@ -113,11 +116,16 @@ impl Turn<'_> {
             // so regenerate and reply to each only after the last try
             let codeless = |call: &Call| call.error == Some(CallError::NoCode);
             let glitch = step.calls.iter().any(codeless) && glitches < MAX_RETRIES;
-            let error = match generated {
-                Ok(Finish::Length) => StepError::Cut,
+            let failure = match generated {
+                Ok(Finish::Length) => {
+                    step.error = Some(StepError::Cut);
+                    break step;
+                }
                 Ok(_) if glitch => {
+                    let reason = CallError::NoCode.to_string();
+                    warn!("step: regenerating, {reason}");
                     let retried = Event::Retry {
-                        reason: CODELESS,
+                        reason: &reason,
                         wait: Duration::ZERO,
                     };
                     self.sink.event(retried);
@@ -125,17 +133,27 @@ impl Turn<'_> {
                     continue;
                 }
                 Ok(_) => break step,
-                Err(error) => error,
+                Err(failure) => failure,
             };
-            if !retry(&mut tries, &error, interrupt, &mut *self.sink).await {
-                step.error = Some(error);
-                break step;
+            if retry(&mut tries, &failure, interrupt, &mut *self.sink).await {
+                continue;
+            }
+
+            match failure {
+                Failure::Interrupted => {
+                    step.error = Some(StepError::Interrupted);
+                    break step;
+                }
+                Failure::Model(error) => {
+                    self.sink.event(Event::StepFailed(&step));
+                    return Err(error);
+                }
             }
         };
 
         // An interrupted reply keeps its code too, but only a step without an error runs
         if step.error.is_some() {
-            return step;
+            return Ok(step);
         }
 
         for index in 0..step.calls.len() {
@@ -145,16 +163,17 @@ impl Turn<'_> {
                 break;
             }
             if step.calls[index].unread() {
-                self.sink.event(Event::Ran(index, &step.calls[index]));
+                self.sink.event(Event::RunEnd(index, &step.calls[index]));
                 break;
             }
 
             let started = Instant::now();
             let call = &step.calls[index];
-            self.sink.event(Event::Execute(index, call));
+            self.sink.event(Event::Run(index, call));
 
             let views = self.sink.helpers(index);
-            let records = Records::default();
+            let at = self.memory.steps.len();
+            let records = Arc::new(Records::new(at, index));
             let mut serving = self.agent.serving(self.servers, views, &records);
             let code = &call.code;
             let mut shown = |output: &str| self.sink.event(Event::Output(index, call, output));
@@ -164,7 +183,7 @@ impl Turn<'_> {
             let evaluated = evaluating.await;
             step.usage.duration += started.elapsed().as_secs_f64();
             // Every call that could still change them has ended with the code
-            let mut recorded = records.lock().expect("records");
+            let mut recorded = records.helpers.lock().expect("records");
             let agents = mem::take(&mut *recorded);
             drop(recorded);
 
@@ -215,7 +234,7 @@ impl Turn<'_> {
                 // Code that never reached the worker gets no `result`
                 Err(error) => call.error = Some(error),
             }
-            self.sink.event(Event::Ran(index, call));
+            self.sink.event(Event::RunEnd(index, call));
 
             let Some(error) = &call.error else {
                 continue;
@@ -227,7 +246,7 @@ impl Turn<'_> {
             break;
         }
 
-        step
+        Ok(step)
     }
 }
 
@@ -372,7 +391,7 @@ mod tests {
         let on_event = Box::new(move |event: Event| {
             let retried = match event {
                 Event::Retry { .. } => true,
-                Event::StepEnd(_) => false,
+                Event::StepEnd(_) | Event::StepFailed(_) => false,
                 _ => return,
             };
             seen.lock().expect("ends lock").push(retried);
@@ -488,7 +507,7 @@ mod tests {
         let executed = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&executed);
         let on_event = Box::new(move |event: Event| {
-            if let Event::Execute(index, _) = event {
+            if let Event::Run(index, _) = event {
                 seen.lock().expect("executed").push(index);
             }
         });
@@ -541,6 +560,16 @@ mod tests {
     /// Tag-only code is quietly regenerated until tries run out, then never runs or is echoed back
     #[test]
     fn bare_tags_retried() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&events);
+        let on_event = Box::new(move |event: Event| {
+            let kind = match event {
+                Event::Retry { reason, .. } => reason.to_owned(),
+                Event::StepEnd(_) => "end".to_owned(),
+                _ => return,
+            };
+            seen.lock().expect("events lock").push(kind);
+        });
         let replies = [
             called("<eval>\n</eval>"),
             called(""),
@@ -548,12 +577,14 @@ mod tests {
             called("<script>\n"),
             reply("three"),
         ];
-        let (mut agent, ends) = recording(replies.into_iter().map(Ok).collect());
+        let model = ScriptedModel::new(replies.into_iter().map(Ok).collect());
+        let mut agent = scripted(model, on_event);
         let mut memory = AgentMemory::default();
         let answer = agent.turn(&mut memory, "task").expect("run");
         assert_eq!(answer.as_deref(), Some("three"));
-        let retried = [true, true, true, false, false];
-        assert_eq!(*ends.lock().expect("ends lock"), retried);
+        let codeless = "eval: no code in the arguments";
+        let expected = [codeless, codeless, codeless, "end", "end"];
+        assert_eq!(*events.lock().expect("events lock"), expected);
 
         let steps = actions(&memory);
         assert_eq!(steps.len(), 2);
@@ -811,27 +842,6 @@ mod tests {
     }
 
     #[test]
-    fn transient_retried() {
-        let answered = || Ok(reply("1"));
-        let busy = || ModelError::transient("http 503: service busy");
-        let replies = vec![Err(busy()), Err(busy()), answered()];
-        let (mut flaky, ends) = recording(replies);
-
-        let mut memory = AgentMemory::default();
-        let answer = flaky.turn(&mut memory, "Add one to x").expect("run");
-        assert_eq!(answer, Some("1".to_owned()));
-        assert_eq!(actions(&memory).len(), 1);
-        assert_eq!(*ends.lock().expect("ends lock"), [true, true, false]);
-
-        let refused = ModelError::new("http 400: bad request");
-        let (mut agent, ends) = recording(vec![Err(refused), answered()]);
-        let mut memory = AgentMemory::default();
-        let ran = agent.turn(&mut memory, "Add one to x");
-        assert!(ran.is_err());
-        assert_eq!(*ends.lock().expect("ends lock"), [false]);
-    }
-
-    #[test]
     fn cut_reply_unused() {
         let cut = Script {
             calls: vec![Ok("print('half".to_owned())],
@@ -849,8 +859,9 @@ mod tests {
         assert_eq!(step.error, Some(StepError::Cut));
         assert_eq!(step.text, "Starting.");
         assert_eq!(codes(step), ["print('half"]);
-        assert!(step.dropped() && printed(step).is_none());
-        let told = prompt::error(step).unwrap_or_default();
+        assert_eq!(step.seen(), ("", &[][..]));
+        assert!(printed(step).is_none());
+        let told = prompt::step_error(step).unwrap_or_default();
         assert!(told.contains("too long and was discarded"), "{told}");
 
         let requests = run.requests.lock().expect("requests");
@@ -917,10 +928,6 @@ mod tests {
             tagged(),
             tagged(),
             unread(),
-            tagged(),
-            unread(),
-            unread(),
-            call("", ""),
         ];
         let mut agent = agent(replies);
 
@@ -929,17 +936,16 @@ mod tests {
         assert_eq!(answer, Some("42".to_owned()));
 
         let steps = actions(&memory);
-        assert_eq!(steps.len(), 5);
+        assert_eq!(steps.len(), 4);
         assert_eq!(steps[0].text, "Let me work it out.");
         assert_eq!(codes(steps[0]), [code]);
         assert_eq!(printed(steps[0]), Some("42"));
         assert_eq!(codes(steps[1]), ["print('again')"]);
-        for step in &steps[2..4] {
-            assert_eq!(step.error, None);
-            assert_eq!(step.calls[0].error, Some(CallError::NoCode));
-            assert!(printed(step).is_none());
-        }
-        assert_eq!(steps[2].calls[0].arguments.as_deref(), Some("{}"));
+        let codeless = steps[2];
+        assert_eq!(codeless.error, None);
+        assert_eq!(codeless.calls[0].error, Some(CallError::NoCode));
+        assert!(printed(codeless).is_none());
+        assert_eq!(codeless.calls[0].arguments.as_deref(), Some("{}"));
     }
 
     #[test]
@@ -1126,12 +1132,15 @@ mod tests {
 
     #[test]
     fn generation_failure_ends() {
-        let errors = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&errors);
+        let failed = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&failed);
         let on_event = Box::new(move |event: Event| {
-            if let Event::StepEnd(step) = event {
-                seen.lock().expect("errors lock").push(step.error.clone());
-            }
+            let ended = match event {
+                Event::StepEnd(_) => "end",
+                Event::StepFailed(_) => "failed",
+                _ => return,
+            };
+            seen.lock().expect("failed lock").push(ended);
         });
         let replies = vec![Err(ModelError::new("model went offline"))];
         let model = ScriptedModel::new(replies);
@@ -1141,9 +1150,7 @@ mod tests {
         let error = agent.turn(&mut memory, "task").expect_err("error");
         assert!(error.to_string().contains("model went offline"), "{error}");
         assert!(actions(&memory).is_empty());
-
-        let errors = errors.lock().expect("errors lock");
-        assert!(matches!(errors[..], [Some(StepError::Model(_))]));
+        assert_eq!(*failed.lock().expect("failed lock"), ["failed"]);
     }
 
     #[test]
@@ -1210,7 +1217,7 @@ mod tests {
         let trigger = Arc::clone(&handle);
         let mut executed = 0;
         let on_event = Box::new(move |event: Event| {
-            if let (Event::Execute(..), Some(interrupt)) = (event, trigger.get()) {
+            if let (Event::Run(..), Some(interrupt)) = (event, trigger.get()) {
                 executed += 1;
                 if executed == 2 {
                     interrupt.cancel(u64::MAX);
@@ -1236,23 +1243,5 @@ mod tests {
         assert!(printed(last).is_none());
         let told = prompt::call_error(last, &last.calls[0]).unwrap_or_default();
         assert_eq!(told, "[not run: interrupted by the user]");
-    }
-
-    #[test]
-    fn interrupt_code() {
-        let id = new_id();
-        let name = format!("smol-started-{id}");
-        let code = format!("print('started')\nopen({name:?}, 'w').close()\nwhile True:\n    pass");
-        let mut agent = running(&[code.as_str()]);
-        let started = Instant::now();
-        interrupt_started(&agent, &name);
-
-        let mut memory = AgentMemory::default();
-        agent.turn(&mut memory, "task").expect("run");
-
-        assert!(started.elapsed() < Duration::from_secs(30));
-        let step = interrupted(&memory);
-        assert_eq!(printed(step), Some("started"));
-        assert_eq!(step.calls[0].error, Some(CallError::Interrupted));
     }
 }

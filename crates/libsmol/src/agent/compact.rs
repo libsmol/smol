@@ -1,8 +1,8 @@
-use crate::agent::{retry, text_reply, Event, Turn};
+use crate::agent::{retry, text_reply, Event, Failure, Turn};
 use crate::model::{ChatMessage, Purpose};
 use crate::prompt::{self, SUMMARIZER};
 use crate::steps::{
-    bytes, estimate, text_bytes, MemoryStep, StepError, SummaryStep, Usage, MAX_OBSERVATION_CHARS,
+    bytes, estimate, text_bytes, MemoryStep, SummaryStep, Usage, MAX_OBSERVATION_CHARS,
 };
 use crate::utils::truncated;
 use crate::Result;
@@ -25,9 +25,6 @@ impl Turn<'_> {
             return Ok(());
         };
 
-        // Only the last step counts, as a summary followed by an unrecorded failure
-        // must not stop later compaction
-        let added = !matches!(self.memory.steps.last(), Some(MemoryStep::Summary(_)));
         let takes = |kind| model.takes(kind);
         let used = self.memory.tokens(&self.system, &takes, Some(window));
         let reserve = (window as f64 * RESERVE_SHARE) as u64;
@@ -35,12 +32,13 @@ impl Turn<'_> {
         // Servers may refuse a request whose input and output limit together pass the window,
         // and past half of what the system prompt leaves, every step would compact again
         let output = model.max_tokens();
-        let system = text_bytes(&self.system);
-        let left = window.saturating_sub(estimate(system));
+        let size = text_bytes(&self.system);
+        let system = estimate(size);
+        let left = window.saturating_sub(system);
         let limit = output.unwrap_or(0).min(left / 2);
         let reserve = reserve.max(limit);
         let interrupted = self.agent.interrupt.triggered();
-        if !added || interrupted || used < window - reserve {
+        if interrupted || used < window - reserve {
             return Ok(());
         }
 
@@ -151,19 +149,19 @@ impl Turn<'_> {
                 let replying = text_reply(model, interrupt, &request, Purpose::Summary);
                 let (replied, measured) = replying.await;
                 // A cut-off summary is kept too
-                let error = match replied {
+                let failure = match replied {
                     Ok(text) => {
                         usage.add(&measured);
                         break text.trim().to_owned();
                     }
-                    Err(error) => error,
+                    Err(failure) => failure,
                 };
-                if retry(&mut tries, &error, interrupt, &mut *self.sink).await {
+                if retry(&mut tries, &failure, interrupt, &mut *self.sink).await {
                     continue;
                 }
 
-                self.sink.event(Event::CompactEnd(Err(&error)));
-                let StepError::Model(error) = error else {
+                self.sink.event(Event::CompactEnd(Err(&failure)));
+                let Failure::Model(error) = failure else {
                     return Ok(());
                 };
                 return Err(error.into());
@@ -226,7 +224,7 @@ mod tests {
     use crate::agent::tests::{called, recorded, reply, Run, Script};
     use crate::model::{Finish, Generating, MediaKind, Model, ModelError, StreamDelta, TokenUsage};
     use crate::steps::tests::{asked, coded, metered, replied};
-    use crate::steps::{AgentMemory, AgentStep, Attachment, Exit, ShellStep, TaskStep};
+    use crate::steps::{AgentMemory, AgentStep, Attachment, Exit, ShellStep, StepError, TaskStep};
     use crate::tests::content;
     use std::sync::{Arc, Mutex};
 

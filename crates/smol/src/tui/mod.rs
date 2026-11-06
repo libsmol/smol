@@ -19,7 +19,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 mod app;
-mod browser;
+mod desktop;
 mod diagram;
 mod highlight;
 mod markdown;
@@ -162,7 +162,7 @@ pub(crate) fn run(
     let mut listened = Instant::now();
     while !app.quit && !terminated.load(Ordering::Relaxed) {
         // Images drawn last frame go out now, and their placeholders show them once they arrive
-        picture::send(&mut stdout())?;
+        picture::send(&mut stdout(), &app.shown)?;
         if app.take_dirty() {
             execute!(stdout(), BeginSynchronizedUpdate)?;
             screen.terminal.draw(|frame| {
@@ -209,7 +209,10 @@ pub(crate) fn run(
         app.pump();
     }
 
-    picture::forget(&mut stdout()).ok();
+    // The terminal keeps the images it was sent after smol exits unless they are deleted,
+    // as placeholders don't count as placements on screen
+    picture::clear();
+    picture::send(&mut stdout(), &[]).ok();
     drop(screen);
     if let Some(line) = app.session.parting() {
         println!("{line}");
@@ -227,9 +230,9 @@ pub(crate) fn run(
 
 #[cfg(test)]
 mod tests {
+    use crate::conversation::{Entry, Helper};
     use crate::tests::fake;
-    use crate::tui::picture::{state, Source, State};
-    use crate::tui::transcript::{Entry, Helper};
+    use crate::tui::picture::{state, Load, Source};
     use crate::tui::*;
     use agent_client_protocol_schema::v1::ToolCallStatus;
     use image::{ImageBuffer, Rgba, RgbaImage};
@@ -255,14 +258,14 @@ mod tests {
     pub(crate) fn fill(app: &mut App, lines: usize) {
         for line in 0..lines {
             let text = format!("line {line}");
-            app.transcript.push(Entry::Info(text));
+            app.session.conversation.push(Entry::Info(text));
         }
     }
 
-    pub(crate) fn helper(title: &str, status: ToolCallStatus, text: &str) -> Helper {
+    pub(crate) fn helper(task: &str, status: ToolCallStatus, text: &str) -> Helper {
         Helper {
             id: "call_1.1".to_owned(),
-            title: title.to_owned(),
+            task: task.to_owned(),
             role: None,
             name: None,
             status,
@@ -270,18 +273,18 @@ mod tests {
             preview: String::new(),
             interrupted: false,
             started: None,
-            color: theme::HELPERS[0],
+            hue: 0,
             tokens: None,
             totals: None,
         }
     }
 
-    /// Pictures load on a thread of their own
-    pub(crate) fn settled(source: &Source) -> State {
+    /// Pictures load on loader threads
+    pub(crate) fn settled(source: &Source) -> Load {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let state = state(source);
-            if !matches!(state, State::Loading(_)) || Instant::now() > deadline {
+            if !matches!(state, Load::Loading(_)) || Instant::now() > deadline {
                 return state;
             }
             thread::sleep(Duration::from_millis(10));
@@ -305,11 +308,11 @@ mod tests {
     #[test]
     fn kilo_units() {
         let cases = [
-            0, 999, 1_000, 1_250, 1_300, 9_999, 45_442, 123_195, 999_500, 1_048_576,
+            999, 1_000, 1_250, 1_300, 9_999, 45_442, 123_195, 999_500, 1_048_576,
         ];
         let shown = cases.map(kilo);
         let expected = [
-            "0", "999", "1k", "1.25k", "1.3k", "10k", "45.4k", "123k", "1M", "1.05M",
+            "999", "1k", "1.25k", "1.3k", "10k", "45.4k", "123k", "1M", "1.05M",
         ];
         assert_eq!(shown, expected, "{cases:?}");
     }

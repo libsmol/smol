@@ -1,4 +1,4 @@
-use crate::model::{Model, ModelSpec, OpenAIModel};
+use crate::model::{Model, OpenAIModel};
 use crate::{Error, Result};
 use reaper::{cause, tilde};
 use reqwest::Url;
@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::ops::Not;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{self, Path, PathBuf};
@@ -50,13 +51,27 @@ struct ModelFile {
 
 /// One `[model.<name>]` table, as `models` reads it and `save_model` writes it
 #[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, expecting = "a table")]
 struct Provider {
     #[serde(rename = "type")]
     kind: Kind,
     api: Option<String>,
     api_key: Option<String>,
     models: Vec<ModelSpec>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, expecting = "a table")]
+pub(crate) struct ModelSpec {
+    pub(crate) id: String,
+    pub(crate) effort: Option<String>,
+    pub(crate) context: Option<u64>,
+    /// DeepSeek counts reasoning toward it, and a small value cuts the reply off mid-reasoning
+    pub(crate) max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Not::not")]
+    pub(crate) image: bool,
+    #[serde(default, skip_serializing_if = "Not::not")]
+    pub(crate) video: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -107,19 +122,16 @@ impl Models {
 pub(crate) fn models(dir: &Path) -> Result<Models> {
     let path = dir.join(MODEL_FILE);
     let invalid = invalid(&path);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+    let text = match read_text(&path) {
+        Ok(Some(text)) => text,
+        Ok(None) => {
             let shown = tilde(&path);
             let message = format!(
                 "{shown}: not found; run `libsmol setup` or create it, for example:\n{MODEL_EXAMPLE}"
             );
             return Err(Error::Unconfigured(message));
         }
-        Err(e) => {
-            let reason = unreadable(&e);
-            return Err(invalid(reason));
-        }
+        Err(reason) => return Err(invalid(reason)),
     };
 
     let file: ModelFile = parsed(&text).map_err(&invalid)?;
@@ -252,19 +264,17 @@ pub(crate) fn instructions(dir: &Path, project: &Path) -> (Vec<String>, Vec<Erro
             continue;
         };
 
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) => {
-                let invalid = invalid(&path);
-                let reason = unreadable(&e);
-                let problem = format!("{reason}, skipped");
-                skipped.push(invalid(problem));
+        let text = match read_text(&path) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(reason) => {
+                let error = skip(&path, &reason);
+                skipped.push(error);
                 continue;
             }
         };
 
-        // Editors on Windows often write a BOM at the start
-        let text = text.trim_start_matches('\u{feff}').trim();
+        let text = text.trim();
         if !text.is_empty() {
             found.push(text.to_owned());
         }
@@ -308,10 +318,9 @@ pub(crate) fn skills(dir: &Path, project: &Path) -> (Vec<Skill>, Vec<Error>) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => {
-                let invalid = invalid(&root);
                 let reason = unreadable(&e);
-                let problem = format!("{reason}, skipped");
-                skipped.push(invalid(problem));
+                let error = skip(&root, &reason);
+                skipped.push(error);
                 continue;
             }
         };
@@ -324,23 +333,20 @@ pub(crate) fn skills(dir: &Path, project: &Path) -> (Vec<Skill>, Vec<Error>) {
                 continue;
             }
 
-            let invalid = invalid(&path);
-            let text = match fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(e) => {
-                    let reason = unreadable(&e);
-                    let problem = format!("{reason}, skipped");
-                    skipped.push(invalid(problem));
+            let text = match read_text(&path) {
+                Ok(Some(text)) => text,
+                Ok(None) => continue,
+                Err(reason) => {
+                    let error = skip(&path, &reason);
+                    skipped.push(error);
                     continue;
                 }
             };
 
-            let text = text.trim_start_matches('\u{feff}');
-            let mut fields = front_matter(text).unwrap_or_default();
+            let mut fields = front_matter(&text).unwrap_or_default();
             let description = fields.remove("description").filter(|text| !text.is_empty());
             let Some(description) = description else {
-                let problem = "no description in its front matter, skipped".to_owned();
-                let error = invalid(problem);
+                let error = skip(&path, "no description in its front matter");
                 skipped.push(error);
                 continue;
             };
@@ -373,7 +379,7 @@ pub(crate) struct Role {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, expecting = "a table")]
 struct RoleSpec {
     description: String,
     model: Option<String>,
@@ -387,22 +393,20 @@ pub(crate) fn roles(dir: &Path, project: &Path, models: &Models) -> (Vec<Role>, 
     let mut found = BTreeMap::new();
     let mut skipped = Vec::new();
     for path in paths {
-        let invalid = invalid(&path);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                let reason = unreadable(&e);
-                let problem = format!("{reason}, skipped");
-                skipped.push(invalid(problem));
+        let text = match read_text(&path) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(reason) => {
+                let error = skip(&path, &reason);
+                skipped.push(error);
                 continue;
             }
         };
         let table: Table = match parsed(&text) {
             Ok(table) => table,
             Err(problem) => {
-                let problem = format!("{problem}, skipped");
-                skipped.push(invalid(problem));
+                let error = skip(&path, &problem);
+                skipped.push(error);
                 continue;
             }
         };
@@ -412,15 +416,17 @@ pub(crate) fn roles(dir: &Path, project: &Path, models: &Models) -> (Vec<Role>, 
                 Ok(spec) => spec,
                 Err(e) => {
                     let message = without_value(e.message());
-                    let problem = format!("[{name}]: {message}, skipped");
-                    skipped.push(invalid(problem));
+                    let problem = format!("[{name}]: {message}");
+                    let error = skip(&path, &problem);
+                    skipped.push(error);
                     continue;
                 }
             };
             let description = spec.description.trim();
             if description.is_empty() {
-                let problem = format!("[{name}]: description is empty, skipped");
-                skipped.push(invalid(problem));
+                let problem = format!("[{name}]: description is empty");
+                let error = skip(&path, &problem);
+                skipped.push(error);
                 continue;
             }
 
@@ -428,8 +434,9 @@ pub(crate) fn roles(dir: &Path, project: &Path, models: &Models) -> (Vec<Role>, 
                 None => None,
                 Some(Ok(built)) => Some(Arc::from(built)),
                 Some(Err(e)) => {
-                    let problem = format!("[{name}]: {e}, skipped");
-                    skipped.push(invalid(problem));
+                    let problem = format!("[{name}]: {e}");
+                    let error = skip(&path, &problem);
+                    skipped.push(error);
                     continue;
                 }
             };
@@ -546,6 +553,18 @@ fn scalar(parts: &[&str]) -> String {
     plain.trim().to_owned()
 }
 
+/// `None` when it doesn't exist, without the BOM editors on Windows often write
+fn read_text(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let text = text.trim_start_matches('\u{feff}');
+            Ok(Some(text.to_owned()))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(unreadable(&e)),
+    }
+}
+
 fn unreadable(e: &io::Error) -> String {
     match e.kind() {
         io::ErrorKind::InvalidData => "not UTF-8 text".to_owned(),
@@ -565,7 +584,7 @@ struct AgentFile {
 }
 
 #[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, expecting = "a table")]
 struct Allow {
     #[serde(default)]
     env: Vec<String>,
@@ -574,7 +593,7 @@ struct Allow {
 }
 
 #[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, expecting = "a table")]
 struct Deny {
     #[serde(default)]
     read: Vec<String>,
@@ -591,7 +610,12 @@ pub(crate) struct Access {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+#[serde(
+    tag = "type",
+    rename_all = "lowercase",
+    deny_unknown_fields,
+    expecting = "a table"
+)]
 enum McpSpec {
     Stdio {
         #[serde(default = "enabled")]
@@ -639,30 +663,36 @@ pub(crate) enum McpKind {
     },
 }
 
-pub(crate) fn agent(dir: &Path) -> Result<(Vec<McpConfig>, Access)> {
+/// An `[mcp.*]` entry that can't be used
+#[derive(Debug)]
+pub(crate) struct Skipped {
+    pub(crate) name: String,
+    pub(crate) problem: Error,
+}
+
+/// MCP entries that can't be used are skipped and returned with their problems
+pub(crate) fn agent(dir: &Path) -> Result<(Vec<McpConfig>, Access, Vec<Skipped>)> {
     let path = dir.join("agent.toml");
     let invalid = invalid(&path);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), Access::default()));
-        }
-        Err(e) => {
-            let reason = unreadable(&e);
-            return Err(invalid(reason));
-        }
+    let text = match read_text(&path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok((Vec::new(), Access::default(), Vec::new())),
+        Err(reason) => return Err(invalid(reason)),
     };
 
     let file: AgentFile = parsed(&text).map_err(&invalid)?;
 
     let mut servers = Vec::new();
+    let mut skipped = Vec::new();
     for (name, value) in file.mcp {
         let spec = match value.try_into::<McpSpec>() {
             Ok(spec) => spec,
             Err(e) => {
                 let message = without_value(e.message());
                 let problem = format!("[mcp.{name}]: {message}");
-                return Err(invalid(problem));
+                let problem = skip(&path, &problem);
+                skipped.push(Skipped { name, problem });
+                continue;
             }
         };
 
@@ -694,13 +724,17 @@ pub(crate) fn agent(dir: &Path) -> Result<(Vec<McpConfig>, Access)> {
                     let problem = format!(
                         "[mcp.{name}]: unsupported transport {transport} (expected streamable-http)"
                     );
-                    return Err(invalid(problem));
+                    let problem = skip(&path, &problem);
+                    skipped.push(Skipped { name, problem });
+                    continue;
                 }
 
                 // The URL may carry a secret, so it is never shown
                 if let Err(problem) = parse_url(&url) {
                     let problem = format!("[mcp.{name}]: url: {problem}");
-                    return Err(invalid(problem));
+                    let problem = skip(&path, &problem);
+                    skipped.push(Skipped { name, problem });
+                    continue;
                 }
 
                 let kind = McpKind::Http { url, headers };
@@ -742,7 +776,7 @@ pub(crate) fn agent(dir: &Path) -> Result<(Vec<McpConfig>, Access)> {
         hidden,
     };
 
-    Ok((servers, access))
+    Ok((servers, access, skipped))
 }
 
 pub(crate) fn parse_url(url: &str) -> Result<Url, String> {
@@ -761,15 +795,21 @@ fn invalid(path: &Path) -> impl Fn(String) -> Error {
     }
 }
 
+fn skip(path: &Path, problem: &str) -> Error {
+    let invalid = invalid(path);
+    let problem = format!("{problem}, skipped");
+    invalid(problem)
+}
+
 fn parsed<T: DeserializeOwned>(text: &str) -> Result<T, String> {
     let e = match toml::from_str(text) {
         Ok(value) => return Ok(value),
         Err(e) => e,
     };
 
-    let message = e.message();
+    let message = without_value(e.message());
     let Some(span) = e.span() else {
-        return Err(message.to_owned());
+        return Err(message);
     };
     let head = &text[..span.start];
     let line = head.matches('\n').count() + 1;
@@ -818,9 +858,9 @@ fn without_value(message: &str) -> String {
 mod tests {
     use crate::config::{
         agent, front_matter, instructions, models, roles, save_model, scalar, skills, Access,
-        McpConfig, McpKind, Skill, MODEL_EXAMPLE,
+        McpConfig, McpKind, ModelSpec, Skill, MODEL_EXAMPLE,
     };
-    use crate::model::{MediaKind, ModelSpec};
+    use crate::model::MediaKind;
     use crate::tests::temp_dir;
     use crate::Error;
     use reaper::tilde;
@@ -880,10 +920,6 @@ models = [{ id = "m3" }]
                 "[model.café]: unknown field `id`, expected one of `type`, `api`, `api_key`, `models`",
             ),
             (
-                "[model.odd]\ntype = \"anthropic\"\nmodels = [{ id = \"m1\" }]\n",
-                "[model.odd]: unknown variant `anthropic`, expected `openai-completions`",
-            ),
-            (
                 "[model.\"naïve\"]\ntype = \"openai-completions\"\nmodels = []\n",
                 "[model.naïve]: no models",
             ),
@@ -918,6 +954,14 @@ models = [{ id = "m3" }]
             (
                 "[model.\"café\"]\ntype = \"openai-completions\"\napi_key = 4242\nmodels = [{ id = \"m\" }]\n",
                 "[model.café]: invalid type: integer, expected a string",
+            ),
+            (
+                "[model]\n\"café\" = 5\n",
+                "[model.café]: invalid type: integer, expected a table",
+            ),
+            (
+                "[model.\"naïve\"]\ntype = \"openai-completions\"\nmodels = [5]\n",
+                "[model.naïve]: invalid type: integer, expected a table",
             ),
         ];
 
@@ -1172,9 +1216,9 @@ models = [{ id = "m3" }]
             fs::write(&path, text).expect("write");
             tilde(&path)
         };
-        write(
+        let top = write(
             global.clone(),
-            "[reviewer]\ndescription = \"Reviews the café's code\"\n\n[tester]\ndescription = \"Writes tests\"\nmodel = \"mock/m1\"\n",
+            "stray = \"x\"\n\n[reviewer]\ndescription = \"Reviews the café's code\"\n\n[tester]\ndescription = \"Writes tests\"\nmodel = \"mock/m1\"\n",
         );
         let middle = write(
             outer.join(".smol"),
@@ -1196,6 +1240,7 @@ models = [{ id = "m3" }]
         assert_eq!(listed, expected);
         let skipped: Vec<String> = skipped.iter().map(ToString::to_string).collect();
         let expected = [
+            format!("config: {top}: [stray]: invalid type: string, expected a table, skipped"),
             format!("config: {middle}: [writer]: description is empty, skipped"),
             format!("config: {middle}: [guesser]: model: mock/m9: not in model.toml (models: mock/m1), skipped"),
             format!("config: {middle}: [typo]: unknown field `descripton`, expected `description` or `model`, skipped"),
@@ -1214,14 +1259,15 @@ models = [{ id = "m3" }]
     fn servers_read() {
         let dir = temp_dir("mcp-config");
         fs::create_dir_all(&dir).expect("create");
-        let (servers, access) = agent(&dir).expect("missing");
+        let (servers, access, _) = agent(&dir).expect("missing");
         assert!(servers.is_empty());
         assert_eq!(access, Access::default());
 
         let text = "[mcp.\"workspace\"]\ntype = \"stdio\"\ncommand = \"desktop-mcp\"\nargs = [\"--quiet\"]\nenv = { LANG = \"en_US.UTF-8\" }\n\n\
             [mcp.web]\ntype = \"http\"\nurl = \"http://127.0.0.1:1/mcp\"\nenabled = false\ndescription = \"Search the web\"\n";
         fs::write(dir.join("agent.toml"), text).expect("write");
-        let (read, _) = agent(&dir).expect("servers");
+        let (read, _, skipped) = agent(&dir).expect("servers");
+        assert!(skipped.is_empty(), "{skipped:?}");
 
         let http = McpKind::Http {
             url: "http://127.0.0.1:1/mcp".to_owned(),
@@ -1247,35 +1293,59 @@ models = [{ id = "m3" }]
         };
         assert_eq!(read, [web, desktop]);
 
+        // An entry that can't be used is skipped and the others are still read
         let shown = tilde(&dir.join("agent.toml"));
+        let kept = "\n[mcp.kept]\ntype = \"stdio\"\ncommand = \"kept-mcp\"\n";
         let cases = [
             (
+                "café",
                 "[mcp.\"café\"]\ntype = \"sse\"\n",
-                "[mcp.café]: unknown variant `sse`, expected `stdio` or `http`",
+                "unknown variant `sse`, expected `stdio` or `http`",
             ),
             (
-                "[mcp.\"workspace\"]\ntype = \"stdio\"\nargs = []\n",
-                "[mcp.workspace]: missing field `command`",
+                "café",
+                "[mcp]\n\"café\" = 1\n",
+                "invalid type: integer, expected a table",
             ),
             (
+                "workspace",
                 "[mcp.\"workspace\"]\ntype = \"stdio\"\ncommand = \"x\"\nurl = \"http://127.0.0.1:1/mcp\"\n",
-                "[mcp.workspace]: unknown field `url`, expected one of `enabled`, `description`, `command`, `args`, `env`",
+                "unknown field `url`, expected one of `enabled`, `description`, `command`, `args`, `env`",
             ),
             (
+                "web",
                 "[mcp.\"web\"]\ntype = \"http\"\nurl = \"localhost:3000/mcp\"\n",
-                "[mcp.web]: url: expected http:// or https://",
+                "url: expected http:// or https://",
             ),
             (
+                "web",
                 "[mcp.\"web\"]\ntype = \"http\"\nurl = \"café/mcp\"\n",
-                "[mcp.web]: url: relative URL without a base",
+                "url: relative URL without a base",
             ),
+            (
+                "web",
+                "[mcp.web]\ntype = \"http\"\nurl = \"https://example.com/mcp\"\nheaders = \"Authorization: Bearer naïve\"\n",
+                "invalid type: string, expected a map",
+            ),
+        ];
+        for (name, text, problem) in cases {
+            let text = format!("{text}{kept}");
+            fs::write(dir.join("agent.toml"), text).expect("write");
+            let (servers, _, skipped) = agent(&dir).expect("skipped");
+            let names: Vec<&str> = servers.iter().map(|server| server.name.as_str()).collect();
+            assert_eq!(names, ["kept"]);
+            let mut said = Vec::new();
+            for entry in skipped {
+                said.push((entry.name, entry.problem.to_string()));
+            }
+            let problem = format!("config: {shown}: [mcp.{name}]: {problem}, skipped");
+            assert_eq!(said, [(name.to_owned(), problem)]);
+        }
+
+        let cases = [
             (
                 "[sandbox]\nnet = true\n",
                 "line 1: unknown field `sandbox`, expected one of `mcp`, `allow`, `deny`",
-            ),
-            (
-                "[mcp.web]\ntype = \"http\"\nurl = \"https://example.com/mcp\"\nheaders = \"Authorization: Bearer naïve\"\n",
-                "[mcp.web]: invalid type: string, expected a map",
             ),
             (
                 "[mcp.\"workspace\"]\ntype = \"stdio\"\ncommand = \"x\"\nargs = [\n  \"--quiet\",\n  sk-naïve,\n]\n",
@@ -1303,7 +1373,7 @@ models = [{ id = "m3" }]
             "[allow]\nenv = [\"GITHUB_TOKEN\"]\nwrite = [\"~/.npm\", '{absolute}']\n\n[deny]\nread = [\"~\"]\n"
         );
         fs::write(dir.join("agent.toml"), text).expect("write");
-        let (_, access) = agent(&dir).expect("access");
+        let (_, access, _) = agent(&dir).expect("access");
 
         let expected = Access {
             env: vec!["GITHUB_TOKEN".to_owned()],
@@ -1325,6 +1395,10 @@ models = [{ id = "m3" }]
             (
                 "[allow]\nnet = true\n",
                 "line 2: unknown field `net`, expected `env` or `write`",
+            ),
+            (
+                "allow = 5\n",
+                "line 1: allow: invalid type: integer, expected a table",
             ),
         ];
         for (text, problem) in cases {

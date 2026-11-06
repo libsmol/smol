@@ -105,7 +105,7 @@ fn initialize(role: Role<'_>) {
     let exe = executable();
     stdlib::install(&exe);
     #[cfg(windows)]
-    windows::prepare();
+    windows::install();
     let home = exe.parent().unwrap_or(Path::new("")).to_owned();
 
     let argv: Vec<OsString> = match role {

@@ -1,7 +1,6 @@
-use crate::acp::rpc::{Notice, Peer};
-use crate::acp::{AGENT, SHELL, UPDATE};
-use crate::agent::{Event, HelperView, Helpers, Status, Unseen};
-use crate::prompt::{SKIPPED, STOPPED, STOPPED_BY_CODE, TOOL, UNFINISHED};
+use crate::acp::rpc::{Notice, SessionPeer};
+use crate::agent::{Event, Failure, HelperView, Helpers, Status, Unseen};
+use crate::prompt::{SKIPPED, TOOL};
 use crate::steps::{
     estimate, text_bytes, AgentMemory, AgentStep, Call, CallError, Ending, Exit, Helper,
     MemoryStep, ShellStep, StepError, SummaryStep, TaskStep, Usage,
@@ -11,11 +10,14 @@ use agent_client_protocol_schema::v1::{
     ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use reaper::one_line;
+use reaper::wire::{
+    AGENT, DECODE_DURATION, DURATION, ERROR, ESTIMATED_OUTPUT, INPUT_TOKENS, INTERRUPTED, NAME,
+    OUTPUT_TOKENS, PARENT, ROLE, SHELL, STEPS, TASK, UPDATE,
+};
 use reqwest::Url;
 use serde_json::json;
 use std::mem;
 use std::path::{self, Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const ESTIMATE_EVERY: Duration = Duration::from_secs(1);
@@ -24,15 +26,14 @@ const COMPACTING: &str = "Compact context";
 const RESTARTED: &str = "python: restarted, earlier variables are gone";
 
 pub(crate) struct Translator {
-    session: String,
-    peer: Arc<Peer>,
+    peer: SessionPeer,
     ids: usize,
     tasks: usize,
     window: u64,
     used: u64,
     calls: Vec<Opened>,
     /// The open compaction call
-    thinking: Option<String>,
+    compacting: Option<String>,
     /// The call for the user command that is running
     shell: Option<String>,
     progress: Progress,
@@ -58,21 +59,19 @@ struct Progress {
 
 impl Translator {
     pub(crate) fn new(
-        session: String,
-        peer: Arc<Peer>,
+        peer: SessionPeer,
         window: Option<u64>,
         cwd: PathBuf,
         copies: PathBuf,
     ) -> Self {
         Self {
-            session,
             peer,
             ids: 0,
             tasks: 0,
             window: window.unwrap_or(0),
             used: 0,
             calls: Vec::new(),
-            thinking: None,
+            compacting: None,
             shell: None,
             progress: Progress::default(),
             cwd,
@@ -85,9 +84,47 @@ impl Translator {
             match step {
                 MemoryStep::Task(task) => self.task(task, false),
                 MemoryStep::Update(update) => self.task(update, true),
-                MemoryStep::Action(step) => self.action(step),
+                // Each call's code goes out in one piece
+                MemoryStep::Action(step) => {
+                    let reasoning = step.reasoning.as_deref().unwrap_or_default();
+                    if !reasoning.is_empty() {
+                        let chunk = chunk(reasoning);
+                        self.peer.update(SessionUpdate::AgentThoughtChunk(chunk));
+                    }
+
+                    // Split the text where each call started to restore the live order
+                    let mut said = 0;
+                    for (index, call) in step.calls.iter().enumerate() {
+                        let at = call.at.min(step.text.len()).max(said);
+                        let before = step.text.get(said..at).unwrap_or_default();
+                        self.said(before);
+                        said = at;
+
+                        // Live calls open when their first code chunk arrives,
+                        // and unreadable ones open when received
+                        if !call.code.is_empty() {
+                            self.code(index, &call.code);
+                        } else if call.arguments.is_some() {
+                            self.unread(index, call);
+                        }
+
+                        let result = call.result.as_ref();
+                        let helpers = result.map(|result| result.agents.as_slice());
+                        let views = self.helpers(index);
+                        for (offset, helper) in helpers.unwrap_or_default().iter().enumerate() {
+                            let mut view = views.open(offset + 1, helper);
+                            view.close(helper);
+                        }
+                        if call.result.is_some() || call.error.is_some() {
+                            self.ran(index, call);
+                        }
+                    }
+                    let rest = step.text.get(said..).unwrap_or_default();
+                    self.said(rest);
+                    self.step_end(step);
+                }
                 MemoryStep::Summary(summary) => {
-                    self.think(COMPACTING);
+                    self.compact();
                     self.compact_end(Ok(summary));
                 }
                 MemoryStep::Shell(shell) => {
@@ -106,7 +143,7 @@ impl Translator {
             Event::Thought(text) => {
                 self.streamed(text.added);
                 let chunk = chunk(text.added);
-                self.update(SessionUpdate::AgentThoughtChunk(chunk));
+                self.peer.update(SessionUpdate::AgentThoughtChunk(chunk));
             }
             Event::Text(text) => {
                 self.streamed(text.added);
@@ -117,11 +154,11 @@ impl Translator {
                 self.code(index, code.whole);
             }
             Event::Unread(index, call) => self.unread(index, call),
-            Event::Execute(index, _) => {
+            Event::Run(index, _) => {
                 if let Some(opened) = self.opened(index) {
                     let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
                     let update = ToolCallUpdate::new(opened.id.clone(), fields);
-                    self.update(SessionUpdate::ToolCallUpdate(update));
+                    self.peer.update(SessionUpdate::ToolCallUpdate(update));
                 }
             }
             Event::Output(index, call, output) => {
@@ -131,22 +168,27 @@ impl Translator {
                     let content = vec![code, output];
                     let fields = ToolCallUpdateFields::new().content(content);
                     let update = ToolCallUpdate::new(opened.id.clone(), fields);
-                    self.update(SessionUpdate::ToolCallUpdate(update));
+                    self.peer.update(SessionUpdate::ToolCallUpdate(update));
                 }
             }
-            Event::Ran(index, call) => self.ran(index, call),
+            Event::RunEnd(index, call) => self.ran(index, call),
             Event::Restarted => self.notice(RESTARTED, None),
             Event::Retry { reason, wait } => {
                 for opened in mem::take(&mut self.calls) {
                     let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Failed);
                     let update = ToolCallUpdate::new(opened.id, fields);
-                    self.update(SessionUpdate::ToolCallUpdate(update));
+                    self.peer.update(SessionUpdate::ToolCallUpdate(update));
                 }
                 self.notice(reason, Some(wait));
                 self.withdraw();
             }
             Event::StepEnd(step) => self.step_end(step),
-            Event::Compact => self.think(COMPACTING),
+            // The model error is reported once, by a notice or by the turn's error
+            Event::StepFailed(step) => {
+                self.close_unrun(step, None);
+                self.withdraw();
+            }
+            Event::Compact => self.compact(),
             Event::CompactEnd(result) => self.compact_end(result),
         }
     }
@@ -156,7 +198,7 @@ impl Translator {
         self.window = window.unwrap_or(0);
         self.used = 0;
         let update = UsageUpdate::new(0, self.window);
-        self.update(SessionUpdate::UsageUpdate(update));
+        self.peer.update(SessionUpdate::UsageUpdate(update));
     }
 
     pub(crate) fn shell(&mut self, command: &str) {
@@ -167,7 +209,7 @@ impl Translator {
             .kind(ToolKind::Execute)
             .status(ToolCallStatus::InProgress)
             .meta(meta);
-        self.update(SessionUpdate::ToolCall(started));
+        self.peer.update(SessionUpdate::ToolCall(started));
         self.shell = Some(id);
     }
 
@@ -179,7 +221,7 @@ impl Translator {
         let content = vec![ToolCallContent::from(output)];
         let fields = ToolCallUpdateFields::new().content(content);
         let update = ToolCallUpdate::new(id.clone(), fields);
-        self.update(SessionUpdate::ToolCallUpdate(update));
+        self.peer.update(SessionUpdate::ToolCallUpdate(update));
     }
 
     pub(crate) fn shell_end(&mut self, shell: &ShellStep) {
@@ -201,15 +243,15 @@ impl Translator {
         let fields = ToolCallUpdateFields::new().status(status).content(content);
         let mut update = ToolCallUpdate::new(id, fields);
         if failed {
-            let error = ("error".to_owned(), json!(shell.end.to_string()));
+            let error = (ERROR.to_owned(), json!(shell.end.to_string()));
             let mut meta = Meta::from_iter([error]);
             // The client recognizes interrupts by this key, which matches the one on usage updates
             if shell.end == Exit::Interrupted {
-                meta.insert("interrupted".to_owned(), true.into());
+                meta.insert(INTERRUPTED.to_owned(), true.into());
             }
             update = update.meta(meta);
         }
-        self.update(SessionUpdate::ToolCallUpdate(update));
+        self.peer.update(SessionUpdate::ToolCallUpdate(update));
     }
 
     fn task(&mut self, asked: &TaskStep, appended: bool) {
@@ -222,53 +264,13 @@ impl Translator {
             let meta = Meta::from_iter([flag]);
             chunk = chunk.meta(meta);
         }
-        self.update(SessionUpdate::UserMessageChunk(chunk));
-    }
-
-    /// A saved step, with each call's code sent in one piece
-    fn action(&mut self, step: &AgentStep) {
-        let reasoning = step.reasoning.as_deref().unwrap_or_default();
-        if !reasoning.is_empty() {
-            let chunk = chunk(reasoning);
-            self.update(SessionUpdate::AgentThoughtChunk(chunk));
-        }
-
-        // Split the text where each call started to restore the live order
-        let mut said = 0;
-        for (index, call) in step.calls.iter().enumerate() {
-            let at = call.at.min(step.text.len()).max(said);
-            let before = step.text.get(said..at).unwrap_or_default();
-            self.said(before);
-            said = at;
-
-            // Live calls open when their first code chunk arrives,
-            // and unreadable ones open when received
-            if !call.code.is_empty() {
-                self.code(index, &call.code);
-            } else if call.arguments.is_some() {
-                self.unread(index, call);
-            }
-
-            let result = call.result.as_ref();
-            let helpers = result.map(|result| result.agents.as_slice());
-            let views = self.helpers(index);
-            for (offset, helper) in helpers.unwrap_or_default().iter().enumerate() {
-                let mut view = views.open(offset + 1, helper);
-                view.close(helper);
-            }
-            if call.result.is_some() || call.error.is_some() {
-                self.ran(index, call);
-            }
-        }
-        let rest = step.text.get(said..).unwrap_or_default();
-        self.said(rest);
-        self.step_end(step);
+        self.peer.update(SessionUpdate::UserMessageChunk(chunk));
     }
 
     fn said(&self, text: &str) {
         if !text.is_empty() {
             let chunk = chunk(text);
-            self.update(SessionUpdate::AgentMessageChunk(chunk));
+            self.peer.update(SessionUpdate::AgentMessageChunk(chunk));
         }
     }
 
@@ -288,10 +290,10 @@ impl Translator {
                 0 => 0,
                 used => used + output,
             };
-            let estimated = ("estimatedOutput".to_owned(), json!(output));
+            let estimated = (ESTIMATED_OUTPUT.to_owned(), json!(output));
             let meta = Meta::from_iter([estimated]);
             let update = UsageUpdate::new(used, self.window).meta(meta);
-            self.update(SessionUpdate::UsageUpdate(update));
+            self.peer.update(SessionUpdate::UsageUpdate(update));
         }
     }
 
@@ -322,7 +324,7 @@ impl Translator {
                 SessionUpdate::ToolCall(started)
             }
         };
-        self.update(update);
+        self.peer.update(update);
     }
 
     /// A call that already streamed code keeps showing its code
@@ -347,7 +349,7 @@ impl Translator {
             ended: false,
         };
         self.calls.push(opened);
-        self.update(SessionUpdate::ToolCall(started));
+        self.peer.update(SessionUpdate::ToolCall(started));
     }
 
     fn next_id(&mut self) -> String {
@@ -366,8 +368,7 @@ impl Translator {
         };
 
         Box::new(HelperCalls {
-            peer: Arc::clone(&self.peer),
-            session: self.session.clone(),
+            peer: self.peer.clone(),
             parent: opened.id.clone(),
             cwd: self.cwd.clone(),
         })
@@ -388,7 +389,7 @@ impl Translator {
         };
         let fields = ToolCallUpdateFields::new().status(status).content(content);
         let update = ToolCallUpdate::new(id, fields);
-        self.update(SessionUpdate::ToolCallUpdate(update));
+        self.peer.update(SessionUpdate::ToolCallUpdate(update));
     }
 
     /// Shows the saved code, which already has stray tags stripped
@@ -421,11 +422,26 @@ impl Translator {
 
     fn step_end(&mut self, step: &AgentStep) {
         let error = step.error.as_ref();
+        let reported = !self.calls.is_empty();
+        let reason = match error {
+            Some(error) => error.to_string(),
+            None => SKIPPED.to_owned(),
+        };
+        self.close_unrun(step, Some(&reason));
 
-        // Calls that never ran close as failed and show the saved call as replay does
-        let opened = mem::take(&mut self.calls);
-        let reported = !opened.is_empty();
-        for call in opened {
+        if error.is_some() && !reported {
+            self.notice(&reason, None);
+        }
+        self.progress = Progress::default();
+
+        let interrupted = error == Some(&StepError::Interrupted);
+        self.report_usage(&step.usage, step.used, interrupted);
+    }
+
+    /// Closes the calls that never ran as failed, showing the saved call as replay does
+    /// and `reason` unless the call carries its own
+    fn close_unrun(&mut self, step: &AgentStep, reason: Option<&str>) {
+        for call in mem::take(&mut self.calls) {
             if call.ended {
                 continue;
             }
@@ -434,15 +450,8 @@ impl Translator {
                 Some(stored) => self.content(stored),
                 None => Vec::new(),
             };
-            let reason = match error {
-                // Unreadable calls already carry their own reason
-                _ if stored.is_some_and(Call::unread) => None,
-                // A model error is reported once, by a notice or by the turn's error
-                Some(StepError::Model(_)) => None,
-                Some(error) => Some(error.to_string()),
-                None => Some(SKIPPED.to_owned()),
-            };
-            if let Some(reason) = reason {
+            let unread = stored.is_some_and(Call::unread);
+            if let Some(reason) = reason.filter(|_| !unread) {
                 let reason = ToolCallContent::from(reason);
                 content.push(reason);
             }
@@ -450,24 +459,8 @@ impl Translator {
                 .status(ToolCallStatus::Failed)
                 .content(content);
             let update = ToolCallUpdate::new(call.id, fields);
-            self.update(SessionUpdate::ToolCallUpdate(update));
+            self.peer.update(SessionUpdate::ToolCallUpdate(update));
         }
-
-        if let Some(error @ (StepError::Cut | StepError::Interrupted)) = error {
-            if !reported {
-                let text = error.to_string();
-                self.notice(&text, None);
-            }
-        }
-
-        // A request the model failed is not recorded and doesn't count as a step
-        if let Some(StepError::Model(_)) = error {
-            return self.withdraw();
-        }
-        self.progress = Progress::default();
-
-        let interrupted = error == Some(&StepError::Interrupted);
-        self.report_usage(&step.usage, step.used, interrupted);
     }
 
     /// Takes back the reported estimate of a step that was thrown away
@@ -476,55 +469,45 @@ impl Translator {
         // Without metrics it doesn't count as a step
         if progress.reported > 0 {
             let update = UsageUpdate::new(self.used, self.window);
-            self.update(SessionUpdate::UsageUpdate(update));
+            self.peer.update(SessionUpdate::UsageUpdate(update));
         }
     }
 
-    fn compact_end(&mut self, result: Result<&SummaryStep, &StepError>) {
+    fn compact(&mut self) {
+        let id = self.next_id();
+        let started = ToolCall::new(id.clone(), COMPACTING)
+            .kind(ToolKind::Think)
+            .status(ToolCallStatus::InProgress);
+        self.peer.update(SessionUpdate::ToolCall(started));
+        self.compacting = Some(id);
+    }
+
+    fn compact_end(&mut self, result: Result<&SummaryStep, &Failure>) {
         let (status, text) = match result {
             Ok(summary) => (ToolCallStatus::Completed, summary.summary.clone()),
             // The step that follows reports the interrupt
-            Err(StepError::Interrupted) => (ToolCallStatus::Failed, String::new()),
+            Err(Failure::Interrupted) => (ToolCallStatus::Failed, String::new()),
             Err(error) => (ToolCallStatus::Failed, error.to_string()),
         };
-        self.think_end(status, &text);
+        if let Some(id) = self.compacting.take() {
+            let mut content = Vec::new();
+            if !text.is_empty() {
+                let text = ToolCallContent::from(text);
+                content.push(text);
+            }
+            let fields = ToolCallUpdateFields::new().status(status).content(content);
+            let update = ToolCallUpdate::new(id, fields);
+            self.peer.update(SessionUpdate::ToolCallUpdate(update));
+        }
 
         if let Ok(summary) = result {
             self.report_usage(&summary.usage, summary.used, false);
         }
     }
 
-    fn update(&self, update: SessionUpdate) {
-        self.peer.update(&self.session, update);
-    }
-
     fn notice(&self, text: &str, retry_in: Option<Duration>) {
         let kind = Notice::Step(retry_in);
-        self.peer.notice(&self.session, text, kind);
-    }
-
-    fn think(&mut self, title: &str) {
-        let id = self.next_id();
-        let started = ToolCall::new(id.clone(), title)
-            .kind(ToolKind::Think)
-            .status(ToolCallStatus::InProgress);
-        self.update(SessionUpdate::ToolCall(started));
-        self.thinking = Some(id);
-    }
-
-    fn think_end(&mut self, status: ToolCallStatus, text: &str) {
-        let Some(id) = self.thinking.take() else {
-            return;
-        };
-
-        let mut content = Vec::new();
-        if !text.is_empty() {
-            let text = ToolCallContent::from(text);
-            content.push(text);
-        }
-        let fields = ToolCallUpdateFields::new().status(status).content(content);
-        let update = ToolCallUpdate::new(id, fields);
-        self.update(SessionUpdate::ToolCallUpdate(update));
+        self.peer.notice(text, kind);
     }
 
     fn report_usage(&mut self, usage: &Usage, used: Option<u64>, interrupted: bool) {
@@ -535,38 +518,36 @@ impl Translator {
         let mut meta = usage_meta(usage);
         // Replay has no stop reason for the turn, so interrupts can only go on the step
         if interrupted {
-            meta.insert("interrupted".to_owned(), true.into());
+            meta.insert(INTERRUPTED.to_owned(), true.into());
         }
 
         let update = UsageUpdate::new(self.used, self.window).meta(meta);
-        self.update(SessionUpdate::UsageUpdate(update));
+        self.peer.update(SessionUpdate::UsageUpdate(update));
     }
 }
 
 /// The keys that steps and agents report their usage with
 fn usage_meta(usage: &Usage) -> Meta {
     let mut meta = Meta::new();
-    meta.insert("duration".to_owned(), usage.duration.into());
+    meta.insert(DURATION.to_owned(), usage.duration.into());
     if let Some(tokens) = usage.tokens {
-        meta.insert("inputTokens".to_owned(), tokens.input_tokens.into());
-        meta.insert("outputTokens".to_owned(), tokens.output_tokens.into());
+        meta.insert(INPUT_TOKENS.to_owned(), tokens.input_tokens.into());
+        meta.insert(OUTPUT_TOKENS.to_owned(), tokens.output_tokens.into());
     }
     if let Some(decode) = usage.decode_duration {
-        meta.insert("decodeDuration".to_owned(), decode.into());
+        meta.insert(DECODE_DURATION.to_owned(), decode.into());
     }
     meta
 }
 
 struct HelperCalls {
-    peer: Arc<Peer>,
-    session: String,
+    peer: SessionPeer,
     parent: String,
     cwd: PathBuf,
 }
 
 struct HelperCall {
-    peer: Arc<Peer>,
-    session: String,
+    peer: SessionPeer,
     id: String,
     started: bool,
     /// Agents still running when their snippet ends are aborted before they close
@@ -577,21 +558,19 @@ impl Helpers for HelperCalls {
     fn open(&self, number: usize, helper: &Helper) -> Box<dyn HelperView> {
         let id = format!("{}.{number}", self.parent);
         let title = agent_title(&helper.task, &self.cwd);
-        let asked = json!({ "task": helper.task, "role": helper.role, "name": helper.name });
+        let asked = json!({ TASK: helper.task, ROLE: helper.role, NAME: helper.name });
         let marked = (AGENT.to_owned(), json!(true));
-        let parent = ("parent".to_owned(), json!(self.parent));
+        let parent = (PARENT.to_owned(), json!(self.parent));
         let meta = Meta::from_iter([marked, parent]);
         let opened = ToolCall::new(id.clone(), title)
             .kind(ToolKind::Other)
             .status(ToolCallStatus::Pending)
             .raw_input(asked)
             .meta(meta);
-        let update = SessionUpdate::ToolCall(opened);
-        self.peer.update(&self.session, update);
+        self.peer.update(SessionUpdate::ToolCall(opened));
 
         let view = HelperCall {
-            peer: Arc::clone(&self.peer),
-            session: self.session.clone(),
+            peer: self.peer.clone(),
             id,
             started: false,
             closed: false,
@@ -603,27 +582,23 @@ impl Helpers for HelperCalls {
 impl HelperCall {
     fn send(&self, fields: ToolCallUpdateFields, meta: Meta) {
         let update = ToolCallUpdate::new(self.id.clone(), fields).meta(meta);
-        self.peer
-            .update(&self.session, SessionUpdate::ToolCallUpdate(update));
+        self.peer.update(SessionUpdate::ToolCallUpdate(update));
     }
 
     /// Replay closes it right after opening it, and an aborted one ends as its saved record does,
     /// so every way it ends sends the same last update
     fn finish(&mut self, end: &Ending, memory: &AgentMemory) {
-        let (status, text) = match end {
-            Ending::Answer(answer) => (ToolCallStatus::Completed, answer.as_str()),
-            Ending::Error(error) => (ToolCallStatus::Failed, error.as_str()),
-            Ending::Interrupted {} => (ToolCallStatus::Failed, STOPPED),
-            Ending::Stopped {} => (ToolCallStatus::Failed, STOPPED_BY_CODE),
-            Ending::Unfinished {} | Ending::Running {} => (ToolCallStatus::Failed, UNFINISHED),
+        let (status, text) = match end.outcome() {
+            Ok(text) => (ToolCallStatus::Completed, text),
+            Err(text) => (ToolCallStatus::Failed, text),
         };
 
         let (usage, steps) = memory.spent();
         let mut meta = usage_meta(&usage);
-        meta.insert("steps".to_owned(), steps.into());
+        meta.insert(STEPS.to_owned(), steps.into());
         // The client recognizes interrupts by this key, which matches the one on usage updates
         if matches!(end, Ending::Interrupted {} | Ending::Stopped {}) {
-            meta.insert("interrupted".to_owned(), true.into());
+            meta.insert(INTERRUPTED.to_owned(), true.into());
         }
 
         let content = vec![ToolCallContent::from(text)];
@@ -646,7 +621,7 @@ impl HelperView for HelperCall {
         self.started = true;
 
         let mut meta = usage_meta(&status.usage);
-        meta.insert("steps".to_owned(), status.steps.into());
+        meta.insert(STEPS.to_owned(), status.steps.into());
         self.send(fields, meta);
     }
 
@@ -706,13 +681,13 @@ fn file_uri(path: &Path) -> Option<Url> {
 
 #[cfg(test)]
 mod tests {
-    use crate::acp::rpc::{Lines, Out};
+    use crate::acp::rpc::{Lines, Out, Peer};
     use crate::acp::tests::drained;
     use crate::acp::translator::*;
     use crate::agent::tests::{called, reply, scripted, streamed, Script, ScriptedModel};
     use crate::agent::Streamed;
     use crate::model::tests::png;
-    use crate::model::{Finish, ModelError};
+    use crate::model::Finish;
     use crate::steps::tests::{asked, coded, metered, replied};
     use crate::steps::{CodeResult, Helper};
     use serde_json::Value;
@@ -723,10 +698,10 @@ mod tests {
     fn translator(window: u64) -> (Translator, Lines) {
         let (lines, sent) = mpsc::unbounded_channel();
         let peer = Peer::new(Out::Lines(lines));
+        let peer = SessionPeer::new(peer, "session-1");
         let cwd = env::temp_dir();
         let copies = cwd.join("copies");
-        let session = "session-1".to_owned();
-        let translator = Translator::new(session, peer, Some(window), cwd, copies);
+        let translator = Translator::new(peer, Some(window), cwd, copies);
         (translator, sent)
     }
 
@@ -769,7 +744,7 @@ mod tests {
             code: code.to_owned(),
             ..Call::default()
         };
-        translator.translate(Event::Execute(0, &call));
+        translator.translate(Event::Run(0, &call));
         translator.translate(Event::Output(0, &call, "café 0\ncafé 1\n"));
 
         let messages = drained(&mut sent);
@@ -965,7 +940,7 @@ mod tests {
             ..Call::default()
         };
         live.translate(Event::Unread(0, &bash));
-        live.translate(Event::Ran(0, &bash));
+        live.translate(Event::RunEnd(0, &bash));
         let step = AgentStep {
             calls: vec![bash],
             ..AgentStep::default()
@@ -1000,13 +975,13 @@ mod tests {
             code: "1 / 0".to_owned(),
             ..Call::default()
         };
-        translator.translate(Event::Execute(0, &running));
+        translator.translate(Event::Run(0, &running));
         let failed = Call {
             result: Some(CodeResult::default()),
             error: Some(CallError::Execution("ZeroDivisionError".to_owned())),
             ..running
         };
-        translator.translate(Event::Ran(0, &failed));
+        translator.translate(Event::RunEnd(0, &failed));
         let skipped = Call {
             code: "print('second')".to_owned(),
             ..Call::default()
@@ -1139,7 +1114,7 @@ mod tests {
         let written = "<parameter name=\"code\">\nprint('seven')\n</parameter>\n";
         translator.translate(Event::Code(0, streamed(written)));
         let step = coded("print('seven')", Some("seven".to_owned()));
-        translator.translate(Event::Ran(0, &step.calls[0]));
+        translator.translate(Event::RunEnd(0, &step.calls[0]));
         translator.translate(Event::StepEnd(&step));
 
         let mut completed = Value::Null;
@@ -1216,20 +1191,31 @@ mod tests {
         assert_eq!(ended[0]["_meta"]["estimatedOutput"], Value::Null);
     }
 
-    /// A step the model failed doesn't count, so it sends no usage
+    /// A call that streamed before the model failed closes with only its code
     #[test]
-    fn failed_step_quiet() {
+    fn failed_step_closes() {
         let (mut translator, mut sent) = translator(1000);
-        let busy = ModelError::transient("busy");
+        translator.translate(Event::Code(0, streamed("print('café')\n")));
+        let streamed = Call {
+            code: "print('café')".to_owned(),
+            ..Call::default()
+        };
         let failed = AgentStep {
-            error: Some(StepError::Model(busy)),
-            usage: metered(100, 10),
+            calls: vec![streamed],
             ..AgentStep::default()
         };
-        translator.translate(Event::StepEnd(&failed));
+        translator.translate(Event::StepFailed(&failed));
 
         let messages = drained(&mut sent);
-        assert!(messages.is_empty(), "{messages:?}");
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        let closed = &messages[1]["params"]["update"];
+        assert_eq!(closed["status"], "failed");
+        let content = &closed["content"];
+        assert_eq!(content.as_array().map(Vec::len), Some(1), "{content}");
+        assert_eq!(
+            content[0]["content"]["text"],
+            "```python\nprint('café')\n```"
+        );
     }
 
     #[test]
@@ -1302,7 +1288,7 @@ mod tests {
     fn compact_interrupt_quiet() {
         let (mut translator, mut sent) = translator(1000);
         translator.translate(Event::Compact);
-        let stopped = StepError::Interrupted;
+        let stopped = Failure::Interrupted;
         translator.translate(Event::CompactEnd(Err(&stopped)));
 
         let messages = drained(&mut sent);
@@ -1327,7 +1313,7 @@ mod tests {
             code: "print(agent('Count the cafés'))".to_owned(),
             ..Call::default()
         };
-        live.translate(Event::Execute(0, &running));
+        live.translate(Event::Run(0, &running));
         let started = live.helpers(0);
         let counted = AgentStep {
             usage: metered(100, 20),
@@ -1368,7 +1354,7 @@ mod tests {
             result: Some(result),
             ..running
         };
-        live.translate(Event::Ran(0, &ran));
+        live.translate(Event::RunEnd(0, &ran));
         let step = AgentStep {
             calls: vec![ran],
             ..AgentStep::default()

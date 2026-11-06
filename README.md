@@ -144,7 +144,7 @@ first one is the default.
 | `api_key` | Sent as a bearer token. `"none"` or empty sends no key. |
 | `id` | The model name the endpoint expects. |
 | `context` | Context window in tokens. With it, older steps are summarized before the window fills; without it, nothing is compacted. |
-| `max_tokens` | Output limit per reply. Some providers count reasoning in it, so a small value can cut a reply off mid-thought. |
+| `max_tokens` | Output limit per reply. Some providers count reasoning in it, so a small value can cut a reply off mid-thought. OpenAI's reasoning models (o-series, gpt-5) refuse it; leave it out for them. |
 | `effort` | Sent as `reasoning_effort`. |
 | `image`, `video` | `true` if the model accepts images or videos. Then `view()` and attached media are sent to it; otherwise it gets a note that the media is not shown. |
 
@@ -161,10 +161,11 @@ Run `smol` in the directory you want to work in, then type a task.
   with your next message.
 - Paths written as `@path` are attached to the message.
 - An image the answer puts on a line of its own, as `![label](chart.png)` or a
-  web address, shows in the conversation: sharp in Ghostty and kitty, in
-  colored blocks in other terminals and inside tmux, screen or Zellij. Clicking
-  it opens it in the system's image viewer. Images the code viewed show when
-  expanded.
+  web address, shows in the conversation: sharp in Ghostty and kitty when
+  `TERM` names them or Ghostty sends its name over SSH, in colored blocks in
+  other terminals and inside tmux,
+  screen or Zellij. Clicking it opens it in the system's image viewer. Images
+  the code viewed show when expanded.
 - `ctrl+o` expands long output, `ctrl+d` quits.
 
 | Command | What it does |
@@ -263,6 +264,8 @@ enabled = false
 | `description` | Added to the prompt next to the server's functions. |
 | `enabled` | `false` to keep it off until `:mcp on <server>`. |
 
+An entry that can't be used is skipped with a notice.
+
 ## Sandbox
 
 On Linux (with Landlock, kernel 5.13 or later) and macOS (with Seatbelt, which
@@ -311,16 +314,19 @@ Behind a proxy, add the variables you set for it, such as `HTTPS_PROXY`,
 code starts go through it.
 
 Paths are absolute or start with `~`. Where rules overlap, the deeper path
-wins: with `~/.cargo` in `write`, `~/.cargo/credentials.toml` stays hidden.
-On Linux a folder that holds a hidden path is opened entry by entry: it can be
-listed, but files created or replaced directly in it after the session opens
-can't be read, and no new files can be made directly in it, so when the
-working directory is your home folder or holds a hidden path, new files go
-into its subfolders. `~/.config/git` is such a folder once
-`~/.config/git/credentials` exists, so a git config rewritten there during a
-session can't be read until the next one. On macOS the folders above a hidden path can't be renamed
-or removed, and hiding `~/Library/Keychains` hides the keychain files but not
-the system service that hands their items to the programs each item trusts.
+wins: with `~/.cargo` in `write`, `~/.cargo/credentials.toml` stays hidden,
+on Linux if it exists when the session opens. On Linux a folder that holds a
+hidden path, or outside the places the code writes would hold one that doesn't
+exist yet, is opened entry by entry: it can be listed, but files created or
+replaced directly in it after the session opens can't be read, and no new
+files can be made directly in it, so when the working directory is your home
+folder or holds a hidden path, new files go into its subfolders.
+`~/.config/git` is such a folder, as `~/.config/git/credentials` is hidden
+before it exists too, so a git config rewritten there during a session can't
+be read until the next one. On macOS the folders above a hidden path can't be
+renamed or removed, and hiding `~/Library/Keychains` hides the keychain files
+but not the system service that hands their items to the programs each item
+trusts.
 
 On Windows, and on Linux kernels without Landlock, files are not isolated; the
 environment is still cut down, on Windows to the system variables programs

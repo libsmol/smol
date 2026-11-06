@@ -132,9 +132,13 @@ pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment
                         Err(e) => Err(cause(&e)),
                     },
                     None => match (String::from_utf8(data), wanted) {
-                        (Ok(text), Some(range)) => {
-                            lines = Some(range);
-                            Ok(lines_of(&text, range))
+                        (Ok(text), Some((first, last))) => {
+                            lines = wanted;
+                            let skipped = first.saturating_sub(1) as usize;
+                            let count = last.saturating_sub(first) as usize + 1;
+                            let picked = text.lines().skip(skipped).take(count);
+                            let picked: Vec<&str> = picked.collect();
+                            Ok(picked.join("\n"))
                         }
                         (Ok(text), None) => Ok(text),
                         (Err(_), _) => Err(prompt::undecoded(meta.len())),
@@ -155,14 +159,6 @@ pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment
         media,
         resource: false,
     }
-}
-
-/// Lines past the end of the text are left out
-fn lines_of(text: &str, (first, last): (u32, u32)) -> String {
-    let skipped = first.saturating_sub(1) as usize;
-    let count = last.saturating_sub(first) as usize + 1;
-    let picked: Vec<&str> = text.lines().skip(skipped).take(count).collect();
-    picked.join("\n")
 }
 
 pub fn viewed(path: &Path, copies: &Path) -> Result<Media, ToolError> {
@@ -203,7 +199,7 @@ pub fn viewed(path: &Path, copies: &Path) -> Result<Media, ToolError> {
 }
 
 /// For media in MCP results, an unknown format gives None and the reason names no file
-pub(crate) fn kept(copies: &Path, data: &[u8]) -> Option<Result<Media, String>> {
+pub(crate) fn returned(copies: &Path, data: &[u8]) -> Option<Result<Media, String>> {
     let found = sniffed(data)?;
     let (_, kind, _) = found;
     let size = data.len() as u64;
@@ -506,18 +502,18 @@ pub(crate) mod tests {
         let refused = "65 bytes, over the 64-byte image limit";
         assert_eq!(large.content, format!("[not attached: {refused}]"));
 
-        assert!(kept(&copies, b"BM").is_none());
-        assert!(kept(&copies, b"\0\0\0\x1cftypavif").is_none());
-        let media = kept(&copies, &png).expect("known").expect("kept");
+        assert!(returned(&copies, b"BM").is_none());
+        assert!(returned(&copies, b"\0\0\0\x1cftypavif").is_none());
+        let media = returned(&copies, &png).expect("known").expect("copied");
         assert!(media.from_call);
         let mut big = png.clone();
         big.resize(65, 0);
-        let refused_big = kept(&copies, &big);
+        let refused_big = returned(&copies, &big);
         assert_eq!(refused_big, Some(Err(refused.to_owned())));
 
         // A file in the way keeps the copies directory from being created
         let blocked = dir.join("screenshot.PNG");
-        let failed = kept(&blocked, &png).expect("known");
+        let failed = returned(&blocked, &png).expect("known");
         let failed = failed.expect_err("blocked");
         assert!(failed.starts_with("not copied: "), "{failed}");
 

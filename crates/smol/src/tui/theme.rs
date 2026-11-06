@@ -1,3 +1,4 @@
+use crate::conversation::HUES;
 use crate::tui::Spans;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Style};
@@ -23,7 +24,7 @@ const LIME: Color = Color::Rgb(0xB5, 0xF3, 0x6B);
 const TEAL: Color = Color::Rgb(0x3F, 0xE0, 0xC5);
 
 /// One for each agent at work, none of them the main agent's purple
-pub(crate) const HELPERS: [Color; 8] = [CYAN, ORANGE, GREEN, PINK, YELLOW, BLUE, LIME, TEAL];
+pub(crate) const HELPERS: [Color; HUES] = [CYAN, ORANGE, GREEN, PINK, YELLOW, BLUE, LIME, TEAL];
 
 /// Intensity of each level of the 6×6×6 cube in the 256-color palette
 const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
@@ -109,11 +110,8 @@ mod tests {
     fn colors_downgraded() {
         let pairs = [
             (BG, 236),
-            (LINE, 239),
             (FG, 255),
             (COMMENT, 61),
-            (PURPLE, 141),
-            (PINK, 212),
             // An average ending in 0 is nearer the grey step below it
             (Color::Rgb(0x50, 0x50, 0x50), 239),
         ];

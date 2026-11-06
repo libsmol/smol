@@ -1,9 +1,9 @@
-use crate::acp::NOTICE;
 use crate::utils::Waiting;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     Error as RpcError, ErrorCode, SessionNotification, SessionUpdate, CLIENT_METHOD_NAMES,
 };
+use reaper::wire::{MCP, NOTICE, QUEUED};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{self, Write};
@@ -65,7 +65,7 @@ impl Peer {
         }
     }
 
-    pub(crate) fn notify(&self, method: &str, params: impl Serialize) {
+    fn notify(&self, method: &str, params: impl Serialize) {
         let line = encoded(None, method, params);
         self.write(line);
     }
@@ -83,7 +83,7 @@ impl Peer {
     }
 
     /// None when the client replies with an error
-    pub(crate) async fn call(&self, method: &str, params: impl Serialize) -> Option<Value> {
+    async fn call(&self, method: &str, params: impl Serialize) -> Option<Value> {
         let (id, reply) = self.pending.ask();
         let line = encoded(Some(id), method, params);
         self.write(line);
@@ -105,10 +105,6 @@ impl Peer {
         self.queued.store(queued, Ordering::Relaxed);
     }
 
-    pub(crate) fn queued(&self) -> bool {
-        self.queued.load(Ordering::Relaxed)
-    }
-
     pub(crate) fn set_images(&self, images: bool) {
         self.images.store(images, Ordering::Relaxed);
     }
@@ -116,13 +112,29 @@ impl Peer {
     pub(crate) fn images(&self) -> bool {
         self.images.load(Ordering::Relaxed)
     }
+}
 
-    pub(crate) fn update(&self, session: &str, update: SessionUpdate) {
-        let notification = SessionNotification::new(session.to_owned(), update);
-        self.notify(CLIENT_METHOD_NAMES.session_update, notification);
+/// Sends what concerns one session, with its id
+#[derive(Clone)]
+pub(crate) struct SessionPeer {
+    peer: Arc<Peer>,
+    id: Arc<str>,
+}
+
+impl SessionPeer {
+    pub(crate) fn new(peer: Arc<Peer>, id: &str) -> Self {
+        let id = Arc::from(id);
+        Self { peer, id }
     }
 
-    pub(crate) fn notice(&self, session: &str, text: &str, kind: Notice) {
+    pub(crate) fn update(&self, update: SessionUpdate) {
+        let id = Arc::clone(&self.id);
+        let notification = SessionNotification::new(id, update);
+        let method = CLIENT_METHOD_NAMES.session_update;
+        self.peer.notify(method, notification);
+    }
+
+    pub(crate) fn notice(&self, text: &str, kind: Notice) {
         let (retry_in, step, unsaved) = match kind {
             Notice::Step(retry_in) => (retry_in, true, false),
             Notice::Session => (None, false, false),
@@ -131,13 +143,28 @@ impl Peer {
         let retry_in = retry_in.map(|wait| wait.as_secs_f64());
 
         let params = json!({
-            "sessionId": session,
+            "sessionId": &*self.id,
             "text": text,
             "retryIn": retry_in,
             "step": step,
             "unsaved": unsaved,
         });
-        self.notify(NOTICE, params);
+        self.peer.notify(NOTICE, params);
+    }
+
+    pub(crate) fn servers(&self, servers: Vec<Value>) {
+        let status = json!({ "sessionId": &*self.id, "servers": servers });
+        self.peer.notify(MCP, status);
+    }
+
+    /// None unless the client declared `QUEUED` and answered
+    pub(crate) async fn queued(&self) -> Option<Value> {
+        if !self.peer.queued.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let params = json!({ "sessionId": &*self.id });
+        self.peer.call(QUEUED, params).await
     }
 }
 

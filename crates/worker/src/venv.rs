@@ -4,7 +4,7 @@ use crate::windows::{link, replace, same_build, sweep};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use reaper::cause;
+use reaper::{cause, tilde};
 use std::env;
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -79,7 +79,7 @@ pub fn enter(py: Python<'_>, venv: &Path) -> PyResult<()> {
         let relinked = replace(&linked, |fresh| link(&exe, fresh));
         if let Err(e) = relinked {
             let reason = cause(&e);
-            let shown = linked.display();
+            let shown = tilde(&linked);
             let message = format!("worker: {shown}: {reason}");
             return Err(PyRuntimeError::new_err(message));
         }
@@ -93,6 +93,7 @@ pub fn enter(py: Python<'_>, venv: &Path) -> PyResult<()> {
     if !found(EXE) || !found(PIP) {
         let code = CString::new(VENV).expect("venv.py");
         let globals = PyDict::new(py);
+        #[cfg(unix)]
         globals.set_item("_LINKED", LINKED)?;
         py.run(&code, Some(&globals), None)?;
         let repairing = globals.as_any().get_item("_repair")?;

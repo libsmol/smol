@@ -21,8 +21,7 @@ pub use crate::config::setup::{run as setup, SETUP_ARG};
 /// Runs as a venv's python or as a session's worker when started as one with `args`,
 /// and returns its exit status
 pub fn embedded(args: &[OsString]) -> Option<i32> {
-    // The worker goes first, since Windows starts it under the interpreter's name.
-    // `::worker` is the crate, which the worker module shadows here
+    // The worker goes first since Windows starts it under the interpreter's name
     guest::main(args).or_else(|| ::worker::main(args))
 }
 
@@ -57,11 +56,13 @@ pub enum Error {
     Python(String),
     #[error("history: {0}")]
     History(String),
-    /// Has no label because the memories write one into the text
-    #[error("{0}")]
+    #[error("memory: {0}")]
     Memory(String),
     #[error("memory: {0}: not found")]
     MemoryNotFound(i64),
+    /// Has no label because the server's status names it
+    #[error("{0}")]
+    Mcp(String),
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;
@@ -124,6 +125,14 @@ mod tests {
         // Another test may be running the one already there
         fs::rename(&aside, &named).ok();
         named
+    }
+
+    /// `target/<profile>`, which holds the test binary's folder
+    pub(crate) fn profile_dir() -> PathBuf {
+        let exe = env::current_exe().expect("test binary");
+        let deps = exe.parent().expect("deps");
+        let built = deps.parent().expect("profile");
+        built.to_owned()
     }
 
     pub(crate) fn temp_dir(name: &str) -> PathBuf {

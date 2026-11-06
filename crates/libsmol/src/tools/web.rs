@@ -1,6 +1,6 @@
 use crate::prompt;
 use crate::tools::ToolError;
-use crate::utils::{excerpt, http_cause, http_client};
+use crate::utils::{excerpt, http_client, read_cause};
 use encoding_rs::{Encoding, UTF_8};
 use html5ever::driver::{parse_fragment, ParseOpts};
 use html5ever::tendril::TendrilSink;
@@ -186,15 +186,7 @@ fn charset(part: &str) -> Option<&str> {
 }
 
 fn failed(url: &str, error: reqwest::Error) -> ToolError {
-    // `http_cause` reports a timeout while connecting as a failure to connect
-    let reason = match error.is_timeout() && !error.is_connect() {
-        true => {
-            let seconds = FETCH_WAIT.as_secs();
-            prompt::timed_out(seconds)
-        }
-        false => http_cause(&error),
-    };
-
+    let reason = read_cause(&error, FETCH_WAIT);
     let message = prompt::failure("fetch", url, &reason);
     ToolError::Failed(message)
 }
@@ -297,7 +289,7 @@ struct Markdown<'a> {
     base: &'a Url,
     out: String,
     in_pre: bool,
-    /// An opening mark was just written and no content has followed yet
+    /// A mark such as `- ` or `[` was just written and no content has followed yet
     opened: bool,
     /// One per nesting level, holding the count for ordered lists
     lists: Vec<Option<usize>>,
@@ -331,7 +323,7 @@ impl Markdown<'_> {
                 ("\n".into(), "\n".into())
             }
             "br" | "tr" => ("\n".into(), String::new()),
-            "blockquote" => ("\n> ".into(), String::new()),
+            "blockquote" => ("\n> ".into(), "\n".into()),
             "td" | "th" => (" | ".into(), String::new()),
             "pre" => ("\n```\n".into(), "\n```\n".into()),
             "code" if !self.in_pre => ("`".into(), "`".into()),
@@ -341,13 +333,17 @@ impl Markdown<'_> {
                 self.lists.push(count);
                 (String::new(), "\n".into())
             }
-            "li" => match self.lists.last_mut() {
-                Some(Some(count)) => {
-                    *count += 1;
-                    (format!("\n{count}. "), String::new())
+            "li" => {
+                let levels = self.lists.len().saturating_sub(1);
+                let indent = "  ".repeat(levels);
+                match self.lists.last_mut() {
+                    Some(Some(count)) => {
+                        *count += 1;
+                        (format!("\n{indent}{count}. "), String::new())
+                    }
+                    _ => (format!("\n{indent}- "), String::new()),
                 }
-                _ => ("\n- ".into(), String::new()),
-            },
+            }
             "a" => {
                 let href = el.attr("href").filter(|href| !href.starts_with('#'));
                 let url = href.and_then(|href| web_url(self.base, href));
@@ -359,12 +355,22 @@ impl Markdown<'_> {
             _ => Default::default(),
         };
 
+        // Items, rows and fences still start a line of their own
+        let joins = self.opened && open.starts_with('\n') && !matches!(tag, "li" | "tr" | "pre");
+        let open = match joins {
+            true => open.trim_start_matches('\n'),
+            false => open.as_str(),
+        };
         if open.starts_with(char::is_whitespace) {
             let kept = self.out.trim_end_matches(' ').len();
             self.out.truncate(kept);
         }
-        self.out.push_str(&open);
-        self.opened |= !open.is_empty();
+        self.out.push_str(open);
+        // A new line ends the mark, which text in a fence never does
+        if open.starts_with('\n') {
+            self.opened = false;
+        }
+        self.opened |= open.ends_with(|c: char| c != '\n');
         let in_pre = self.in_pre;
         self.in_pre |= tag == "pre";
 
@@ -392,7 +398,9 @@ impl Markdown<'_> {
             self.lists.pop();
         }
 
-        if !close.is_empty() {
+        if joins {
+            self.write(" ");
+        } else if !close.is_empty() {
             let kept = self.out.trim_end_matches(' ').len();
             let spaced = kept < self.out.len();
             self.out.truncate(kept);
@@ -426,13 +434,18 @@ impl Markdown<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::tools::web::{fetch, FETCH_WAIT, MAX_REDIRECTS};
+    use crate::tools::web::{
+        declared, fetch, markdown, parsed, refresh, FETCH_WAIT, MAX_REDIRECTS,
+    };
     use crate::utils::block_on;
-    use encoding_rs::WINDOWS_1252;
+    use encoding_rs::{SHIFT_JIS, UTF_8, WINDOWS_1252};
+    use reqwest::Url;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    const BASE: &str = "http://example.com/docs/page.html";
 
     /// Serves `head` and `body` once and keeps the connection open when `endless`
     fn served(head: String, body: Vec<u8>, endless: bool) -> SocketAddr {
@@ -472,6 +485,12 @@ mod tests {
         failed.to_string()
     }
 
+    fn converted(html: &str) -> String {
+        let base = Url::parse(BASE).expect("url");
+        let page = parsed(html);
+        markdown(&page, &base)
+    }
+
     #[test]
     fn fetch_markdown() {
         let html = |body: &str| fetched("text/html", body.as_bytes().to_vec()).1;
@@ -509,19 +528,65 @@ mod tests {
     }
 
     #[test]
+    fn list_paragraphs() {
+        let page = "<ul><li><p>one café</p></li><li><p>two</p></li></ul><p>after</p>";
+        assert_eq!(converted(page), "- one café\n- two\n\nafter");
+
+        let code = "<ul><li><pre><div>let café;</div><div>let naïve;</div></pre></li></ul>";
+        let expected = "-\n```\n\nlet café;\n\nlet naïve;\n\n```";
+        assert_eq!(converted(code), expected);
+    }
+
+    #[test]
+    fn quote_paragraphs() {
+        let page = "<blockquote><p>quoted naïve</p></blockquote><p>after</p>";
+        assert_eq!(converted(page), "> quoted naïve\n\nafter");
+    }
+
+    #[test]
+    fn cell_paragraphs() {
+        let page = "<table><tr><td><p>c1</p></td><td><p>résumé</p></td></tr></table><p>after</p>";
+        assert_eq!(converted(page), "| c1 | résumé\n\nafter");
+    }
+
+    #[test]
+    fn link_heading() {
+        let page = "<a href=\"/x\"><h3>Card title</h3></a><p>Crème brûlée</p>";
+        let expected = "[### Card title](http://example.com/x)\nCrème brûlée";
+        assert_eq!(converted(page), expected);
+    }
+
+    #[test]
+    fn nested_lists() {
+        let page = "<ul><li>one<ul><li>two<ol><li>three</li><li>four</li></ol></li></ul></li></ul>";
+        let expected = "- one\n  - two\n    1. three\n    2. four";
+        assert_eq!(converted(page), expected);
+    }
+
+    #[test]
     fn fetch_charset() {
         let (body, _, _) = WINDOWS_1252.encode("<p>café</p>");
-        let declared = [br#"<meta charset="windows-1252">"#.as_slice(), &body].concat();
-        assert_eq!(fetched("text/html", declared).1, "café");
-        let old = br#"<meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-1">"#;
-        let old = [old.as_slice(), &body].concat();
-        assert_eq!(fetched("text/html", old).1, "café");
+        let meta = [br#"<meta charset="windows-1252">"#.as_slice(), &body].concat();
+        assert_eq!(fetched("text/html", meta).1, "café");
 
         let (text, _, _) = WINDOWS_1252.encode("crème brûlée");
         let named = fetched("text/plain; Charset=ISO-8859-1", text.to_vec());
         assert_eq!(named.1, "crème brûlée");
-        let wide = "<meta charset='utf-16'><p>café</p>".as_bytes().to_vec();
-        assert_eq!(fetched("text/html", wide).1, "café");
+    }
+
+    #[test]
+    fn charset_declared() {
+        let meta = r#"<meta charset="windows-1252"><p>café</p>"#;
+        assert_eq!(declared(meta.as_bytes()), Some(WINDOWS_1252));
+        let old = br#"<meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-1">"#;
+        assert_eq!(declared(old), Some(WINDOWS_1252));
+        assert_eq!(declared(b"<meta charset='utf-16'>"), Some(UTF_8));
+        assert_eq!(declared(b"<META CHARSET=Shift_JIS>"), Some(SHIFT_JIS));
+
+        assert_eq!(declared("<p>café</p>".as_bytes()), None);
+        let late = format!("<p>{}</p><meta charset=\"windows-1252\">", "x".repeat(1024));
+        assert_eq!(declared(late.as_bytes()), None);
+        assert_eq!(declared(b"<meta charset=klingon>"), None);
     }
 
     #[test]
@@ -599,17 +664,11 @@ mod tests {
         let full = page("<p>full page</p>");
         let script = format!("<script>location.replace('{full}')</script><noscript><meta http-equiv=\"refresh\" content=\"0;url={full}\"></noscript>");
         assert_eq!(fetched("text/html", script.into_bytes()).1, "full page");
-        let quoted = page("<p>quoted</p>");
-        let quoted = format!("<meta http-equiv=\"Refresh\" content=\" 0.5 , URL = '{quoted}' \">");
-        assert_eq!(fetched("text/html", quoted.into_bytes()).1, "quoted");
 
         // Following it would fail to connect to port 1
         let later =
             "<meta http-equiv=\"refresh\" content=\"5;url=http://127.0.0.1:1/\"><p>redirecting in 5s</p>";
         assert_eq!(fetched("text/html", later.into()).1, "redirecting in 5s");
-        let itself =
-            "<meta http-equiv=\"refresh\" content=\"0; url=page.html\"><p>refreshes itself</p>";
-        assert_eq!(fetched("text/html", itself.into()).1, "refreshes itself");
 
         let chained = |end: String, hops: usize| {
             let mut next = end;
@@ -628,5 +687,32 @@ mod tests {
         let message = failure(&first);
         let expected = format!("fetch: {first}: too many redirects");
         assert_eq!(message, expected);
+    }
+
+    #[test]
+    fn refresh_parsed() {
+        let base = Url::parse(BASE).expect("url");
+        let target = |html: &str| {
+            let page = parsed(html);
+            let next = refresh(&page, &base);
+            next.map(String::from)
+        };
+        let meta = |content: &str| format!("<meta http-equiv=\"refresh\" content=\"{content}\">");
+
+        let full = target(&meta("0;url=/full"));
+        assert_eq!(full.as_deref(), Some("http://example.com/full"));
+        let quoted = target(&meta(" 0.5 , URL = 'résumé.html' "));
+        let expected = "http://example.com/docs/r%C3%A9sum%C3%A9.html";
+        assert_eq!(quoted.as_deref(), Some(expected));
+        let padded = target("<meta http-equiv=\"Refresh\" content='00;url=\"x.html\"'>");
+        assert_eq!(padded.as_deref(), Some("http://example.com/docs/x.html"));
+
+        assert_eq!(target(&meta("5;url=/later")), None);
+        assert_eq!(target(&meta("1.5;url=x.html")), None);
+        assert_eq!(target(&meta("0; url=page.html")), None);
+        assert_eq!(target(&meta("0")), None);
+        assert_eq!(target(&meta("0;url=javascript:alert(1)")), None);
+        let twice = format!("{}{}", meta("5;url=later.html"), meta("0;url=now.html"));
+        assert_eq!(target(&twice), None);
     }
 }

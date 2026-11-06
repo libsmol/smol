@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::future;
 use std::future::Future;
 use std::hash::{BuildHasher, Hasher};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
@@ -224,6 +225,24 @@ pub(crate) fn http_cause(error: &reqwest::Error) -> String {
     }
 }
 
+/// Names `wait` only for reqwest's own read timeout, in clients without an overall timeout,
+/// and not for one the system reports, such as a keepalive's
+pub(crate) fn read_cause(error: &reqwest::Error, wait: Duration) -> String {
+    let mut reported = false;
+    let mut source = error.source();
+    while let Some(inner) = source {
+        let io = inner.downcast_ref::<io::Error>();
+        reported |= io.is_some_and(|io| io.kind() == io::ErrorKind::TimedOut);
+        source = inner.source();
+    }
+    if !error.is_timeout() || error.is_connect() || reported {
+        return http_cause(error);
+    }
+
+    let seconds = wait.as_secs();
+    prompt::timed_out(seconds)
+}
+
 pub(crate) fn http_client(builder: ClientBuilder) -> Result<Client, String> {
     // An idle connection may have been closed by the peer or a proxy,
     // and reusing it fails with connection closed
@@ -241,7 +260,12 @@ pub(crate) fn http_client(builder: ClientBuilder) -> Result<Client, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::excerpt;
+    use crate::utils::{block_on, excerpt, read_cause};
+    use futures_util::stream;
+    use http::Response;
+    use reqwest::Body;
+    use std::io;
+    use std::time::Duration;
 
     #[test]
     fn excerpt_cut() {
@@ -251,5 +275,19 @@ mod tests {
         assert_eq!(excerpt(&whole), whole);
         let long = format!("{whole}s");
         assert_eq!(excerpt(&long), format!("{whole}…"));
+    }
+
+    #[test]
+    fn system_timeout_cause() {
+        let failed = io::Error::from(io::ErrorKind::TimedOut);
+        let chunks = stream::iter([Err::<Vec<u8>, io::Error>(failed)]);
+        let body = Body::wrap_stream(chunks);
+        let mut response: reqwest::Response = Response::new(body).into();
+        let reading = response.chunk();
+        let error = block_on(reading).expect_err("timed out");
+
+        assert!(error.is_timeout());
+        let wait = Duration::from_secs(5);
+        assert_eq!(read_cause(&error, wait), "timed out");
     }
 }

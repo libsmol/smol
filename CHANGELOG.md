@@ -7,6 +7,79 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- A program or thread the code leaves running no longer stops when it prints
+  between calls. Its output used to fill the pipe and block it until the next
+  call; now what it prints in between starts the next call's output, and
+  output printed while an MCP server is added is kept too.
+- An error inside a function an earlier call defined names its line, as
+  `an earlier call, line 2, in lookup: value = row['key']`, where it used to
+  show only the calling line. Tracebacks the code prints, warnings and
+  `inspect.getsource` see the source of earlier calls too.
+- Errors add what led to them: `Caused by …` and `Raised while handling …` with
+  their lines, notes, and up to three errors inside an exception group, such as
+  the one `asyncio.TaskGroup` raises, which used to show only its count.
+- Background agents an interrupt stopped are no longer announced to the model
+  as `[Agent done]` in the next turn.
+- On Linux a credential folder made during a session, such as `~/.config/gh`
+  after `gh auth login` in another terminal, stays hidden from the code, unless
+  it is inside the working directory or a folder in `[allow] write`. It was
+  readable when its parent folder held nothing else hidden. New or replaced
+  entries right in `~/.config`, `~/.config/git`, `~/.cargo`, `~/.local` and
+  `~/.local/share` can't be read for the rest of that session.
+- On Linux the sandbox is no longer dropped when a folder that holds a hidden
+  path has more entries than the open file limit.
+- `fetch()` keeps a list item, quote, table cell or link whose content is a
+  paragraph or heading on one line with its mark, as Sphinx and MkDocs pages
+  write them, and indents nested lists. The mark used to stand alone on a line.
+- A `[mcp.*]` entry in `agent.toml` that can't be used, such as `type = "sse"`,
+  is skipped with a notice instead of failing every session. Config errors say
+  `expected a table` instead of naming types of the code, and a value of the
+  wrong type is no longer quoted in them.
+- A role description over several lines is listed on one line in the system
+  prompt; the agent in that role still gets all of it.
+- A model that sends nothing for 300 seconds fails with
+  `received no data for 300s`, as `fetch()` already said, and a connection the
+  system timed out gives the system's reason instead. The error of `grep()`
+  past 32 MiB of matches names the path, and errors of `remember()`, `recall()`
+  and `forget()` no longer repeat `memory:`.
+- When Python fails to start, its output in the error has terminal escapes
+  removed and is cut like other output, and an error relinking a venv's
+  `python` writes the home folder as `~`.
+- An agent's status shows at most 100 characters of the line it runs.
+- The status of an MCP server that failed shows its last lines of stderr
+  without terminal escapes or progress redraws.
+- On Windows a session that was never saved no longer leaves `<id>.lock` in
+  its project folder.
+- smol sends a message that starts with `:` but not with a command word, such
+  as `:) thanks`.
+- On macOS smol's newline hint says `ctrl+j`, as Option+Return is plain Return
+  in Terminal and iTerm2 by default.
+- A paste of more than 1000 characters on one line is folded too.
+- `@` completion offers the paths of a large tree from the top down, and walks
+  the tree once per message.
+- When libsmol exits unexpectedly, smol still prints how to resume the session
+  if it was saved, and agents it showed at work end as failed instead of
+  working on forever.
+- `:resume` and `:memory` with nothing to list leave the input empty, and
+  `:model ` and `:mcp ` typed with nothing to list say so.
+- Photos that phones store turned, with an EXIF orientation, show upright.
+- Kitty images are drawn only where `TERM` names kitty or Ghostty, or Ghostty
+  sends its name over SSH, so VS Code or JetBrains started from a kitty shell
+  show colored blocks instead of broken placeholders, and Ghostty over SSH draws
+  sharp images.
+- In Kitty and Ghostty an image goes to the terminal when it shows, at up to
+  1280 pixels a side, and the terminal holds at most 24, dropping the one shown
+  longest ago. At most two images load at a time, and `:new` and `:resume` free
+  them.
+- Web addresses in answers are links, and `<br>` breaks a line, also in a table
+  cell.
+- The Windows install script keeps the `%VARIABLE%` entries of the user `PATH`,
+  which it used to expand for good.
+- Building from a checkout whose target folder existed before the first build,
+  such as a `CARGO_TARGET_DIR` made by hand, no longer fails with `target dir`.
+
 ## 0.7.0 - 2026-11-05
 
 - The Python is inside `libsmol`: CPython 3.14 is linked in with its

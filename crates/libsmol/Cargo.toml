@@ -68,6 +68,8 @@ worker.workspace = true
 
 [dev-dependencies]
 ctor = "0.6"
+futures-util = "0.3"
+http = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"

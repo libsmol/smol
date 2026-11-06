@@ -1,17 +1,16 @@
 use crate::chat::resolved;
-use crate::tui::{browser, theme};
+use crate::tui::{desktop, screen, theme};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use image::imageops::{self, FilterType};
-use image::{ImageFormat, ImageReader, Limits, Rgba, RgbaImage};
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, Rgba, RgbaImage};
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
-use reaper::cause;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str;
@@ -47,13 +46,19 @@ const MAX_ROWS: u64 = 20;
 /// About how wide a cell is in pixels, so a small picture is not blown up
 const CELL_PIXELS: u64 = 8;
 /// The longer side of what is sent to a terminal that takes Kitty graphics
-const MAX_SIDE_PIXELS: u32 = 1600;
+const MAX_SIDE_PIXELS: u32 = 1280;
+/// Kitty and Ghostty drop the oldest images past 320 MB without a word,
+/// which this many of the largest stay well under
+const MAX_HELD_IMAGES: usize = 24;
 /// The longer side kept for half blocks, a few times what the largest picture shows
 const MAX_HALVES_PIXELS: u32 = 400;
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
-/// A small file can declare a huge image, which decoding would allocate whole
-const MAX_DECODED_PIXELS: u32 = 16_384;
+/// The longer side decoding allows, since a small file can declare a huge image that decoding
+/// would allocate whole
+const MAX_DECODED_SIDE: u32 = 16_384;
 const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+/// Each decode can take MAX_DECODED_BYTES
+const MAX_LOADERS: usize = 2;
 const FETCH_WAIT: Duration = Duration::from_secs(10);
 /// Kitty takes a payload in base64 chunks of at most this many bytes
 const MAX_CHUNK_BYTES: usize = 4096;
@@ -88,7 +93,7 @@ impl Source {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum State {
+pub(crate) enum Load {
     Loading(Instant),
     Ready(Arc<Picture>),
     /// Shown as its alt text, so why it failed goes unsaid
@@ -119,36 +124,51 @@ enum Look {
 #[derive(Default)]
 struct Store {
     /// With the stamp a file had when it was read
-    states: HashMap<Source, (State, Option<Stamp>)>,
-    /// Kitty image ids by picture, and whether the terminal has the image
-    images: HashMap<Source, (u32, bool)>,
+    states: HashMap<Source, (Load, Option<Stamp>)>,
+    /// Kitty image ids by picture, and while the terminal has the image, the last send it showed in
+    images: HashMap<Source, (u32, Option<u64>)>,
     /// Kitty placement ids by picture and size in cells, and whether the terminal has the placement
     placed: HashMap<(Source, u32, u32), (u32, bool)>,
-    /// Ids the terminal still holds for pictures loaded again since
+    /// Ids the terminal still holds for pictures loaded again or of an earlier conversation
     retired: Vec<u32>,
     last_id: u32,
+    sends: u64,
+    /// Pictures waiting for a loader, which takes the latest first, as the bottom of a conversation
+    /// is laid out last
+    queue: Vec<(Source, Option<Stamp>)>,
+    loaders: usize,
 }
 
-static STORE: LazyLock<Mutex<Store>> = LazyLock::new(Mutex::default);
+thread_local! {
+    /// Only the UI thread draws, and tests each get their own
+    static STORE: Arc<Mutex<Store>> = Arc::default();
+}
 /// Counts loads that ended, so the transcript lays its rows out again
 static LOADED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KITTY: LazyLock<bool> = LazyLock::new(kitty_terminal);
-
-/// Only terminals known to draw Kitty's Unicode placeholders, and not inside a multiplexer,
+/// Kitty images are drawn only outside a multiplexer,
 /// which keeps graphics to itself unless set up to pass them through
-fn kitty_terminal() -> bool {
+pub(crate) static KITTY: LazyLock<bool> = LazyLock::new(|| {
     // Tests run in whatever terminal started them
     if cfg!(test) {
         return false;
     }
     let term = env::var("TERM").unwrap_or_default();
     let program = env::var("TERM_PROGRAM").unwrap_or_default();
+    let remote = ["SSH_TTY", "SSH_CONNECTION"].map(env::var_os);
+    let ssh = remote.iter().any(Option::is_some);
     let multiplexed = ["TMUX", "STY", "ZELLIJ"].map(env::var_os);
-    let nested = multiplexed.iter().any(Option::is_some)
-        || term.starts_with("screen")
-        || term.starts_with("tmux");
-    let kitty = term == "xterm-kitty" || env::var_os("KITTY_WINDOW_ID").is_some();
-    (program == "ghostty" || kitty) && !nested
+    let nested = multiplexed.iter().any(Option::is_some);
+    !nested && kitty_terminal(&term, &program, ssh)
+});
+
+/// Terminals known to draw Kitty's Unicode placeholders, by the TERM they set,
+/// since other variables pass on to terminals started from their shells
+fn kitty_terminal(term: &str, program: &str, ssh: bool) -> bool {
+    let own = matches!(term, "xterm-kitty" | "xterm-ghostty");
+    // Ghostty's ssh-env sends TERM_PROGRAM with a plain xterm TERM, which a terminal started
+    // from Ghostty's shell may also have
+    let forwarded = ssh && program == "ghostty" && term == "xterm-256color";
+    own || forwarded
 }
 
 pub(crate) fn loaded() -> u64 {
@@ -156,14 +176,15 @@ pub(crate) fn loaded() -> u64 {
 }
 
 pub(crate) fn loading() -> bool {
-    let store = STORE.lock().expect("pictures");
-    let waiting = |(state, _): &(State, Option<Stamp>)| matches!(state, State::Loading(_));
+    let shared = STORE.with(Arc::clone);
+    let store = shared.lock().expect("pictures");
+    let waiting = |(state, _): &(Load, Option<Stamp>)| matches!(state, Load::Loading(_));
     store.states.values().any(waiting)
 }
 
 /// Starts loading a picture in the background the first time it is asked for,
 /// and again once its file was written again or appeared
-pub(crate) fn state(source: &Source) -> State {
+pub(crate) fn state(source: &Source) -> Load {
     let stamp = match source {
         Source::File(path) => match fs::metadata(path) {
             Ok(meta) => meta.modified().ok().map(|at| (at, meta.len())),
@@ -171,36 +192,76 @@ pub(crate) fn state(source: &Source) -> State {
         },
         Source::Web(_) => None,
     };
-    let mut store = STORE.lock().expect("pictures");
+    let shared = STORE.with(Arc::clone);
+    let mut store = shared.lock().expect("pictures");
     if let Some((state, read)) = store.states.get(source) {
-        if matches!(state, State::Loading(_)) || *read == stamp {
+        if matches!(state, Load::Loading(_)) || *read == stamp {
             return state.clone();
         }
     }
-    let started = State::Loading(Instant::now());
+    let started = Load::Loading(Instant::now());
     store
         .states
         .insert(source.clone(), (started.clone(), stamp));
+    store.queue.push((source.clone(), stamp));
+    if store.loaders == MAX_LOADERS {
+        return started;
+    }
+    store.loaders += 1;
     drop(store);
 
-    let source = source.clone();
     let kitty = *KITTY;
-    thread::spawn(move || {
-        let loaded = match load(&source, kitty) {
-            Some(picture) => State::Ready(Arc::new(picture)),
-            None => State::Failed,
+    thread::spawn(move || loop {
+        let mut store = shared.lock().expect("pictures");
+        let Some((source, stamp)) = store.queue.pop() else {
+            store.loaders -= 1;
+            return;
         };
-        let mut store = STORE.lock().expect("pictures");
+        drop(store);
+
+        // A panic must neither end the loader uncounted nor restore the terminal
+        let loaded = screen::caught(|| load(&source, kitty));
+        let loaded = match loaded.flatten() {
+            Some(picture) => Load::Ready(Arc::new(picture)),
+            None => Load::Failed,
+        };
+        let mut store = shared.lock().expect("pictures");
         store.states.insert(source.clone(), (loaded, stamp));
 
-        // The terminal's copy of an earlier version goes at exit, and its placements with it
-        if let Some((id, true)) = store.images.remove(&source) {
+        // The terminal's copy of an earlier version goes at the next send, with its placements
+        if let Some((id, Some(_))) = store.images.remove(&source) {
             store.retired.push(id);
         }
         store.placed.retain(|key, _| key.0 != source);
         LOADED.fetch_add(1, Ordering::Relaxed);
     });
     started
+}
+
+/// Frees the pictures of a conversation that was replaced
+pub(crate) fn clear() {
+    let shared = STORE.with(Arc::clone);
+    let mut store = shared.lock().expect("pictures");
+    let Store {
+        states,
+        images,
+        placed,
+        retired,
+        queue,
+        ..
+    } = &mut *store;
+
+    // No loader takes the queued ones now, while those at work end on their own
+    for (source, _) in queue.drain(..) {
+        states.remove(&source);
+    }
+    states.retain(|_, (state, _)| matches!(state, Load::Loading(_)));
+
+    // The terminal holds these until the next send, so ids keep counting on rather than start over
+    let held = images.drain().filter(|(_, (_, shown))| shown.is_some());
+    let ids = held.map(|(_, (id, _))| id);
+    retired.extend(ids);
+    placed.clear();
 }
 
 fn load(source: &Source, kitty: bool) -> Option<Picture> {
@@ -240,21 +301,38 @@ fn load(source: &Source, kitty: bool) -> Option<Picture> {
     }
     let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
     let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_DECODED_PIXELS);
-    limits.max_image_height = Some(MAX_DECODED_PIXELS);
+    limits.max_image_width = Some(MAX_DECODED_SIDE);
+    limits.max_image_height = Some(MAX_DECODED_SIDE);
     limits.max_alloc = Some(MAX_DECODED_BYTES);
-    reader.limits(limits);
-    let decoded = reader.decode().ok()?;
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder().ok()?;
+    // The decoded image counts against the limit before the decoder's own buffers, as in decode()
+    limits.reserve(decoder.total_bytes()).ok()?;
+    decoder.set_limits(limits).ok()?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let decoded = DynamicImage::from_decoder(decoder).ok()?;
 
-    let natural = (decoded.width(), decoded.height());
+    let turned = matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    let natural = match turned {
+        true => (decoded.height(), decoded.width()),
+        false => (decoded.width(), decoded.height()),
+    };
     let side = match kitty {
         true => MAX_SIDE_PIXELS,
         false => MAX_HALVES_PIXELS,
     };
-    let shrunk = match natural.0.max(natural.1) > side {
+    let mut shrunk = match natural.0.max(natural.1) > side {
         true => decoded.thumbnail(side, side),
         false => decoded,
     };
+    // Turning the shrunk copy spares copying the whole decoded image
+    shrunk.apply_orientation(orientation);
     let pixels = shrunk.to_rgba8();
     let look = match kitty {
         true => {
@@ -315,7 +393,8 @@ pub(crate) fn drawn(source: &Source, picture: &Picture, room: usize) -> Lines {
     let (columns, rows) = cells(width, height, room);
     match &picture.look {
         Look::Png(_) => {
-            let mut store = STORE.lock().expect("pictures");
+            let shared = STORE.with(Arc::clone);
+            let mut store = shared.lock().expect("pictures");
             let Store {
                 images,
                 placed,
@@ -341,16 +420,20 @@ pub(crate) fn drawn(source: &Source, picture: &Picture, room: usize) -> Lines {
     }
 }
 
-/// The image id is the placeholders' foreground color
 /// The id of `key`, numbered next when it has none yet
-fn numbered<K: Eq + Hash>(ids: &mut HashMap<K, (u32, bool)>, key: K, last: &mut u32) -> u32 {
+fn numbered<K: Eq + Hash, V: Default>(
+    ids: &mut HashMap<K, (u32, V)>,
+    key: K,
+    last: &mut u32,
+) -> u32 {
     let next = || {
         *last = *last % MAX_ID + 1;
-        (*last, false)
+        (*last, V::default())
     };
     ids.entry(key).or_insert_with(next).0
 }
 
+/// The image id is the placeholders' foreground color
 fn placeholders(image: u32, placement: u32, columns: u32, rows: u32) -> Lines {
     let [_, red, green, blue] = image.to_be_bytes();
     let [_, under_red, under_green, under_blue] = placement.to_be_bytes();
@@ -404,28 +487,69 @@ fn blended(pixel: &Rgba<u8>) -> Color {
     )
 }
 
-/// Sends the terminal each Kitty image once and a placement for every size it was drawn at,
-/// which its placeholders then show
-pub(crate) fn send(out: &mut impl Write) -> io::Result<()> {
-    let mut store = STORE.lock().expect("pictures");
+/// Deletes the Kitty images the terminal no longer needs, sends it the first one on screen
+/// it lacks, and a placement for every size the ones it holds were drawn at, which their
+/// placeholders then show
+pub(crate) fn send(out: &mut impl Write, visible: &[Source]) -> io::Result<()> {
+    let shared = STORE.with(Arc::clone);
+    let mut store = shared.lock().expect("pictures");
+    store.sends += 1;
     let Store {
         states,
         images,
         placed,
+        retired,
+        sends,
         ..
     } = &mut *store;
     let mut wrote = false;
-    for (source, (id, sent)) in images.iter_mut() {
-        if *sent {
-            continue;
-        }
-        let Some((State::Ready(picture), _)) = states.get(source) else {
-            continue;
-        };
-        let Look::Png(png) = &picture.look else {
-            continue;
-        };
 
+    // Deleting an image deletes its placements too
+    for id in retired.drain(..) {
+        write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")?;
+        wrote = true;
+    }
+
+    for source in visible {
+        if let Some((_, Some(shown))) = images.get_mut(source) {
+            *shown = *sends;
+        }
+    }
+
+    // One image a pass lets the keys typed meanwhile in
+    let mut next = None;
+    for source in visible {
+        let Some(&(id, None)) = images.get(source) else {
+            continue;
+        };
+        let Some((Load::Ready(picture), _)) = states.get(source) else {
+            continue;
+        };
+        if let Look::Png(png) = &picture.look {
+            next = Some((source, id, png));
+            break;
+        }
+    }
+
+    // The held image that showed longest ago makes room, and goes again once it shows
+    let held = images.values().filter(|(_, shown)| shown.is_some()).count();
+    let hidden = images
+        .iter()
+        .filter(|(_, (_, shown))| shown.is_some_and(|at| at < *sends));
+    let stalest = hidden.min_by_key(|(_, (_, shown))| *shown);
+    let stalest = stalest.map(|(key, (id, _))| (key.clone(), *id));
+    let evicted = stalest.filter(|_| next.is_some() && held >= MAX_HELD_IMAGES);
+    if let Some((gone, id)) = evicted {
+        write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")?;
+        images.insert(gone.clone(), (id, None));
+        for ((key, _, _), (_, sent)) in placed.iter_mut() {
+            if *key == gone {
+                *sent = false;
+            }
+        }
+    }
+
+    if let Some((source, id, png)) = next {
         let data = STANDARD.encode(png);
         let chunks: Vec<&[u8]> = data.as_bytes().chunks(MAX_CHUNK_BYTES).collect();
         for (index, chunk) in chunks.iter().enumerate() {
@@ -437,13 +561,13 @@ pub(crate) fn send(out: &mut impl Write) -> io::Result<()> {
                 _ => write!(out, "\x1b_Gm={more};{chunk}\x1b\\")?,
             }
         }
-        *sent = true;
+        images.insert(source.clone(), (id, Some(*sends)));
         wrote = true;
     }
 
     // A placement needs the image the terminal already has
     for ((source, columns, rows), (id, sent)) in placed.iter_mut() {
-        let Some(&(image, true)) = images.get(source) else {
+        let Some(&(image, Some(_))) = images.get(source) else {
             continue;
         };
         if *sent {
@@ -464,30 +588,10 @@ pub(crate) fn send(out: &mut impl Write) -> io::Result<()> {
     }
 }
 
-/// The terminal keeps the images it was sent after smol exits unless they are deleted,
-/// each by its id, as placeholders don't count as placements on screen
-pub(crate) fn forget(out: &mut impl Write) -> io::Result<()> {
-    let store = STORE.lock().expect("pictures");
-    // Deleting an image deletes its placements too
-    let sent = store.images.values().filter(|(_, sent)| *sent);
-    let ids: Vec<u32> = sent
-        .map(|(id, _)| *id)
-        .chain(store.retired.clone())
-        .collect();
-    for id in &ids {
-        write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")?;
-    }
-
-    match ids.is_empty() {
-        true => Ok(()),
-        false => out.flush(),
-    }
-}
-
 /// Writes the picture's file, named after its real format, where only the user can read it,
 /// because the system opens a file by its name and the model chose this one
 pub(crate) fn open(source: &Source) -> Result<(), String> {
-    let State::Ready(picture) = state(source) else {
+    let Load::Ready(picture) = state(source) else {
         return Err("image: not loaded yet".to_owned());
     };
     let read_again = match source {
@@ -503,27 +607,18 @@ pub(crate) fn open(source: &Source) -> Result<(), String> {
         return Err("image: no longer the image shown".to_owned());
     }
 
-    let mut hasher = DefaultHasher::new();
-    source.hash(&mut hasher);
-    let hash = hasher.finish();
     let extension = picture.format.extensions_str().first().unwrap_or(&"png");
-    let name = format!("smol-image-{hash:016x}.{extension}");
-    let path = browser::private_dir().join(name);
-    let failed = |e: io::Error| {
-        let reason = cause(&e);
-        format!("image: {}: {reason}", path.display())
-    };
-    browser::write_private(&path, bytes).map_err(failed)?;
-
-    browser::open(&path)
+    let path = desktop::saved("image", source, extension, bytes)?;
+    desktop::open(&path)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::tui::picture::*;
     use crate::tui::tests::{settled, written};
-    use image::ImageBuffer;
-    use std::process;
+    use image::codecs::jpeg::JpegEncoder;
+    use image::{ImageBuffer, ImageEncoder, Rgb, RgbImage};
+    use std::{process, slice};
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -539,7 +634,6 @@ mod tests {
         // A file URL has a drive letter on Windows
         let path = env::temp_dir().join("résumé.png");
         let file = Url::from_file_path(&path).expect("url");
-        assert!(file.as_str().ends_with("/r%C3%A9sum%C3%A9.png"), "{file}");
         assert_eq!(Source::of(file.as_str(), cwd), Some(Source::File(path)));
         let drive = r"C:\Users\zoë\café.png";
         let windows = Source::of(drive, cwd);
@@ -547,6 +641,22 @@ mod tests {
         let web = "https://example.com/a/café.png?size=2";
         assert_eq!(Source::of(web, cwd), Some(Source::Web(web.to_owned())));
         assert_eq!(Source::of("data:image/png;base64,AAAA", cwd), None);
+    }
+
+    #[test]
+    fn kitty_detected() {
+        let cases = [
+            ("xterm-kitty", "", false, true),
+            ("xterm-ghostty", "ghostty", false, true),
+            ("xterm-256color", "ghostty", true, true),
+            ("xterm-256color", "ghostty", false, false),
+            ("xterm-256color", "vscode", true, false),
+            ("alacritty", "ghostty", true, false),
+        ];
+        for (term, program, ssh, kitty) in cases {
+            let found = kitty_terminal(term, program, ssh);
+            assert_eq!(found, kitty, "{term} {program} {ssh}");
+        }
     }
 
     #[test]
@@ -599,72 +709,169 @@ mod tests {
         assert_eq!(second, [PLACEHOLDER, DIACRITICS[1], DIACRITICS[1]]);
     }
 
-    /// A picture drawn at another width gets a placement of its own, and its image goes once
+    /// Only pictures on screen go to the terminal, one a call, and the one shown longest ago
+    /// makes room past the limit and goes again once it shows
     #[test]
-    fn kitty_sent_once() {
+    fn kitty_sent_visible() {
         let path = written("kitty", 80, 80);
-        let source = Source::File(path.clone());
-        let picture = Arc::new(load(&source, true).expect("load"));
+        let picture = Arc::new(load(&Source::File(path.clone()), true).expect("load"));
         fs::remove_dir_all(path.parent().expect("dir")).ok();
-        let ready = State::Ready(picture.clone());
-        let mut store = STORE.lock().expect("pictures");
-        store.states.insert(source.clone(), (ready, None));
-        drop(store);
+        let web = |name: &str| Source::Web(format!("https://a.io/{name}.png"));
+        let [a, b, c] = ["café", "naïve", "résumé"].map(web);
+        let shared = STORE.with(Arc::clone);
+        for source in [&a, &b, &c] {
+            let ready = Load::Ready(picture.clone());
+            let mut store = shared.lock().expect("pictures");
+            store.states.insert(source.clone(), (ready, None));
+        }
 
-        let lines = drawn(&source, &picture, 100);
-        assert_eq!(lines.len(), 5);
-        let Some(Color::Rgb(red, green, blue)) = lines[0][0].style.fg else {
-            panic!("{:?}", lines[0][0]);
+        let id = |source: &Source| {
+            let lines = drawn(source, &picture, 100);
+            let Some(Color::Rgb(red, green, blue)) = lines[0][0].style.fg else {
+                panic!("{:?}", lines[0][0]);
+            };
+            u32::from_be_bytes([0, red, green, blue])
         };
-        let id = u32::from_be_bytes([0, red, green, blue]);
-        let mut out = Vec::new();
-        send(&mut out).expect("send");
-        let sent = String::from_utf8(out).expect("utf8");
-        let image = format!("\x1b_Ga=t,i={id},f=100,q=2,m=0;");
-        assert!(sent.starts_with(&image), "{sent}");
-        let placed = format!("\x1b_Ga=p,U=1,i={id},p=");
-        assert!(
-            sent.contains(&placed) && sent.ends_with(",c=10,r=5,q=2\x1b\\"),
-            "{sent}"
-        );
+        let sent = |visible: &[Source]| {
+            let mut out = Vec::new();
+            send(&mut out, visible).expect("send");
+            String::from_utf8(out).expect("utf8")
+        };
+        let image = |id: u32| format!("\x1b_Ga=t,i={id},f=100,q=2,m=0;");
+        let deleted = |id: u32| format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
+        let (first, second) = (id(&a), id(&b));
 
-        let mut again = Vec::new();
-        send(&mut again).expect("send");
-        assert!(again.is_empty());
+        assert_eq!(sent(&[]), "");
+        let shown = sent(slice::from_ref(&a));
+        assert!(shown.starts_with(&image(first)), "{shown}");
+        let placed = format!("\x1b_Ga=p,U=1,i={first},p=");
+        assert!(shown.contains(&placed), "{shown}");
+        assert!(shown.ends_with(",c=10,r=5,q=2\x1b\\"), "{shown}");
+        assert_eq!(shown.matches("\x1b_Ga=").count(), 2, "{shown}");
 
-        drawn(&source, &picture, 6);
-        let mut narrower = Vec::new();
-        send(&mut narrower).expect("send");
-        let narrower = String::from_utf8(narrower).expect("utf8");
+        // Drawn at another width, it gets a placement of its own
+        drawn(&a, &picture, 6);
+        let narrower = sent(slice::from_ref(&a));
         assert!(narrower.starts_with(&placed), "{narrower}");
         assert!(narrower.ends_with(",c=6,r=3,q=2\x1b\\"), "{narrower}");
+        let both = sent(&[a.clone(), b.clone()]);
+        assert!(both.starts_with(&image(second)), "{both}");
+        assert!(!both.contains(&image(first)), "{both}");
+        assert_eq!(sent(slice::from_ref(&b)), "");
 
-        let mut freed = Vec::new();
-        forget(&mut freed).expect("forget");
-        let freed = String::from_utf8(freed).expect("utf8");
-        let deleted = format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
-        assert!(freed.contains(&deleted), "{freed}");
+        shared.lock().expect("pictures").retired.push(7);
+        assert_eq!(sent(&[]), deleted(7));
+        assert_eq!(sent(&[]), "");
+
+        let third = id(&c);
+        let mut store = shared.lock().expect("pictures");
+        let latest = Some(store.sends);
+        for n in 2..MAX_HELD_IMAGES {
+            let filler = web(&n.to_string());
+            store.images.insert(filler, (1000 + n as u32, latest));
+        }
+        drop(store);
+        let full = sent(slice::from_ref(&c));
+        assert!(full.starts_with(&deleted(first)), "{full}");
+        assert!(full.contains(&image(third)), "{full}");
+        let again = sent(slice::from_ref(&a));
+        assert!(again.starts_with(&deleted(second)), "{again}");
+        assert!(again.contains(&image(first)), "{again}");
+        assert!(again.contains(&placed), "{again}");
+    }
+
+    /// A conversation's pictures go with it, and the terminal's ids are deleted at the next send
+    #[test]
+    fn pictures_cleared() {
+        let picture = Picture {
+            natural: (1, 1),
+            look: Look::Png(Vec::new()),
+            bytes: None,
+            format: ImageFormat::Png,
+        };
+        let ready = Source::Web("https://a.io/café.png".to_owned());
+        let failed = Source::Web("https://a.io/naïve.png".to_owned());
+        let busy = Source::Web("https://a.io/résumé.png".to_owned());
+        let shared = STORE.with(Arc::clone);
+        let mut store = shared.lock().expect("pictures");
+        let loaded = Load::Ready(Arc::new(picture));
+        store.states.insert(ready.clone(), (loaded, None));
+        store.states.insert(failed.clone(), (Load::Failed, None));
+        // A loader is at work on one, so the next ones wait for it
+        let started = Load::Loading(Instant::now());
+        store.states.insert(busy.clone(), (started, None));
+        store.loaders = MAX_LOADERS;
+        store.images.insert(ready.clone(), (7, Some(1)));
+        store.images.insert(failed, (8, None));
+        store.placed.insert((ready, 2, 1), (9, true));
+        store.last_id = 9;
+        drop(store);
+        for name in ["a", "b", "c"] {
+            let missing = Source::File(PathBuf::from(format!("/nowhere/{name}.png")));
+            assert!(matches!(state(&missing), Load::Loading(_)));
+        }
+
+        clear();
+        let store = shared.lock().expect("pictures");
+        let left: Vec<&Source> = store.states.keys().collect();
+        assert_eq!(left, [&busy]);
+        assert!(store.queue.is_empty() && store.images.is_empty() && store.placed.is_empty());
+        assert_eq!(store.retired, [7]);
+        assert_eq!(store.last_id, 9);
     }
 
     #[test]
     fn failures_settled() {
-        let missing = Source::File(PathBuf::from("/nowhere/smol/naïve.png"));
-        let state = settled(&missing);
-        assert!(matches!(state, State::Failed), "{state:?}");
-
         let dir = env::temp_dir().join(format!("smol-picture-text-{}", process::id()));
         fs::create_dir_all(&dir).expect("dir");
         let text = dir.join("notes.png");
         fs::write(&text, "café notes").expect("write");
         let state = settled(&Source::File(text));
         fs::remove_dir_all(&dir).ok();
-        assert!(matches!(state, State::Failed), "{state:?}");
+        assert!(matches!(state, Load::Failed), "{state:?}");
 
         // Wider than decoding allows, though the file is small
-        let wide = written("wide", MAX_DECODED_PIXELS + 1, 2);
+        let wide = written("wide", MAX_DECODED_SIDE + 1, 2);
         let state = settled(&Source::File(wide.clone()));
         fs::remove_dir_all(wide.parent().expect("dir")).ok();
-        assert!(matches!(state, State::Failed), "{state:?}");
+        assert!(matches!(state, Load::Failed), "{state:?}");
+    }
+
+    /// A photo tagged as turned shows upright, with its sides swapped
+    #[test]
+    fn exif_turned() {
+        let painted = |_: u32, y: u32| match y < 4 {
+            true => Rgb([255, 0, 0]),
+            false => Rgb([0, 0, 255]),
+        };
+        let pixels: RgbImage = ImageBuffer::from_fn(16, 8, painted);
+        // A little-endian TIFF whose one entry is orientation 6, a quarter turn clockwise
+        let exif = [
+            b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0,
+            0,
+        ];
+        let mut jpeg = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut jpeg, 95);
+        encoder.set_exif_metadata(exif.to_vec()).expect("exif");
+        encoder.encode_image(&pixels).expect("encode");
+        let dir = env::temp_dir().join(format!("smol-picture-exif-{}", process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("café.jpg");
+        fs::write(&path, &jpeg).expect("write");
+
+        let loaded = load(&Source::File(path), false);
+        fs::remove_dir_all(&dir).ok();
+        let picture = loaded.expect("load");
+        assert_eq!(picture.natural, (8, 16));
+        let Look::Pixels { pixels, .. } = &picture.look else {
+            panic!("{picture:?}");
+        };
+        assert_eq!(pixels.dimensions(), (8, 16));
+        // The red top is now on the right, and JPEG blurs the colors a little
+        let [red, _, blue, _] = pixels.get_pixel(0, 8).0;
+        assert!(blue > 200 && red < 60, "{red} {blue}");
+        let [red, _, blue, _] = pixels.get_pixel(7, 8).0;
+        assert!(red > 200 && blue < 60, "{red} {blue}");
     }
 
     /// A file written again, or one that appears after it was asked for, loads anew
@@ -672,23 +879,23 @@ mod tests {
     fn rewritten_reloaded() {
         let path = written("rewritten", 16, 8);
         let source = Source::File(path.clone());
-        let State::Ready(first) = settled(&source) else {
+        let Load::Ready(first) = settled(&source) else {
             panic!("{:?}", settled(&source));
         };
         assert_eq!(first.natural, (16, 8));
 
         written("rewritten", 24, 8);
-        let State::Ready(second) = settled(&source) else {
+        let Load::Ready(second) = settled(&source) else {
             panic!("{:?}", settled(&source));
         };
         assert_eq!(second.natural, (24, 8));
 
         let later = Source::File(path.with_file_name("later.png"));
-        assert!(matches!(settled(&later), State::Failed));
+        assert!(matches!(settled(&later), Load::Failed));
         fs::copy(&path, path.with_file_name("later.png")).expect("copy");
         let state = settled(&later);
         fs::remove_dir_all(path.parent().expect("dir")).ok();
-        assert!(matches!(state, State::Ready(_)), "{state:?}");
+        assert!(matches!(state, Load::Ready(_)), "{state:?}");
     }
 
     /// A device reports no size and would be read forever
