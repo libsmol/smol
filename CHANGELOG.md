@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
-## Unreleased
+## 0.7.2 - 2026-11-06
 
 - An MCP server over HTTP that rejects its credentials with a 401 now shows as
   unauthorized, in yellow, rather than as failed or still connected. A 401 on
