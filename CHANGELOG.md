@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
-## Unreleased
+## 0.8.0 - 2026-11-08
 
 - `smol web` shows smol in browsers as well as in its terminal, at an address
   with a token made for each run, or the same one every run with `--token`.
@@ -16,6 +16,8 @@ but their files stay in `~/.smol/projects` untouched.
   goes to that browser. On a phone, a row of keys adds esc, tab, ctrl, the
   arrows and paste, and a finger held still selects text. It listens on
   `127.0.0.1:8421` unless `--listen` says otherwise.
+- smol ends on SIGINT as it does on SIGTERM: it puts the terminal back and saves
+  the session, then exits by the signal.
 - The output of a `!` command says it goes to the model with the next message,
   until that message is sent.
 
