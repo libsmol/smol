@@ -16,6 +16,8 @@ but their files stay in `~/.smol/projects` untouched.
   required, chose or ruled out in any task, why the agent changed what it did
   and whether the changes are committed, and no longer copy tables or long
   lists from answers.
+- Building from a checkout tries the CPython download up to 6 times, 30
+  seconds apart, where one failure, such as a 504 from GitHub, ended it.
 
 ## 0.8.1 - 2026-11-08
 
