@@ -1,29 +1,40 @@
-use crate::tui::theme::{BG, FG};
+use crate::tui::app::{pasted, App};
+use crate::tui::theme::{self, BG, FG};
+use crate::tui::{picture, ui, Host};
+use anyhow::Result;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{SetCursorStyle, Show};
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::style::Print;
 use ratatui::crossterm::terminal::{
-    self, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    self, BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use ratatui::Terminal;
 use std::cell::Cell;
+use std::env;
 use std::io::{self, stdout, Stdout};
 use std::panic::{self, AssertUnwindSafe, PanicHookInfo};
+use std::time::{Duration, Instant};
 
 /// OSC 110 and 111 restore the terminal's own foreground and background
 const OWN_COLORS: &str = "\x1b]110\x1b\\\x1b]111\x1b\\";
+/// Keys buffered after this long without reading events may have been typed during a stall
+const STALL_WAIT: Duration = Duration::from_millis(200);
 
 thread_local! {
     static CAUGHT: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) struct Screen {
-    pub(crate) terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+    truecolor: bool,
+    /// When events were last read
+    listened: Instant,
 }
 
 impl Screen {
@@ -61,13 +72,88 @@ impl Screen {
         };
         let terminal = setup().inspect_err(|_| restore())?;
 
-        Ok(Self { terminal })
+        // SSH drops COLORTERM, so only terminals known to lack truecolor get 256 colors
+        let term = env::var("TERM").unwrap_or_default();
+        let program = env::var("TERM_PROGRAM").unwrap_or_default();
+        let truecolor = term != "linux" && program != "Apple_Terminal";
+
+        Ok(Self {
+            terminal,
+            truecolor,
+            listened: Instant::now(),
+        })
+    }
+
+    /// For a host that draws cells it laid out elsewhere
+    pub(crate) fn backend(&mut self) -> &mut CrosstermBackend<Stdout> {
+        self.terminal.backend_mut()
+    }
+
+    pub(crate) fn truecolor(&self) -> bool {
+        self.truecolor
+    }
+}
+
+impl Host for Screen {
+    fn show(&mut self, app: &mut App) -> Result<()> {
+        // Images drawn last frame go out now, and their placeholders show them once they arrive
+        picture::send(&mut stdout(), &app.shown)?;
+        if !app.take_dirty() {
+            return Ok(());
+        }
+
+        execute!(stdout(), BeginSynchronizedUpdate)?;
+        self.terminal.draw(|frame| {
+            ui::draw(frame, app);
+            if !self.truecolor {
+                for cell in &mut frame.buffer_mut().content {
+                    theme::downgrade(cell);
+                }
+            }
+        })?;
+        execute!(stdout(), EndSynchronizedUpdate)?;
+        Ok(())
+    }
+
+    fn listen(&mut self, app: &mut App, wait: Duration) -> Result<()> {
+        let stalled = self.listened.elapsed() > STALL_WAIT;
+        let events = read(wait, stalled)?;
+        self.listened = Instant::now();
+
+        for event in events {
+            app.on_event(event);
+        }
+        Ok(())
     }
 }
 
 impl Drop for Screen {
     fn drop(&mut self) {
         restore();
+    }
+}
+
+/// The terminal's events that arrive within `wait`, with a paste on Windows made one event
+pub(crate) fn read(wait: Duration, stalled: bool) -> io::Result<Vec<Event>> {
+    if !event::poll(wait)? {
+        return Ok(Vec::new());
+    }
+    let first = event::read()?;
+    let mut events = vec![first];
+    while event::poll(Duration::ZERO)? {
+        let event = event::read()?;
+        events.push(event);
+    }
+
+    // Other platforms report pastes as their own event,
+    // and keys buffered during a stall are not a paste
+    let burst = match cfg!(windows) {
+        true => pasted(&events, stalled),
+        false => None,
+    };
+    match burst {
+        Some(text) => Ok(vec![Event::Paste(text)]),
+        None => Ok(events),
     }
 }
 

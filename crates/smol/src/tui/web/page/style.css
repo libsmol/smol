@@ -1,0 +1,224 @@
+/* The colors are theme.rs's, and app.js paints the screen with --bg, --fg and --font */
+:root {
+  --bg: #282a36;
+  --band: #343746;
+  --line: #44475a;
+  --fg: #f8f8f2;
+  --comment: #6272a4;
+  --purple: #bd93f9;
+  --font: "JetBrains Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Noto Sans Mono CJK SC", "PingFang SC", "Microsoft YaHei", monospace;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+}
+
+* {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* iOS types nothing into a field whose text can't be selected */
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+/* app.js keeps it on the visual viewport, which iOS pans and shrinks under its keyboard */
+#view {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  touch-action: none;
+}
+
+#screen {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  cursor: text;
+}
+
+#keys {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 2px;
+  height: 1em;
+  padding: 0;
+  border: 0;
+  margin: 0;
+  opacity: 0;
+  resize: none;
+  overflow: hidden;
+  white-space: pre;
+  caret-color: transparent;
+  /* Smaller text makes iOS zoom in on focus */
+  font-size: 16px;
+  /* A phone would hand it taps near the cursor, which then never reach the screen */
+  pointer-events: none;
+}
+
+#bar {
+  display: none;
+  justify-content: center;
+  gap: 4px;
+  padding: 6px;
+}
+
+@media (pointer: coarse) {
+  #bar {
+    display: flex;
+  }
+}
+
+#bar button {
+  flex: 1;
+  min-width: 0;
+  max-width: 96px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  outline: none;
+  background: var(--band);
+  color: var(--fg);
+  font: inherit;
+  /* Fits "paste" on a screen 320 pixels wide */
+  font-size: clamp(11px, 3.4vw, 14px);
+  /* Fades out after a tap however short */
+  transition: background-color 0.2s, transform 0.2s;
+}
+
+/* A phone on its side keeps its few rows for the screen */
+@media (pointer: coarse) and (max-height: 500px) {
+  #bar {
+    padding: 4px 6px;
+  }
+
+  #bar button {
+    height: 30px;
+  }
+}
+
+#bar button[aria-pressed="true"] {
+  background: var(--purple);
+  color: var(--bg);
+  font-weight: 600;
+}
+
+#bar button.down {
+  background: var(--comment);
+  color: var(--fg);
+  transform: scale(0.92);
+  transition: none;
+}
+
+#notice {
+  position: absolute;
+  top: 12px;
+  left: 16px;
+  right: 16px;
+  width: fit-content;
+  margin: 0 auto;
+  padding: 8px 14px;
+  border-radius: 6px;
+  background: var(--line);
+  color: var(--fg);
+  font-size: 14px;
+  box-shadow: 0 2px 12px rgb(0 0 0 / 40%);
+}
+
+#notice a {
+  color: var(--purple);
+}
+
+dialog {
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  box-sizing: border-box;
+  overflow: auto;
+  border: 1px solid var(--comment);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+dialog::backdrop {
+  background: rgb(0 0 0 / 50%);
+}
+
+dialog p {
+  margin: 0 0 10px;
+}
+
+dialog textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  height: clamp(72px, 40dvh, 320px);
+  padding: 8px;
+  resize: none;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  outline: none;
+  background: var(--band);
+  color: var(--fg);
+  font: inherit;
+  /* Smaller text makes iOS zoom in on focus */
+  font-size: 16px;
+}
+
+dialog textarea:focus {
+  border-color: var(--purple);
+}
+
+dialog textarea::selection {
+  background: var(--line);
+}
+
+dialog .actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+dialog button {
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 4px;
+  outline: none;
+  background: var(--line);
+  color: var(--fg);
+  font: inherit;
+  font-weight: 600;
+}
+
+dialog button:focus-visible {
+  outline: 2px solid var(--purple);
+  outline-offset: 2px;
+}
+
+dialog button.primary {
+  background: var(--purple);
+  color: var(--bg);
+}

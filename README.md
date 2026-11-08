@@ -183,6 +183,30 @@ in a folder for each working directory under `~/.smol/projects`, with copies of
 the images and videos the model looked at, and resume only in the directory
 they were started in.
 
+### In a browser
+
+`smol web` shows the same screen in browsers as well as in the terminal it runs
+in, and takes `--resume` and `--model` too. It prints an address with a token
+made for this run; opening it sets a cookie and drops the token from the
+address. `--token` gives a token of at least 16 letters, digits or `-._~` to
+use on every run instead, so a browser that came in once stays in across
+restarts (the cookie lasts 400 days). The browsers and the terminal share one
+screen, which takes the size of the device used last, and any of them can type.
+`ctrl+d` or `:quit` in a browser leaves only that browser, while in the
+terminal it ends `smol web`. Started without a terminal, as by a service
+manager, it runs until it is stopped.
+
+It listens on `127.0.0.1:8421`, and `--listen 0.0.0.0:8421` lets other devices
+in. Anyone with the address can run code on this machine, and the page goes
+over plain HTTP, so reach it through a private network, an SSH tunnel or a
+proxy that adds TLS.
+
+On a phone, a row of keys under the screen adds `esc`, `tab`, `ctrl` (held for
+the next key), the arrows and `paste`, and a finger held still before it moves
+selects text. Copying and pasting use the browser's clipboard where the browser
+lets the page reach it (localhost and HTTPS); elsewhere a box comes up to copy
+from or paste into by hand.
+
 ### What the code can use
 
 The code runs in CPython 3.14, in a venv of its working directory, so

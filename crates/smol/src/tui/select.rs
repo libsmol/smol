@@ -2,15 +2,9 @@ use crate::tui::render::Row;
 use crate::tui::theme::LINE;
 use crate::tui::transcript::Rows;
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::clipboard::CopyToClipboard;
-use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use std::env;
-use std::io::{stdout, Write};
 use std::ops::Range;
-use std::process::{Command, Stdio};
-use std::thread;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -166,56 +160,6 @@ fn graphemes(row: &Row) -> Vec<(usize, &str)> {
         col += grapheme.width();
     }
     found
-}
-
-/// Some terminals ignore OSC 52
-pub(crate) fn copy(text: &str) {
-    let osc = CopyToClipboard::to_clipboard_from(text);
-    execute!(stdout(), osc).ok();
-
-    let commands: &[&[&str]] = if cfg!(target_os = "macos") {
-        &[&["pbcopy"]]
-    } else if cfg!(windows) {
-        &[&["clip"]]
-    } else if env::var_os("WAYLAND_DISPLAY").is_some() {
-        &[&["wl-copy"]]
-    } else if env::var_os("DISPLAY").is_some() {
-        &[
-            &["xclip", "-selection", "clipboard"],
-            &["xsel", "--clipboard", "--input"],
-        ]
-    } else {
-        &[]
-    };
-
-    // clip reads input in the console code page unless it is UTF-16 with a BOM
-    let bytes = match cfg!(windows) {
-        true => {
-            let mut bytes = vec![0xFF, 0xFE];
-            let units = text.encode_utf16().flat_map(u16::to_le_bytes);
-            bytes.extend(units);
-            bytes
-        }
-        false => text.as_bytes().to_vec(),
-    };
-
-    for command in commands {
-        let child = Command::new(command[0])
-            .args(&command[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-
-        if let Ok(mut child) = child {
-            // stdin must be closed before waiting or the child never sees the end of input
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(&bytes).ok();
-            }
-            thread::spawn(move || child.wait());
-            return;
-        }
-    }
 }
 
 #[cfg(test)]

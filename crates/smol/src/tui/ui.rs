@@ -475,6 +475,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let input_block = panel().border_style(border);
     app.input.set_block(input_block);
     frame.render_widget(&app.input, input);
+    app.input_area = input;
 
     let inner = panel().inner(input);
     let cursor = app.input.screen_cursor();

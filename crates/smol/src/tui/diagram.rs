@@ -1,4 +1,4 @@
-use crate::tui::{desktop, screen};
+use crate::tui::screen;
 use mmdflux::{render_diagram, OutputFormat, RenderConfig};
 
 /// mmdflux panics on malformed nested subgraphs
@@ -23,12 +23,6 @@ pub(crate) fn page(code: &str) -> Result<String, String> {
         "<!doctype html>\n<meta charset=\"utf-8\">\n<title>diagram</title>\n<body style=\"margin: 16px; background: #fff\">\n{svg}\n</body>\n"
     );
     Ok(html)
-}
-
-pub(crate) fn open(code: &str) -> Result<(), String> {
-    let html = page(code)?;
-    let path = desktop::saved("diagram", code, "html", html.as_bytes())?;
-    desktop::open(&path)
 }
 
 #[cfg(test)]

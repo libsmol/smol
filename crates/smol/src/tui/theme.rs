@@ -1,6 +1,6 @@
 use crate::conversation::HUES;
 use crate::tui::Spans;
-use ratatui::buffer::Buffer;
+use ratatui::buffer::Cell;
 use ratatui::style::{Color, Style};
 use std::f32::consts::TAU;
 use std::sync::LazyLock;
@@ -62,11 +62,9 @@ pub(crate) fn shimmer(text: &str, base: Style, glow: Color, started: Instant) ->
     spans
 }
 
-pub(crate) fn downgrade(buffer: &mut Buffer) {
-    for cell in &mut buffer.content {
-        cell.fg = indexed(cell.fg);
-        cell.bg = indexed(cell.bg);
-    }
+pub(crate) fn downgrade(cell: &mut Cell) {
+    cell.fg = indexed(cell.fg);
+    cell.bg = indexed(cell.bg);
 }
 
 fn indexed(color: Color) -> Color {

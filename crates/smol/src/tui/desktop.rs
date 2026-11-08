@@ -1,10 +1,14 @@
+use crate::tui::render::Target;
+use crate::tui::{diagram, picture};
+use ratatui::crossterm::clipboard::CopyToClipboard;
+use ratatui::crossterm::execute;
 use reaper::cause;
 use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, stdout, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
@@ -18,13 +22,88 @@ const OPEN_WAIT: Duration = Duration::from_millis(500);
 #[cfg(not(windows))]
 const OPEN_EVERY: Duration = Duration::from_millis(20);
 
+/// Where what the user copies and opens goes, which is the device they look at the TUI on
+pub(crate) trait Desktop {
+    fn copy(&mut self, text: &str);
+    fn open(&mut self, target: &Target) -> Result<(), String>;
+}
+
+/// The machine smol runs on, and the terminal it runs in
+pub(crate) struct Local;
+
+impl Desktop for Local {
+    /// Some terminals ignore OSC 52
+    fn copy(&mut self, text: &str) {
+        let osc = CopyToClipboard::to_clipboard_from(text);
+        execute!(stdout(), osc).ok();
+
+        let commands: &[&[&str]] = if cfg!(target_os = "macos") {
+            &[&["pbcopy"]]
+        } else if cfg!(windows) {
+            &[&["clip"]]
+        } else if env::var_os("WAYLAND_DISPLAY").is_some() {
+            &[&["wl-copy"]]
+        } else if env::var_os("DISPLAY").is_some() {
+            &[
+                &["xclip", "-selection", "clipboard"],
+                &["xsel", "--clipboard", "--input"],
+            ]
+        } else {
+            &[]
+        };
+
+        // clip reads input in the console code page unless it is UTF-16 with a BOM
+        let bytes = match cfg!(windows) {
+            true => {
+                let mut bytes = vec![0xFF, 0xFE];
+                let units = text.encode_utf16().flat_map(u16::to_le_bytes);
+                bytes.extend(units);
+                bytes
+            }
+            false => text.as_bytes().to_vec(),
+        };
+
+        for command in commands {
+            let child = Command::new(command[0])
+                .args(&command[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+
+            if let Ok(mut child) = child {
+                // stdin must be closed before waiting or the child never sees the end of input
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin.write_all(&bytes).ok();
+                }
+                thread::spawn(move || child.wait());
+                return;
+            }
+        }
+    }
+
+    fn open(&mut self, target: &Target) -> Result<(), String> {
+        match target {
+            Target::Url(url) => open(url),
+            Target::Diagram(code) => {
+                let html = diagram::page(code)?;
+                let path = saved("diagram", code, "html", html.as_bytes())?;
+                open(&path)
+            }
+            // Named after the format the bytes really have, as the system opens a file by its name,
+            // which the model chose
+            Target::Picture(source) => {
+                let (bytes, format) = picture::original(source)?;
+                let extension = format.extensions_str().first().unwrap_or(&"png");
+                let path = saved("image", source, extension, &bytes)?;
+                open(&path)
+            }
+        }
+    }
+}
+
 /// The same key always gets the same file, which only the user can read
-pub(crate) fn saved(
-    kind: &str,
-    key: impl Hash,
-    extension: &str,
-    bytes: &[u8],
-) -> Result<PathBuf, String> {
+fn saved(kind: &str, key: impl Hash, extension: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     let hash = hasher.finish();
@@ -57,7 +136,7 @@ pub(crate) fn saved(
     Ok(path)
 }
 
-pub(crate) fn open(target: impl AsRef<OsStr>) -> Result<(), String> {
+fn open(target: impl AsRef<OsStr>) -> Result<(), String> {
     let program = if cfg!(target_os = "macos") {
         "open"
     } else if cfg!(windows) {

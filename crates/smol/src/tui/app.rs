@@ -1,12 +1,12 @@
 use crate::chat::{opens_mention, resolved, Output, Session};
 use crate::client::McpState;
 use crate::conversation::{Entry, Outcome};
-use crate::tui::picture::Source;
+use crate::tui::desktop::Desktop;
+use crate::tui::picture::{self, Source};
 use crate::tui::render::Target;
-use crate::tui::select::{self, Point, Selection};
+use crate::tui::select::{Point, Selection};
 use crate::tui::transcript::Transcript;
 use crate::tui::ui::input_box;
-use crate::tui::{desktop, diagram, picture};
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use ignore::WalkBuilder;
@@ -39,6 +39,7 @@ const MAX_MATCHES: usize = 200;
 
 pub(crate) struct App {
     pub(crate) session: Session,
+    desktop: Box<dyn Desktop>,
     pub(crate) transcript: Transcript,
     pub(crate) queued: VecDeque<String>,
     pub(crate) input: TextArea<'static>,
@@ -74,6 +75,7 @@ pub(crate) struct App {
     pub(crate) messages_area: Rect,
     pub(crate) pinned_area: Rect,
     pub(crate) scrollbar: Rect,
+    pub(crate) input_area: Rect,
     /// The pictures the last frame drew
     pub(crate) shown: Vec<Source>,
     pub(crate) selection: Option<Selection>,
@@ -278,10 +280,11 @@ static COMMANDS: [Spec; 6] = [
 ];
 
 impl App {
-    pub(crate) fn new(session: Session) -> Self {
+    pub(crate) fn new(session: Session, desktop: Box<dyn Desktop>) -> Self {
         let cwd = session.client.cwd.clone();
         Self {
             session,
+            desktop,
             transcript: Transcript::new(cwd),
             queued: VecDeque::new(),
             input: input_box(""),
@@ -307,6 +310,7 @@ impl App {
             messages_area: Rect::default(),
             pinned_area: Rect::default(),
             scrollbar: Rect::default(),
+            input_area: Rect::default(),
             shown: Vec::new(),
             selection: None,
             pressed: None,
@@ -695,20 +699,13 @@ impl App {
                                 return;
                             };
 
-                            let told = match target {
-                                Target::Url(url) => {
-                                    let opened = desktop::open(&url);
-                                    opened.map(|()| "opening the link in a browser".to_owned())
-                                }
-                                Target::Diagram(code) => {
-                                    let opened = diagram::open(&code);
-                                    opened.map(|()| "opening the diagram in a browser".to_owned())
-                                }
-                                Target::Picture(source) => {
-                                    let opened = picture::open(&source);
-                                    opened.map(|()| "opening the image".to_owned())
-                                }
+                            let opening = match target {
+                                Target::Url(_) => "opening the link in a browser",
+                                Target::Diagram(_) => "opening the diagram in a browser",
+                                Target::Picture(_) => "opening the image",
                             };
+                            let opened = self.desktop.open(&target);
+                            let told = opened.map(|()| opening.to_owned());
                             self.flash = Some((told, Instant::now()));
                             return;
                         };
@@ -716,7 +713,7 @@ impl App {
                         let rows = self.transcript.rows(talk, area.width, self.expanded);
                         let text = selection.text(rows);
                         if !text.trim().is_empty() {
-                            select::copy(&text);
+                            self.desktop.copy(&text);
                             let count = text.chars().count();
                             let copied = format!("copied {count} characters");
                             self.flash = Some((Ok(copied), Instant::now()));

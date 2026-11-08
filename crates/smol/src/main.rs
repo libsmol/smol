@@ -1,9 +1,10 @@
 use anyhow::{bail, Result};
 use clap::builder::NonEmptyStringValueParser;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::env;
 use std::env::consts::EXE_SUFFIX;
 use std::io::{self, IsTerminal};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -15,16 +16,37 @@ mod tui;
 const AGENT: &str = "libsmol";
 
 #[derive(Parser)]
-#[command(name = "smol", version, about)]
+#[command(
+    name = "smol",
+    version,
+    about,
+    args_conflicts_with_subcommands = true,
+    disable_help_subcommand = true
+)]
 struct Cli {
+    #[command(subcommand)]
+    mode: Option<Mode>,
     /// first task, optional
     prompt: Option<String>,
     /// resume a stored session by id, or `latest`
-    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    #[arg(long, global = true, value_parser = NonEmptyStringValueParser::new())]
     resume: Option<String>,
     /// model to use, as the agent names it; defaults to the agent's choice
-    #[arg(long)]
+    #[arg(long, global = true)]
     model: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum Mode {
+    /// show smol in a browser too, at an address with a token made for this run
+    Web {
+        /// address to listen on
+        #[arg(long, default_value = "127.0.0.1:8421")]
+        listen: SocketAddr,
+        /// token to use on every run instead, at least 16 letters, digits or `-._~`
+        #[arg(long, value_parser = tui::web::fixed_token)]
+        token: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -39,7 +61,8 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+    let terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if cli.mode.is_none() && !terminal {
         bail!("terminal: stdin and stdout: not both a terminal");
     }
 
@@ -60,7 +83,12 @@ fn run() -> Result<()> {
 
     let command = [program.display().to_string()];
     let resume = cli.resume.as_deref();
-    tui::run(&command, cli.model, resume, cli.prompt)
+    match cli.mode {
+        Some(Mode::Web { listen, token }) => {
+            tui::web::run(&command, cli.model, resume, listen, token, terminal)
+        }
+        None => tui::run(&command, cli.model, resume, cli.prompt),
+    }
 }
 
 #[cfg(test)]

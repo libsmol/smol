@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content">
+<meta name="color-scheme" content="dark">
+<title>smol</title>
+<link rel="stylesheet" href="style.css">
+<div id="view">
+  <canvas id="screen"></canvas>
+  <textarea id="keys" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="Input"></textarea>
+  <div id="bar">
+    <button type="button" data-key="Escape">esc</button>
+    <button type="button" data-key="Tab">tab</button>
+    <button type="button" id="ctrl" aria-pressed="false">ctrl</button>
+    <button type="button" data-key="ArrowUp" aria-label="up">↑</button>
+    <button type="button" data-key="ArrowDown" aria-label="down">↓</button>
+    <button type="button" data-key="ArrowLeft" aria-label="left">←</button>
+    <button type="button" data-key="ArrowRight" aria-label="right">→</button>
+    <button type="button" id="paste">paste</button>
+  </div>
+  <div id="notice" role="status" hidden></div>
+</div>
+<dialog id="copied">
+  <p>The browser keeps scripts out of the clipboard here, so copy it from below.</p>
+  <textarea readonly></textarea>
+  <div class="actions">
+    <button type="button">Close</button>
+  </div>
+</dialog>
+<dialog id="pasting">
+  <p>The browser keeps scripts out of the clipboard here, so paste it below.</p>
+  <textarea></textarea>
+  <div class="actions">
+    <button type="button">Cancel</button>
+    <button type="button" class="primary" value="paste">Paste</button>
+  </div>
+</dialog>
+<script type="module" src="app.js"></script>
+</html>

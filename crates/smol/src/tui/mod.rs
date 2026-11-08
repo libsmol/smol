@@ -1,17 +1,16 @@
 use crate::chat::Session;
-use crate::tui::app::{pasted, App};
+use crate::tui::app::App;
+use crate::tui::desktop::Local;
 use crate::tui::screen::Screen;
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event};
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::style::{Modifier, Style};
 #[cfg(unix)]
-use signal_hook::consts::SIGTERM;
+use signal_hook::consts::{SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::{flag, low_level};
-use std::env;
 use std::io::stdout;
+#[cfg(unix)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,10 +29,9 @@ mod select;
 mod theme;
 mod transcript;
 mod ui;
+pub(crate) mod web;
 
 const POLL_EVERY: Duration = Duration::from_millis(30);
-/// Keys buffered after this long without reading events may have been typed during a stall
-const STALL_WAIT: Duration = Duration::from_millis(200);
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 pub(crate) const SPIN_EVERY: Duration = Duration::from_millis(80);
@@ -130,14 +128,83 @@ pub(crate) fn kilo(n: u64) -> String {
     format!("{value}{unit}")
 }
 
+/// What shows the TUI and passes on its input
+pub(crate) trait Host {
+    /// Whether the app asking to quit ends it, where a host may instead let go of only the device that asked
+    fn quits(&mut self, _app: &mut App) -> bool {
+        true
+    }
+    /// Shows the app, once on every turn of the loop
+    fn show(&mut self, app: &mut App) -> Result<()>;
+    /// Hands the app the input that arrives within `wait`
+    fn listen(&mut self, app: &mut App, wait: Duration) -> Result<()>;
+}
+
+/// Catches the signals that end smol, so the session closes and saves first, and a second one
+/// ends smol at once
+#[derive(Default)]
+pub(crate) struct Ending {
+    ended: Arc<AtomicBool>,
+    #[cfg(unix)]
+    signal: Arc<AtomicUsize>,
+}
+
+impl Ending {
+    pub(crate) fn catch() -> Self {
+        let ending = Self::default();
+        // Registered before the flags, the shutdown ends smol only on a second signal
+        #[cfg(unix)]
+        for signal in [SIGINT, SIGTERM] {
+            flag::register_conditional_shutdown(signal, 1, Arc::clone(&ending.ended)).ok();
+            flag::register(signal, Arc::clone(&ending.ended)).ok();
+            flag::register_usize(signal, Arc::clone(&ending.signal), signal as usize).ok();
+        }
+        ending
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
+    }
+
+    /// Ends smol by the signal that was caught, as that signal would have
+    fn resend(&self) {
+        #[cfg(unix)]
+        if self.ended() {
+            let signal = self.signal.load(Ordering::Relaxed);
+            low_level::emulate_default_handler(signal as i32).ok();
+        }
+    }
+}
+
+pub(crate) fn drive(app: &mut App, host: &mut impl Host, ending: &Ending) -> Result<()> {
+    while !ending.ended() {
+        if app.quit && host.quits(app) {
+            break;
+        }
+        host.show(app)?;
+
+        let now = Instant::now();
+        let wait = match app.scroll_at {
+            Some(at) => at.saturating_duration_since(now).min(POLL_EVERY),
+            None => POLL_EVERY,
+        };
+        host.listen(app, wait)?;
+
+        app.pump();
+    }
+    Ok(())
+}
+
 pub(crate) fn run(
     command: &[String],
     model: Option<String>,
     resume: Option<&str>,
     task: Option<String>,
 ) -> Result<()> {
-    let session = Session::start(command, model, resume, *picture::KITTY)?;
-    let mut app = App::new(session);
+    let kitty = picture::kitty_here();
+    picture::set_kitty(kitty);
+    let session = Session::start(command, model, resume, kitty)?;
+    let mut app = App::new(session, Box::new(Local));
 
     if resume.is_some() {
         app.show_session();
@@ -146,87 +213,27 @@ pub(crate) fn run(
         app.submit_text(&task);
     }
 
-    // SSH drops COLORTERM, so only terminals known to lack truecolor get 256 colors
-    let term = env::var("TERM").unwrap_or_default();
-    let program = env::var("TERM_PROGRAM").unwrap_or_default();
-    let truecolor = term != "linux" && program != "Apple_Terminal";
-
-    // Registered before the flag, the shutdown ends smol only on a second SIGTERM
-    let terminated = Arc::new(AtomicBool::new(false));
-    #[cfg(unix)]
-    {
-        flag::register_conditional_shutdown(SIGTERM, 1, Arc::clone(&terminated)).ok();
-        flag::register(SIGTERM, Arc::clone(&terminated)).ok();
-    }
-
+    let ending = Ending::catch();
     let mut screen = Screen::enter()?;
-    let mut listened = Instant::now();
-    while !app.quit && !terminated.load(Ordering::Relaxed) {
-        // Images drawn last frame go out now, and their placeholders show them once they arrive
-        picture::send(&mut stdout(), &app.shown)?;
-        if app.take_dirty() {
-            execute!(stdout(), BeginSynchronizedUpdate)?;
-            screen.terminal.draw(|frame| {
-                ui::draw(frame, &mut app);
-                if !truecolor {
-                    theme::downgrade(frame.buffer_mut());
-                }
-            })?;
-            execute!(stdout(), EndSynchronizedUpdate)?;
-        }
-
-        let stalled = listened.elapsed() > STALL_WAIT;
-        let now = Instant::now();
-        let wait = match app.scroll_at {
-            Some(at) => at.saturating_duration_since(now).min(POLL_EVERY),
-            None => POLL_EVERY,
-        };
-        let ready = event::poll(wait)?;
-        listened = Instant::now();
-        if ready {
-            let first = event::read()?;
-            let mut events = vec![first];
-            while event::poll(Duration::ZERO)? {
-                let event = event::read()?;
-                events.push(event);
-            }
-
-            // Other platforms report pastes as their own event,
-            // and keys buffered during a stall are not a paste
-            let burst = match cfg!(windows) {
-                true => pasted(&events, stalled),
-                false => None,
-            };
-            match burst {
-                Some(text) => app.on_event(Event::Paste(text)),
-                None => {
-                    for event in events {
-                        app.on_event(event);
-                    }
-                }
-            }
-        }
-
-        app.pump();
-    }
+    drive(&mut app, &mut screen, &ending)?;
 
     // The terminal keeps the images it was sent after smol exits unless they are deleted,
     // as placeholders don't count as placements on screen
     picture::clear();
     picture::send(&mut stdout(), &[]).ok();
     drop(screen);
+    leave(app, &ending);
+    Ok(())
+}
+
+/// Says goodbye once the host gave the terminal back, then lets libsmol save before a caught
+/// signal ends smol
+pub(crate) fn leave(app: App, ending: &Ending) {
     if let Some(line) = app.session.parting() {
         println!("{line}");
     }
-
-    // libsmol gets to save first, then the signal ends smol as it would have
     drop(app);
-    #[cfg(unix)]
-    if terminated.load(Ordering::Relaxed) {
-        low_level::emulate_default_handler(SIGTERM).ok();
-    }
-
-    Ok(())
+    ending.resend();
 }
 
 #[cfg(test)]
@@ -246,7 +253,7 @@ mod tests {
     pub(crate) fn app() -> App {
         let agent = fake();
         let session = Session::start(&agent, None, None, false).expect("start");
-        App::new(session)
+        App::new(session, Box::new(Local))
     }
 
     pub(crate) fn draw(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {

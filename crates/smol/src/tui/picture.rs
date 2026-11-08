@@ -1,10 +1,11 @@
 use crate::chat::resolved;
-use crate::tui::{desktop, screen, theme};
+use crate::tui::{screen, theme};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use image::imageops::{self, FilterType};
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, Rgba, RgbaImage};
+use ratatui::buffer::Cell;
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use std::collections::HashMap;
@@ -15,7 +16,7 @@ use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use ureq::tls::{RootCerts, TlsConfig};
@@ -145,9 +146,21 @@ thread_local! {
 }
 /// Counts loads that ended, so the transcript lays its rows out again
 static LOADED: AtomicU64 = AtomicU64::new(0);
+static KITTY: OnceLock<bool> = OnceLock::new();
+
+/// Whether pictures are drawn as Kitty images, as the host set it
+pub(crate) fn kitty() -> bool {
+    KITTY.get().copied().unwrap_or(false)
+}
+
+/// For the host to call once, before any picture is drawn
+pub(crate) fn set_kitty(drawn: bool) {
+    KITTY.set(drawn).expect("kitty");
+}
+
 /// Kitty images are drawn only outside a multiplexer,
 /// which keeps graphics to itself unless set up to pass them through
-pub(crate) static KITTY: LazyLock<bool> = LazyLock::new(|| {
+pub(crate) fn kitty_here() -> bool {
     // Tests run in whatever terminal started them
     if cfg!(test) {
         return false;
@@ -159,7 +172,7 @@ pub(crate) static KITTY: LazyLock<bool> = LazyLock::new(|| {
     let multiplexed = ["TMUX", "STY", "ZELLIJ"].map(env::var_os);
     let nested = multiplexed.iter().any(Option::is_some);
     !nested && kitty_terminal(&term, &program, ssh)
-});
+}
 
 /// Terminals known to draw Kitty's Unicode placeholders, by the TERM they set,
 /// since other variables pass on to terminals started from their shells
@@ -210,7 +223,7 @@ pub(crate) fn state(source: &Source) -> Load {
     store.loaders += 1;
     drop(store);
 
-    let kitty = *KITTY;
+    let kitty = kitty();
     thread::spawn(move || loop {
         let mut store = shared.lock().expect("pictures");
         let Some((source, stamp)) = store.queue.pop() else {
@@ -454,6 +467,66 @@ fn placeholders(image: u32, placement: u32, columns: u32, rows: u32) -> Lines {
     lines
 }
 
+/// The part of a picture one placeholder cell shows, counted in cells
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Tile {
+    pub(crate) image: u32,
+    pub(crate) columns: u32,
+    pub(crate) rows: u32,
+    pub(crate) column: u32,
+    pub(crate) row: u32,
+}
+
+/// Reads back what `placeholders` drew, for a placement of this conversation
+pub(crate) fn tile(cell: &Cell) -> Option<Tile> {
+    let mut chars = cell.symbol().chars();
+    if chars.next() != Some(PLACEHOLDER) {
+        return None;
+    }
+    let index = |mark: Option<char>| DIACRITICS.iter().position(|&known| Some(known) == mark);
+    let row = index(chars.next())?;
+    let column = index(chars.next())?;
+    let (Color::Rgb(red, green, blue), Color::Rgb(under_red, under_green, under_blue)) =
+        (cell.fg, cell.underline_color)
+    else {
+        return None;
+    };
+    let image = u32::from_be_bytes([0, red, green, blue]);
+    let placement = u32::from_be_bytes([0, under_red, under_green, under_blue]);
+
+    let shared = STORE.with(Arc::clone);
+    let store = shared.lock().expect("pictures");
+    let placed = store.placed.iter().find(|(_, (id, _))| *id == placement);
+    let ((_, columns, rows), _) = placed?;
+    Some(Tile {
+        image,
+        columns: *columns,
+        rows: *rows,
+        column: column as u32,
+        row: row as u32,
+    })
+}
+
+/// The picture a Kitty image id was given to, once loaded
+pub(crate) fn image(id: u32) -> Option<Arc<Picture>> {
+    let shared = STORE.with(Arc::clone);
+    let store = shared.lock().expect("pictures");
+    let (source, _) = store.images.iter().find(|(_, (image, _))| *image == id)?;
+    match store.states.get(source) {
+        Some((Load::Ready(picture), _)) => Some(Arc::clone(picture)),
+        _ => None,
+    }
+}
+
+impl Picture {
+    pub(crate) fn png(&self) -> Option<&[u8]> {
+        match &self.look {
+            Look::Png(png) => Some(png),
+            Look::Pixels { .. } => None,
+        }
+    }
+}
+
 /// Each cell shows two pixels, the upper half block in the color above and its background below
 fn halves(pixels: &RgbaImage, columns: u32, rows: u32) -> Lines {
     let small = imageops::resize(pixels, columns, rows * 2, FilterType::Triangle);
@@ -588,9 +661,8 @@ pub(crate) fn send(out: &mut impl Write, visible: &[Source]) -> io::Result<()> {
     }
 }
 
-/// Writes the picture's file, named after its real format, where only the user can read it,
-/// because the system opens a file by its name and the model chose this one
-pub(crate) fn open(source: &Source) -> Result<(), String> {
+/// The picture's bytes in their real format, a file's read again, for opening it outside the TUI
+pub(crate) fn original(source: &Source) -> Result<(Vec<u8>, ImageFormat), String> {
     let Load::Ready(picture) = state(source) else {
         return Err("image: not loaded yet".to_owned());
     };
@@ -598,18 +670,16 @@ pub(crate) fn open(source: &Source) -> Result<(), String> {
         Source::File(path) => read(path),
         Source::Web(_) => None,
     };
-    let Some(bytes) = picture.bytes.as_ref().or(read_again.as_ref()) else {
+    let Some(bytes) = read_again.or_else(|| picture.bytes.clone()) else {
         return Err("image: can't be read again".to_owned());
     };
     // The file may have changed since it was drawn
-    let format = image::guess_format(bytes).ok();
+    let format = image::guess_format(&bytes).ok();
     if format != Some(picture.format) {
         return Err("image: no longer the image shown".to_owned());
     }
 
-    let extension = picture.format.extensions_str().first().unwrap_or(&"png");
-    let path = desktop::saved("image", source, extension, bytes)?;
-    desktop::open(&path)
+    Ok((bytes, picture.format))
 }
 
 #[cfg(test)]
@@ -618,6 +688,9 @@ mod tests {
     use crate::tui::tests::{settled, written};
     use image::codecs::jpeg::JpegEncoder;
     use image::{ImageBuffer, ImageEncoder, Rgb, RgbImage};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::text::Line;
     use std::{process, slice};
     use unicode_width::UnicodeWidthStr;
 
@@ -707,6 +780,36 @@ mod tests {
         assert_eq!(span.content.width(), 3);
         let second: Vec<char> = span.content.chars().skip(3).take(3).collect();
         assert_eq!(second, [PLACEHOLDER, DIACRITICS[1], DIACRITICS[1]]);
+    }
+
+    /// A placeholder drawn into a buffer reads back as the part of its picture it shows
+    #[test]
+    fn tiles_read_back() {
+        let source = Source::Web("https://a.io/café.png".to_owned());
+        let shared = STORE.with(Arc::clone);
+        let placed = (source, 3, 2);
+        shared
+            .lock()
+            .expect("pictures")
+            .placed
+            .insert(placed, (0x04_05_06, false));
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 2));
+        let lines = placeholders(0x01_02_03, 0x04_05_06, 3, 2);
+        for (y, spans) in (0..).zip(lines) {
+            buffer.set_line(0, y, &Line::from(spans), 3);
+        }
+
+        let read = tile(&buffer[(2, 1)]);
+        let expected = Tile {
+            image: 0x01_02_03,
+            columns: 3,
+            rows: 2,
+            column: 2,
+            row: 1,
+        };
+        assert_eq!(read, Some(expected));
+        assert_eq!(tile(&Cell::new("é")), None);
     }
 
     /// Only pictures on screen go to the terminal, one a call, and the one shown longest ago

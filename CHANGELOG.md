@@ -9,6 +9,13 @@ but their files stay in `~/.smol/projects` untouched.
 
 ## Unreleased
 
+- `smol web` shows smol in browsers as well as in its terminal, at an address
+  with a token made for each run, or the same one every run with `--token`.
+  Every device shares one screen, drawn on a canvas, which takes the size of
+  the device used last; pictures show sharp, and what a browser copies or opens
+  goes to that browser. On a phone, a row of keys adds esc, tab, ctrl, the
+  arrows and paste, and a finger held still selects text. It listens on
+  `127.0.0.1:8421` unless `--listen` says otherwise.
 - The output of a `!` command says it goes to the model with the next message,
   until that message is sent.
 
