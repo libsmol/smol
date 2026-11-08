@@ -7,6 +7,12 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- Building from a checkout tries the CPython download again when GitHub answers
+  with a server error or the connection fails, up to 6 times over about two
+  and a half minutes, where it used to fail at once.
+
 ## 0.8.1 - 2026-11-08
 
 - In `smol web`, a symbol that the browser's font draws past the edges of its

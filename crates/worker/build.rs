@@ -7,6 +7,8 @@ use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 use tar::Archive;
 
 /// The python-build-standalone release and the CPython it builds
@@ -41,6 +43,9 @@ const BUILDS: [(&str, &str, &str); 5] = [
         "7a828feea84763362f5e56031a12eee5d2697196ccf987b21ccce5ec9ad4a00f",
     ),
 ];
+/// GitHub can answer a release download with 504 for minutes at a time
+const MAX_TRIES: u32 = 6;
+const RETRY_WAIT: Duration = Duration::from_secs(5);
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -107,15 +112,34 @@ fn main() {
             let url = format!(
                 "https://github.com/astral-sh/python-build-standalone/releases/download/{RELEASE}/{named}-{flavor}"
             );
-            let response = match ureq::get(&url).call() {
-                Ok(response) => response,
-                Err(e) => panic!("{url}: {e}"),
+
+            let mut tries = 1;
+            let mut wait = RETRY_WAIT;
+            let bytes = loop {
+                let failure = match ureq::get(&url).call() {
+                    Ok(response) => {
+                        let mut body = response.into_body().into_reader();
+                        let mut bytes = Vec::new();
+                        match body.read_to_end(&mut bytes) {
+                            Ok(_) => break bytes,
+                            Err(e) => e.to_string(),
+                        }
+                    }
+                    Err(ureq::Error::StatusCode(code)) if code < 500 && code != 429 => {
+                        panic!("{url}: http status: {code}")
+                    }
+                    Err(e) => e.to_string(),
+                };
+                if tries == MAX_TRIES {
+                    panic!("{url}: {failure}");
+                }
+
+                let seconds = wait.as_secs();
+                println!("cargo:warning={url}: {failure}, trying again in {seconds}s");
+                thread::sleep(wait);
+                tries += 1;
+                wait *= 2;
             };
-            let mut body = response.into_body().into_reader();
-            let mut bytes = Vec::new();
-            if let Err(e) = body.read_to_end(&mut bytes) {
-                panic!("{url}: {e}");
-            }
             if hashed(&bytes) != *sha {
                 panic!("{url}: checksum mismatch");
             }
