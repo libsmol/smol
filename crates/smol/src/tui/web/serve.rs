@@ -3,10 +3,10 @@ use crate::tui::web::input::decode;
 use crate::tui::web::{Arrival, Who};
 use httparse::{Request, Status, EMPTY_HEADER};
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::str;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tungstenite::handshake::derive_accept_key;
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
-use tungstenite::{Message, WebSocket};
+use tungstenite::{Error, Message, WebSocket};
 
 const INDEX: &str = include_str!("page/index.html");
 const SCRIPT: &str = include_str!("page/app.js");
@@ -30,6 +30,9 @@ const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const REQUEST_WAIT: Duration = Duration::from_secs(10);
 /// Accepting fails again at once while no file descriptor is free
 const ACCEPT_WAIT: Duration = Duration::from_millis(100);
+/// How long a socket's read blocks before it looks whether the sending thread ended, as shutting
+/// the socket doesn't wake a read on Windows
+const READ_WAIT: Duration = Duration::from_secs(1);
 /// Frames a browser can fall behind by, after which it gets the whole screen instead
 const MAX_QUEUED: usize = 64;
 const MAX_OPENED: usize = 16;
@@ -268,15 +271,18 @@ impl Server {
     }
 
     /// Passes the browser's messages on while another thread sends it what was queued for it,
-    /// and the side that ends first shuts the socket, which ends the other
+    /// and the side that ends first ends the other
     fn converse(&self, stream: TcpStream, rest: Vec<u8>) {
         let Ok(writing) = stream.try_clone() else {
             return;
         };
         let (outbox, outgoing) = mpsc::sync_channel(MAX_QUEUED);
         let parting = Arc::new(AtomicU16::new(ENDED));
+        let finished = Arc::new(AtomicBool::new(false));
         let closing = Arc::clone(&parting);
-        let sending = thread::Builder::new().spawn(move || send_queued(writing, outgoing, closing));
+        let ending = Arc::clone(&finished);
+        let sending =
+            thread::Builder::new().spawn(move || send_queued(writing, outgoing, closing, ending));
         if sending.is_err() {
             return;
         }
@@ -289,7 +295,7 @@ impl Server {
             return;
         }
 
-        stream.set_read_timeout(None).ok();
+        stream.set_read_timeout(Some(READ_WAIT)).ok();
         let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE_BYTES));
         let reading = Reading(stream);
         let mut socket = WebSocket::from_partially_read(reading, rest, Role::Server, Some(config));
@@ -304,8 +310,16 @@ impl Server {
                         break;
                     }
                 }
-                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(Message::Close(_)) => break,
                 Ok(_) => {}
+                Err(Error::Io(e))
+                    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    if finished.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                Err(_) => break,
             }
         }
 
@@ -333,7 +347,12 @@ impl Write for Reading {
 
 /// Sends each frame as soon as it is queued, and once the host drops the outbox closes with the
 /// code it left in `parting`, unless the browser is gone
-fn send_queued(stream: TcpStream, outgoing: Receiver<String>, parting: Arc<AtomicU16>) {
+fn send_queued(
+    stream: TcpStream,
+    outgoing: Receiver<String>,
+    parting: Arc<AtomicU16>,
+    finished: Arc<AtomicBool>,
+) {
     let mut socket = WebSocket::from_raw_socket(stream, Role::Server, None);
     let mut sent = |text: String| socket.send(Message::text(text)).is_ok();
     if outgoing.iter().all(&mut sent) {
@@ -345,6 +364,7 @@ fn send_queued(stream: TcpStream, outgoing: Receiver<String>, parting: Arc<Atomi
         socket.close(Some(frame)).ok();
         socket.flush().ok();
     }
+    finished.store(true, Ordering::Relaxed);
     socket.get_ref().shutdown(Shutdown::Both).ok();
 }
 
