@@ -7,6 +7,12 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- In `smol web`, a symbol that the browser's font draws past the edges of its
+  cell, as some fonts do with the ◆ before an answer, no longer leaves specks
+  where it was once the conversation scrolls.
+
 ## 0.8.0 - 2026-11-08
 
 - `smol web` shows smol in browsers as well as in its terminal, at an address

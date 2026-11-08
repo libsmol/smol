@@ -290,15 +290,20 @@ function draw(x, y) {
     paint.textBaseline = "middle";
     const measured = paint.measureText(here.symbol).width;
     const middle = top + cell.height / 2;
+
+    // Ink past the cell, as fallback fonts draw some symbols, would outlast the next redraw
+    paint.save();
+    paint.beginPath();
+    paint.rect(left, top, width, cell.height);
+    paint.clip();
     if (measured > width) {
-      paint.save();
       paint.translate(left, middle);
       paint.scale(width / measured, 1);
       paint.fillText(here.symbol, 0, 0);
-      paint.restore();
     } else {
       paint.fillText(here.symbol, left + (width - measured) / 2, middle);
     }
+    paint.restore();
   }
 
   if (modifiers & UNDERLINED) {
