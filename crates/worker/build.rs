@@ -7,6 +7,8 @@ use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 use tar::Archive;
 
 /// The python-build-standalone release and the CPython it builds
@@ -41,6 +43,9 @@ const BUILDS: [(&str, &str, &str); 5] = [
         "7a828feea84763362f5e56031a12eee5d2697196ccf987b21ccce5ec9ad4a00f",
     ),
 ];
+/// GitHub can answer a release download with 504 for minutes at a time
+const MAX_TRIES: u32 = 6;
+const RETRY_WAIT: Duration = Duration::from_secs(30);
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -107,15 +112,25 @@ fn main() {
             let url = format!(
                 "https://github.com/astral-sh/python-build-standalone/releases/download/{RELEASE}/{named}-{flavor}"
             );
-            let response = match ureq::get(&url).call() {
-                Ok(response) => response,
+            let fetch = || -> Result<Vec<u8>, ureq::Error> {
+                let response = ureq::get(&url).call()?;
+                let mut body = response.into_body().into_reader();
+                let mut bytes = Vec::new();
+                body.read_to_end(&mut bytes)?;
+                Ok(bytes)
+            };
+
+            let mut fetched = fetch();
+            for _ in 1..MAX_TRIES {
+                let Err(e) = &fetched else { break };
+                println!("cargo:warning={url}: {e}, trying again");
+                thread::sleep(RETRY_WAIT);
+                fetched = fetch();
+            }
+            let bytes = match fetched {
+                Ok(bytes) => bytes,
                 Err(e) => panic!("{url}: {e}"),
             };
-            let mut body = response.into_body().into_reader();
-            let mut bytes = Vec::new();
-            if let Err(e) = body.read_to_end(&mut bytes) {
-                panic!("{url}: {e}");
-            }
             if hashed(&bytes) != *sha {
                 panic!("{url}: checksum mismatch");
             }
