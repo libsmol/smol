@@ -7,6 +7,12 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- In `smol web` on a phone, a tap outside the screen, as beside the row of keys
+  or below it, no longer puts the keyboard away, and a tap just beside a key
+  presses that key.
+
 ## 0.8.1 - 2026-11-08
 
 - In `smol web`, a symbol that the browser's font draws past the edges of its

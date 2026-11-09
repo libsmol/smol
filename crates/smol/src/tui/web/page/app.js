@@ -638,8 +638,12 @@ function paste() {
   }, ask);
 }
 
-// Pressing on the bar keeps the focus, and with it the phone's keyboard
-bar.addEventListener("mousedown", (event) => event.preventDefault());
+// Pressing outside the dialogs keeps the focus, and with it the phone's keyboard
+document.addEventListener("mousedown", (event) => {
+  if (!event.target.closest("dialog")) {
+    event.preventDefault();
+  }
+});
 
 // A key stays lit while the finger is on it, as phones show :active for a tap barely if at all
 const lit = (event) => {
@@ -652,8 +656,7 @@ for (const type of ["pointerdown", "pointerup", "pointercancel"]) {
   bar.addEventListener(type, lit);
 }
 
-bar.addEventListener("click", (event) => {
-  const button = event.target.closest("button");
+function activate(button) {
   if (button === ctrlButton) {
     latch(!latched);
   } else if (button === pasteButton) {
@@ -661,7 +664,29 @@ bar.addEventListener("click", (event) => {
   } else if (button) {
     press(button.dataset.key);
   }
-});
+}
+
+bar.addEventListener("click", (event) => activate(event.target.closest("button")));
+
+// Safari keeps its keyboard up after a tap outside the screen only when the tap's end is canceled
+document.addEventListener("touchend", (event) => {
+  // The screen handles its own taps, and links and the paste dialog's field need the click
+  if (event.target.closest("#screen, dialog, a, #paste")) {
+    return;
+  }
+  // The end of a finger that moved can't be canceled, and clicks nothing anyway
+  if (event.cancelable) {
+    event.preventDefault();
+  }
+  const button = event.target.closest("#bar button");
+  const finger = event.changedTouches[0];
+  const lifted = document.elementFromPoint(finger.clientX, finger.clientY);
+  // A pressed key shrinks, so a finger lifted at its edge may be over the bar
+  const landed = bar.contains(lifted) && (lifted.closest("button") ?? button);
+  if (button && landed === button) {
+    activate(button);
+  }
+}, { passive: false });
 
 function point(event) {
   const bounds = canvas.getBoundingClientRect();
