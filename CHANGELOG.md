@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
-## Unreleased
+## 0.8.2 - 2026-11-10
 
 - Compaction keeps every task of the session in order, one line each with the
   files it changed or the gist of its answer, where summaries used to keep only
