@@ -76,10 +76,12 @@ textarea {
 }
 
 #bar {
+  --rim: 6px;
+  --gap: 4px;
   display: none;
   justify-content: center;
-  gap: 4px;
-  padding: 6px;
+  gap: var(--gap);
+  padding: var(--rim) 6px;
 }
 
 @media (pointer: coarse) {
@@ -89,6 +91,7 @@ textarea {
 }
 
 #bar button {
+  position: relative;
   flex: 1;
   min-width: 0;
   max-width: 96px;
@@ -104,28 +107,23 @@ textarea {
   font-size: clamp(11px, 3.4vw, 14px);
   /* Fades out after a tap however short */
   transition: background-color 0.2s, transform 0.2s;
-  position: relative;
 }
 
 /* app.js cancels the end of a tap, which keeps browsers from widening it to the key it nearly hit */
 #bar button::before {
   content: "";
   position: absolute;
-  inset: -6px -2px;
+  inset: calc(-1 * var(--rim)) calc(var(--gap) / -2);
 }
 
 /* A phone on its side keeps its few rows for the screen */
 @media (pointer: coarse) and (max-height: 500px) {
   #bar {
-    padding: 4px 6px;
+    --rim: 4px;
   }
 
   #bar button {
     height: 30px;
-  }
-
-  #bar button::before {
-    inset: -4px -2px;
   }
 }
 

@@ -678,11 +678,12 @@ document.addEventListener("touchend", (event) => {
   if (event.cancelable) {
     event.preventDefault();
   }
+
   const button = event.target.closest("#bar button");
   const finger = event.changedTouches[0];
-  const lifted = document.elementFromPoint(finger.clientX, finger.clientY);
+  const under = document.elementFromPoint(finger.clientX, finger.clientY);
   // A pressed key shrinks, so a finger lifted at its edge may be over the bar
-  const landed = bar.contains(lifted) && (lifted.closest("button") ?? button);
+  const landed = bar.contains(under) ? (under.closest("button") ?? button) : null;
   if (button && landed === button) {
     activate(button);
   }
@@ -700,7 +701,6 @@ let pressed = -1;
 let dragged = null;
 
 canvas.addEventListener("mousedown", (event) => {
-  event.preventDefault();
   // A keyboard put away can leave the field focused, and only a new focus brings it back
   if (clicking) {
     clicking = false;
