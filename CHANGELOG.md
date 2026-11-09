@@ -7,6 +7,16 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- Compaction keeps every task of the session in order, one line each with the
+  files it changed or the gist of its answer, where summaries used to keep only
+  the last task and earlier ones that still mattered, so "undo the second task"
+  still finds it after several compactions. Summaries also keep what the user
+  required, chose or ruled out in any task, why the agent changed what it did
+  and whether the changes are committed, and no longer copy tables or long
+  lists from answers.
+
 ## 0.8.1 - 2026-11-08
 
 - In `smol web`, a symbol that the browser's font draws past the edges of its
