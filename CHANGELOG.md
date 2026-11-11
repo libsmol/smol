@@ -7,6 +7,15 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- `:effort <level>` switches the reasoning effort for the session, among the
+  levels a model lists in `efforts` in `model.toml`, and the bar and the sidebar
+  show the effort after the model's name. libsmol offers it to ACP clients as a
+  thought level option. The session keeps the choice when resumed, `:new` keeps
+  it along with the model, and switching models goes back to the new model's
+  `effort`.
+
 ## 0.8.2 - 2026-11-10
 
 - Compaction keeps every task of the session in order, one line each with the

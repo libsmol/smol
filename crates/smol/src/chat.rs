@@ -1,5 +1,6 @@
 use crate::client::{
-    model_of, models, Asked, Client, Incoming, McpState, McpStatus, Memory, Model, Refusal,
+    choices, chosen, Asked, Client, Incoming, McpState, McpStatus, Memory, Offering, Refusal,
+    Selector,
 };
 use crate::conversation::{Conversation, Entry};
 use agent_client_protocol_schema::v1::{
@@ -83,7 +84,7 @@ impl Session {
         };
 
         let options = match model {
-            Some(model) => client.set_model(&opened.id, &opened.options, &model)?,
+            Some(model) => client.choose(&opened.id, &opened.options, Selector::Model, &model)?,
             None => opened.options,
         };
 
@@ -118,12 +119,18 @@ impl Session {
             self.client.close(&self.id);
         }
 
-        // The chosen model may be gone from the config,
-        // so keep the new session's default if switching fails
-        let current = self.models().into_iter().find(|model| model.current);
+        // The chosen model and effort may be gone from the config, and a failed switch keeps the default
+        // The effort goes second, as switching models resets it
         let mut options = opened.options;
-        if let (Some(model), None) = (current, resume) {
-            let switched = self.client.set_model(&opened.id, &options, &model.value);
+        for selector in [Selector::Model, Selector::Effort] {
+            let offered = self.choices(selector);
+            let current = offered.into_iter().find(|offering| offering.current);
+            let Some(current) = current.filter(|_| resume.is_none()) else {
+                continue;
+            };
+            let switched = self
+                .client
+                .choose(&opened.id, &options, selector, &current.value);
             if let Ok(switched) = switched {
                 options = switched;
             }
@@ -149,8 +156,8 @@ impl Session {
         Ok(sessions)
     }
 
-    pub(crate) fn models(&self) -> Vec<Model> {
-        models(&self.options)
+    pub(crate) fn choices(&self, selector: Selector) -> Vec<Offering> {
+        choices(&self.options, selector)
     }
 
     pub(crate) fn memories(&self) -> Result<Vec<Memory>> {
@@ -159,11 +166,17 @@ impl Session {
 
     pub(crate) fn model(&self) -> String {
         let named = || self.client.agent.name.clone();
-        model_of(&self.options).unwrap_or_else(named)
+        chosen(&self.options, Selector::Model).unwrap_or_else(named)
     }
 
-    pub(crate) fn set_model(&mut self, name: &str) -> Result<()> {
-        self.options = self.client.set_model(&self.id, &self.options, name)?;
+    pub(crate) fn effort(&self) -> Option<String> {
+        chosen(&self.options, Selector::Effort)
+    }
+
+    pub(crate) fn choose(&mut self, selector: Selector, value: &str) -> Result<()> {
+        self.options = self
+            .client
+            .choose(&self.id, &self.options, selector, value)?;
         Ok(())
     }
 
@@ -664,7 +677,7 @@ mod tests {
         assert_eq!(resumed.model(), "m2-café");
 
         let mut session = Session::start(&agent, None, None, false).expect("start");
-        session.set_model("m2-café").expect("switch");
+        session.choose(Selector::Model, "m2-café").expect("switch");
         session.open(None).expect("open");
         assert_eq!(
             (session.id.as_str(), session.model()),
@@ -672,6 +685,14 @@ mod tests {
         );
         session.open(Some("s1")).expect("resume");
         assert_eq!(session.model(), "m1");
+
+        // A new session keeps the chosen effort after the model, which would reset it
+        assert_eq!(session.effort().as_deref(), Some("high"));
+        session.choose(Selector::Effort, "low").expect("switch");
+        session.open(None).expect("open");
+        assert_eq!(session.effort().as_deref(), Some("low"));
+        session.open(Some("s1")).expect("resume");
+        assert_eq!(session.effort().as_deref(), Some("high"));
     }
 
     #[test]

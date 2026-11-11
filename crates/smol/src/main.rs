@@ -105,6 +105,9 @@ mod tests {
 model() {
     printf '{"id":"model","name":"Model","category":"model","type":"select","currentValue":"%s","options":[{"value":"m1","name":"m1"},{"value":"m2-café","name":"m2-café"}]}' "$1"
 }
+effort() {
+    printf '{"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"%s","options":[{"value":"low","name":"low"},{"value":"high","name":"high"}]}' "$1"
+}
 n=0
 while IFS= read -r line; do
     id=$(printf '%s\n' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
@@ -117,15 +120,19 @@ while IFS= read -r line; do
         result='{"sessions":[]}' ;;
     *'"method":"session/new"'*)
         n=$((n + 1))
-        result="{\"sessionId\":\"s$n\",\"configOptions\":[$(model m1)]}" ;;
+        result="{\"sessionId\":\"s$n\",\"configOptions\":[$(model m1),$(effort high)]}" ;;
     *'"method":"session/load"'*'"sessionId":"s1"'*)
         printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"old task"}}}}'
-        result="{\"configOptions\":[$(model m1)]}" ;;
+        result="{\"configOptions\":[$(model m1),$(effort high)]}" ;;
     *'"method":"session/load"'*)
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"unknown session"}}\n' "$id"
         continue ;;
     *'"method":"session/set_config_option"'*'"value":"m2-café"'*)
         result="{\"configOptions\":[$(model m2-café)]}" ;;
+    *'"method":"session/set_config_option"'*'"value":"m1"'*)
+        result="{\"configOptions\":[$(model m1),$(effort high)]}" ;;
+    *'"method":"session/set_config_option"'*'"value":"low"'*)
+        result="{\"configOptions\":[$(model m1),$(effort low)]}" ;;
     *'"method":"session/set_config_option"'*)
         result='{"configOptions":[]}' ;;
     *'"method":"session/prompt"'*'"text":"wait"'*)

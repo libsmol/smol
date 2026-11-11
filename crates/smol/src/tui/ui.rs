@@ -129,7 +129,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let cwd = tilde(&app.session.client.cwd);
         let cwd = tail(&cwd, width);
 
-        let model = app.session.model();
+        let model = running(app);
         let model = fitted(&model, width);
 
         // The row count is fixed, so rows hold their place even before data arrives
@@ -566,7 +566,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         app.choices_area = area;
     }
 
-    let name = app.session.model();
+    let name = running(app);
     let name = format!(" · {name}");
     let brand = vec![Span::styled(" smol", STRONG), Span::styled(name, DIM)];
 
@@ -619,6 +619,15 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let width = usize::from(status.width);
     let line = spread(brand, help, width);
     frame.render_widget(line, status);
+}
+
+/// The model and the effort it runs at
+fn running(app: &App) -> String {
+    let model = app.session.model();
+    match app.session.effort() {
+        Some(effort) => format!("{model} · {effort}"),
+        None => model,
+    }
 }
 
 /// The first word of each part is the key
@@ -828,6 +837,7 @@ fn scroll_top(top: u16, row: u16, height: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use crate::client::Selector;
     use crate::tui::tests::{app, draw, fill};
     use crate::tui::ui::*;
     use agent_client_protocol_schema::v1::{
@@ -1049,9 +1059,24 @@ mod tests {
     }
 
     #[test]
+    fn effort_shown() {
+        let mut app = app();
+        let rows = screen(&mut app, 120, 20);
+        assert!(rows[19].starts_with(" smol · m1 · high "), "{rows:#?}");
+        let sidebar = |row: &String| row.contains("││ m1 · high ");
+        assert!(rows.iter().any(sidebar), "{rows:#?}");
+
+        app.session.choose(Selector::Effort, "low").expect("switch");
+        let rows = screen(&mut app, 120, 20);
+        assert!(rows[19].starts_with(" smol · m1 · low "), "{rows:#?}");
+    }
+
+    #[test]
     fn welcome_hint_wraps() {
         let mut app = app();
-        app.session.set_model("m2-café").expect("switch");
+        app.session
+            .choose(Selector::Model, "m2-café")
+            .expect("switch");
         let rows = screen(&mut app, 60, 20);
         let text = rows.join("\n");
         assert!(text.contains("earlier session"), "{text}");

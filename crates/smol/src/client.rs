@@ -138,8 +138,33 @@ struct Memories {
     memories: Vec<Memory>,
 }
 
-/// One choice of the model option
-pub(crate) struct Model {
+/// The select options smol shows and switches, each found by its ACP category
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Selector {
+    Model,
+    Effort,
+}
+
+impl Selector {
+    fn category(self) -> SessionConfigOptionCategory {
+        match self {
+            Selector::Model => SessionConfigOptionCategory::Model,
+            Selector::Effort => SessionConfigOptionCategory::ThoughtLevel,
+        }
+    }
+}
+
+impl fmt::Display for Selector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Selector::Model => f.write_str("model"),
+            Selector::Effort => f.write_str("effort"),
+        }
+    }
+}
+
+/// One choice of a select option
+pub(crate) struct Offering {
     /// What the agent takes to switch to it
     pub(crate) value: String,
     pub(crate) name: String,
@@ -564,17 +589,18 @@ impl Client {
         Ok(response.config_options)
     }
 
-    pub(crate) fn set_model(
+    pub(crate) fn choose(
         &self,
         session: &str,
         options: &[SessionConfigOption],
-        model: &str,
+        selector: Selector,
+        value: &str,
     ) -> Result<Vec<SessionConfigOption>> {
-        let Some(option) = model_option(options) else {
-            bail!("agent: {}: has no model option", self.agent.name);
+        let Some(option) = option_of(options, selector) else {
+            bail!("agent: {}: has no {selector} option", self.agent.name);
         };
         let id = option.id.0.to_string();
-        self.set_option(session, &id, model)
+        self.set_option(session, &id, value)
     }
 
     pub(crate) fn sessions(&self) -> Result<Vec<SessionInfo>> {
@@ -661,49 +687,51 @@ impl Drop for Client {
     }
 }
 
-pub(crate) fn model_of(options: &[SessionConfigOption]) -> Option<String> {
-    let select = model_select(options)?;
-    let current = models(options).into_iter().find(|choice| choice.current);
+/// The name of the current choice
+pub(crate) fn chosen(options: &[SessionConfigOption], selector: Selector) -> Option<String> {
+    let select = select_of(options, selector)?;
+    let offered = choices(options, selector);
+    let current = offered.into_iter().find(|offering| offering.current);
 
     let name = match current {
-        Some(choice) => choice.name,
+        Some(offering) => offering.name,
         None => select.current_value.0.to_string(),
     };
     Some(name)
 }
 
-pub(crate) fn models(options: &[SessionConfigOption]) -> Vec<Model> {
-    let Some(select) = model_select(options) else {
+pub(crate) fn choices(options: &[SessionConfigOption], selector: Selector) -> Vec<Offering> {
+    let Some(select) = select_of(options, selector) else {
         return Vec::new();
     };
 
-    let choices: Vec<_> = match &select.options {
-        SessionConfigSelectOptions::Ungrouped(choices) => choices.iter().collect(),
+    let listed: Vec<_> = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(listed) => listed.iter().collect(),
         SessionConfigSelectOptions::Grouped(groups) => {
             groups.iter().flat_map(|group| &group.options).collect()
         }
         _ => Vec::new(),
     };
 
-    let mut models = Vec::new();
-    for choice in choices {
-        models.push(Model {
+    let mut offered = Vec::new();
+    for choice in listed {
+        offered.push(Offering {
             value: choice.value.0.to_string(),
             name: choice.name.clone(),
             description: choice.description.clone(),
             current: choice.value == select.current_value,
         });
     }
-    models
+    offered
 }
 
-fn model_option(options: &[SessionConfigOption]) -> Option<&SessionConfigOption> {
-    let model = Some(SessionConfigOptionCategory::Model);
-    options.iter().find(|option| option.category == model)
+fn option_of(options: &[SessionConfigOption], selector: Selector) -> Option<&SessionConfigOption> {
+    let category = Some(selector.category());
+    options.iter().find(|option| option.category == category)
 }
 
-fn model_select(options: &[SessionConfigOption]) -> Option<&SessionConfigSelect> {
-    let option = model_option(options)?;
+fn select_of(options: &[SessionConfigOption], selector: Selector) -> Option<&SessionConfigSelect> {
+    let option = option_of(options, selector)?;
     match &option.kind {
         SessionConfigKind::Select(select) => Some(select),
         _ => None,
@@ -718,18 +746,18 @@ mod tests {
 
     #[test]
     fn model_display_name() {
-        let choices = vec![
+        let models = vec![
             SessionConfigSelectOption::new("llama", "llama (qwen3)"),
             SessionConfigSelectOption::new("deepseek", "DeepSeek (deepseek-flash)"),
         ];
         let option = |current: &str| {
-            SessionConfigOption::select("model", "Model", current.to_owned(), choices.clone())
+            SessionConfigOption::select("model", "Model", current.to_owned(), models.clone())
                 .category(SessionConfigOptionCategory::Model)
         };
 
         let model = |current| {
             let options = [option(current)];
-            model_of(&options)
+            chosen(&options, Selector::Model)
         };
         assert_eq!(
             model("deepseek").as_deref(),
@@ -738,10 +766,19 @@ mod tests {
         assert_eq!(model("other").as_deref(), Some("other"));
 
         let options = [option("llama")];
-        let listed = models(&options);
+        let listed = choices(&options, Selector::Model);
         let current: Vec<bool> = listed.iter().map(|choice| choice.current).collect();
         assert_eq!(listed[1].value, "deepseek");
         assert_eq!(current, [true, false]);
+
+        // Each selector finds only the option of its own category
+        let levels = vec![SessionConfigSelectOption::new("max", "max")];
+        let effort = SessionConfigOption::select("effort", "Effort", "max".to_owned(), levels)
+            .category(SessionConfigOptionCategory::ThoughtLevel);
+        let options = [option("llama"), effort];
+        assert_eq!(chosen(&options, Selector::Effort).as_deref(), Some("max"));
+        assert_eq!(choices(&options, Selector::Model).len(), 2);
+        assert_eq!(chosen(&options[..1], Selector::Effort), None);
     }
 
     #[test]

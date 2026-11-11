@@ -65,6 +65,8 @@ struct Provider {
 pub(crate) struct ModelSpec {
     pub(crate) id: String,
     pub(crate) effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) efforts: Vec<String>,
     pub(crate) context: Option<u64>,
     /// DeepSeek counts reasoning toward it, and a small value cuts the reply off mid-reasoning
     pub(crate) max_tokens: Option<u64>,
@@ -72,6 +74,16 @@ pub(crate) struct ModelSpec {
     pub(crate) image: bool,
     #[serde(default, skip_serializing_if = "Not::not")]
     pub(crate) video: bool,
+}
+
+impl ModelSpec {
+    /// The efforts a session can switch among, only its own without a list
+    pub(crate) fn offered(&self) -> Vec<String> {
+        match self.efforts.is_empty() {
+            true => self.effort.iter().cloned().collect(),
+            false => self.efforts.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -95,26 +107,57 @@ impl Models {
         names
     }
 
-    pub(crate) fn make(&self, name: &str) -> Result<Box<dyn Model>> {
+    pub(crate) fn spec(&self, name: &str) -> Option<&ModelSpec> {
+        let (_, spec) = self.find(name)?;
+        Some(spec)
+    }
+
+    fn find(&self, name: &str) -> Option<(&Provider, &ModelSpec)> {
         for (prefix, provider) in &self.0 {
             let rest = name.strip_prefix(prefix.as_str());
             let Some(id) = rest.and_then(|rest| rest.strip_prefix('/')) else {
                 continue;
             };
-            let Some(model) = provider.models.iter().find(|model| model.id == id) else {
-                continue;
-            };
+            if let Some(model) = provider.models.iter().find(|model| model.id == id) {
+                return Some((provider, model));
+            }
+        }
+        None
+    }
 
-            let api = provider.api.clone();
-            let key = provider.api_key.clone();
-            let built = match provider.kind {
-                Kind::OpenAI => OpenAIModel::new(model, api, key)?,
-            };
-            return Ok(Box::new(built));
+    /// `effort` replaces the one model.toml gives
+    pub(crate) fn make(&self, name: &str, effort: Option<&str>) -> Result<Box<dyn Model>> {
+        let Some((provider, model)) = self.find(name) else {
+            let names = self.names().join(", ");
+            let message = format!("model: {name}: not in model.toml (models: {names})");
+            return Err(Error::InvalidParams(message));
+        };
+
+        let mut spec = model.clone();
+        if let Some(effort) = effort {
+            spec.effort = Some(effort.to_owned());
+        }
+        let api = provider.api.clone();
+        let key = provider.api_key.clone();
+        let built = match provider.kind {
+            Kind::OpenAI => OpenAIModel::new(&spec, api, key)?,
+        };
+        Ok(Box::new(built))
+    }
+
+    pub(crate) fn check_effort(&self, name: &str, effort: &str) -> Result<()> {
+        let offered = self.spec(name).map(ModelSpec::offered).unwrap_or_default();
+        if offered.iter().any(|known| known == effort) {
+            return Ok(());
         }
 
-        let names = self.names().join(", ");
-        let message = format!("model: {name}: not in model.toml (models: {names})");
+        let message = match offered.is_empty() {
+            true => format!("effort: {effort}: not offered by {name}"),
+            false => {
+                let efforts = offered.join(", ");
+                format!("effort: {effort}: not offered by {name} (efforts: {efforts})")
+            }
+        };
         Err(Error::InvalidParams(message))
     }
 }
@@ -166,6 +209,13 @@ pub(crate) fn models(dir: &Path) -> Result<Models> {
             }
             if model.context.is_some_and(|context| context < MIN_CONTEXT) {
                 let problem = format!("[model.{name}]: {id}: context below {MIN_CONTEXT}");
+                return Err(invalid(problem));
+            }
+            let effort = model.effort.as_ref();
+            let unlisted = effort.is_none_or(|effort| !model.efforts.contains(effort));
+            if !model.efforts.is_empty() && unlisted {
+                let efforts = model.efforts.join(", ");
+                let problem = format!("[model.{name}]: {id}: effort: not one of {efforts}");
                 return Err(invalid(problem));
             }
         }
@@ -430,7 +480,7 @@ pub(crate) fn roles(dir: &Path, project: &Path, models: &Models) -> (Vec<Role>, 
                 continue;
             }
 
-            let model = match spec.model.as_deref().map(|model| models.make(model)) {
+            let model = match spec.model.as_deref().map(|model| models.make(model, None)) {
                 None => None,
                 Some(Ok(built)) => Some(Arc::from(built)),
                 Some(Err(e)) => {
@@ -890,24 +940,41 @@ type = "openai-completions"
 api = "http://127.0.0.1:1/v1"
 models = [
     { id = "m1" },
-    { id = "piñata-2", effort = "high", context = 8000, max_tokens = 4096, image = true, video = true },
+    { id = "piñata-2", effort = "high", efforts = ["low", "high"], context = 8000, max_tokens = 4096, image = true, video = true },
 ]
 
 [model.slow]
 type = "openai-completions"
-models = [{ id = "m3" }]
+models = [{ id = "m3", effort = "max" }]
 "#;
         let (dir, _) = written(text);
         let read = models(&dir).expect("load");
         assert_eq!(read.names(), ["über/m1", "über/piñata-2", "slow/m3"]);
-        let built = read.make("über/piñata-2").expect("make");
+        let built = read.make("über/piñata-2", Some("low")).expect("make");
         assert_eq!(built.context_window(), Some(8000));
         assert!(built.takes(MediaKind::Image) && built.takes(MediaKind::Video));
 
-        let missing = read.make("über").err().expect("missing").to_string();
+        let missing = read.make("über", None).err().expect("missing").to_string();
         let names = "über/m1, über/piñata-2, slow/m3";
         let expected = format!("model: über: not in model.toml (models: {names})");
         assert_eq!(missing, expected);
+
+        // Without a list a model offers only its own effort, and without one none
+        let offered = |name: &str| read.spec(name).expect("spec").offered();
+        assert_eq!(offered("über/piñata-2"), ["low", "high"]);
+        assert_eq!(offered("slow/m3"), ["max"]);
+        assert!(offered("über/m1").is_empty());
+        read.check_effort("über/piñata-2", "low").expect("offered");
+        let refused = |name: &str, effort: &str| {
+            let checked = read.check_effort(name, effort);
+            checked.expect_err("refused").to_string()
+        };
+        let expected = "effort: max: not offered by über/piñata-2 (efforts: low, high)";
+        assert_eq!(refused("über/piñata-2", "max"), expected);
+        assert_eq!(
+            refused("über/m1", "low"),
+            "effort: low: not offered by über/m1"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -930,6 +997,14 @@ models = [{ id = "m3" }]
             (
                 "[model.\"jalapeño\"]\ntype = \"openai-completions\"\nmodels = [{ id = \"m\", context = 0 }]\n",
                 "[model.jalapeño]: m: context below 1024",
+            ),
+            (
+                "[model.\"café\"]\ntype = \"openai-completions\"\nmodels = [{ id = \"m\", efforts = [\"low\", \"high\"] }]\n",
+                "[model.café]: m: effort: not one of low, high",
+            ),
+            (
+                "[model.\"café\"]\ntype = \"openai-completions\"\nmodels = [{ id = \"m\", effort = \"xhigh\", efforts = [\"low\", \"high\"] }]\n",
+                "[model.café]: m: effort: not one of low, high",
             ),
             (
                 "[model.\"café\"]\ntype = \"openai-completions\"\napi = \"api.café.com/v1\"\nmodels = [{ id = \"m\" }]\n",
@@ -1005,7 +1080,7 @@ models = [{ id = "m3" }]
 
         let read = models(&dir).expect("load");
         assert_eq!(read.names(), ["über café.v2/piñata-2"]);
-        let built = read.make("über café.v2/piñata-2").expect("make");
+        let built = read.make("über café.v2/piñata-2", None).expect("make");
         assert_eq!(built.context_window(), Some(8192));
         assert!(built.takes(MediaKind::Image) && !built.takes(MediaKind::Video));
         let text = fs::read_to_string(&path).expect("read");
@@ -1030,7 +1105,7 @@ models = [{ id = "m3" }]
             assert_eq!(mode & 0o777, 0o600);
         }
         let read = models(&dir).expect("load");
-        let built = read.make("local-1/qwen3:32b").expect("make");
+        let built = read.make("local-1/qwen3:32b", None).expect("make");
         assert_eq!(built.context_window(), None);
 
         // A link a dotfile manager made stays, and the file it leads to is rewritten

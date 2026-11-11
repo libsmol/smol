@@ -60,6 +60,9 @@ impl SessionMeta {
 pub(crate) struct Settings {
     pub(crate) cwd: PathBuf,
     pub(crate) model: String,
+    /// The one chosen for `model`, None for its own in model.toml
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) effort: Option<String>,
     /// Only servers whose switch differs from `enabled` in agent.toml
     pub(crate) mcp: BTreeMap<String, bool>,
 }
@@ -418,6 +421,7 @@ pub(crate) mod tests {
         let settings = Settings {
             cwd: cwd.to_owned(),
             model: "tiny".to_owned(),
+            effort: Some("high".to_owned()),
             mcp: BTreeMap::from([("fake".to_owned(), false)]),
         };
 
@@ -425,6 +429,7 @@ pub(crate) mod tests {
         let (meta, _) = store.load(cwd, "a1").expect("load");
         assert_eq!(meta.title, "A task");
         assert_eq!(meta.settings.model, "tiny");
+        assert_eq!(meta.settings.effort.as_deref(), Some("high"));
         assert_eq!(meta.settings.mcp.get("fake"), Some(&false));
 
         let listed = store.list(Some(cwd)).expect("list");

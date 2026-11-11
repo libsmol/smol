@@ -5,7 +5,7 @@ use crate::acp::{rfc3339, task_of, to_value, App};
 use crate::agent::{
     title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Sink, Task,
 };
-use crate::config::{self, Access, McpConfig, Models, Skipped};
+use crate::config::{self, Access, McpConfig, ModelSpec, Models, Skipped};
 use crate::history::{Lock, SessionMeta, Settings};
 use crate::spawn::{run_shell, Process};
 use crate::steps::{AgentMemory, Exit, MemoryStep};
@@ -40,6 +40,7 @@ use tracing::{error, info, warn};
 /// Starts once the closing turn is saved, and only the title is lost past serve's SAVE_WAIT
 const NAME_WAIT: Duration = Duration::from_secs(3);
 const MODEL_OPTION: &str = "model";
+const EFFORT_OPTION: &str = "effort";
 
 /// All of these wait in the channel while a turn is running
 pub(crate) enum Message {
@@ -177,6 +178,18 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             let notice = format!("model: {gone}: not in model.toml, using {model}");
             notices.push(notice);
         }
+        let mut effort = previously.effort.clone();
+        if let Some(chosen) = &previously.effort {
+            if let Err(error) = models.check_effort(&model, chosen) {
+                let own = models.spec(&model).and_then(|spec| spec.effort.as_deref());
+                let notice = match own {
+                    Some(own) => format!("{error}, using {own}"),
+                    None => error.to_string(),
+                };
+                notices.push(notice);
+                effort = None;
+            }
+        }
 
         let (instructions, skipped) = config::instructions(&app.config, &cwd);
         for problem in skipped {
@@ -209,6 +222,7 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
         let mut settings = Settings {
             cwd: cwd.clone(),
             model,
+            effort,
             ..Settings::default()
         };
         for server in &servers {
@@ -223,7 +237,8 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             }
         }
         meta.settings = settings;
-        let built = models.make(&meta.settings.model)?;
+        let effort = meta.settings.effort.as_deref();
+        let built = models.make(&meta.settings.model, effort)?;
         let options = options(&models, &meta.settings, &servers);
 
         let copies = app.store.copies(&cwd, &meta.id)?;
@@ -513,13 +528,31 @@ impl Session {
             // and rewrites the saved session
             (MODEL_OPTION, _, SessionConfigOptionValue::ValueId { value }) => {
                 if *value.0 != keeper.meta.settings.model {
-                    let model = self.models.make(&value.0)?;
+                    let model = self.models.make(&value.0, None)?;
                     let window = model.context_window();
                     self.agent.model = Arc::from(model);
                     keeper.translator.model_changed(window);
                     keeper.meta.settings.model = value.0.to_string();
+                    keeper.meta.settings.effort = None;
                     let name = &keeper.meta.settings.model;
                     info!("session: model switched [model={name}]");
+                    keeper.save(&self.memory);
+                }
+            }
+            (EFFORT_OPTION, _, SessionConfigOptionValue::ValueId { value }) => {
+                let name = &keeper.meta.settings.model;
+                let effort = &*value.0;
+                self.models.check_effort(name, effort)?;
+                let own = self
+                    .models
+                    .spec(name)
+                    .and_then(|spec| spec.effort.as_deref());
+                let current = keeper.meta.settings.effort.as_deref().or(own);
+                if current != Some(effort) {
+                    let model = self.models.make(name, Some(effort))?;
+                    self.agent.model = Arc::from(model);
+                    keeper.meta.settings.effort = Some(effort.to_owned());
+                    info!("session: effort switched [effort={effort}]");
                     keeper.save(&self.memory);
                 }
             }
@@ -530,6 +563,10 @@ impl Session {
             }
             (MODEL_OPTION, _, _) => {
                 let message = "option: model: takes a model name".to_owned();
+                return Err(Error::InvalidParams(message));
+            }
+            (EFFORT_OPTION, _, _) => {
+                let message = "option: effort: takes an effort name".to_owned();
                 return Err(Error::InvalidParams(message));
             }
             (_, Some(_), _) => {
@@ -665,6 +702,20 @@ fn options<'a>(
     let model = SessionConfigOption::select(MODEL_OPTION, "Model", current, choices)
         .category(SessionConfigOptionCategory::Model);
     let mut options = vec![model];
+
+    // A model without an effort in model.toml runs at the provider's default, which has no name
+    let spec = models.spec(&settings.model);
+    let own = spec.and_then(|spec| spec.effort.clone());
+    if let Some(current) = settings.effort.clone().or(own) {
+        let mut choices = Vec::new();
+        for effort in spec.map(ModelSpec::offered).unwrap_or_default() {
+            let choice = SessionConfigSelectOption::new(effort.clone(), effort);
+            choices.push(choice);
+        }
+        let effort = SessionConfigOption::select(EFFORT_OPTION, "Effort", current, choices)
+            .category(SessionConfigOptionCategory::ThoughtLevel);
+        options.push(effort);
+    }
 
     for server in servers {
         let id = format!("{MCP_PREFIX}{}", server.name);
@@ -1246,6 +1297,7 @@ mod tests {
                 json!({"configId": "mcp.files", "type": "boolean", "value": true}),
                 json!({"configId": "theme", "value": "dark"}),
                 json!({"configId": "model", "value": "model2"}),
+                json!({"configId": "effort", "value": "high"}),
             ];
             for mut params in options {
                 params["sessionId"] = json!(session);
@@ -1263,8 +1315,72 @@ mod tests {
             "mcp: files: not in agent.toml",
             "option: theme: unknown",
             "model: model2: not in model.toml (models: mock/m1)",
+            "effort: high: not offered by mock/m1",
         ];
         assert_eq!(refused, expected);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The chosen effort goes with every request but titles, and stays with the saved session
+    #[test]
+    fn effort_switched() {
+        let dir = temp_dir("effort");
+        let efforts = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&efforts);
+        let api = model_server(move |body| {
+            if system_prompt(body) != NAMER {
+                let effort = body["reasoning_effort"].clone();
+                seen.lock().expect("efforts").push(effort);
+            }
+            Ok("Done.".to_owned())
+        });
+        let extra = ", effort = \"high\", efforts = [\"low\", \"high\"]";
+        let running = async {
+            let mut connection = Connection::open(&dir, &api, extra);
+            let params = json!({"cwd": CWD, "mcpServers": []});
+            let opened = connection.request("session/new", params).await;
+            let session = opened["result"]["sessionId"].as_str().expect("session");
+            let session = session.to_owned();
+            connection.prompt(&session, "Count the cafés").await;
+
+            let mut answers = Vec::new();
+            for effort in ["low", "max"] {
+                let params = json!({"sessionId": session, "configId": "effort", "value": effort});
+                let answered = connection.request("session/set_config_option", params);
+                answers.push(answered.await);
+            }
+            connection.prompt(&session, "Count them again").await;
+
+            let load = json!({"sessionId": session, "cwd": CWD, "mcpServers": []});
+            let loaded = connection.request("session/load", load).await;
+            connection.close().await;
+            (opened, answers, loaded)
+        };
+        let (opened, answers, loaded) = block_on(running);
+
+        let effort_of = |options: &Value| {
+            let list = options.as_array().cloned().unwrap_or_default();
+            list.into_iter().find(|option| option["id"] == "effort")
+        };
+        let offered = json!({
+            "id": "effort",
+            "name": "Effort",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "high",
+            "options": [{"value": "low", "name": "low"}, {"value": "high", "name": "high"}],
+        });
+        let first = effort_of(&opened["result"]["configOptions"]);
+        assert_eq!(first, Some(offered), "{opened}");
+        let switched = effort_of(&answers[0]["result"]["configOptions"]).expect("effort");
+        assert_eq!(switched["currentValue"], "low", "{switched}");
+        let refused = "effort: max: not offered by mock/m1 (efforts: low, high)";
+        assert_eq!(answers[1]["error"]["message"], refused, "{:?}", answers[1]);
+        let reloaded = effort_of(&loaded["result"]["configOptions"]).expect("effort");
+        assert_eq!(reloaded["currentValue"], "low", "{reloaded}");
+
+        let efforts = efforts.lock().expect("efforts");
+        assert_eq!(*efforts, [json!("high"), json!("low")]);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1340,6 +1456,7 @@ mod tests {
         };
         let settings = Settings {
             model: "mock/old-model".to_owned(),
+            effort: Some("ultra".to_owned()),
             ..here()
         };
         saved(&HistoryStore::new(&dir), &memory, "s1", &settings);
@@ -1366,6 +1483,7 @@ mod tests {
         let servers = tilde(&dir.join("agent.toml"));
         let expected = [
             "model: mock/old-model: not in model.toml, using mock/m1".to_owned(),
+            "effort: ultra: not offered by mock/m1".to_owned(),
             format!("config: {shown}: not UTF-8 text, skipped"),
             format!("config: {servers}: [mcp.café]: unknown variant `sse`, expected `stdio` or `http`, skipped"),
         ];

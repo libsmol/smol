@@ -145,7 +145,8 @@ first one is the default.
 | `id` | The model name the endpoint expects. |
 | `context` | Context window in tokens. With it, older steps are summarized before the window fills; without it, nothing is compacted. |
 | `max_tokens` | Output limit per reply. Some providers count reasoning in it, so a small value can cut a reply off mid-thought. OpenAI's reasoning models (o-series, gpt-5) refuse it; leave it out for them. |
-| `effort` | Sent as `reasoning_effort`. |
+| `effort` | Sent as `reasoning_effort`, shown after the model's name. |
+| `efforts` | The efforts `:effort` can switch among, such as `["low", "high", "max"]`; they must include `effort`. Without it the effort stays as set. |
 | `image`, `video` | `true` if the model accepts images or videos. Then `view()` and attached media are sent to it; otherwise it gets a note that the media is not shown. |
 
 Keys are stored in plain text, so keep `model.toml` readable only by you.
@@ -173,6 +174,7 @@ Run `smol` in the directory you want to work in, then type a task.
 | `:new` | Start a new session (re-reads the configuration). |
 | `:resume <session>` | Resume an earlier session. `:resume` lists them. |
 | `:model <name>` | Switch the model. `:model` lists them. |
+| `:effort <level>` | Switch the reasoning effort among the model's `efforts`. `:effort` lists them. |
 | `:mcp <on\|off> <server>` | Turn an MCP server on (again) or off. `:mcp` lists them. |
 | `:memory` | List the project's and the global memories; `del` then `enter` forgets the selected one. |
 | `:quit` | Quit. |

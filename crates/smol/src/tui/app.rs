@@ -1,5 +1,5 @@
 use crate::chat::{opens_mention, resolved, Output, Session};
-use crate::client::McpState;
+use crate::client::{McpState, Selector};
 use crate::conversation::{Entry, Outcome};
 use crate::tui::desktop::Desktop;
 use crate::tui::picture::{self, Source};
@@ -92,6 +92,7 @@ pub(crate) struct App {
 enum List {
     Sessions,
     Models,
+    Efforts,
     Servers,
     Memories,
 }
@@ -166,6 +167,7 @@ enum Command {
     List(List),
     Resume(String),
     Model(String),
+    Effort(String),
     Mcp(bool, String),
     Shell(String),
     Quit,
@@ -203,6 +205,7 @@ impl Command {
             (bare, "") => Some(bare.clone()),
             (Self::List(List::Sessions), id) => Some(Self::Resume(id.to_owned())),
             (Self::List(List::Models), model) => Some(Self::Model(model.to_owned())),
+            (Self::List(List::Efforts), effort) => Some(Self::Effort(effort.to_owned())),
             (Self::List(List::Servers), arg) => match arg.split_once(char::is_whitespace) {
                 Some((switch @ ("on" | "off"), server)) => {
                     let server = server.trim().to_owned();
@@ -240,7 +243,7 @@ impl Spec {
     }
 }
 
-static COMMANDS: [Spec; 6] = [
+static COMMANDS: [Spec; 7] = [
     Spec {
         name: ":new",
         args: "",
@@ -258,6 +261,12 @@ static COMMANDS: [Spec; 6] = [
         args: " <name>",
         summary: "switch the model",
         bare: Command::List(List::Models),
+    },
+    Spec {
+        name: ":effort",
+        args: " <level>",
+        summary: "switch the reasoning effort",
+        bare: Command::List(List::Efforts),
     },
     Spec {
         name: ":mcp",
@@ -404,9 +413,14 @@ impl App {
             Command::New => return self.open(None),
             Command::Resume(id) => return self.open(Some(id)),
             Command::Model(name) => {
-                let switched = self.session.set_model(name);
+                let switched = self.session.choose(Selector::Model, name);
                 let model = switched.map(|()| self.session.model());
                 model.map(|model| format!("model: {model}"))
+            }
+            Command::Effort(level) => {
+                let switched = self.session.choose(Selector::Effort, level);
+                let effort = switched.map(|()| self.session.effort().unwrap_or_default());
+                effort.map(|effort| format!("effort: {effort}"))
             }
             Command::Mcp(on, name) => {
                 let switched = self.session.set_mcp(*on, name);
@@ -942,9 +956,11 @@ impl App {
         }
 
         // Lists from the agent use only what was asked when the list opened, since asking again
-        // here would freeze the UI, while models are read live to keep the current one marked
+        // here would freeze the UI, while models and efforts are read live to keep the current
+        // one marked
+        let live = matches!(list, List::Models | List::Efforts);
         let picks = match &self.opened {
-            Some((_, picks)) if list != List::Models => picks.clone(),
+            Some((_, picks)) if !live => picks.clone(),
             _ => self.picks(list).unwrap_or_default(),
         };
         let query = arg.trim().to_lowercase();
@@ -956,7 +972,7 @@ impl App {
             }
 
             let exact = label == query || value == query;
-            let current = pick.current && query.is_empty() && list == List::Models;
+            let current = pick.current && query.is_empty() && live;
             let detail = match pick.current {
                 true => "current",
                 false => &pick.detail,
@@ -1014,18 +1030,8 @@ impl App {
                 }
             }
 
-            List::Models => {
-                for model in self.session.models() {
-                    let completion = Completion::Input(format!("{prefix}{}", model.value));
-                    picks.push(Pick {
-                        value: model.value,
-                        label: model.name,
-                        detail: model.description.unwrap_or_default(),
-                        current: model.current,
-                        completion,
-                    });
-                }
-            }
+            List::Models => picks = self.offered(Selector::Model, &prefix),
+            List::Efforts => picks = self.offered(Selector::Effort, &prefix),
 
             List::Servers => {
                 for server in &self.session.mcp {
@@ -1059,6 +1065,22 @@ impl App {
             }
         }
         Ok(picks)
+    }
+
+    /// The choices of a select option, each completing `prefix`
+    fn offered(&self, selector: Selector, prefix: &str) -> Vec<Pick> {
+        let mut picks = Vec::new();
+        for offering in self.session.choices(selector) {
+            let completion = Completion::Input(format!("{prefix}{}", offering.value));
+            picks.push(Pick {
+                value: offering.value,
+                label: offering.name,
+                detail: offering.description.unwrap_or_default(),
+                current: offering.current,
+                completion,
+            });
+        }
+        picks
     }
 
     /// Sticks to the edge when a drag leaves the messages area
@@ -1495,6 +1517,7 @@ fn empty_text(list: List) -> &'static str {
     match list {
         List::Sessions => "no other sessions",
         List::Models => "no models",
+        List::Efforts => "no effort levels",
         List::Servers => "no MCP servers",
         List::Memories => "no memories",
     }
@@ -1690,6 +1713,7 @@ mod tests {
         };
 
         assert_eq!(list(&app, List::Models), "m1  (current)\nm2-café");
+        assert_eq!(list(&app, List::Efforts), "low\nhigh  (current)");
         assert_eq!(list(&app, List::Sessions), "no other sessions");
         assert_eq!(list(&app, List::Servers), "no MCP servers");
 
@@ -1771,9 +1795,21 @@ mod tests {
     #[test]
     fn current_model_first() {
         let mut app = app();
-        app.session.set_model("m2-café").expect("switch");
+        app.session
+            .choose(Selector::Model, "m2-café")
+            .expect("switch");
         assert_eq!(labels(&mut app, ":model "), ["m2-café", "m1"]);
         assert_eq!(labels(&mut app, ":model m"), ["m1", "m2-café"]);
+    }
+
+    #[test]
+    fn effort_switched() {
+        let mut app = app();
+        assert_eq!(labels(&mut app, ":effort "), ["high", "low"]);
+
+        app.submit_text(":effort low");
+        assert_eq!(shown(&mut app), ["", "  effort: low"]);
+        assert_eq!(labels(&mut app, ":effort "), ["low", "high"]);
     }
 
     #[test]
@@ -2359,6 +2395,8 @@ mod tests {
         assert_eq!(resume, Some(Command::Resume("abc-123".to_owned())));
         let model = Command::parse(":model tiny");
         assert_eq!(model, Some(Command::Model("tiny".to_owned())));
+        let effort = Command::parse(":effort  high ");
+        assert_eq!(effort, Some(Command::Effort("high".to_owned())));
 
         let on = Command::parse(":mcp on fake");
         assert_eq!(on, Some(Command::Mcp(true, "fake".to_owned())));
@@ -2379,8 +2417,8 @@ mod tests {
             assert_eq!(Command::parse(line), mcp, "{line}");
         }
 
-        let commands =
-            ":new, :resume <session>, :model <name>, :mcp <on|off> <server>, :memory, :quit, !<command>";
+        let commands = ":new, :resume <session>, :model <name>, :effort <level>, \
+                        :mcp <on|off> <server>, :memory, :quit, !<command>";
         let unknown = format!("command: :help: unknown (commands: {commands})");
         assert_eq!(Command::parse(":help"), usage(&unknown));
     }
@@ -2392,7 +2430,9 @@ mod tests {
             found.iter().map(|spec| spec.name).collect::<Vec<_>>()
         };
 
-        let all = [":new", ":resume", ":model", ":mcp", ":memory", ":quit"];
+        let all = [
+            ":new", ":resume", ":model", ":effort", ":mcp", ":memory", ":quit",
+        ];
         assert_eq!(names(":"), all);
         assert_eq!(names(":res"), [":resume"]);
         assert_eq!(names(":m"), [":model", ":mcp", ":memory"]);
@@ -2403,9 +2443,16 @@ mod tests {
             assert_eq!(parsed.as_ref(), Some(&spec.bare));
         }
 
-        let lists = [List::Sessions, List::Models, List::Servers, List::Memories];
+        let lists = [
+            List::Sessions,
+            List::Models,
+            List::Efforts,
+            List::Servers,
+            List::Memories,
+        ];
         let prefixes = lists.map(prefix);
-        assert_eq!(prefixes, [":resume ", ":model ", ":mcp ", ":memory "]);
+        let expected = [":resume ", ":model ", ":effort ", ":mcp ", ":memory "];
+        assert_eq!(prefixes, expected);
     }
 
     /// A command whose list is empty says so once and leaves the input empty
