@@ -76,16 +76,6 @@ pub(crate) struct ModelSpec {
     pub(crate) video: bool,
 }
 
-impl ModelSpec {
-    /// The efforts a session can switch among, only its own without a list
-    pub(crate) fn offered(&self) -> Vec<String> {
-        match self.efforts.is_empty() {
-            true => self.effort.iter().cloned().collect(),
-            false => self.efforts.clone(),
-        }
-    }
-}
-
 #[derive(Deserialize, Serialize)]
 enum Kind {
     #[serde(rename = "openai-completions")]
@@ -105,11 +95,6 @@ impl Models {
             }
         }
         names
-    }
-
-    pub(crate) fn spec(&self, name: &str) -> Option<&ModelSpec> {
-        let (_, spec) = self.find(name)?;
-        Some(spec)
     }
 
     fn find(&self, name: &str) -> Option<(&Provider, &ModelSpec)> {
@@ -137,6 +122,7 @@ impl Models {
         if let Some(effort) = effort {
             spec.effort = Some(effort.to_owned());
         }
+
         let api = provider.api.clone();
         let key = provider.api_key.clone();
         let built = match provider.kind {
@@ -145,8 +131,26 @@ impl Models {
         Ok(Box::new(built))
     }
 
+    /// The one model.toml gives
+    pub(crate) fn effort(&self, name: &str) -> Option<&str> {
+        let (_, spec) = self.find(name)?;
+        spec.effort.as_deref()
+    }
+
+    /// The efforts a session can switch among, only its own without a list
+    pub(crate) fn offered(&self, name: &str) -> Vec<String> {
+        let Some((_, spec)) = self.find(name) else {
+            return Vec::new();
+        };
+
+        match spec.efforts.is_empty() {
+            true => spec.effort.iter().cloned().collect(),
+            false => spec.efforts.clone(),
+        }
+    }
+
     pub(crate) fn check_effort(&self, name: &str, effort: &str) -> Result<()> {
-        let offered = self.spec(name).map(ModelSpec::offered).unwrap_or_default();
+        let offered = self.offered(name);
         if offered.iter().any(|known| known == effort) {
             return Ok(());
         }
@@ -210,6 +214,12 @@ pub(crate) fn models(dir: &Path) -> Result<Models> {
             if model.context.is_some_and(|context| context < MIN_CONTEXT) {
                 let problem = format!("[model.{name}]: {id}: context below {MIN_CONTEXT}");
                 return Err(invalid(problem));
+            }
+            for (index, effort) in model.efforts.iter().enumerate() {
+                if model.efforts[..index].contains(effort) {
+                    let problem = format!("[model.{name}]: {id}: efforts: {effort}: duplicate");
+                    return Err(invalid(problem));
+                }
             }
             let effort = model.effort.as_ref();
             let unlisted = effort.is_none_or(|effort| !model.efforts.contains(effort));
@@ -960,10 +970,11 @@ models = [{ id = "m3", effort = "max" }]
         assert_eq!(missing, expected);
 
         // Without a list a model offers only its own effort, and without one none
-        let offered = |name: &str| read.spec(name).expect("spec").offered();
-        assert_eq!(offered("über/piñata-2"), ["low", "high"]);
-        assert_eq!(offered("slow/m3"), ["max"]);
-        assert!(offered("über/m1").is_empty());
+        assert_eq!(read.offered("über/piñata-2"), ["low", "high"]);
+        assert_eq!(read.offered("slow/m3"), ["max"]);
+        assert!(read.offered("über/m1").is_empty());
+        assert_eq!(read.effort("über/piñata-2"), Some("high"));
+        assert_eq!(read.effort("über/m1"), None);
         read.check_effort("über/piñata-2", "low").expect("offered");
         let refused = |name: &str, effort: &str| {
             let checked = read.check_effort(name, effort);
@@ -1005,6 +1016,10 @@ models = [{ id = "m3", effort = "max" }]
             (
                 "[model.\"café\"]\ntype = \"openai-completions\"\nmodels = [{ id = \"m\", effort = \"xhigh\", efforts = [\"low\", \"high\"] }]\n",
                 "[model.café]: m: effort: not one of low, high",
+            ),
+            (
+                "[model.\"café\"]\ntype = \"openai-completions\"\nmodels = [{ id = \"m\", effort = \"low\", efforts = [\"low\", \"high\", \"low\"] }]\n",
+                "[model.café]: m: efforts: low: duplicate",
             ),
             (
                 "[model.\"café\"]\ntype = \"openai-completions\"\napi = \"api.café.com/v1\"\nmodels = [{ id = \"m\" }]\n",

@@ -5,7 +5,7 @@ use crate::acp::{rfc3339, task_of, to_value, App};
 use crate::agent::{
     title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Sink, Task,
 };
-use crate::config::{self, Access, McpConfig, ModelSpec, Models, Skipped};
+use crate::config::{self, Access, McpConfig, Models, Skipped};
 use crate::history::{Lock, SessionMeta, Settings};
 use crate::spawn::{run_shell, Process};
 use crate::steps::{AgentMemory, Exit, MemoryStep};
@@ -178,17 +178,19 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             let notice = format!("model: {gone}: not in model.toml, using {model}");
             notices.push(notice);
         }
-        let mut effort = previously.effort.clone();
-        if let Some(chosen) = &previously.effort {
-            if let Err(error) = models.check_effort(&model, chosen) {
-                let own = models.spec(&model).and_then(|spec| spec.effort.as_deref());
-                let notice = match own {
-                    Some(own) => format!("{error}, using {own}"),
-                    None => error.to_string(),
-                };
-                notices.push(notice);
-                effort = None;
-            }
+
+        // A chosen effort belongs to its model, so a model that is gone takes it along
+        let kept = model == previously.model;
+        let mut effort = previously.effort.clone().filter(|_| kept);
+        let check = |chosen: &str| models.check_effort(&model, chosen);
+        let checked = effort.as_deref().map(check);
+        if let Some(Err(error)) = checked {
+            let notice = match models.effort(&model) {
+                Some(own) => format!("{error}, using {own}"),
+                None => error.to_string(),
+            };
+            notices.push(notice);
+            effort = None;
         }
 
         let (instructions, skipped) = config::instructions(&app.config, &cwd);
@@ -543,11 +545,8 @@ impl Session {
                 let name = &keeper.meta.settings.model;
                 let effort = &*value.0;
                 self.models.check_effort(name, effort)?;
-                let own = self
-                    .models
-                    .spec(name)
-                    .and_then(|spec| spec.effort.as_deref());
-                let current = keeper.meta.settings.effort.as_deref().or(own);
+
+                let current = current_effort(&self.models, &keeper.meta.settings);
                 if current != Some(effort) {
                     let model = self.models.make(name, Some(effort))?;
                     self.agent.model = Arc::from(model);
@@ -704,14 +703,14 @@ fn options<'a>(
     let mut options = vec![model];
 
     // A model without an effort in model.toml runs at the provider's default, which has no name
-    let spec = models.spec(&settings.model);
-    let own = spec.and_then(|spec| spec.effort.clone());
-    if let Some(current) = settings.effort.clone().or(own) {
+    if let Some(current) = current_effort(models, settings) {
         let mut choices = Vec::new();
-        for effort in spec.map(ModelSpec::offered).unwrap_or_default() {
+        for effort in models.offered(&settings.model) {
             let choice = SessionConfigSelectOption::new(effort.clone(), effort);
             choices.push(choice);
         }
+
+        let current = current.to_owned();
         let effort = SessionConfigOption::select(EFFORT_OPTION, "Effort", current, choices)
             .category(SessionConfigOptionCategory::ThoughtLevel);
         options.push(effort);
@@ -726,6 +725,12 @@ fn options<'a>(
     }
 
     options
+}
+
+/// The chosen effort, or the model's own in model.toml without one
+fn current_effort<'a>(models: &'a Models, settings: &'a Settings) -> Option<&'a str> {
+    let own = models.effort(&settings.model);
+    settings.effort.as_deref().or(own)
 }
 
 fn update_session(peer: &SessionPeer, meta: &SessionMeta) {
@@ -1384,6 +1389,76 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// An effort belongs to the model it was chosen for
+    #[test]
+    fn effort_follows_model() {
+        let dir = temp_dir("effort-model");
+        let store = HistoryStore::new(&dir);
+        let memory = one_task("Count the cafés");
+        let chosen = |model: &str, effort: &str| Settings {
+            model: model.to_owned(),
+            effort: Some(effort.to_owned()),
+            ..here()
+        };
+        saved(&store, &memory, "s1", &chosen("mock/m1", "ultra"));
+        saved(&store, &memory, "s2", &chosen("mock/gone", "low"));
+
+        let extra = ", effort = \"high\", efforts = [\"low\", \"high\"]";
+        let other = "\n[model.other]\ntype = \"openai-completions\"\nmodels = [{ id = \"m2\", effort = \"max\" }]\n";
+        let running = async {
+            let mut connection = Connection::open(&dir, "http://127.0.0.1:1/v1", extra);
+            let path = dir.join("model.toml");
+            let mut text = fs::read_to_string(&path).expect("read");
+            text.push_str(other);
+            fs::write(&path, text).expect("write");
+
+            let mut currents = Vec::new();
+            for session in ["s2", "s1"] {
+                let load = json!({"sessionId": session, "cwd": CWD, "mcpServers": []});
+                let loaded = connection.request("session/load", load).await;
+                currents.push(loaded["result"]["configOptions"].clone());
+            }
+            let switches = [
+                ("effort", "low"),
+                ("model", "other/m2"),
+                ("model", "mock/m1"),
+            ];
+            for (option, value) in switches {
+                let params = json!({"sessionId": "s1", "configId": option, "value": value});
+                let answered = connection
+                    .request("session/set_config_option", params)
+                    .await;
+                currents.push(answered["result"]["configOptions"].clone());
+            }
+            let seen = connection.close().await;
+            (currents, seen)
+        };
+        let (currents, seen) = block_on(running);
+
+        let mut efforts = Vec::new();
+        for options in &currents {
+            let list = options.as_array().cloned().unwrap_or_default();
+            let effort = list.into_iter().find(|option| option["id"] == "effort");
+            efforts.push(effort.map(|effort| effort["currentValue"].clone()));
+        }
+        let expected = ["high", "high", "low", "max", "high"].map(|effort| Some(json!(effort)));
+        assert_eq!(efforts, expected);
+
+        let mut notices = Vec::new();
+        for message in seen {
+            if message["method"] == "_smol/notice" {
+                let text = message["params"]["text"].as_str().unwrap_or_default();
+                notices.push(text.to_owned());
+            }
+        }
+        let expected = [
+            "model: mock/gone: not in model.toml, using mock/m1",
+            "effort: ultra: not offered by mock/m1 (efforts: low, high), using high",
+        ];
+        assert_eq!(notices, expected);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// The client sees and forgets only the memories the session's directory sees,
     /// without waiting for the turn in progress
     #[test]
@@ -1483,7 +1558,6 @@ mod tests {
         let servers = tilde(&dir.join("agent.toml"));
         let expected = [
             "model: mock/old-model: not in model.toml, using mock/m1".to_owned(),
-            "effort: ultra: not offered by mock/m1".to_owned(),
             format!("config: {shown}: not UTF-8 text, skipped"),
             format!("config: {servers}: [mcp.café]: unknown variant `sse`, expected `stdio` or `http`, skipped"),
         ];

@@ -419,8 +419,8 @@ impl App {
             }
             Command::Effort(level) => {
                 let switched = self.session.choose(Selector::Effort, level);
-                let effort = switched.map(|()| self.session.effort().unwrap_or_default());
-                effort.map(|effort| format!("effort: {effort}"))
+                let effort = self.session.effort().unwrap_or_else(|| level.clone());
+                switched.map(|()| format!("effort: {effort}"))
             }
             Command::Mcp(on, name) => {
                 let switched = self.session.set_mcp(*on, name);
@@ -1030,8 +1030,8 @@ impl App {
                 }
             }
 
-            List::Models => picks = self.offered(Selector::Model, &prefix),
-            List::Efforts => picks = self.offered(Selector::Effort, &prefix),
+            List::Models => return Ok(self.option_picks(Selector::Model, &prefix)),
+            List::Efforts => return Ok(self.option_picks(Selector::Effort, &prefix)),
 
             List::Servers => {
                 for server in &self.session.mcp {
@@ -1068,9 +1068,9 @@ impl App {
     }
 
     /// The choices of a select option, each completing `prefix`
-    fn offered(&self, selector: Selector, prefix: &str) -> Vec<Pick> {
+    fn option_picks(&self, selector: Selector, prefix: &str) -> Vec<Pick> {
         let mut picks = Vec::new();
-        for offering in self.session.choices(selector) {
+        for offering in self.session.offerings(selector) {
             let completion = Completion::Input(format!("{prefix}{}", offering.value));
             picks.push(Pick {
                 value: offering.value,

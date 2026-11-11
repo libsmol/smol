@@ -145,15 +145,6 @@ pub(crate) enum Selector {
     Effort,
 }
 
-impl Selector {
-    fn category(self) -> SessionConfigOptionCategory {
-        match self {
-            Selector::Model => SessionConfigOptionCategory::Model,
-            Selector::Effort => SessionConfigOptionCategory::ThoughtLevel,
-        }
-    }
-}
-
 impl fmt::Display for Selector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -690,7 +681,7 @@ impl Drop for Client {
 /// The name of the current choice
 pub(crate) fn chosen(options: &[SessionConfigOption], selector: Selector) -> Option<String> {
     let select = select_of(options, selector)?;
-    let offered = choices(options, selector);
+    let offered = offerings(options, selector);
     let current = offered.into_iter().find(|offering| offering.current);
 
     let name = match current {
@@ -700,7 +691,7 @@ pub(crate) fn chosen(options: &[SessionConfigOption], selector: Selector) -> Opt
     Some(name)
 }
 
-pub(crate) fn choices(options: &[SessionConfigOption], selector: Selector) -> Vec<Offering> {
+pub(crate) fn offerings(options: &[SessionConfigOption], selector: Selector) -> Vec<Offering> {
     let Some(select) = select_of(options, selector) else {
         return Vec::new();
     };
@@ -726,7 +717,11 @@ pub(crate) fn choices(options: &[SessionConfigOption], selector: Selector) -> Ve
 }
 
 fn option_of(options: &[SessionConfigOption], selector: Selector) -> Option<&SessionConfigOption> {
-    let category = Some(selector.category());
+    let category = match selector {
+        Selector::Model => SessionConfigOptionCategory::Model,
+        Selector::Effort => SessionConfigOptionCategory::ThoughtLevel,
+    };
+    let category = Some(category);
     options.iter().find(|option| option.category == category)
 }
 
@@ -766,8 +761,8 @@ mod tests {
         assert_eq!(model("other").as_deref(), Some("other"));
 
         let options = [option("llama")];
-        let listed = choices(&options, Selector::Model);
-        let current: Vec<bool> = listed.iter().map(|choice| choice.current).collect();
+        let listed = offerings(&options, Selector::Model);
+        let current: Vec<bool> = listed.iter().map(|offering| offering.current).collect();
         assert_eq!(listed[1].value, "deepseek");
         assert_eq!(current, [true, false]);
 
@@ -777,7 +772,7 @@ mod tests {
             .category(SessionConfigOptionCategory::ThoughtLevel);
         let options = [option("llama"), effort];
         assert_eq!(chosen(&options, Selector::Effort).as_deref(), Some("max"));
-        assert_eq!(choices(&options, Selector::Model).len(), 2);
+        assert_eq!(offerings(&options, Selector::Model).len(), 2);
         assert_eq!(chosen(&options[..1], Selector::Effort), None);
     }
 

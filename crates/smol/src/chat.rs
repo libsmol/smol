@@ -1,5 +1,5 @@
 use crate::client::{
-    choices, chosen, Asked, Client, Incoming, McpState, McpStatus, Memory, Offering, Refusal,
+    chosen, offerings, Asked, Client, Incoming, McpState, McpStatus, Memory, Offering, Refusal,
     Selector,
 };
 use crate::conversation::{Conversation, Entry};
@@ -119,20 +119,23 @@ impl Session {
             self.client.close(&self.id);
         }
 
-        // The chosen model and effort may be gone from the config, and a failed switch keeps the default
-        // The effort goes second, as switching models resets it
+        // A model or effort gone from the config fails to switch and leaves the default
         let mut options = opened.options;
-        for selector in [Selector::Model, Selector::Effort] {
-            let offered = self.choices(selector);
-            let current = offered.into_iter().find(|offering| offering.current);
-            let Some(current) = current.filter(|_| resume.is_none()) else {
-                continue;
-            };
-            let switched = self
-                .client
-                .choose(&opened.id, &options, selector, &current.value);
-            if let Ok(switched) = switched {
-                options = switched;
+        if resume.is_none() {
+            // The effort goes second, as switching models resets it
+            for selector in [Selector::Model, Selector::Effort] {
+                let offered = self.offerings(selector);
+                let current = offered.into_iter().find(|offering| offering.current);
+                let Some(current) = current else {
+                    continue;
+                };
+
+                let switched = self
+                    .client
+                    .choose(&opened.id, &options, selector, &current.value);
+                if let Ok(switched) = switched {
+                    options = switched;
+                }
             }
         }
 
@@ -156,8 +159,8 @@ impl Session {
         Ok(sessions)
     }
 
-    pub(crate) fn choices(&self, selector: Selector) -> Vec<Offering> {
-        choices(&self.options, selector)
+    pub(crate) fn offerings(&self, selector: Selector) -> Vec<Offering> {
+        offerings(&self.options, selector)
     }
 
     pub(crate) fn memories(&self) -> Result<Vec<Memory>> {

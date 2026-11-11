@@ -129,7 +129,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let cwd = tilde(&app.session.client.cwd);
         let cwd = tail(&cwd, width);
 
-        let model = running(app);
+        let model = model_label(app);
         let model = fitted(&model, width);
 
         // The row count is fixed, so rows hold their place even before data arrives
@@ -566,7 +566,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         app.choices_area = area;
     }
 
-    let name = running(app);
+    let name = model_label(app);
     let name = format!(" · {name}");
     let brand = vec![Span::styled(" smol", STRONG), Span::styled(name, DIM)];
 
@@ -622,7 +622,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 /// The model and the effort it runs at
-fn running(app: &App) -> String {
+fn model_label(app: &App) -> String {
     let model = app.session.model();
     match app.session.effort() {
         Some(effort) => format!("{model} · {effort}"),
