@@ -4,7 +4,7 @@ use crate::agent::{
 };
 use crate::prompt;
 use crate::spawn::SHOWN_EVERY;
-use crate::steps::{AgentMemory, Ending, Helper, MemoryStep};
+use crate::steps::{AgentMemory, DoneStep, Ending, Helper, MemoryStep};
 use crate::utils::{Interrupt, Reply};
 use crate::worker::host::{Added, Called, Calling, Worker};
 use crate::worker::AgentCall;
@@ -337,6 +337,7 @@ impl Agent {
                             text: asked.task.clone(),
                             mentions: Vec::new(),
                         };
+                        let task = Some(task);
                         let running =
                             self.run(&mut worker, &installed, &mut memory, task, &mut watched);
                         running.await
@@ -584,8 +585,8 @@ impl Turn<'_> {
         untaken
     }
 
-    /// Waits for an agent started in the background to end, an interrupt or the client
-    /// to queue a message, and returns the messages queued
+    /// Waits for an agent started in the background or a program the code left running to end,
+    /// an interrupt or the client to queue a message, and returns the messages queued
     pub(crate) async fn news(&mut self) -> Vec<Task> {
         let Place::Main { team, queue, .. } = &self.agent.place else {
             return Vec::new();
@@ -593,11 +594,13 @@ impl Turn<'_> {
 
         let unfiled = |members: &[Member]| members.iter().any(Member::unfiled);
         let ended = team.until(unfiled);
+        let exited = self.worker.ending();
         let enqueued = queue.enqueued();
         let queued = select! {
             biased;
             () = self.agent.interrupt.wait() => false,
             () = ended => false,
+            () = exited => false,
             () = enqueued => true,
         };
 
@@ -613,8 +616,11 @@ impl Turn<'_> {
         // Taken before the rest are stopped, which aren't announced
         let done = self.ended();
         if !done.is_empty() {
-            let ended = MemoryStep::Done { agents: done };
-            self.memory.steps.push(ended);
+            let step = DoneStep {
+                agents: done,
+                ..DoneStep::default()
+            };
+            self.memory.steps.push(MemoryStep::Done(step));
             self.sink.saved(self.memory);
         }
 
@@ -731,7 +737,8 @@ impl Sink for Watched {
             | Event::RunEnd(..)
             | Event::StepEnd(_)
             | Event::StepFailed(_)
-            | Event::CompactEnd(_) => return,
+            | Event::CompactEnd(_)
+            | Event::Programs(_) => return,
         };
         drop(live);
 
@@ -789,7 +796,7 @@ mod tests {
         TokenUsage,
     };
     use crate::steps::tests::metered;
-    use crate::steps::{AgentMemory, AgentStep, Call, Ending, Helper, MemoryStep};
+    use crate::steps::{AgentMemory, AgentStep, Call, DoneStep, Ending, Helper, MemoryStep};
     use crate::tests::{cancel_soon, content};
     use crate::tools::mcp::tests::fake;
     use crate::utils::{block_on, Interrupt};
@@ -1133,16 +1140,53 @@ mod tests {
             ends(call),
             [(Some("cafés"), &cafés), (Some("naïve"), &naïve)]
         );
-        let done = MemoryStep::Done {
+        let done = DoneStep {
             agents: vec!["naïve".to_owned()],
+            ..DoneStep::default()
         };
-        assert_eq!(memory.steps[3], done);
+        assert_eq!(memory.steps[3], MemoryStep::Done(done));
         assert_eq!(memory.steps.len(), 5, "{:?}", memory.steps);
 
         let requests = requests.lock().expect("requests");
         let last = requests.last().and_then(|request| request.last());
         let told = last.map(content).unwrap_or_default();
         assert_eq!(told, "[Agent done]\nnaïve");
+    }
+
+    /// A program the code left running that ends during the turn comes with the next step,
+    /// while one still running when the model answers doesn't keep the turn open
+    #[test]
+    fn programs_announced() {
+        let codes = vec![
+            "import subprocess, sys\n\
+             quick = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.2)'])\n\
+             slow = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n\
+             print(quick.pid)",
+            "import time\ntime.sleep(1)",
+        ];
+        let requests = Requests::default();
+        let model = Background(codes, Arc::clone(&requests));
+        let mut agent = scripted(model, Box::new(|_| {}));
+
+        let mut memory = AgentMemory::default();
+        let answer = agent.turn(&mut memory, "Run the cafés").expect("run");
+        assert_eq!(answer.as_deref(), Some("Answer 2"));
+        assert_eq!(memory.steps.len(), 5, "{:?}", memory.steps);
+
+        let result = ran(&memory, 1).result.as_ref().expect("ran");
+        let printed = result.printed.as_deref().unwrap_or_default();
+        let quick: u32 = printed.trim().parse().expect("pid");
+        let MemoryStep::Done(done) = &memory.steps[3] else {
+            panic!("{:?}", memory.steps);
+        };
+        let pids: Vec<u32> = done.programs.iter().map(|program| program.pid).collect();
+        assert_eq!(pids, [quick]);
+
+        let requests = requests.lock().expect("requests");
+        let last = requests.last().and_then(|request| request.last());
+        let told = last.map(content).unwrap_or_default();
+        let announced = format!("[Program done]\npid {quick}: ");
+        assert!(told.starts_with(&announced), "{told}");
     }
 
     /// The final record of an agent started in the background goes to the call that started it
@@ -1194,7 +1238,7 @@ mod tests {
                 MemoryStep::Task(_) => "task",
                 MemoryStep::Update(_) => "update",
                 MemoryStep::Action(_) => "action",
-                MemoryStep::Done { .. } => "done",
+                MemoryStep::Done(_) => "done",
                 _ => "other",
             };
             kinds.push(kind);
@@ -1234,7 +1278,7 @@ mod tests {
         assert_eq!(ends(ran(&memory, 1)), [(Some("slow"), &Ending::Stopped {})]);
         let again = Ending::Answer("Answer: Spell naïve".to_owned());
         assert_eq!(ends(call), [(Some("slow"), &again)]);
-        let done = |step: &MemoryStep| matches!(step, MemoryStep::Done { .. });
+        let done = |step: &MemoryStep| matches!(step, MemoryStep::Done(_));
         assert!(!memory.steps.iter().any(done), "{:?}", memory.steps);
     }
 
@@ -1301,7 +1345,7 @@ mod tests {
             ends(ran(&memory, 1)),
             [(Some("slow"), &Ending::Interrupted {})]
         );
-        let done = |step: &MemoryStep| matches!(step, MemoryStep::Done { .. });
+        let done = |step: &MemoryStep| matches!(step, MemoryStep::Done(_));
         assert!(!memory.steps.iter().any(done), "{:?}", memory.steps);
     }
 
@@ -1349,9 +1393,11 @@ mod tests {
         let mut memory = AgentMemory::default();
         let answer = agent.turn(&mut memory, "Count them").expect("run");
         assert_eq!(answer, None);
-        let done = MemoryStep::Done {
+        let done = DoneStep {
             agents: vec!["cafés".to_owned()],
+            ..DoneStep::default()
         };
+        let done = MemoryStep::Done(done);
         assert_eq!(memory.steps.last(), Some(&done), "{:?}", memory.steps);
     }
 

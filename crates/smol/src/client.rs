@@ -10,7 +10,9 @@ use agent_client_protocol_schema::v1::{
 };
 use agent_client_protocol_schema::ProtocolVersion;
 use anyhow::{anyhow, bail, Result};
-use reaper::wire::{ENQUEUED, FORGET, IMAGES, MCP, MEMORIES, NOTICE, QUEUED, SHELL};
+use reaper::wire::{
+    BACKGROUND, ENQUEUED, FORGET, IMAGES, MCP, MEMORIES, NOTICE, PROGRAMS, QUEUED, SHELL,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -49,9 +51,22 @@ pub(crate) enum Incoming {
     Notice(String, Notice),
     Mcp(String, Vec<McpStatus>),
     Queued(String, Asked),
+    /// Programs the code left running ended while no turn ran
+    Background(String),
+    /// The programs the code left running that still run
+    Programs(String, Vec<Program>),
     /// Sent only when no request is waiting for a reply
     Exited(String),
     Done(Result<StopReason>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Program {
+    pub(crate) pid: u32,
+    pub(crate) command: String,
+    /// When smol first heard it runs
+    #[serde(skip, default = "Instant::now")]
+    pub(crate) since: Instant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,6 +462,15 @@ impl Client {
                         Err(_) => continue,
                     },
 
+                    (None, Some(BACKGROUND)) => Incoming::Background(session),
+
+                    (None, Some(PROGRAMS)) => {
+                        match Vec::<Program>::deserialize(&params["programs"]) {
+                            Ok(programs) => Incoming::Programs(session, programs),
+                            Err(_) => continue,
+                        }
+                    }
+
                     _ => continue,
                 };
                 sender.send(incoming).ok();
@@ -473,7 +497,8 @@ impl Client {
 
         let info = Implementation::new("smol", env!("CARGO_PKG_VERSION"));
         let queued = (QUEUED.to_owned(), json!(true));
-        let mut meta = Meta::from_iter([queued]);
+        let background = (BACKGROUND.to_owned(), json!(true));
+        let mut meta = Meta::from_iter([queued, background]);
         if images_shown {
             meta.insert(IMAGES.to_owned(), json!(true));
         }
@@ -617,6 +642,16 @@ impl Client {
     pub(crate) fn prompt(&self, session: &str, blocks: Vec<ContentBlock>) {
         let session = session.to_owned();
         let request = PromptRequest::new(session, blocks);
+        let method = AGENT_METHOD_NAMES.session_prompt;
+        self.start_turn(method, request);
+    }
+
+    /// Hands the next turn to the programs the code left running that ended
+    pub(crate) fn background(&self, session: &str) {
+        let session = session.to_owned();
+        let marked = (BACKGROUND.to_owned(), json!(true));
+        let meta = Meta::from_iter([marked]);
+        let request = PromptRequest::new(session, Vec::new()).meta(meta);
         let method = AGENT_METHOD_NAMES.session_prompt;
         self.start_turn(method, request);
     }

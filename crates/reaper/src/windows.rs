@@ -1,24 +1,34 @@
+use crate::{worded, Member};
 use std::ffi::c_void;
 use std::io;
 use std::mem;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::ptr;
+use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Wdk::System::Threading::{
+    NtQueryInformationProcess, ProcessCommandLineInformation,
+};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING,
+};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First, Thread32Next,
+    PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-    TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, OpenThread, ResumeThread, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
-    CREATE_SUSPENDED, PROCESS_SET_QUOTA, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
+    GetProcessTimes, OpenProcess, OpenThread, ResumeThread, CREATE_NEW_PROCESS_GROUP,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+    PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
 };
 
 /// HANDLE is a raw pointer and can't go in a static as it is
@@ -48,6 +58,8 @@ pub fn prepare_attached(command: &mut Command) -> Mark {
 /// Dropping it kills every process in the job, descendants included
 pub struct Group {
     job: usize,
+    /// The process the job started with, which `members` leaves out
+    pid: u32,
     released: AtomicBool,
 }
 
@@ -62,6 +74,7 @@ impl Group {
         // Dropped on an error below, which kills what the job holds and closes it
         let group = Group {
             job: job as usize,
+            pid,
             released: AtomicBool::new(false),
         };
         limit(job, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
@@ -138,6 +151,130 @@ impl Group {
             )
         };
         info.ActiveProcesses > 0
+    }
+
+    /// Leaves out the processes that exited, which the job no longer lists
+    pub fn members(&self) -> io::Result<Vec<Member>> {
+        // The list's pids follow its header, as many as the rest of the buffer holds
+        let header = mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
+        let header = header / mem::size_of::<usize>();
+        let mut room = 64;
+        let pids = loop {
+            let mut buffer = vec![0_usize; header + room];
+            let size = mem::size_of_val(buffer.as_slice()) as u32;
+            // SAFETY: The handle stays open while the Group lives, and the buffer holds `size`
+            // bytes aligned for the list
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.handle(),
+                    JobObjectBasicProcessIdList,
+                    buffer.as_mut_ptr().cast(),
+                    size,
+                    ptr::null_mut(),
+                )
+            };
+            // SAFETY: The buffer starts with the header, which the query filled or left zeroed
+            let list = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
+            let assigned = list.NumberOfAssignedProcesses as usize;
+            if assigned > room {
+                room = assigned;
+                continue;
+            }
+            if queried == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let listed = list.NumberOfProcessIdsInList as usize;
+            break buffer[header..header + listed.min(room)].to_vec();
+        };
+
+        // SAFETY: Only takes a snapshot of processes
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = Vec::new();
+        // SAFETY: entry has its dwSize filled in
+        let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+        while more {
+            let pid = entry.th32ProcessID;
+            if pid != self.pid && pids.contains(&(pid as usize)) {
+                found.push((pid, entry.th32ParentProcessID, entry.szExeFile));
+            }
+            // SAFETY: Keeps reading the same snapshot
+            more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        }
+        // SAFETY: The snapshot is no longer used
+        unsafe { CloseHandle(snapshot) };
+
+        let mut members = Vec::new();
+        for (pid, parent, executable) in found {
+            // SAFETY: Only opens the process to read its start time and command line
+            let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            // It exited since the job listed it
+            if process.is_null() {
+                continue;
+            }
+
+            let [mut created, mut exited, mut kernel, mut user] = [FILETIME::default(); 4];
+            // SAFETY: The handle was just opened, and each pointer is to a FILETIME
+            let timed = unsafe {
+                GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user)
+            };
+            let started =
+                u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime);
+
+            // The query writes a UNICODE_STRING whose text follows it in the same buffer
+            let mut needed = 0;
+            let class = ProcessCommandLineInformation;
+            // SAFETY: An empty buffer only asks for the size
+            unsafe { NtQueryInformationProcess(process, class, ptr::null_mut(), 0, &mut needed) };
+            let words = (needed as usize).div_ceil(mem::size_of::<usize>());
+            let mut buffer = vec![0_usize; words];
+            let size = mem::size_of_val(buffer.as_slice()) as u32;
+            let into = buffer.as_mut_ptr().cast();
+            // SAFETY: The buffer holds `size` bytes aligned for the UNICODE_STRING it starts with
+            let status =
+                unsafe { NtQueryInformationProcess(process, class, into, size, &mut needed) };
+            // SAFETY: The handle was opened above and is not used again
+            unsafe { CloseHandle(process) };
+            if timed == 0 {
+                continue;
+            }
+
+            let line = match status >= 0 && words > 0 {
+                true => {
+                    // SAFETY: The buffer starts with the UNICODE_STRING the query wrote
+                    let text = unsafe { &*buffer.as_ptr().cast::<UNICODE_STRING>() };
+                    let start = buffer.as_ptr() as usize;
+                    let at = text.Buffer as usize;
+                    let length = usize::from(text.Length) / 2;
+                    let inside = at >= start && at + length * 2 <= start + size as usize;
+                    match inside {
+                        // SAFETY: The text lies inside the buffer, which outlives the slice
+                        true => unsafe { slice::from_raw_parts(text.Buffer, length) },
+                        false => &[],
+                    }
+                }
+                false => &[],
+            };
+            let named = executable.iter().position(|unit| *unit == 0);
+            let name = &executable[..named.unwrap_or(executable.len())];
+            let command = match line.is_empty() {
+                true => String::from_utf16_lossy(name),
+                false => String::from_utf16_lossy(line),
+            };
+            members.push(Member {
+                pid,
+                parent,
+                started,
+                command: worded(&command),
+            });
+        }
+        Ok(members)
     }
 
     /// After `release` the handle is closed, so it is never killed
@@ -237,8 +374,8 @@ mod tests {
         listed.unwrap_or_default().contains(&pid)
     }
 
-    #[test]
-    fn tree_killed() {
+    /// A job whose first process exited and left a ping running, and the ping's pid
+    fn pinging() -> (Group, u32) {
         let script = "$p = Start-Process -PassThru -WindowStyle Hidden ping -ArgumentList '-n','60','127.0.0.1'; $p.Id";
         let mut command = Command::new("powershell");
         command
@@ -251,6 +388,12 @@ mod tests {
         let output = child.wait_with_output().expect("wait");
         let pid = String::from_utf8_lossy(&output.stdout);
         let pid: u32 = pid.trim().parse().expect("pid");
+        (group, pid)
+    }
+
+    #[test]
+    fn tree_killed() {
+        let (group, pid) = pinging();
         assert!(group.alive());
         assert!(running(pid));
 
@@ -260,6 +403,16 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(5), "{pid}");
             thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    #[test]
+    fn members_listed() {
+        let (group, pid) = pinging();
+        let members = group.members().expect("members");
+        let ping = members.iter().find(|member| member.pid == pid);
+        let ping = ping.expect("ping");
+        assert!(ping.command.ends_with("-n 60 127.0.0.1"), "{ping:?}");
+        assert!(ping.started > 0, "{ping:?}");
     }
 
     #[test]

@@ -1,9 +1,12 @@
+use crate::{worded, Member};
 #[cfg(target_os = "linux")]
 use std::env;
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::fs::File;
 use std::io::{self, PipeWriter, Read, Write};
+#[cfg(target_os = "macos")]
+use std::mem;
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -11,9 +14,11 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::process;
 use std::process::Command;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ptr;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicU64;
@@ -48,6 +53,19 @@ pub struct Mark(u64);
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone, Copy)]
 pub struct Mark(());
+
+/// What /proc tells of a process
+#[cfg(target_os = "linux")]
+struct Listed {
+    pid: u32,
+    parent: u32,
+    group: i32,
+    started: u64,
+    zombie: bool,
+    /// Its executable's name, for one that shows no arguments
+    name: String,
+    path: PathBuf,
+}
 
 /// Must be called before any thread starts, because the forked watchdog keeps running Rust
 pub fn guard() {
@@ -187,6 +205,155 @@ impl Group {
     pub fn alive(&self) -> bool {
         // SAFETY: Signal 0 only checks whether the group still has a process
         unsafe { libc::killpg(self.id, 0) == 0 }
+    }
+
+    /// Includes descendants in a session of their own, which leaves the group but not the tree,
+    /// leaves out zombies and reads /proc, which can block an async thread
+    #[cfg(target_os = "linux")]
+    pub fn members(&self) -> io::Result<Vec<Member>> {
+        let entries = fs::read_dir("/proc")?;
+
+        // All are read before following parents, which /proc may list after their children
+        let mut listed = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let pid: Option<u32> = name.to_str().and_then(|name| name.parse().ok());
+            let Some(pid) = pid else {
+                continue;
+            };
+            let path = entry.path();
+            let Ok(stat) = fs::read_to_string(path.join("stat")) else {
+                continue;
+            };
+
+            // The fields follow the name in parentheses, which may hold parentheses itself,
+            // and proc(5) numbers the state 3, so the parent, group and start time are 1, 2 and 19
+            let Some((head, tail)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let fields: Vec<&str> = tail.split_whitespace().collect();
+            let state = fields.first().copied().unwrap_or_default();
+            let parent = fields.get(1).and_then(|field| field.parse().ok());
+            let group = fields.get(2).and_then(|field| field.parse().ok());
+            let started = fields.get(19).and_then(|field| field.parse().ok());
+            let (Some(parent), Some(group), Some(started)) = (parent, group, started) else {
+                continue;
+            };
+            let name = head.split_once('(').map_or("", |(_, name)| name);
+            listed.push(Listed {
+                pid,
+                parent,
+                group,
+                started,
+                zombie: matches!(state, "Z" | "X"),
+                name: name.to_owned(),
+                path,
+            });
+        }
+
+        let mut inside: Vec<u32> = Vec::new();
+        for process in listed.iter().filter(|process| process.group == self.id) {
+            inside.push(process.pid);
+        }
+        loop {
+            let before = inside.len();
+            for process in &listed {
+                if inside.contains(&process.parent) && !inside.contains(&process.pid) {
+                    inside.push(process.pid);
+                }
+            }
+            if inside.len() == before {
+                break;
+            }
+        }
+
+        let mut members = Vec::new();
+        for process in listed {
+            let first = process.pid == self.id as u32;
+            if first || process.zombie || !inside.contains(&process.pid) {
+                continue;
+            }
+
+            // A process in the middle of exec shows no arguments
+            let arguments = fs::read(process.path.join("cmdline")).unwrap_or_default();
+            let arguments = String::from_utf8_lossy(&arguments);
+            let command = match arguments.trim_matches('\0').is_empty() {
+                true => worded(&process.name),
+                false => worded(&arguments),
+            };
+            members.push(Member {
+                pid: process.pid,
+                parent: process.parent,
+                started: process.started,
+                command,
+            });
+        }
+        Ok(members)
+    }
+
+    /// Includes descendants in a session of their own, which leaves the group but not the tree,
+    /// and leaves out zombies
+    #[cfg(target_os = "macos")]
+    pub fn members(&self) -> io::Result<Vec<Member>> {
+        // SAFETY: The buffer holds `size` bytes
+        let grouped = |buffer, size| unsafe { libc::proc_listpgrppids(self.id, buffer, size) };
+        let mut inside = pids(grouped)?;
+        let mut next = 0;
+        while let Some(&parent) = inside.get(next) {
+            next += 1;
+            // SAFETY: The buffer holds `size` bytes
+            let born = |buffer, size| unsafe { libc::proc_listchildpids(parent, buffer, size) };
+            // One that exited meanwhile has no children to list
+            let children = pids(born).unwrap_or_default();
+            for child in children {
+                if !inside.contains(&child) {
+                    inside.push(child);
+                }
+            }
+        }
+
+        let mut members = Vec::new();
+        for &pid in inside.iter().filter(|pid| **pid != self.id) {
+            // SAFETY: proc_bsdinfo holds only integers, for which zero is valid
+            let mut info: libc::proc_bsdinfo = unsafe { mem::zeroed() };
+            let size = mem::size_of_val(&info) as libc::c_int;
+            let buffer = (&raw mut info).cast();
+            // SAFETY: The buffer holds `size` bytes
+            let read = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, buffer, size) };
+            // A process that already exited has nothing to read
+            if read != size || info.pbi_status == libc::SZOMB {
+                continue;
+            }
+
+            let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+            let mut length = 0;
+            let unused = ptr::null_mut();
+            // SAFETY: A null buffer only asks for the length
+            let sized =
+                unsafe { libc::sysctl(name.as_mut_ptr(), 3, unused, &mut length, unused, 0) };
+            let mut procargs = vec![0u8; length];
+            let buffer = procargs.as_mut_ptr().cast();
+            // SAFETY: The buffer holds `length` bytes
+            let read =
+                unsafe { libc::sysctl(name.as_mut_ptr(), 3, buffer, &mut length, unused, 0) };
+            procargs.truncate(length);
+
+            let command = match sized == 0 && read == 0 {
+                true => arguments(&procargs),
+                false => None,
+            };
+            let comm = info.pbi_comm.iter().take_while(|c| **c != 0);
+            let comm: Vec<u8> = comm.map(|c| *c as u8).collect();
+            let command = command.unwrap_or_else(|| String::from_utf8_lossy(&comm).into_owned());
+            let started = info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec;
+            members.push(Member {
+                pid: pid as u32,
+                parent: info.pbi_ppid,
+                started,
+                command: worded(&command),
+            });
+        }
+        Ok(members)
     }
 
     /// After `release` the group id may already be reused, so it is never killed
@@ -350,6 +517,45 @@ fn kill_marked(text: &str) {
     }
 }
 
+/// The pids `list` writes into a buffer of the size it is given, a larger one until they fit
+#[cfg(target_os = "macos")]
+fn pids(
+    list: impl Fn(*mut libc::c_void, libc::c_int) -> libc::c_int,
+) -> io::Result<Vec<libc::pid_t>> {
+    let mut pids: Vec<libc::pid_t> = vec![0; 64];
+    loop {
+        let size = mem::size_of_val(pids.as_slice()) as libc::c_int;
+        let count = list(pids.as_mut_ptr().cast(), size);
+        let Ok(count) = usize::try_from(count) else {
+            return Err(io::Error::last_os_error());
+        };
+        // A full buffer may have left some out
+        if count < pids.len() {
+            pids.truncate(count);
+            return Ok(pids);
+        }
+        pids.resize(pids.len() * 2, 0);
+    }
+}
+
+/// What KERN_PROCARGS2 gives is the count of arguments, the executable's path,
+/// NULs up to the first argument, then each argument and the environment ending in NUL
+#[cfg(any(target_os = "macos", test))]
+fn arguments(procargs: &[u8]) -> Option<String> {
+    let (count, rest) = procargs.split_first_chunk::<4>()?;
+    let count = usize::try_from(i32::from_ne_bytes(*count)).ok()?;
+    let path = rest.iter().position(|byte| *byte == 0)?;
+    let rest = &rest[path..];
+    let first = rest.iter().position(|byte| *byte != 0)?;
+
+    let mut arguments = Vec::new();
+    for argument in rest[first..].split(|byte| *byte == 0).take(count) {
+        let argument = String::from_utf8_lossy(argument);
+        arguments.push(argument.into_owned());
+    }
+    Some(arguments.join(" "))
+}
+
 /// `environ` is \0-separated `NAME=value` pairs with marks listed outermost first,
 /// and `text` only matches up to a `.` boundary
 #[cfg(target_os = "linux")]
@@ -371,7 +577,7 @@ fn marked(environ: &[u8], text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::unix::prepare;
+    use crate::unix::{arguments, prepare, Group};
     #[cfg(target_os = "linux")]
     use crate::unix::{marked, sweep};
     #[cfg(target_os = "linux")]
@@ -379,9 +585,7 @@ mod tests {
     use std::process::Command;
     #[cfg(target_os = "linux")]
     use std::process::Stdio;
-    #[cfg(target_os = "linux")]
     use std::thread;
-    #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
 
     #[test]
@@ -397,6 +601,50 @@ mod tests {
         child.kill().ok();
         child.wait().ok();
         assert_eq!(ids, (pid, pid));
+    }
+
+    /// The group's first process is left out, and so is a child it never reaps,
+    /// while a child in a session of its own is still listed
+    #[test]
+    fn members_listed() {
+        let detached = "perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sleep 32";
+        let script = format!("sleep 30 & sleep 0 & {detached} & exec sleep 31");
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+        let mark = prepare(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        let group = Group::new(child.id(), mark).expect("group");
+
+        let started = Instant::now();
+        let members = loop {
+            let members = group.members().expect("members");
+            let mut commands: Vec<&str> = members.iter().map(|member| &*member.command).collect();
+            commands.sort_unstable();
+            if commands == ["sleep 30", "sleep 32"] {
+                break members;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "{members:?}");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(members.iter().all(|member| member.parent == child.id()));
+        // A session of its own is out of reach of the group's kill
+        for member in &members {
+            // SAFETY: Only sends a signal to a child of this test's own
+            unsafe { libc::kill(member.pid as libc::pid_t, libc::SIGKILL) };
+        }
+
+        drop(group);
+        child.wait().ok();
+    }
+
+    #[test]
+    fn procargs_read() {
+        let mut procargs = 3_i32.to_ne_bytes().to_vec();
+        let rest = "/usr/bin/python3\0\0\0python3\0-c\0print('café')\0HOME=/Users/zoë\0";
+        procargs.extend(rest.as_bytes());
+        let read = arguments(&procargs);
+        assert_eq!(read.as_deref(), Some("python3 -c print('café')"));
+        assert_eq!(arguments(&[1, 0]), None);
     }
 
     #[test]

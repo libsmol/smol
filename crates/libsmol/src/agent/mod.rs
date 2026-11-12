@@ -5,8 +5,8 @@ use crate::model::{
 };
 use crate::prompt;
 use crate::steps::{
-    bytes, estimate, AgentMemory, AgentStep, Call, Helper, MemoryStep, StepError, SummaryStep,
-    TaskStep, Usage,
+    bytes, estimate, AgentMemory, AgentStep, Call, Helper, MemoryStep, Program, StepError,
+    SummaryStep, TaskStep, Usage,
 };
 use crate::tools::attach::{attach, Mention};
 use crate::tools::memories::{Listed, Memories};
@@ -65,6 +65,8 @@ pub(crate) enum Event<'a> {
     StepFailed(&'a AgentStep),
     Compact,
     CompactEnd(Result<&'a SummaryStep, &'a Failure>),
+    /// The programs the code left running that still run
+    Programs(&'a [Program]),
 }
 
 /// What arrived since the last event for it, and all of it so far in this reply
@@ -275,13 +277,14 @@ struct Turn<'a> {
 }
 
 impl Agent {
-    /// `servers` are the MCP servers loaded into the worker and stay fixed for the turn
+    /// `servers` are the MCP servers loaded into the worker and stay fixed for the turn,
+    /// and without a task the turn takes up the programs that ended, which the last step names
     pub(crate) async fn run(
         &self,
         worker: &mut Worker,
         servers: &[&Added],
         memory: &mut AgentMemory,
-        task: Task,
+        task: Option<Task>,
         sink: &mut dyn Sink,
     ) -> Result<Option<String>> {
         let takes = |kind| self.model.takes(kind);
@@ -365,37 +368,39 @@ pub(crate) fn serve(
 }
 
 impl Turn<'_> {
-    async fn run(&mut self, task: Task) -> Result<Option<String>> {
-        let task = self.agent.attached(task).await;
-        if task.text.trim().is_empty() && task.files.is_empty() {
-            return Err(Error::Refused("empty".to_owned()));
-        }
-
-        // The task text survives compaction verbatim, so a task over half the window can never fit
-        let copies = &self.agent.workplace.copies;
-        if let Some(window) = self.agent.model.context_window() {
-            // Image and video estimates run high, so only text counts toward refusing
-            let text_only = |_: MediaKind| false;
-            let parts = prompt::task(&task);
-            let asked = [ChatMessage::User(parts)];
-            let sent = bytes(&asked, &text_only);
-            let size = estimate(sent);
-            if size > window / 2 {
-                discard(&task, copies);
-                let message = format!(
-                    "too large: about {size} tokens, over half of the {window}-token context"
-                );
-                return Err(Error::Refused(message));
+    async fn run(&mut self, task: Option<Task>) -> Result<Option<String>> {
+        if let Some(task) = task {
+            let task = self.agent.attached(task).await;
+            if task.text.trim().is_empty() && task.files.is_empty() {
+                return Err(Error::Refused("empty".to_owned()));
             }
-        }
 
-        // A task whose turn hit a model error stays in the record, so resending it replaces it
-        if let Some(old) = self.memory.withdraw(&task.text) {
-            discard(&old, copies);
-        }
+            // The task text survives compaction verbatim, so one over half the window can never fit
+            let copies = &self.agent.workplace.copies;
+            if let Some(window) = self.agent.model.context_window() {
+                // Image and video estimates run high, so only text counts toward refusing
+                let text_only = |_: MediaKind| false;
+                let parts = prompt::task(&task);
+                let asked = [ChatMessage::User(parts)];
+                let sent = bytes(&asked, &text_only);
+                let size = estimate(sent);
+                if size > window / 2 {
+                    discard(&task, copies);
+                    let message = format!(
+                        "too large: about {size} tokens, over half of the {window}-token context"
+                    );
+                    return Err(Error::Refused(message));
+                }
+            }
 
-        self.memory.steps.push(MemoryStep::Task(task));
-        self.sink.saved(self.memory);
+            // A task whose turn hit a model error stays in the record, so resending it replaces it
+            if let Some(old) = self.memory.withdraw(&task.text) {
+                discard(&old, copies);
+            }
+
+            self.memory.steps.push(MemoryStep::Task(task));
+            self.sink.saved(self.memory);
+        }
 
         loop {
             self.compact().await?;
@@ -422,8 +427,9 @@ impl Turn<'_> {
             self.sink.event(Event::StepEnd(step));
             self.sink.saved(self.memory);
 
-            // An answer ends the turn only once no agent started in the background runs
-            let (updates, done) = loop {
+            // An answer ends the turn only once no agent started in the background runs,
+            // while programs the code left running never hold it open
+            let (updates, done, exited) = loop {
                 // An interrupt that arrives after the answer still ends the turn as interrupted
                 if self.agent.interrupt.triggered() {
                     return Ok(None);
@@ -433,9 +439,12 @@ impl Turn<'_> {
                 let team = self.agent.place.team();
                 let running = team.is_some_and(|team| team.running());
                 let done = self.ended();
-                if answer.is_none() || !done.is_empty() {
+                let exited = self.worker.ended().await;
+                let programs = self.worker.running();
+                self.sink.event(Event::Programs(&programs));
+                if answer.is_none() || !done.is_empty() || exited.is_some() {
                     let updates = self.queued().await;
-                    break (updates, done);
+                    break (updates, done, exited);
                 }
                 if !running {
                     return Ok(answer);
@@ -443,18 +452,20 @@ impl Turn<'_> {
 
                 let updates = self.news().await;
                 if !updates.is_empty() {
-                    break (updates, done);
+                    break (updates, done, None);
                 }
             };
 
-            let received = !updates.is_empty() || !done.is_empty();
+            let finished = !done.is_empty() || exited.is_some();
+            let received = !updates.is_empty() || finished;
             for update in updates {
                 let update = self.agent.attached(update).await;
                 self.memory.steps.push(MemoryStep::Update(update));
             }
-            if !done.is_empty() {
-                let ended = MemoryStep::Done { agents: done };
-                self.memory.steps.push(ended);
+            if finished {
+                let mut step = exited.unwrap_or_default();
+                step.agents = done;
+                self.memory.steps.push(MemoryStep::Done(step));
             }
             if received {
                 self.sink.saved(self.memory);
@@ -893,6 +904,7 @@ pub(crate) mod tests {
                 text: task.to_owned(),
                 mentions,
             };
+            let task = Some(task);
             let probe = &mut self.probe;
             let running = self.agent.run(&mut self.worker, &[], memory, task, probe);
             block_on(running)

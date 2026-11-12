@@ -2,8 +2,8 @@ use crate::acp::rpc::{Notice, SessionPeer};
 use crate::agent::{Event, Failure, HelperView, Helpers, Status, Unseen};
 use crate::prompt::{SKIPPED, TOOL};
 use crate::steps::{
-    estimate, text_bytes, AgentMemory, AgentStep, Call, CallError, Ending, Exit, Helper,
-    MemoryStep, ShellStep, StepError, SummaryStep, TaskStep, Usage,
+    estimate, text_bytes, AgentMemory, AgentStep, Call, CallError, DoneStep, Ending, Exit, Helper,
+    MemoryStep, Program, ShellStep, StepError, SummaryStep, TaskStep, Usage,
 };
 use agent_client_protocol_schema::v1::{
     ContentBlock, ContentChunk, MessageId, Meta, ResourceLink, SessionUpdate, ToolCall,
@@ -11,8 +11,8 @@ use agent_client_protocol_schema::v1::{
 };
 use reaper::one_line;
 use reaper::wire::{
-    AGENT, DECODE_DURATION, DURATION, ERROR, ESTIMATED_OUTPUT, INPUT_TOKENS, INTERRUPTED, NAME,
-    OUTPUT_TOKENS, PARENT, ROLE, SHELL, STEPS, TASK, UPDATE,
+    AGENT, BACKGROUND, DECODE_DURATION, DURATION, ERROR, ESTIMATED_OUTPUT, INPUT_TOKENS,
+    INTERRUPTED, NAME, OUTPUT_TOKENS, PARENT, ROLE, SHELL, STEPS, TASK, UPDATE,
 };
 use reqwest::Url;
 use serde_json::json;
@@ -36,6 +36,8 @@ pub(crate) struct Translator {
     compacting: Option<String>,
     /// The call for the user command that is running
     shell: Option<String>,
+    /// The programs the client last heard are running
+    programs: Vec<Program>,
     progress: Progress,
     cwd: PathBuf,
     copies: PathBuf,
@@ -73,6 +75,7 @@ impl Translator {
             calls: Vec::new(),
             compacting: None,
             shell: None,
+            programs: Vec::new(),
             progress: Progress::default(),
             cwd,
             copies,
@@ -132,8 +135,9 @@ impl Translator {
                     self.shell_end(shell);
                 }
                 MemoryStep::Restarted => self.notice(RESTARTED, None),
-                // The agents it names already showed how they ended
-                MemoryStep::Done { .. } => {}
+                MemoryStep::Done(done) if done.idle => self.ended(done),
+                // As live, programs that end within a turn show nothing and agents showed their end
+                MemoryStep::Done(_) => {}
             }
         }
     }
@@ -190,6 +194,15 @@ impl Translator {
             }
             Event::Compact => self.compact(),
             Event::CompactEnd(result) => self.compact_end(result),
+            Event::Programs(running) => self.programs(running),
+        }
+    }
+
+    /// Tells the client only of a change
+    pub(crate) fn programs(&mut self, running: &[Program]) {
+        if self.programs != running {
+            self.programs = running.to_vec();
+            self.peer.programs(running);
         }
     }
 
@@ -252,6 +265,23 @@ impl Translator {
             update = update.meta(meta);
         }
         self.peer.update(SessionUpdate::ToolCallUpdate(update));
+    }
+
+    /// Shows a client that declared `BACKGROUND` the programs that ended while no turn ran
+    pub(crate) fn ended(&mut self, done: &DoneStep) {
+        if !self.peer.background() {
+            return;
+        }
+
+        self.tasks += 1;
+        let id = format!("task_{}", self.tasks);
+        let id = MessageId::new(id);
+        let lines: Vec<String> = done.programs.iter().map(ToString::to_string).collect();
+        let text = lines.join("\n");
+        let flag = (BACKGROUND.to_owned(), json!(true));
+        let meta = Meta::from_iter([flag]);
+        let chunk = chunk(&text).message_id(id).meta(meta);
+        self.peer.update(SessionUpdate::UserMessageChunk(chunk));
     }
 
     fn task(&mut self, asked: &TaskStep, appended: bool) {
@@ -1260,6 +1290,44 @@ mod tests {
         assert_eq!(update["messageId"], "task_2");
         assert_eq!(update["_meta"], json!({ "_smol/update": true }));
         assert_eq!(update["content"]["text"], "Add tests too");
+    }
+
+    /// Programs that ended within a turn stay out of the replay, which shows only those that
+    /// ended while no turn ran
+    #[test]
+    fn idle_replayed() {
+        let program = Program {
+            pid: 42,
+            command: "python3 brew.py --café".to_owned(),
+        };
+        let inside = DoneStep {
+            programs: vec![program],
+            ..DoneStep::default()
+        };
+        let idle = DoneStep {
+            idle: true,
+            ..inside.clone()
+        };
+        let memory = AgentMemory {
+            steps: vec![MemoryStep::Done(inside), MemoryStep::Done(idle)],
+        };
+
+        let (lines, mut sent) = mpsc::unbounded_channel();
+        let peer = Peer::new(Out::Lines(lines));
+        peer.set_background(true);
+        let peer = SessionPeer::new(peer, "session-1");
+        let cwd = env::temp_dir();
+        let copies = cwd.join("copies");
+        let mut translator = Translator::new(peer, Some(1000), cwd, copies);
+        translator.replay(&memory);
+
+        let messages = drained(&mut sent);
+        let [ended] = &messages[..] else {
+            panic!("{messages:?}");
+        };
+        let update = &ended["params"]["update"];
+        assert_eq!(update["_meta"], json!({ "_smol/background": true }));
+        assert_eq!(update["content"]["text"], "pid 42: python3 brew.py --café");
     }
 
     #[test]

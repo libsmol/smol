@@ -1,16 +1,16 @@
 use crate::model::Media;
 use crate::prompt::{self, ADDING_SERVER, LEFT_BEHIND, NO_SERVER};
 use crate::spawn::{Clip, Output, Process, DRAIN_WAIT, SHOWN_EVERY};
-use crate::steps::{CallError, MAX_OBSERVATION_CHARS};
+use crate::steps::{CallError, DoneStep, Program, MAX_OBSERVATION_CHARS};
 use crate::tools::mcp::Server;
-use crate::utils::{new_id, Interrupt, Reply};
+use crate::utils::{new_id, one_lined, Interrupt, Reply};
 use crate::worker::workplace::Workplace;
 use crate::worker::{
     end_marker, greeting, AgentCall, Delegation, FromWorker, Function, HostCall, HostNote, Message,
     Service, ToWorker, WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, WORKER_ARG,
 };
 use crate::{Error, Result};
-use reaper::cause;
+use reaper::{cause, Member};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::{self, Future};
@@ -28,6 +28,7 @@ use tokio::select;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::{self, AbortHandle, JoinSet};
 use tokio::time::{self, Instant};
+use tracing::info;
 
 const STOP_WAIT: Duration = Duration::from_secs(3);
 /// Code that swallows exceptions may have caught the previous interrupt
@@ -35,6 +36,14 @@ const CANCEL_EVERY: Duration = Duration::from_millis(500);
 /// Code that closes the worker's own copy of the pipe never lets the end marker through
 const OUTPUT_WAIT: Duration = Duration::from_secs(2);
 const START_WAIT: Duration = Duration::from_secs(30);
+const MAX_COMMAND_CHARS: usize = 300;
+/// How often the programs that calls left running are checked
+const PROGRAMS_EVERY: Duration = match cfg!(test) {
+    true => Duration::from_millis(50),
+    false => Duration::from_secs(1),
+};
+/// In the command line of the helpers multiprocessing starts, which run as long as the worker
+const MULTIPROCESSING: &str = "from multiprocessing.";
 
 pub(crate) type Calling = Pin<Box<dyn Future<Output = Called> + Send>>;
 pub(crate) type Serving<'a> = dyn FnMut(Service) -> Calling + Send + 'a;
@@ -99,6 +108,10 @@ struct Live {
     /// Every call not yet answered, which a thread the code started may still wait for
     running: HashMap<u64, Running>,
     media: Vec<(String, Media)>,
+    /// Programs that calls left running and their descendants, as last seen
+    left: Vec<Member>,
+    /// The worker's own processes, such as its console host on Windows
+    own: Vec<Member>,
 }
 
 struct Running {
@@ -275,6 +288,8 @@ impl Worker {
             calls: JoinSet::new(),
             running: HashMap::new(),
             media: Vec::new(),
+            left: Vec::new(),
+            own: Vec::new(),
         };
 
         // Startup output runs up to the end marker and doesn't belong to the first snippet
@@ -302,6 +317,9 @@ impl Worker {
                 }
             }
         };
+
+        let own = live.process.members().await;
+        live.own = own.unwrap_or_default();
 
         for added in servers {
             live.install(&added.server, Some(&added.name)).await?;
@@ -533,6 +551,16 @@ impl Worker {
 
         let failure = match outcome {
             Outcome::Replied(Ok(ran)) => {
+                // Ones that ended since `ended` last looked stay until it reports them
+                let members = live.members().await.unwrap_or_default();
+                for member in members {
+                    match live.left.iter_mut().find(|left| left.same(&member)) {
+                        // One in the middle of exec shows its name alone until it is seen again
+                        Some(left) => *left = member,
+                        None => live.left.push(member),
+                    }
+                }
+
                 let judged = |error: String| match interrupt.triggered() {
                     true => CallError::Interrupted,
                     false => CallError::Execution(error),
@@ -555,9 +583,78 @@ impl Worker {
         output.error = Some(error);
         Ok(output)
     }
+
+    /// The programs that calls left running and that ended since, with the output printed since
+    /// the last call, or None while they all run. Dropping the future loses nothing
+    pub(crate) async fn ended(&mut self) -> Option<DoneStep> {
+        let live = self.live.as_mut().filter(|live| !live.left.is_empty())?;
+        let members = live.members().await?;
+
+        let mut programs = Vec::new();
+        for top in tops(&live.left) {
+            let alive = members.iter().any(|member| member.same(top));
+            if !alive {
+                let ended = program(top);
+                programs.push(ended);
+            }
+        }
+        live.left = members;
+        if programs.is_empty() {
+            return None;
+        }
+
+        let said = live.output.take();
+        let output = said.shown(MAX_OBSERVATION_CHARS);
+        info!("programs: ended [count={}]", programs.len());
+        Some(DoneStep {
+            programs,
+            output,
+            ..DoneStep::default()
+        })
+    }
+
+    /// The programs that calls left running, as they were when last seen
+    pub(crate) fn running(&self) -> Vec<Program> {
+        let Some(live) = &self.live else {
+            return Vec::new();
+        };
+
+        let tops = tops(&live.left);
+        tops.into_iter().map(program).collect()
+    }
+
+    /// Resolves once a program that a call left running has ended, for `ended` to take,
+    /// and never while none runs
+    pub(crate) async fn ending(&self) {
+        let Some(live) = &self.live else {
+            return future::pending().await;
+        };
+        let tops = tops(&live.left);
+        if tops.is_empty() {
+            return future::pending().await;
+        }
+
+        loop {
+            time::sleep(PROGRAMS_EVERY).await;
+            let Some(members) = live.members().await else {
+                continue;
+            };
+            let alive = |top: &&Member| members.iter().any(|member| member.same(top));
+            if !tops.iter().all(alive) {
+                return;
+            }
+        }
+    }
 }
 
 impl Live {
+    /// Leaves out the worker's own processes, and is None when they can't be listed
+    async fn members(&self) -> Option<Vec<Member>> {
+        let mut members = self.process.members().await?;
+        members.retain(|member| !self.own.iter().any(|own| own.same(member)));
+        Some(members)
+    }
+
     fn send(&mut self, call: HostCall) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -656,6 +753,28 @@ impl Live {
     }
 }
 
+/// The followed processes whose parent isn't followed too, each a program of its own,
+/// as one whose parent is belongs to that program until it outlives it
+fn tops(followed: &[Member]) -> Vec<&Member> {
+    let mut tops = Vec::new();
+    for member in followed {
+        let parented = followed.iter().any(|other| other.pid == member.parent);
+        let helper = member.command.contains(MULTIPROCESSING);
+        if !parented && !helper {
+            tops.push(member);
+        }
+    }
+    tops
+}
+
+fn program(member: &Member) -> Program {
+    let command = one_lined(&member.command, MAX_COMMAND_CHARS);
+    Program {
+        pid: member.pid,
+        command,
+    }
+}
+
 async fn start_error(process: Process, output: Output) -> String {
     // Kill it first or the pipe stays open and the output never ends
     drop(process);
@@ -676,9 +795,10 @@ pub(crate) mod tests {
     use crate::tools::mcp::Server;
     use crate::tools::memories::Memories;
     use crate::utils::{block_on, new_id, Interrupt};
-    use crate::worker::host::{Added, Called, Calling, Evaluated, Worker, STOP_WAIT};
+    use crate::worker::host::{tops, Added, Called, Calling, Evaluated, Worker, STOP_WAIT};
     use crate::worker::workplace::tests::opened;
     use crate::worker::{AgentCall, Delegation, Service};
+    use reaper::Member;
     use serde_json::{json, Map, Value};
     use std::env;
     use std::fs;
@@ -2337,6 +2457,66 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// A program the code leaves running is followed until it ends, with what it printed,
+    /// and one it started belongs to it, while one that ended within the call is never followed
+    #[test]
+    fn programs_followed() {
+        let mut worker = fresh();
+        let code = "import subprocess, sys, time\n\
+            inner = \"import time; time.sleep(1); print('café done', flush=True)\"\n\
+            outer = f'import subprocess, sys; subprocess.run([sys.executable, \"-c\", {inner!r}])'\n\
+            ran = subprocess.run([sys.executable, '-c', 'pass'])\n\
+            program = subprocess.Popen([sys.executable, '-c', outer])\n\
+            time.sleep(0.5)\n\
+            print(program.pid)";
+        let output = worker.eval(code);
+        assert_eq!(output.error, None, "{}", output.logs);
+        let pid: u32 = output.logs.trim().parse().expect("pid");
+        assert_eq!(block_on(worker.ended()), None);
+
+        // The inner program may end a moment before the one it belongs to
+        let started = Instant::now();
+        let done = loop {
+            let waiting = async { time::timeout(Duration::from_secs(10), worker.ending()).await };
+            block_on(waiting).expect("ending");
+            if let Some(done) = block_on(worker.ended()) {
+                break done;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10));
+        };
+        let pids: Vec<u32> = done.programs.iter().map(|program| program.pid).collect();
+        assert_eq!(pids, [pid], "{done:?}");
+        let command = &done.programs[0].command;
+        assert!(command.contains(" -c import subprocess, sys;"), "{command}");
+        assert_eq!(done.output.trim(), "café done");
+        assert_eq!(block_on(worker.ended()), None);
+    }
+
+    #[test]
+    fn helpers_skipped() {
+        let member = |pid, parent, command: &str| Member {
+            pid,
+            parent,
+            started: 1,
+            command: command.to_owned(),
+        };
+        let forkserver =
+            "python3 -c import sys; from multiprocessing.forkserver import main; main(10, 11)";
+        let followed = [
+            member(
+                10,
+                1,
+                "python3 -c from multiprocessing.resource_tracker import main;main(5)",
+            ),
+            member(11, 1, forkserver),
+            member(12, 11, forkserver),
+            member(13, 1, "python3 brew.py --café"),
+            member(14, 13, "sleep 30"),
+        ];
+        let pids: Vec<u32> = tops(&followed).iter().map(|top| top.pid).collect();
+        assert_eq!(pids, [13]);
     }
 
     /// An agent the code leaves running is stopped before its snippet's result comes back

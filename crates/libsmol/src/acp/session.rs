@@ -51,7 +51,8 @@ pub(crate) enum Message {
 
 pub(crate) struct Prompt {
     pub(crate) id: Value,
-    pub(crate) task: Task,
+    /// None when the client hands the turn to the programs that ended
+    pub(crate) task: Option<Task>,
     pub(crate) turn: u64,
 }
 
@@ -371,7 +372,7 @@ impl Session {
                     None => future::pending().await,
                 }
             };
-            // MCP events and titles that arrived during a turn come before the next message
+            // MCP events, titles and programs that ended come before the next message
             let message = select! {
                 biased;
                 Some(event) = self.servers.recv() => {
@@ -382,6 +383,19 @@ impl Session {
                     self.keeper.titling = None;
                     if let Ok(Some(name)) = title {
                         self.keeper.rename(name, &self.memory);
+                    }
+                    continue;
+                }
+                () = self.worker.ending() => {
+                    let ended = self.worker.ended().await;
+                    let running = self.worker.running();
+                    self.keeper.translator.programs(&running);
+                    if let Some(mut done) = ended {
+                        done.idle = true;
+                        self.keeper.translator.ended(&done);
+                        self.memory.steps.push(MemoryStep::Done(done));
+                        self.keeper.save(&self.memory);
+                        self.keeper.peer.background_ended();
                     }
                     continue;
                 }
@@ -421,18 +435,27 @@ impl Session {
     }
 
     async fn prompt(&mut self, prompt: Prompt) {
+        // A turn the user's next task started may already have taken up the programs that ended
+        let last = self.memory.steps.last();
+        let pending = matches!(last, Some(MemoryStep::Done(done)) if done.idle);
+        if prompt.task.is_none() && !pending {
+            return finish(&self.keeper.app.peer, &prompt.id, StopReason::EndTurn);
+        }
+
         // One the user interrupted before it started is still recorded and ends as interrupted
         self.agent.interrupt.begin(prompt.turn);
 
         // A session with no task yet gets its title from the model without waiting for it
         let untitled = self.keeper.meta.model_title.is_empty();
-        let worded = !prompt.task.text.trim().is_empty();
+        let asked = prompt.task.as_ref().map(|task| task.text.as_str());
+        let asked = asked.unwrap_or_default();
+        let worded = !asked.trim().is_empty();
         let tasked = |step: &MemoryStep| matches!(step, MemoryStep::Task(_));
         let first = !self.memory.steps.iter().any(tasked);
         let titling = first && untitled && worded && self.keeper.titling.is_none();
         if titling {
             let model = Arc::clone(&self.agent.model);
-            let task = prompt.task.text.clone();
+            let task = asked.to_owned();
             let (sender, receiver) = oneshot::channel();
             let naming = task::spawn(async move {
                 let title = title_of(model, task).await;
@@ -448,6 +471,9 @@ impl Session {
             .agent
             .run(worker, &servers, memory, prompt.task, &mut self.keeper);
         let answer = running.await;
+        // A turn that ends interrupted or failed never told the client what still runs
+        let programs = self.worker.running();
+        self.keeper.translator.programs(&programs);
 
         // A refused task stays out of the record and so must the title made from it
         let refused = matches!(answer, Err(Error::Refused(_)));
@@ -808,7 +834,17 @@ mod tests {
 
         let response = match reply(&body) {
             Ok(text) => {
-                let content = json!({"choices": [{"index": 0, "delta": {"content": text}}]});
+                // A reply that starts with `eval:` calls the tool with the rest as its code
+                let delta = match text.strip_prefix("eval:") {
+                    Some(code) => {
+                        let arguments = json!({ "code": code }).to_string();
+                        let function = json!({ "name": "eval", "arguments": arguments });
+                        let call = json!({"index": 0, "id": "call_1", "function": function});
+                        json!({ "tool_calls": [call] })
+                    }
+                    None => json!({ "content": text }),
+                };
+                let content = json!({"choices": [{"index": 0, "delta": delta}]});
                 let stop = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]});
                 let events = format!("data: {content}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
                 let length = events.len();
@@ -1718,6 +1754,104 @@ mod tests {
         let prompts = prompts.lock().expect("prompts");
         let shown = "To show the user an image, such as a chart you saved, put `![alt](path)`";
         assert!(prompts[0].contains(shown), "{prompts:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Asked of the model, with the latest message of each request but titles
+    fn latest(asked: &Arc<Mutex<Vec<String>>>) -> impl Fn(&Value) -> Result<String, u16> {
+        let seen = Arc::clone(asked);
+        let code = "eval:import subprocess, sys\n\
+            program = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.5)'])";
+        move |body| {
+            if system_prompt(body) == namer() {
+                return Ok("Café timer".to_owned());
+            }
+            let messages = body["messages"].as_array().cloned().unwrap_or_default();
+            let last = messages.last().cloned().unwrap_or_default();
+            let text = last["content"].as_str().unwrap_or_default();
+            seen.lock().expect("asked").push(text.to_owned());
+            // The task's first request runs the code, and the rest answer
+            match messages.len() {
+                2 => Ok(code.to_owned()),
+                _ => Ok("Done.".to_owned()),
+            }
+        }
+    }
+
+    /// Programs the code left running that end between turns are shown and announced to a client
+    /// that declared `_smol/background`, whose prompt hands them a turn only once
+    #[test]
+    fn background_handed() {
+        let dir = temp_dir("background");
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let api = model_server(latest(&asked));
+        let running = async {
+            let mut connection = Connection::open(&dir, &api, "");
+            let capabilities = json!({"_meta": {"_smol/background": true}});
+            let params = json!({"protocolVersion": 1, "clientCapabilities": capabilities});
+            connection.request("initialize", params).await;
+            let session = connection.new_session().await;
+            connection.prompt(&session, "Start the café timer").await;
+
+            let announced = |message: &Value| message["method"] == "_smol/background";
+            connection.until(announced).await;
+            let meta = json!({"_smol/background": true});
+            let handed = json!({"sessionId": session, "prompt": [], "_meta": meta});
+            let first = connection.request("session/prompt", handed.clone()).await;
+            let again = connection.request("session/prompt", handed).await;
+            (connection.close().await, first, again)
+        };
+        let (seen, first, again) = block_on(running);
+
+        assert_eq!(first["result"]["stopReason"], "end_turn", "{first}");
+        assert_eq!(again["result"]["stopReason"], "end_turn", "{again}");
+        let marked =
+            |message: &&Value| message["params"]["update"]["_meta"]["_smol/background"] == true;
+        let shown: Vec<&Value> = seen.iter().filter(marked).collect();
+        assert_eq!(shown.len(), 1, "{seen:?}");
+        let listed = shown[0]["params"]["update"]["content"]["text"].as_str();
+        assert!(listed.unwrap_or_default().starts_with("pid "), "{shown:?}");
+        let running = |message: &&Value| message["method"] == "_smol/programs";
+        let counted =
+            |message: &Value| message["params"]["programs"].as_array().map_or(9, Vec::len);
+        let counts: Vec<usize> = seen.iter().filter(running).map(counted).collect();
+        assert_eq!(counts, [1, 0], "{seen:?}");
+
+        let asked = asked.lock().expect("asked");
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        assert!(asked[2].starts_with("[Program done]\npid "), "{asked:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A client that didn't declare `_smol/background` sees nothing of them, and the model hears
+    /// of them before the next task
+    #[test]
+    fn background_kept() {
+        let dir = temp_dir("background-kept");
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let api = model_server(latest(&asked));
+        let running = async {
+            let mut connection = Connection::open(&dir, &api, "");
+            let session = connection.new_session().await;
+            connection.prompt(&session, "Start the café timer").await;
+            time::sleep(Duration::from_secs(2)).await;
+            connection.prompt(&session, "Is it done?").await;
+            connection.close().await
+        };
+        let seen = block_on(running);
+
+        let marked =
+            |message: &Value| message["params"]["update"]["_meta"]["_smol/background"] == true;
+        assert!(!seen.iter().any(marked), "{seen:?}");
+        let announced = |message: &Value| message["method"] == "_smol/background";
+        assert!(!seen.iter().any(announced), "{seen:?}");
+
+        let asked = asked.lock().expect("asked");
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        // Messages in a row go to the model as one
+        let told = &asked[2];
+        let both = told.starts_with("[Program done]\npid ") && told.ends_with("\n\nIs it done?");
+        assert!(both, "{told}");
         fs::remove_dir_all(&dir).ok();
     }
 

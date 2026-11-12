@@ -1,6 +1,6 @@
 use crate::client::{
-    chosen, offerings, Asked, Client, Incoming, McpState, McpStatus, Memory, Offering, Refusal,
-    Selector,
+    chosen, offerings, Asked, Client, Incoming, McpState, McpStatus, Memory, Offering, Program,
+    Refusal, Selector,
 };
 use crate::conversation::{Conversation, Entry, Outcome};
 use agent_client_protocol_schema::v1::{
@@ -27,6 +27,8 @@ pub(crate) enum Output {
     /// The states of the MCP servers changed
     Servers,
     Queued(Asked),
+    /// Programs the code left running ended while no turn ran
+    Background,
     Done(Outcome),
 }
 
@@ -51,6 +53,8 @@ pub(crate) struct Session {
     pub(crate) title: String,
     pub(crate) options: Vec<SessionConfigOption>,
     pub(crate) mcp: Vec<McpStatus>,
+    /// The programs the code left running that still run
+    pub(crate) programs: Vec<Program>,
     pub(crate) conversation: Conversation,
     /// The turn in progress
     pub(crate) run: Option<Run>,
@@ -95,6 +99,7 @@ impl Session {
             title: String::new(),
             options,
             mcp: Vec::new(),
+            programs: Vec::new(),
             conversation: Conversation::default(),
             run: None,
             switched_on: Vec::new(),
@@ -143,6 +148,7 @@ impl Session {
         self.options = options;
         self.title.clear();
         self.mcp.clear();
+        self.programs.clear();
         self.conversation = Conversation::default();
         self.switched_on.clear();
         self.dropped.clear();
@@ -251,6 +257,12 @@ impl Session {
         asked.answer(prompts);
     }
 
+    /// The agent already showed the programs that ended, which open the turn
+    pub(crate) fn background(&mut self) {
+        self.run = Some(Run::new());
+        self.client.background(&self.id);
+    }
+
     pub(crate) fn shell(&mut self, command: &str) {
         self.run = Some(Run::new());
         self.client.shell(&self.id, command);
@@ -311,6 +323,21 @@ impl Session {
             }
 
             Incoming::Queued(session, asked) if session == self.id => Output::Queued(asked),
+
+            Incoming::Background(session) if session == self.id => Output::Background,
+
+            Incoming::Programs(session, programs) if session == self.id => {
+                let mut listed = Vec::new();
+                for mut program in programs {
+                    let known = self.programs.iter().find(|known| known.pid == program.pid);
+                    if let Some(known) = known {
+                        program.since = known.since;
+                    }
+                    listed.push(program);
+                }
+                self.programs = listed;
+                Output::Shown
+            }
 
             Incoming::Mcp(session, servers) if session == self.id => {
                 for server in &servers {
@@ -601,6 +628,36 @@ mod tests {
         let missing = session.open(Some("nope"));
         assert!(missing.is_err());
         assert_eq!(session.id, "s1");
+    }
+
+    /// A program keeps the time it was first listed, and another session lists none
+    #[test]
+    fn programs_timed() {
+        let agent = fake();
+        let mut session = Session::start(&agent, None, None, false).expect("start");
+        let listed = |pids: &[u32]| {
+            let mut programs = Vec::new();
+            for &pid in pids {
+                let command = format!("brew café {pid}");
+                let since = Instant::now();
+                programs.push(Program {
+                    pid,
+                    command,
+                    since,
+                });
+            }
+            Incoming::Programs("s1".to_owned(), programs)
+        };
+
+        session.receive(listed(&[42]));
+        let first = session.programs[0].since;
+        thread::sleep(Duration::from_millis(10));
+        session.receive(listed(&[42, 43]));
+        assert_eq!(session.programs[0].since, first);
+        assert!(session.programs[1].since > first);
+
+        session.open(None).expect("open");
+        assert!(session.programs.is_empty());
     }
 
     #[test]

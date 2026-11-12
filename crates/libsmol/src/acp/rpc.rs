@@ -1,9 +1,10 @@
+use crate::steps::Program;
 use crate::utils::Waiting;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     Error as RpcError, ErrorCode, SessionNotification, SessionUpdate, CLIENT_METHOD_NAMES,
 };
-use reaper::wire::{MCP, NOTICE, QUEUED};
+use reaper::wire::{BACKGROUND, MCP, NOTICE, PROGRAMS, QUEUED};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{self, Write};
@@ -38,6 +39,8 @@ pub(crate) struct Peer {
     queued: AtomicBool,
     /// The client declared `_smol/images`
     images: AtomicBool,
+    /// The client declared `_smol/background`
+    background: AtomicBool,
 }
 
 impl Peer {
@@ -47,6 +50,7 @@ impl Peer {
             pending: Waiting::default(),
             queued: AtomicBool::new(false),
             images: AtomicBool::new(false),
+            background: AtomicBool::new(false),
         })
     }
 
@@ -112,6 +116,10 @@ impl Peer {
     pub(crate) fn images(&self) -> bool {
         self.images.load(Ordering::Relaxed)
     }
+
+    pub(crate) fn set_background(&self, background: bool) {
+        self.background.store(background, Ordering::Relaxed);
+    }
 }
 
 /// Sends what concerns one session, with its id
@@ -155,6 +163,25 @@ impl SessionPeer {
     pub(crate) fn servers(&self, servers: Vec<Value>) {
         let status = json!({ "sessionId": &*self.id, "servers": servers });
         self.peer.notify(MCP, status);
+    }
+
+    pub(crate) fn programs(&self, running: &[Program]) {
+        let params = json!({ "sessionId": &*self.id, "programs": running });
+        self.peer.notify(PROGRAMS, params);
+    }
+
+    /// The client declared `BACKGROUND`
+    pub(crate) fn background(&self) -> bool {
+        self.peer.background.load(Ordering::Relaxed)
+    }
+
+    /// Tells a client that declared `BACKGROUND` that programs the code left running ended
+    /// while no turn ran, for it to hand them the next turn
+    pub(crate) fn background_ended(&self) {
+        if self.background() {
+            let params = json!({ "sessionId": &*self.id });
+            self.peer.notify(BACKGROUND, params);
+        }
     }
 
     /// None unless the client declared `QUEUED` and answered

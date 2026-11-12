@@ -17,6 +17,35 @@ pub use crate::unix::{guard, kill_all, prepare, Group, Mark};
 #[cfg(windows)]
 pub use crate::windows::{command_tail, guard, kill_all, prepare, prepare_attached, Group, Mark};
 
+/// A process in a `Group` or descended from one, besides the one the group started with
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub pid: u32,
+    pub parent: u32,
+    /// Tells it apart from a later process given the same pid, in the system's own units
+    pub started: u64,
+    /// Its arguments on one line
+    pub command: String,
+}
+
+impl Member {
+    /// Whether both are the same process, whatever it runs since and whoever adopted it
+    pub fn same(&self, other: &Member) -> bool {
+        self.pid == other.pid && self.started == other.started
+    }
+}
+
+/// The words of `text` on one line, as control characters such as the NUL between arguments
+/// separate them like spaces
+fn worded(text: &str) -> String {
+    let separates = |c: char| c.is_whitespace() || c.is_control();
+    let words: Vec<&str> = text
+        .split(separates)
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.join(" ")
+}
+
 /// Searches PATH by hand because commands like `npx` are .cmd files on Windows
 /// and the standard library only finds .exe
 pub fn lookup(name: &Path) -> PathBuf {
@@ -211,7 +240,7 @@ fn shortened(text: &str, root: &str, name: &str, inside: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{cause, one_line, searched, shortened, terminal_view};
+    use crate::{cause, one_line, searched, shortened, terminal_view, worded};
     use std::env;
     use std::fs;
     #[cfg(unix)]
@@ -312,6 +341,16 @@ mod tests {
         for (text, expected) in cases {
             assert_eq!(terminal_view(text), expected, "{text:?}");
         }
+    }
+
+    #[test]
+    fn words_joined() {
+        let arguments = "python3\0-c\0print('café')\0\0--naïve\n\x1b[31m 🐍\0";
+        assert_eq!(
+            worded(arguments),
+            "python3 -c print('café') --naïve [31m 🐍"
+        );
+        assert_eq!(worded("\0\t\0"), "");
     }
 
     #[test]

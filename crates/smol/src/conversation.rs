@@ -4,8 +4,8 @@ use agent_client_protocol_schema::v1::{
 };
 use anyhow::Result;
 use reaper::wire::{
-    AGENT, DECODE_DURATION, DURATION, ERROR, ESTIMATED_OUTPUT, INPUT_TOKENS, INTERRUPTED, NAME,
-    OUTPUT_TOKENS, PARENT, ROLE, SHELL, STEPS, TASK, UPDATE,
+    AGENT, BACKGROUND, DECODE_DURATION, DURATION, ERROR, ESTIMATED_OUTPUT, INPUT_TOKENS,
+    INTERRUPTED, NAME, OUTPUT_TOKENS, PARENT, ROLE, SHELL, STEPS, TASK, UPDATE,
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -19,11 +19,17 @@ pub(crate) enum Entry {
     Warning(String),
     Failure(String),
     Task(String),
+    /// Programs the code left running that ended, which open a turn of their own
+    Ended(String),
     Step(Step),
     Shell(Shell),
 }
 
 impl Entry {
+    fn opens_turn(&self) -> bool {
+        matches!(self, Entry::Task(_) | Entry::Ended(_))
+    }
+
     pub(crate) fn step(&self) -> Option<&Step> {
         match self {
             Entry::Step(step) => Some(step),
@@ -138,11 +144,15 @@ impl Conversation {
     }
 
     pub(crate) fn task(&mut self, text: &str) {
+        let text = text.to_owned();
+        self.open_turn(Entry::Task(text));
+    }
+
+    fn open_turn(&mut self, opening: Entry) {
         self.revision += 1;
         self.finish_turn(Outcome::Answered);
         self.stats.turns += 1;
-        let text = text.to_owned();
-        self.held.push(Entry::Task(text));
+        self.held.push(opening);
         self.task_id = None;
     }
 
@@ -160,13 +170,13 @@ impl Conversation {
     /// The agent sends the commands the user ran with the next task
     pub(crate) fn shell_unsent(&self) -> bool {
         let mut entries = self.entries.iter().chain(&self.held).rev();
-        let last = entries.find(|entry| matches!(entry, Entry::Shell(_) | Entry::Task(_)));
+        let last = entries.find(|entry| matches!(entry, Entry::Shell(_)) || entry.opens_turn());
 
         matches!(last, Some(Entry::Shell(_)))
     }
 
     pub(crate) fn unstarted(&self) -> bool {
-        let asked = matches!(self.held.first(), Some(Entry::Task(_)));
+        let asked = self.held.first().is_some_and(Entry::opens_turn);
         let step = |entry: &Entry| matches!(entry, Entry::Step(_));
         let stepped = self.held.iter().any(step);
         asked && !stepped && self.live.is_none()
@@ -372,14 +382,16 @@ impl Conversation {
                 let id = chunk.message_id.as_ref().map(|id| id.0.to_string());
                 let meta = chunk.meta.as_ref();
                 let amends = meta.is_some_and(|meta| meta.contains_key(UPDATE));
+                let background = meta.is_some_and(|meta| meta.contains_key(BACKGROUND));
                 match (&self.live, self.held.last_mut()) {
                     (None, Some(Entry::Task(task))) if id == self.task_id => {
                         task.push_str(&text);
                     }
                     _ => {
-                        match amends {
-                            true => self.amend(&text),
-                            false => self.task(&text),
+                        match (background, amends) {
+                            (true, _) => self.open_turn(Entry::Ended(text)),
+                            (false, true) => self.amend(&text),
+                            (false, false) => self.task(&text),
                         }
                         self.task_id = id;
                     }
@@ -618,7 +630,7 @@ impl Conversation {
                     last = Some(step);
                     break;
                 }
-                Entry::Task(_) => break,
+                entry if entry.opens_turn() => break,
                 _ => {}
             }
         }

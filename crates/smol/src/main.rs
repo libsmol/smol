@@ -135,6 +135,14 @@ while IFS= read -r line; do
         result="{\"configOptions\":[$(model m1),$(effort low)]}" ;;
     *'"method":"session/set_config_option"'*)
         result='{"configOptions":[]}' ;;
+    *'"method":"session/prompt"'*'"_smol/background":true'*)
+        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Brewed."}}}}'
+        result='{"stopReason":"end_turn"}' ;;
+    *'"method":"session/prompt"'*'"text":"background"'*)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"pid 42: brew café"},"messageId":"task_2","_meta":{"_smol/background":true}}}}'
+        printf '%s\n' '{"jsonrpc":"2.0","method":"_smol/background","params":{"sessionId":"s1"}}'
+        continue ;;
     *'"method":"session/prompt"'*'"text":"wait"'*)
         asked=$id
         continue ;;

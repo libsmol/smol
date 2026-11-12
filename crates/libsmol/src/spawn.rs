@@ -2,7 +2,7 @@ use crate::steps::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
 use crate::utils::{seamed, Interrupt};
 #[cfg(windows)]
 use encoding_rs::Encoding;
-use reaper::{cause, terminal_view, Group, Mark};
+use reaper::{cause, terminal_view, Group, Mark, Member};
 use std::collections::VecDeque;
 use std::env;
 use std::io::{self, Read};
@@ -176,6 +176,15 @@ impl Process {
     /// Includes programs it left in the background
     pub(crate) fn alive(&self) -> bool {
         self.group.alive()
+    }
+
+    /// The programs in its group besides itself, listed off the async runtime, or none when that fails
+    pub(crate) async fn members(&self) -> Option<Vec<Member>> {
+        // A dropped `Process` couldn't kill the group while the listing held a strong reference
+        let held = Arc::downgrade(&self.group);
+        let listing = move || held.upgrade().map(|group| group.members());
+        let listed = task::spawn_blocking(listing).await;
+        listed.ok().flatten()?.ok()
     }
 }
 

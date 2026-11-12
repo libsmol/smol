@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
-use reaper::tilde;
+use reaper::{one_line, tilde};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -99,6 +99,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         if !agents.is_empty() {
             let agents = agents.join(" · ");
             usage += &format!(" · agents {agents}");
+        }
+        let programs = app.session.programs.len();
+        if programs > 0 {
+            usage += &format!(" · programs {programs}");
         }
 
         // Startup failures are not reported in the conversation,
@@ -188,6 +192,24 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         if let Some(agents) = agents {
             let agents = labeled("agents", agents, width);
             lines.push(agents);
+        }
+
+        if !app.session.programs.is_empty() {
+            let section = Span::styled("Programs", HEADING);
+            let section = Line::from(section);
+            lines.extend([Line::default(), section]);
+        }
+        for program in &app.session.programs {
+            let pid = format!("{} ", program.pid);
+            let elapsed = lasted(program.since.elapsed());
+            // A command ends with what tells programs apart, such as the script it runs
+            let room = width.saturating_sub(pid.width() + 1 + elapsed.width());
+            let command = one_line(&program.command, &app.session.client.cwd);
+            let command = tail(&command, room);
+            let left = vec![Span::styled(pid, DIM), Span::raw(command)];
+            let right = vec![Span::styled(elapsed, DIM)];
+            let line = spread(left, right, width);
+            lines.push(line);
         }
 
         if !app.session.mcp.is_empty() {
@@ -660,6 +682,16 @@ fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> 
     Line::from(spans)
 }
 
+/// Seconds under a minute, then minutes under an hour, then hours
+fn lasted(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        _ => format!("{}h", seconds / 3600),
+    }
+}
+
 fn approx(stats: &Stats) -> &'static str {
     match stats.estimated {
         Some(_) => "≈",
@@ -828,7 +860,7 @@ fn scroll_top(top: u16, row: u16, height: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use crate::client::Selector;
+    use crate::client::{Program, Selector};
     use crate::tui::tests::{app, draw, fill};
     use crate::tui::ui::*;
     use agent_client_protocol_schema::v1::{
@@ -1024,6 +1056,38 @@ mod tests {
         let top = &rows[0];
         assert!(top.contains("stor… ─"), "{top}");
         assert!(top.ends_with(" ⇡0 ⇣0 · mcp 1 failed ╮"), "{top}");
+    }
+
+    /// A long command keeps its end, and a narrow screen only counts them
+    #[test]
+    fn programs_listed() {
+        let mut app = app();
+        let command = format!("/opt/{}/python3 brew.py --café", "naïve".repeat(8));
+        let program = Program {
+            pid: 4321,
+            command,
+            since: Instant::now(),
+        };
+        app.session.programs.push(program);
+
+        let rows = screen(&mut app, 120, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("│ Programs ")),
+            "{rows:#?}"
+        );
+        let listed =
+            |row: &String| row.contains("│ 4321 …") && row.contains(" brew.py --café 0s │");
+        assert!(rows.iter().any(listed), "{rows:#?}");
+
+        let rows = screen(&mut app, 80, 24);
+        assert!(rows[0].contains(" · programs 1 "), "{rows:#?}");
+    }
+
+    #[test]
+    fn durations_lasted() {
+        let shown =
+            [0, 59, 60, 3599, 3600, 7300].map(|seconds| lasted(Duration::from_secs(seconds)));
+        assert_eq!(shown, ["0s", "59s", "1m", "59m", "1h", "2h"]);
     }
 
     #[test]

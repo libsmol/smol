@@ -272,6 +272,17 @@ meanwhile reaches it as a task update. smol shows running agents under the
 call that started them, and pins them below the conversation while their rows
 are scrolled out of view.
 
+Programs the code leaves running, such as a build, a download or a server, go
+on after the call and don't keep the turn open. The model hears of each one
+that ends, with its pid, its command and what was printed since its last call:
+at the next step while it works, or else in a turn smol starts for it, which
+the conversation opens with `◇ programs ended`. Those still running are listed
+in the sidebar with the time since smol first saw them, or counted above the
+conversation on a narrow screen. This covers the programs the code started and
+their children, also those in a session of their own, but not daemons that
+leave the process tree. Programs that an agent from `agent()` leaves running
+end when it answers.
+
 A real run with DeepSeek: four agents write and test a tool each in the
 background while the main agent answers a question, then it checks their work:
 

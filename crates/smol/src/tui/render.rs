@@ -54,6 +54,11 @@ const SHELL: Mark = Mark {
     first: "! ",
     ..TASK
 };
+const ENDED: Mark = Mark {
+    first: "◇ ",
+    ..TASK
+};
+const ENDED_HEADING: &str = "programs ended";
 const ANSWER: Mark = Mark {
     first: "◆ ",
     rest: "  ",
@@ -182,6 +187,17 @@ impl Render {
             Entry::Task(text) => {
                 let lines = highlight::plain(text.trim(), BOLD);
                 self.band(TASK, lines);
+            }
+
+            Entry::Ended(text) => {
+                let mut shown = vec![ENDED_HEADING.to_owned()];
+                for line in text.lines() {
+                    let line = one_line(line, &self.cwd);
+                    shown.push(line);
+                }
+                let text = shown.join("\n");
+                let lines = highlight::plain(&text, Style::new());
+                self.band(ENDED, lines);
             }
 
             Entry::Shell(shell) => {

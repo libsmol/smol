@@ -7,6 +7,11 @@ pub const QUEUED: &str = "_smol/queued";
 pub const ENQUEUED: &str = "_smol/enqueued";
 /// Declared by a client that shows the images a reply writes in Markdown
 pub const IMAGES: &str = "_smol/images";
+/// Declared by the client, sent to it when programs the code left running end while no turn runs,
+/// and set to `true` on the user chunk that lists them and on the prompt that hands them a turn
+pub const BACKGROUND: &str = "_smol/background";
+/// Sent with the programs the code left running whenever they change
+pub const PROGRAMS: &str = "_smol/programs";
 /// Marks a user chunk that amends the task, with the value `true`
 pub const UPDATE: &str = "_smol/update";
 /// Replied to like a prompt, and marks its tool calls with `true`

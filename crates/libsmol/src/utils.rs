@@ -129,6 +129,16 @@ impl Interrupt {
 }
 
 pub(crate) fn truncated(text: &str, max: usize) -> String {
+    middle_cut(text, max, "\n")
+}
+
+/// Like `truncated`, for text that must stay on one line
+pub(crate) fn one_lined(text: &str, max: usize) -> String {
+    middle_cut(text, max, " ")
+}
+
+/// Keeps `max` characters of `text` with the marker of the cut set off by `apart`
+fn middle_cut(text: &str, max: usize, apart: &str) -> String {
     let count = text.chars().count();
     if count <= max {
         return text.to_owned();
@@ -139,7 +149,7 @@ pub(crate) fn truncated(text: &str, max: usize) -> String {
     let tail: String = text.chars().skip(count - kept).collect();
     let marker = prompt::cut(count - max);
 
-    format!("{head}\n{marker}\n{tail}")
+    format!("{head}{apart}{marker}{apart}{tail}")
 }
 
 /// `head` and `tail` with `cut` characters already dropped between them, kept to `max` characters
@@ -260,12 +270,20 @@ pub(crate) fn http_client(builder: ClientBuilder) -> Result<Client, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::{block_on, excerpt, read_cause};
+    use crate::utils::{block_on, excerpt, one_lined, read_cause};
     use futures_util::stream;
     use http::Response;
     use reqwest::Body;
     use std::io;
     use std::time::Duration;
+
+    #[test]
+    fn middle_one_lined() {
+        let command = format!("python3 -c {} --café", "x = 1; ".repeat(10));
+        let cut = one_lined(&command, 20);
+        assert_eq!(cut, "python3 -c [68 characters cut] 1;  --café");
+        assert_eq!(one_lined("brew 🐍", 20), "brew 🐍");
+    }
 
     #[test]
     fn excerpt_cut() {

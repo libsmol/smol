@@ -17,7 +17,7 @@ use agent_client_protocol_schema::v1::{
 };
 use agent_client_protocol_schema::ProtocolVersion;
 use reaper::cause;
-use reaper::wire::{ENQUEUED, FORGET, IMAGES, MEMORIES, QUEUED, SHELL};
+use reaper::wire::{BACKGROUND, ENQUEUED, FORGET, IMAGES, MEMORIES, QUEUED, SHELL};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -281,6 +281,8 @@ impl Router {
                 self.app.peer.set_queued(queued);
                 let images = client["_meta"][IMAGES].as_bool() == Some(true);
                 self.app.peer.set_images(images);
+                let background = client["_meta"][BACKGROUND].as_bool() == Some(true);
+                self.app.peer.set_background(background);
                 let terminal = client["auth"]["terminal"].as_bool() == Some(true);
 
                 let close = SessionCloseCapabilities::new();
@@ -336,7 +338,12 @@ impl Router {
             }
             m if m == names.session_prompt => {
                 let request: PromptRequest = parsed(params)?;
-                let task = task_of(&request.prompt);
+                let meta = request.meta.as_ref();
+                let marked = meta.and_then(|meta| meta.get(BACKGROUND));
+                let task = match marked.and_then(Value::as_bool) {
+                    Some(true) => None,
+                    _ => Some(task_of(&request.prompt)),
+                };
 
                 let session = &request.session_id.0;
                 let turn = self.next_turn(session)?;

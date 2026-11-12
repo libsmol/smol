@@ -7,6 +7,20 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- Programs the code leaves running are followed after the call, with their
+  children, also those in a session of their own. When one ends, the model gets
+  a `[Program done]` message with its pid, its command (cut in the middle past
+  300 characters) and what was printed since the last call: at the next step of
+  the running turn, or else in a turn smol starts for it, which the conversation
+  opens with `◇ programs ended`. libsmol tells clients that declare
+  `_smol/background` and takes the turn from a prompt marked with it, while
+  with other clients the model gets the message with the next task. The
+  sidebar lists the programs still running with the time since smol first saw
+  them, from the `_smol/programs` notification libsmol sends when they change.
+  Programs that an agent from `agent()` leaves running end when it answers.
+
 ## 0.9.1 - 2026-11-12
 
 - A task that ends after you switched away, with nothing queued to run next, is

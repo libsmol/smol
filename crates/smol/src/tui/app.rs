@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 const FLASH_WAIT: Duration = Duration::from_secs(2);
 const DOUBLE_CLICK_WAIT: Duration = Duration::from_millis(500);
 const ANIMATE_EVERY: Duration = Duration::from_millis(100);
+/// How often the sidebar's timers of the programs the code left running advance
+const TICK_EVERY: Duration = Duration::from_secs(1);
 
 const SHELL_USAGE: &str = "!<command>";
 
@@ -351,7 +353,8 @@ impl App {
         let animated = self.animating && self.drawn.elapsed() >= ANIMATE_EVERY;
         let scrolled = self.scroll_at.is_some_and(|at| at <= Instant::now());
         let busy = self.session.run.is_some();
-        let dirty = mem::take(&mut self.dirty) || busy || animated || scrolled;
+        let ticked = !self.session.programs.is_empty() && self.drawn.elapsed() >= TICK_EVERY;
+        let dirty = mem::take(&mut self.dirty) || busy || animated || scrolled || ticked;
         if dirty {
             self.drawn = Instant::now();
         }
@@ -763,6 +766,8 @@ impl App {
         let mut changed = false;
         // Queued messages go out only once every output is drained
         let mut ended = None;
+        // The session whose programs ended, which the queue may replace with another
+        let mut background = None;
         while let Some(output) = self.session.poll() {
             self.dirty = true;
 
@@ -779,6 +784,8 @@ impl App {
                     let texts = self.queued.drain(..count);
                     self.session.answer(asked, texts);
                 }
+
+                Output::Background => background = Some(self.session.id.clone()),
 
                 Output::Done(outcome) => {
                     ended = Some(outcome);
@@ -808,11 +815,16 @@ impl App {
                 self.submit_text(&next);
             }
         }
+        // A task the queue started takes the programs that ended along with it
+        let kept = background.as_ref() == Some(&self.session.id);
+        if kept && self.session.run.is_none() && !self.quit {
+            self.session.background();
+        }
         if changed {
             self.refresh();
         }
 
-        // A task the queue started is still at work
+        // A turn that the queue or programs that ended started is still at work
         if alert.is_some() && self.session.run.is_none() {
             self.alert = alert;
         }
@@ -1594,7 +1606,7 @@ mod tests {
     use std::process;
     use std::thread;
 
-    fn settle(app: &mut App, done: impl Fn(&App) -> bool) {
+    fn settle(app: &mut App, done: impl Fn(&mut App) -> bool) {
         for _ in 0..500 {
             app.pump();
             if done(app) {
@@ -1848,6 +1860,30 @@ mod tests {
         assert_eq!(shown(&mut app), ["", "  effort: low"]);
         assert_eq!(labels(&mut app, ":effort "), ["low", "high"]);
         assert_eq!(app.highlighted(), Some(0));
+    }
+
+    /// Programs that ended once the turn did take the next turn by themselves
+    #[test]
+    fn background_taken() {
+        let mut app = app();
+        app.submit_text("background");
+        settle(&mut app, |app| {
+            let rows = shown(app);
+            app.session.run.is_none() && rows.iter().any(|row| row.contains("Brewed."))
+        });
+
+        let expected = [
+            "",
+            "❯ background",
+            "",
+            "◇ programs ended",
+            "  pid 42: brew café",
+            "",
+            "◆ Brewed.",
+        ];
+        assert_eq!(shown(&mut app), expected);
+        assert_eq!(app.session.conversation.sent(), ["background"]);
+        assert_eq!(app.alert.as_deref(), Some("done"));
     }
 
     #[test]

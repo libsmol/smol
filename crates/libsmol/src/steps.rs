@@ -221,6 +221,33 @@ pub(crate) struct ShellStep {
     pub(crate) end: Exit,
 }
 
+/// Agents started in the background that ended before the code took their results,
+/// and programs the code left running that ended, with what was printed since the last call
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DoneStep {
+    pub(crate) agents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) programs: Vec<Program>,
+    /// Already truncated
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) output: String,
+    /// Taken while no turn ran, as a message of its own
+    #[serde(default, skip_serializing_if = "Not::not")]
+    pub(crate) idle: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Program {
+    pub(crate) pid: u32,
+    pub(crate) command: String,
+}
+
+impl fmt::Display for Program {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "pid {}: {}", self.pid, self.command)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub(crate) enum Exit {
@@ -271,10 +298,7 @@ pub(crate) enum MemoryStep {
     Summary(SummaryStep),
     Shell(ShellStep),
     Restarted,
-    /// Agents started in the background that ended before the code took their results
-    Done {
-        agents: Vec<String>,
-    },
+    Done(DoneStep),
 }
 
 impl MemoryStep {
@@ -294,8 +318,8 @@ impl MemoryStep {
                 return vec![ChatMessage::user(text)];
             }
             MemoryStep::Restarted => return vec![ChatMessage::user(prompt::RESTARTED)],
-            MemoryStep::Done { agents } => {
-                let text = prompt::done(agents);
+            MemoryStep::Done(done) => {
+                let text = prompt::done(done);
                 return vec![ChatMessage::user(text)];
             }
             MemoryStep::Action(step) => step,
@@ -385,7 +409,7 @@ impl AgentMemory {
                     | MemoryStep::Summary(_)
                     | MemoryStep::Shell(_)
                     | MemoryStep::Restarted
-                    | MemoryStep::Done { .. } => {}
+                    | MemoryStep::Done(_) => {}
                 }
             }
             visible.summary = Some(summary);
@@ -500,7 +524,7 @@ impl AgentMemory {
                 | MemoryStep::Update(_)
                 | MemoryStep::Shell(_)
                 | MemoryStep::Restarted
-                | MemoryStep::Done { .. } => None,
+                | MemoryStep::Done(_) => None,
                 MemoryStep::Action(action) => {
                     let (text, calls) = action.seen();
                     let shown = !text.is_empty() || !calls.is_empty();
