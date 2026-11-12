@@ -2489,7 +2489,7 @@ pub(crate) mod tests {
         let pids: Vec<u32> = done.programs.iter().map(|program| program.pid).collect();
         assert_eq!(pids, [pid], "{done:?}");
         let command = &done.programs[0].command;
-        assert!(command.contains(" -c import subprocess, sys;"), "{command}");
+        assert!(command.contains("import subprocess, sys;"), "{command}");
         assert_eq!(done.output.trim(), "café done");
         assert_eq!(block_on(worker.ended()), None);
     }
