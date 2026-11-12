@@ -167,6 +167,13 @@ Run `smol` in the directory you want to work in, then type a task.
   (`$SHELL`, or `cmd` on Windows). The model sees the command and its output
   with your next message.
 - Paths written as `@path` are attached to the message.
+- `ctrl+v` (`alt+v` on Windows, where the terminal keeps `ctrl+v`) pastes the
+  image on the clipboard into the message as `[image #1]`, and the model gets
+  it with the path of its copy, which its code can open. Over SSH, kitty and
+  other terminals that speak OSC 5522 hand over the clipboard of your own
+  machine once you allow it, for each paste or for the rest of the run; in
+  other terminals and inside tmux, screen or Zellij, paste the image in smol
+  web instead.
 - An image the answer puts on a line of its own, as `![label](chart.png)` or a
   web address, shows in the conversation: sharp in Ghostty and kitty when
   `TERM` names them or Ghostty sends its name over SSH, in colored blocks in
@@ -216,11 +223,14 @@ in. Anyone with the address can run code on this machine, and the page goes
 over plain HTTP, so reach it through a private network, an SSH tunnel or a
 proxy that adds TLS.
 
+An image pasted with the browser's own paste or dropped on the page goes into
+the message as in the terminal, also when smol web runs on another machine.
+
 On a phone, a row of keys under the screen adds `esc`, `tab`, `ctrl` (held for
 the next key), the arrows and `paste`, and a finger held still before it moves
-selects text. Copying and pasting use the browser's clipboard where the browser
-lets the page reach it (localhost and HTTPS); elsewhere a box comes up to copy
-from or paste into by hand.
+selects text. Selected text is copied when you let go, also over plain HTTP.
+Browsers let a page read the clipboard only on localhost and HTTPS, so
+elsewhere the `paste` key is gone and the keyboard's own paste is the way in.
 
 ### What the code can use
 

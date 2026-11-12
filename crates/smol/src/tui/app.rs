@@ -1,4 +1,4 @@
-use crate::chat::{opens_mention, resolved, Output, Session};
+use crate::chat::{image_placeholder, opens_mention, resolved, Output, Session};
 use crate::client::{McpState, Selector};
 use crate::conversation::{Entry, Outcome};
 use crate::tui::desktop::Desktop;
@@ -491,6 +491,7 @@ impl App {
                 let choice = self.choices.get(index).cloned();
 
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
                 let plain = key.modifiers.is_empty();
                 let running = self.session.running();
                 let idle = self.session.run.is_none() && self.draft().is_empty();
@@ -561,6 +562,10 @@ impl App {
                     },
                     (_, KeyCode::Char('d')) if ctrl && idle => self.quit = true,
                     (_, KeyCode::Char('o')) if ctrl => self.expanded = !self.expanded,
+                    // Windows Terminal keeps Ctrl+V for its own paste, which carries no image
+                    (_, KeyCode::Char('v')) if ctrl || alt => {
+                        self.paste_image(|app| app.desktop.image());
+                    }
                     (_, KeyCode::Char('j')) if ctrl => {
                         self.edit(|input| input.insert_str("\n"));
                     }
@@ -641,6 +646,7 @@ impl App {
             }
 
             Event::Mouse(mouse) => {
+                let selected = self.selection;
                 let position = Position::new(mouse.column, mouse.row);
                 let on_choices = self.choices_area.contains(position);
                 let area = self.messages_area;
@@ -743,6 +749,16 @@ impl App {
 
                     _ => {}
                 }
+
+                let grown = self
+                    .selection
+                    .filter(|selection| Some(*selection) != selected);
+                if let Some(selection) = grown {
+                    let talk = &self.session.conversation;
+                    let rows = self.transcript.rows(talk, area.width, self.expanded);
+                    let text = selection.text(rows);
+                    self.desktop.selecting(&text);
+                }
             }
 
             Event::Resize(..) => self.selection = None,
@@ -828,6 +844,35 @@ impl App {
         if alert.is_some() && self.session.run.is_none() {
             self.alert = alert;
         }
+    }
+
+    /// Puts the image `read` gives in the input as its placeholder, or flashes why it can't,
+    /// reading only once it could go in, as a terminal may ask the user first
+    pub(crate) fn paste_image(&mut self, read: impl FnOnce(&mut Self) -> Result<Vec<u8>, String>) {
+        self.dirty = true;
+        let pasted = match (self.shell, self.session.client.image_prompts) {
+            (true, _) => Err("image: shell commands take none".to_owned()),
+            (false, false) => {
+                let name = &self.session.client.agent.name;
+                Err(format!("image: {name} takes no images"))
+            }
+            (false, true) => read(self).and_then(|data| self.session.paste_image(data)),
+        };
+        let number = match pasted {
+            Ok(number) => number,
+            Err(reason) => {
+                self.flash = Some((Err(reason), Instant::now()));
+                return;
+            }
+        };
+
+        self.selection = None;
+        let shown = image_placeholder(number);
+        if self.edit(|input| input.insert_str(shown)) {
+            self.highlight.select(None);
+            self.choices_closed = false;
+        }
+        self.refresh();
     }
 
     /// The replayed history arrives before the `session/load` reply
@@ -1196,8 +1241,16 @@ impl App {
         let edited = (head, old.len() - tail);
         let (mut start, mut end) = edited;
 
+        let mut placeholders = Vec::new();
         for (index, paste) in self.pastes.iter().enumerate() {
             let shown = placeholder(index + 1, paste);
+            placeholders.push(shown);
+        }
+        for &number in self.session.images.keys() {
+            let shown = image_placeholder(number);
+            placeholders.push(shown);
+        }
+        for shown in &placeholders {
             for (at, _) in before.match_indices(shown.as_str()) {
                 let from = before[..at].chars().count();
                 let to = from + shown.chars().count();
@@ -1599,7 +1652,7 @@ fn stamp(rfc3339: &str) -> String {
 mod tests {
     use crate::client::McpStatus;
     use crate::tui::app::*;
-    use crate::tui::tests::{app, draw, fill};
+    use crate::tui::tests::{app, draw, fill, written};
     use crate::tui::{theme, ui, ACCENT};
     use ratatui::crossterm::event::KeyEvent;
     use std::env;
@@ -1635,6 +1688,21 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         app.on_event(Event::Mouse(mouse));
+    }
+
+    /// A clipboard that Ctrl+V and Alt+V read
+    struct Clipped(Result<Vec<u8>, String>);
+
+    impl Desktop for Clipped {
+        fn copy(&mut self, _: &str) {}
+
+        fn open(&mut self, _: &Target) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn image(&mut self) -> Result<Vec<u8>, String> {
+            self.0.clone()
+        }
     }
 
     fn labels(app: &mut App, input: &str) -> Vec<String> {
@@ -2197,6 +2265,65 @@ mod tests {
         }
         key(&mut app, KeyCode::Delete);
         assert_eq!(app.input.lines(), ["Résumé: 🚀"]);
+    }
+
+    /// An image goes in as its placeholder, which goes whole and never gets its number again,
+    /// and goes out with the task
+    #[test]
+    fn image_pasted() {
+        let mut app = app();
+        let path = written("pasted", 2, 2);
+        let png = fs::read(&path).expect("png");
+        fs::remove_dir_all(path.parent().expect("dir")).ok();
+        app.desktop = Box::new(Clipped(Ok(png.clone())));
+        app.set_input("Look at ");
+        let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        app.on_event(Event::Key(ctrl_v));
+        assert_eq!(app.input.lines(), ["Look at [image #1]"]);
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.input.lines(), ["Look at "]);
+
+        let alt_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT);
+        app.on_event(Event::Key(alt_v));
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Char('🐍'));
+        assert_eq!(app.input.lines(), ["Look at [image #2]🐍"]);
+        key(&mut app, KeyCode::Enter);
+        settle(&mut app, |app| app.session.run.is_none());
+        let rows = shown(&mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("Seen image/png.")),
+            "{rows:?}"
+        );
+
+        app.desktop = Box::new(Clipped(Err("clipboard: no image".to_owned())));
+        app.on_event(Event::Key(ctrl_v));
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert_eq!(flash, Some(Err("clipboard: no image".to_owned())));
+        app.paste_image(|_| Ok("café".as_bytes().to_vec()));
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert_eq!(
+            flash,
+            Some(Err("image: not PNG, JPEG, GIF or WebP".to_owned()))
+        );
+        assert!(app.input.lines().iter().all(String::is_empty));
+
+        // Neither a shell command nor an agent without images reads the clipboard
+        app.set_input("! ls ");
+        app.desktop = Box::new(Clipped(Ok(png)));
+        app.on_event(Event::Key(ctrl_v));
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert_eq!(
+            flash,
+            Some(Err("image: shell commands take none".to_owned()))
+        );
+        app.set_input("");
+        app.session.client.image_prompts = false;
+        app.on_event(Event::Key(ctrl_v));
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert_eq!(flash, Some(Err("image: agent takes no images".to_owned())));
+        assert!(app.input.lines().iter().all(String::is_empty));
+        assert_eq!(app.session.images.len(), 2);
     }
 
     #[test]

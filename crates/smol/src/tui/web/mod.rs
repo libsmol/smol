@@ -1,6 +1,7 @@
 use crate::chat::Session;
 use crate::conversation::Entry;
 use crate::tui::app::App;
+use crate::tui::clipboard::{self, UNREACHABLE};
 use crate::tui::desktop::{Desktop, Local};
 use crate::tui::render::Target;
 use crate::tui::screen::{self, Screen};
@@ -98,6 +99,13 @@ struct Web {
 }
 
 impl Desktop for Relay {
+    fn selecting(&mut self, text: &str) {
+        if let Who::Browser(id) = self.asker.get() {
+            let message = json!({ "t": "selection", "text": text });
+            self.told.borrow_mut().push((id, message.to_string()));
+        }
+    }
+
     fn copy(&mut self, text: &str) {
         let Who::Browser(id) = self.asker.get() else {
             return Local.copy(text);
@@ -129,6 +137,16 @@ impl Desktop for Relay {
         let message = json!({ "t": "open", "url": url });
         self.told.borrow_mut().push((id, message.to_string()));
         Ok(())
+    }
+
+    /// The terminal can't be asked for its clipboard while a thread reads its input, and a page
+    /// sends its images as they are pasted
+    fn image(&mut self) -> Result<Vec<u8>, String> {
+        let read = match self.asker.get() {
+            Who::Here => clipboard::system(),
+            Who::Browser(_) => None,
+        };
+        read.unwrap_or_else(|| Err(UNREACHABLE.to_owned()))
     }
 }
 
@@ -285,6 +303,12 @@ impl Host for Web {
                         }
                     }
                 },
+                Arrival::Input(who, Input::Image(data)) => {
+                    self.asker.set(who);
+                    app.paste_image(move |_| Ok(data));
+                    self.latest = Some(who);
+                    self.fit(app);
+                }
                 Arrival::Input(who, Input::Events(events)) => {
                     // Clicks and drags fall on the screen as this device last saw it,
                     // so the screen takes its size only after them
@@ -566,16 +590,21 @@ mod tests {
     use crate::chat::Session;
     use crate::tests::fake;
     use crate::tui::app::App;
+    use crate::tui::clipboard::UNREACHABLE;
+    use crate::tui::tests::{fill, written};
     use crate::tui::web::grid::Grid;
     use crate::tui::web::input::Input;
     use crate::tui::web::serve::LEFT;
     use crate::tui::web::{fixed_token, Arrival, Relay, Web, Who, FIRST_SIZE};
     use crate::tui::Host;
-    use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::Terminal;
     use serde_json::Value;
     use std::cell::Cell;
     use std::collections::HashMap;
+    use std::fs;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -700,6 +729,81 @@ mod tests {
         while to_first.try_recv().is_ok() {}
         assert_eq!(to_first.try_recv(), Err(TryRecvError::Disconnected));
         assert!(!web.browsers.contains_key(&1) && web.browsers.contains_key(&2));
+    }
+
+    /// A browser's image goes in as its placeholder, while its Alt+V can't read the clipboard
+    #[test]
+    fn image_arrived() {
+        let (mut app, mut web, arrive) = hosted();
+        let (outbox, _sent) = mpsc::sync_channel(64);
+        let joined = Arrival::Joined(1, outbox, Arc::default());
+        arrive.send(joined).expect("join");
+        let path = written("browser", 2, 2);
+        let png = fs::read(&path).expect("png");
+        fs::remove_dir_all(path.parent().expect("dir")).ok();
+        let pasted = Arrival::Input(Who::Browser(1), Input::Image(png));
+        arrive.send(pasted).expect("image");
+        step(&mut app, &mut web);
+        assert_eq!(app.input.lines(), ["[image #1]"]);
+
+        let alt_v = Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+        let pressed = Arrival::Input(Who::Browser(1), Input::Events(vec![alt_v]));
+        arrive.send(pressed).expect("key");
+        step(&mut app, &mut web);
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert_eq!(flash, Some(Err(UNREACHABLE.to_owned())));
+    }
+
+    /// A browser hears the text selected so far while it drags, for its release to copy, and the
+    /// copy that follows repeats the last of it
+    #[test]
+    fn selection_sent() {
+        let (mut app, mut web, arrive) = hosted();
+        let (outbox, sent) = mpsc::sync_channel(64);
+        let joined = Arrival::Joined(1, outbox, Arc::default());
+        arrive.send(joined).expect("join");
+        let sized = Arrival::Input(Who::Browser(1), Input::Size(60, 20));
+        arrive.send(sized).expect("size");
+        fill(&mut app, 40);
+        step(&mut app, &mut web);
+
+        let mouse = |kind, column, row| {
+            let modifiers = KeyModifiers::NONE;
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers,
+            })
+        };
+        let left = MouseButton::Left;
+        let dragged = vec![
+            mouse(MouseEventKind::Down(left), 2, 3),
+            mouse(MouseEventKind::Drag(left), 5, 5),
+            mouse(MouseEventKind::Drag(left), 9, 6),
+        ];
+        let released = vec![mouse(MouseEventKind::Up(left), 9, 6)];
+        for events in [dragged, released] {
+            let input = Arrival::Input(Who::Browser(1), Input::Events(events));
+            arrive.send(input).expect("mouse");
+            step(&mut app, &mut web);
+        }
+
+        let mut selections = Vec::new();
+        let mut copies = Vec::new();
+        for text in sent.try_iter() {
+            let message: Value = serde_json::from_str(&text).expect("json");
+            match message["t"].as_str() {
+                Some("selection") => selections.push(message["text"].clone()),
+                Some("copy") => copies.push(message["text"].clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(selections.len(), 2, "{selections:?}");
+        assert!(selections[1]
+            .as_str()
+            .is_some_and(|text| text.contains("line")));
+        assert_eq!(copies, selections[1..]);
     }
 
     #[test]

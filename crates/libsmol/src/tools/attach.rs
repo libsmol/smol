@@ -4,6 +4,8 @@ use crate::steps::{Attachment, MAX_OBSERVATION_CHARS};
 use crate::tools::files::{ls, slashed};
 use crate::tools::ToolError;
 use crate::utils::{new_id, truncated};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use reaper::cause;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
@@ -52,6 +54,8 @@ pub(crate) enum Mention {
     },
     /// Something that is not a local file, so its text always comes along
     Resource { uri: String, text: String },
+    /// Base64 as the client sent it
+    Image { data: String },
 }
 
 /// Images and videos are copied into `copies` and the session keeps using the copy
@@ -62,6 +66,41 @@ pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment
                 path: uri.clone(),
                 content: truncated(text, MAX_OBSERVATION_CHARS),
                 resource: true,
+                ..Attachment::default()
+            };
+        }
+        // Named by its copy, which the code can open
+        Mention::Image { data } => {
+            let unpasted = |reason: &str| Attachment {
+                path: prompt::PASTED.to_owned(),
+                content: prompt::unattached(reason),
+                ..Attachment::default()
+            };
+
+            let Ok(decoded) = STANDARD.decode(data) else {
+                return unpasted(prompt::NOT_BASE64);
+            };
+            let size = decoded.len() as u64;
+            if size > MAX_IMAGE_BYTES {
+                let refused = oversized(MediaKind::Image, size);
+                return unpasted(&refused);
+            }
+            let found = sniffed(&decoded).filter(|(_, kind, _)| *kind == MediaKind::Image);
+            let Some(found) = found else {
+                return unpasted(prompt::NOT_IMAGE);
+            };
+
+            let media = match copied(copies, &decoded, found, false) {
+                Ok(media) => media,
+                Err(e) => {
+                    let reason = cause(&e);
+                    return unpasted(&reason);
+                }
+            };
+            let copy = copies.join(&media.file);
+            return Attachment {
+                path: shown_path(&copy, cwd),
+                media: Some(media),
                 ..Attachment::default()
             };
         }
@@ -516,6 +555,42 @@ pub(crate) mod tests {
         let failed = returned(&blocked, &png).expect("known");
         let failed = failed.expect_err("blocked");
         assert!(failed.starts_with("not copied: "), "{failed}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn images_pasted() {
+        let dir = temp_dir("pasted");
+        let copies = dir.join("copies");
+        let png = [b"\x89PNG\r\n\x1a\n".as_slice(), "pixels".as_bytes()].concat();
+        let pasted = |data: &[u8]| {
+            let data = STANDARD.encode(data);
+            attach(&Mention::Image { data }, &dir, &copies)
+        };
+
+        let image = pasted(&png);
+        let media = image.media.expect("image");
+        assert_eq!(media.mime, "image/png");
+        let copy = copies.join(&media.file);
+        assert_eq!(image.path, shown_path(&copy, &dir));
+        assert_eq!(fs::read(&copy).expect("copy"), png);
+
+        let video = pasted(b"\0\0\0\x18ftypisom");
+        let refused = "[not attached: not a PNG, JPEG, GIF or WebP image]";
+        assert_eq!(
+            (video.path.as_str(), video.content.as_str()),
+            ("pasted image", refused)
+        );
+        let mut big = png.clone();
+        big.resize(65, 0);
+        let refused = "[not attached: 65 bytes, over the 64-byte image limit]";
+        assert_eq!(pasted(&big).content, refused);
+        let garbled = Mention::Image {
+            data: "café".to_owned(),
+        };
+        let garbled = attach(&garbled, &dir, &copies);
+        assert_eq!(garbled.content, "[not attached: not base64]");
 
         fs::remove_dir_all(&dir).ok();
     }

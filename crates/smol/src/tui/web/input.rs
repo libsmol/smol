@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -11,6 +13,8 @@ pub(crate) enum Input {
     /// Whether the user looks at the device
     Focus(bool),
     Events(Vec<Event>),
+    /// Pasted or dropped on the page
+    Image(Vec<u8>),
 }
 
 /// What app.js sends, where `key` is a `KeyboardEvent.key`
@@ -35,6 +39,10 @@ enum Message {
     },
     Paste {
         text: String,
+    },
+    /// In base64
+    Image {
+        data: String,
     },
     Mouse {
         kind: Kind,
@@ -79,7 +87,8 @@ impl Held {
     }
 }
 
-/// None for a message that isn't one, a key the TUI has no name for, or a size out of range
+/// None for a message that isn't one, a key the TUI has no name for, a size out of range or an
+/// image that isn't base64
 pub(crate) fn decode(text: &str) -> Option<Input> {
     let message: Message = serde_json::from_str(text).ok()?;
     let events = match message {
@@ -106,6 +115,11 @@ pub(crate) fn decode(text: &str) -> Option<Input> {
         }
 
         Message::Paste { text } => vec![Event::Paste(text)],
+
+        Message::Image { data } => {
+            let data = STANDARD.decode(data).ok()?;
+            return Some(Input::Image(data));
+        }
 
         Message::Mouse {
             kind,
@@ -242,6 +256,10 @@ mod tests {
         assert_eq!(chars, ['n', 'a', 'ï', 'v', 'e', ' ', '🐍']);
         let pasted = events(r#"{"t":"paste","text":"résumé\nline 2"}"#);
         assert_eq!(pasted, [Event::Paste("résumé\nline 2".to_owned())]);
+
+        let image = decode(r#"{"t":"image","data":"iVBORw0KGgo="}"#);
+        assert!(matches!(image, Some(Input::Image(data)) if data.starts_with(b"\x89PNG")));
+        assert!(decode(r#"{"t":"image","data":"café"}"#).is_none());
     }
 
     #[test]

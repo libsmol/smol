@@ -113,7 +113,7 @@ while IFS= read -r line; do
     id=$(printf '%s\n' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
     case $line in
     *'"method":"initialize"'*)
-        result='{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"close":{},"list":{}}}}' ;;
+        result='{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true},"sessionCapabilities":{"close":{},"list":{}}}}' ;;
     *'"method":"session/list"'*'"cwd"'*)
         result='{"sessions":[{"sessionId":"s1","cwd":"/","title":"old session"}]}' ;;
     *'"method":"session/list"'*)
@@ -165,6 +165,10 @@ while IFS= read -r line; do
     *'"method":"session/prompt"'*'"text":"exit"'*)
         echo goodbye >&2
         exit 0 ;;
+    *'"method":"session/prompt"'*'"type":"image"'*)
+        mime=$(printf '%s\n' "$line" | sed -n 's/.*"mimeType":"\([^"]*\)".*/\1/p')
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Seen %s."}}}}\n' "$mime"
+        result='{"stopReason":"end_turn"}' ;;
     *'"method":"_smol/shell"'*)
         printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"call_9","title":"ls docs","kind":"execute","status":"in_progress","_meta":{"_smol/shell":true}}}}'
         printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_9","status":"failed","content":[{"type":"content","content":{"type":"text","text":"alpha\nbeta"}}],"_meta":{"error":"exit 2"}}}}'

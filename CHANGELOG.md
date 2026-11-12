@@ -20,6 +20,16 @@ but their files stay in `~/.smol/projects` untouched.
   sidebar lists the programs still running with the time since smol first saw
   them, from the `_smol/programs` notification libsmol sends when they change.
   Programs that an agent from `agent()` leaves running end when it answers.
+- `ctrl+v` (`alt+v` on Windows) pastes the image on the clipboard into the
+  message as `[image #1]`. Over SSH it reads your own machine's clipboard
+  through kitty and other terminals that speak OSC 5522, and smol web takes
+  images pasted or dropped in the browser. libsmol now declares image prompts,
+  so other ACP clients can send images too, and attaches each one under the path
+  of its copy, which the code can open.
+- smol web no longer opens boxes to copy from or paste into by hand. Selected
+  text is copied when you let go, also over plain HTTP, and the phone's `paste`
+  key shows only on localhost and HTTPS, where the browser lets the page read
+  the clipboard.
 
 ## 0.9.1 - 2026-11-12
 

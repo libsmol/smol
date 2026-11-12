@@ -289,7 +289,7 @@ impl Router {
                 let list = SessionListCapabilities::new();
                 let sessions = SessionCapabilities::new().close(close).list(list);
                 // Editors then send a selection as they show it, unsaved edits included
-                let prompts = PromptCapabilities::new().embedded_context(true);
+                let prompts = PromptCapabilities::new().embedded_context(true).image(true);
                 let caps = AgentCapabilities::new()
                     .load_session(true)
                     .prompt_capabilities(prompts)

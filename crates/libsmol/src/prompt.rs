@@ -690,6 +690,11 @@ pub(crate) fn media_too_large(word: &str, size: u64, limit: u64) -> String {
 
 pub(crate) const IRREGULAR: &str = "not a regular file";
 
+/// Names an image the client sent that wasn't attached
+pub(crate) const PASTED: &str = "pasted image";
+pub(crate) const NOT_BASE64: &str = "not base64";
+pub(crate) const NOT_IMAGE: &str = "not a PNG, JPEG, GIF or WebP image";
+
 pub(crate) fn too_many(limit: usize) -> String {
     format!("more than {limit} MiB of matches, narrow the pattern or the path")
 }

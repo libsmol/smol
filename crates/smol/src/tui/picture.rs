@@ -1,5 +1,5 @@
-use crate::chat::resolved;
-use crate::tui::{multiplexed, screen, theme};
+use crate::chat::{resolved, IMAGE_FORMATS};
+use crate::tui::{multiplexed, remote, screen, theme};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use image::imageops::{self, FilterType};
@@ -166,8 +166,7 @@ pub(crate) fn kitty_here() -> bool {
     }
     let term = env::var("TERM").unwrap_or_default();
     let program = env::var("TERM_PROGRAM").unwrap_or_default();
-    let remote = ["SSH_TTY", "SSH_CONNECTION"].map(env::var_os);
-    let ssh = remote.iter().any(Option::is_some);
+    let ssh = remote();
     !multiplexed() && kitty_terminal(&term, &program, ssh)
 }
 
@@ -300,13 +299,7 @@ fn load(source: &Source, kitty: bool) -> Option<Picture> {
     };
 
     let format = image::guess_format(&bytes).ok()?;
-    let known = [
-        ImageFormat::Png,
-        ImageFormat::Jpeg,
-        ImageFormat::Gif,
-        ImageFormat::WebP,
-    ];
-    if !known.contains(&format) {
+    if !IMAGE_FORMATS.contains(&format) {
         return None;
     }
     let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);

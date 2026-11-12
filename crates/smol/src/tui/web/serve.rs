@@ -25,7 +25,8 @@ const COOKIE: &str = "smol";
 /// In seconds, the most Chrome keeps a cookie for
 const COOKIE_MAX_AGE: u32 = 400 * 24 * 60 * 60;
 const MAX_HEAD_BYTES: usize = 16 * 1024;
-const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// A pasted image comes as one message, which browsers send as one frame
+const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 /// For a request's head as a whole, and for each frame to go out before the browser counts as gone
 const REQUEST_WAIT: Duration = Duration::from_secs(10);
 /// Accepting fails again at once while no file descriptor is free
@@ -296,7 +297,9 @@ impl Server {
         }
 
         stream.set_read_timeout(Some(READ_WAIT)).ok();
-        let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE_BYTES));
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_MESSAGE_BYTES))
+            .max_frame_size(Some(MAX_MESSAGE_BYTES));
         let reading = Reading(stream);
         let mut socket = WebSocket::from_partially_read(reading, rest, Role::Server, Some(config));
         let who = Who::Browser(id);

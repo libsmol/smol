@@ -4,11 +4,15 @@ use crate::client::{
 };
 use crate::conversation::{Conversation, Entry, Outcome};
 use agent_client_protocol_schema::v1::{
-    ContentBlock, ResourceLink, SessionConfigOption, SessionInfo, SessionUpdate,
+    ContentBlock, ImageContent, ResourceLink, SessionConfigOption, SessionInfo, SessionUpdate,
 };
 use agent_client_protocol_schema::MaybeUndefined;
 use anyhow::Result;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use image::ImageFormat;
 use reaper::wire::MCP_PREFIX;
+use std::collections::BTreeMap;
 use std::env;
 use std::path::{is_separator, Path, PathBuf};
 use std::sync::mpsc::Receiver;
@@ -20,6 +24,15 @@ const MAX_NAME_BYTES: usize = 255;
 const MAX_PATH_BYTES: usize = 4096;
 
 const MAX_PROBES: usize = 4096;
+
+const IMAGE_PREFIX: &str = "[image #";
+/// The formats smol draws and pastes, all of which libsmol takes
+pub(crate) const IMAGE_FORMATS: [ImageFormat; 4] = [
+    ImageFormat::Png,
+    ImageFormat::Jpeg,
+    ImageFormat::Gif,
+    ImageFormat::WebP,
+];
 
 pub(crate) enum Output {
     /// Nothing beyond the conversation or the session changed, which only needs drawing
@@ -35,6 +48,12 @@ pub(crate) enum Output {
 pub(crate) struct Run {
     pub(crate) step_started: Instant,
     pub(crate) interrupting: bool,
+}
+
+/// An image pasted into the input, which the text names with `image_placeholder`
+pub(crate) struct Pasted {
+    mime: &'static str,
+    data: Vec<u8>,
 }
 
 impl Run {
@@ -58,6 +77,8 @@ pub(crate) struct Session {
     pub(crate) conversation: Conversation,
     /// The turn in progress
     pub(crate) run: Option<Run>,
+    /// By number, and kept across sessions, as a queued or recalled message still names them
+    pub(crate) images: BTreeMap<usize, Pasted>,
     /// Servers turned on with `:mcp on`, reported once when they connect or fail
     switched_on: Vec<String>,
     /// Servers that dropped while running and are reconnecting, reported if they fail
@@ -102,6 +123,7 @@ impl Session {
             programs: Vec::new(),
             conversation: Conversation::default(),
             run: None,
+            images: BTreeMap::new(),
             switched_on: Vec::new(),
             dropped: Vec::new(),
             saved: resume.is_some(),
@@ -242,6 +264,23 @@ impl Session {
         self.client.prompt(&self.id, blocks);
     }
 
+    /// The image's number, or why it isn't one smol pastes
+    pub(crate) fn paste_image(&mut self, data: Vec<u8>) -> Result<usize, String> {
+        let format = image::guess_format(&data).ok();
+        let Some(format) = format.filter(|format| IMAGE_FORMATS.contains(format)) else {
+            return Err("image: not PNG, JPEG, GIF or WebP".to_owned());
+        };
+        let mime = format.to_mime_type();
+
+        // A resumed conversation names images of an earlier run, which a new number must not take
+        let sent = self.conversation.sent();
+        let named = sent.iter().flat_map(|text| named_images(text)).max();
+        let last = self.images.keys().next_back().copied();
+        let number = named.max(last).unwrap_or(0) + 1;
+        self.images.insert(number, Pasted { mime, data });
+        Ok(number)
+    }
+
     pub(crate) fn notify_queued(&self) {
         self.client.notify_queued(&self.id);
     }
@@ -290,6 +329,14 @@ impl Session {
             };
             let link = ResourceLink::new(path, uri);
             blocks.push(ContentBlock::ResourceLink(link));
+        }
+        for number in named_images(text) {
+            let Some(pasted) = self.images.get(&number) else {
+                continue;
+            };
+            let data = STANDARD.encode(&pasted.data);
+            let image = ImageContent::new(data, pasted.mime);
+            blocks.push(ContentBlock::Image(image));
         }
 
         blocks
@@ -413,6 +460,29 @@ pub(crate) fn resolved(path: &str, cwd: &Path) -> PathBuf {
     }
 }
 
+pub(crate) fn image_placeholder(number: usize) -> String {
+    format!("{IMAGE_PREFIX}{number}]")
+}
+
+/// The numbers `image_placeholder` wrote in `text`, each once and in order
+fn named_images(text: &str) -> Vec<usize> {
+    let mut named = Vec::new();
+    for (at, _) in text.match_indices(IMAGE_PREFIX) {
+        let rest = &text[at + IMAGE_PREFIX.len()..];
+        let Some((digits, _)) = rest.split_once(']') else {
+            continue;
+        };
+        let Ok(number) = digits.parse::<usize>() else {
+            continue;
+        };
+        // `[image #+1]` and `[image #01]` parse too
+        if number.to_string() == digits && !named.contains(&number) {
+            named.push(number);
+        }
+    }
+    named
+}
+
 /// Windows strips trailing dots from a name when opening it
 fn dotted(path: &str) -> bool {
     let name = path.rsplit(is_separator).next().unwrap_or(path);
@@ -487,7 +557,9 @@ mod tests {
     use crate::client::Notice;
     use crate::tests::{fake, shell};
     use agent_client_protocol_schema::v1::SessionInfoUpdate;
+    use image::RgbaImage;
     use std::cell::Cell;
+    use std::io::Cursor;
     use std::thread;
     use std::time::Duration;
 
@@ -822,6 +894,33 @@ done
         assert_eq!(resolved("~//etc", cwd), home.join("etc"));
         #[cfg(windows)]
         assert_eq!(resolved("~\\résumé.md", cwd), home.join("résumé.md"));
+    }
+
+    #[test]
+    fn images_named() {
+        let text =
+            "Compare [image #2] with [image #10], then [image #2] and [image #x] or [image #3";
+        assert_eq!(named_images(text), [2, 10]);
+        assert_eq!(image_placeholder(7), "[image #7]");
+        assert_eq!(named_images("café [image #7] [image #+1] [image #01]"), [7]);
+    }
+
+    /// A new image takes a number past those the conversation names, as a resumed one names
+    /// images of an earlier run
+    #[test]
+    fn images_numbered() {
+        let agent = fake();
+        let mut session = Session::start(&agent, None, None, false).expect("start");
+        let mut png = Cursor::new(Vec::new());
+        let pixels = RgbaImage::new(2, 2);
+        pixels.write_to(&mut png, ImageFormat::Png).expect("png");
+        let png = png.into_inner();
+
+        session.conversation.task("Explain [image #4] to the café");
+        assert_eq!(session.paste_image(png.clone()), Ok(5));
+        assert_eq!(session.paste_image(png), Ok(6));
+        let refused = session.paste_image("naïve".as_bytes().to_vec());
+        assert_eq!(refused, Err("image: not PNG, JPEG, GIF or WebP".to_owned()));
     }
 
     #[test]

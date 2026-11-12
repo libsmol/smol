@@ -20,20 +20,6 @@
   </div>
   <div id="notice" role="status" hidden></div>
 </div>
-<dialog id="copied">
-  <p>The browser keeps scripts out of the clipboard here, so copy it from below.</p>
-  <textarea readonly></textarea>
-  <div class="actions">
-    <button type="button">Close</button>
-  </div>
-</dialog>
-<dialog id="pasting">
-  <p>The browser keeps scripts out of the clipboard here, so paste it below.</p>
-  <textarea></textarea>
-  <div class="actions">
-    <button type="button">Cancel</button>
-    <button type="button" class="primary" value="paste">Paste</button>
-  </div>
-</dialog>
+<textarea id="copying" readonly tabindex="-1" aria-hidden="true"> </textarea>
 <script type="module" src="app.js"></script>
 </html>

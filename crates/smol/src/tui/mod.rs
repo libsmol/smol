@@ -19,6 +19,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 mod app;
+mod clipboard;
 mod desktop;
 mod diagram;
 mod highlight;
@@ -133,6 +134,12 @@ pub(crate) fn kilo(n: u64) -> String {
 /// them through
 pub(crate) fn multiplexed() -> bool {
     let names = ["TMUX", "STY", "ZELLIJ"].map(env::var_os);
+    names.iter().any(Option::is_some)
+}
+
+/// Over SSH, where this machine's clipboard and desktop are not the user's
+pub(crate) fn remote() -> bool {
+    let names = ["SSH_TTY", "SSH_CONNECTION"].map(env::var_os);
     names.iter().any(Option::is_some)
 }
 

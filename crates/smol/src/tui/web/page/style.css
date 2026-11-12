@@ -149,76 +149,17 @@ textarea {
   color: var(--purple);
 }
 
-dialog {
-  width: min(560px, calc(100vw - 32px));
-  max-height: calc(100dvh - 32px);
-  box-sizing: border-box;
-  overflow: auto;
-  border: 1px solid var(--comment);
-  border-radius: 8px;
-  background: var(--bg);
-  color: var(--fg);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-dialog::backdrop {
-  background: rgb(0 0 0 / 50%);
-}
-
-dialog p {
-  margin: 0 0 10px;
-}
-
-dialog textarea {
-  display: block;
-  box-sizing: border-box;
-  width: 100%;
-  height: clamp(72px, 40dvh, 320px);
-  padding: 8px;
-  resize: none;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  outline: none;
-  background: var(--band);
-  color: var(--fg);
-  font: inherit;
+/* Holds what a copy over plain HTTP selects, and being read-only it brings up no keyboard */
+#copying {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
   /* Smaller text makes iOS zoom in on focus */
   font-size: 16px;
-}
-
-dialog textarea:focus {
-  border-color: var(--purple);
-}
-
-dialog textarea::selection {
-  background: var(--line);
-}
-
-dialog .actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 10px;
-}
-
-dialog button {
-  padding: 8px 16px;
-  border: 0;
-  border-radius: 4px;
-  outline: none;
-  background: var(--line);
-  color: var(--fg);
-  font: inherit;
-  font-weight: 600;
-}
-
-dialog button:focus-visible {
-  outline: 2px solid var(--purple);
-  outline-offset: 2px;
-}
-
-dialog button.primary {
-  background: var(--purple);
-  color: var(--bg);
 }

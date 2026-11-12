@@ -1,5 +1,5 @@
 use crate::tui::render::Target;
-use crate::tui::{diagram, picture};
+use crate::tui::{clipboard, diagram, picture};
 use ratatui::crossterm::clipboard::CopyToClipboard;
 use ratatui::crossterm::execute;
 use reaper::cause;
@@ -26,6 +26,11 @@ const OPEN_EVERY: Duration = Duration::from_millis(20);
 pub(crate) trait Desktop {
     fn copy(&mut self, text: &str);
     fn open(&mut self, target: &Target) -> Result<(), String>;
+    /// The image on the clipboard, or why there is none
+    fn image(&mut self) -> Result<Vec<u8>, String>;
+    /// The text selected so far, for a page to copy when the user lets go, as browsers let a page
+    /// reach the clipboard only while it handles what the user did
+    fn selecting(&mut self, _text: &str) {}
 }
 
 /// The machine smol runs on, and the terminal it runs in
@@ -99,6 +104,10 @@ impl Desktop for Local {
                 open(&path)
             }
         }
+    }
+
+    fn image(&mut self) -> Result<Vec<u8>, String> {
+        clipboard::image()
     }
 }
 

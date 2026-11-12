@@ -33,6 +33,11 @@ fn task_of(blocks: &[ContentBlock]) -> Task {
                 texts.push(text.text.as_str());
                 continue;
             }
+            ContentBlock::Image(image) => {
+                let data = image.data.clone();
+                mentions.push(Mention::Image { data });
+                continue;
+            }
             ContentBlock::ResourceLink(link) => (link.uri.as_str(), None),
             ContentBlock::Resource(embedded) => match &embedded.resource {
                 EmbeddedResourceResource::TextResourceContents(sent) => {
@@ -98,7 +103,7 @@ mod tests {
     use crate::acp::{line_range, task_of};
     use crate::tools::attach::Mention;
     use agent_client_protocol_schema::v1::{
-        ContentBlock, EmbeddedResource, EmbeddedResourceResource, ResourceLink,
+        ContentBlock, EmbeddedResource, EmbeddedResourceResource, ImageContent, ResourceLink,
         TextResourceContents,
     };
     use reqwest::Url;
@@ -120,10 +125,12 @@ mod tests {
         let uri = Url::from_file_path(&path).expect("uri");
         let file = ResourceLink::new("résumé.md", uri.as_str());
         let page = ResourceLink::new("Café", "https://example.com/café");
+        let image = ImageContent::new("iVBORw0KGgo=", "image/png");
         let blocks = [
             ContentBlock::from("Summarize these"),
             ContentBlock::ResourceLink(file),
             ContentBlock::ResourceLink(page),
+            ContentBlock::Image(image),
         ];
 
         let task = task_of(&blocks);
@@ -134,7 +141,10 @@ mod tests {
             lines: None,
             text: None,
         };
-        assert_eq!(task.mentions, [file]);
+        let image = Mention::Image {
+            data: "iVBORw0KGgo=".to_owned(),
+        };
+        assert_eq!(task.mentions, [file, image]);
     }
 
     #[test]

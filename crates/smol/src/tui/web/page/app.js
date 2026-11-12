@@ -51,8 +51,7 @@ const bar = document.getElementById("bar");
 const ctrlButton = document.getElementById("ctrl");
 const pasteButton = document.getElementById("paste");
 const notice = document.getElementById("notice");
-const copied = document.getElementById("copied");
-const pasting = document.getElementById("pasting");
+const copying = document.getElementById("copying");
 const paint = canvas.getContext("2d");
 
 let cell = { width: 9, height: 18, size: 15 };
@@ -68,7 +67,11 @@ let committed = null;
 let latched = false;
 // A composition that the latched ctrl took its letter from, whose text is dropped
 let chorded = false;
-// The clipboard write of the last release, which a copy fills
+// The text the server said is selected while a button or finger is down, which letting go copies
+let selection = null;
+// What the last release copied, which the server's copy then repeats
+let released = null;
+// The clipboard write of the last release that had no text yet, which the server's copy fills
 let pending = null;
 // A tap on the input box that goes on as the browser's own click
 let clicking = false;
@@ -391,21 +394,54 @@ function drawShape(symbol, left, top, width) {
   return false;
 }
 
-function offer(text) {
-  const area = copied.querySelector("textarea");
-  area.value = text;
-  copied.showModal();
-  area.select();
+// Plain HTTP leaves only the copy command, which copies what is selected, so its event swaps the
+// text in, from the field typing goes to or, with no keyboard up, a read-only one that brings none
+function write(text) {
+  if (window.isSecureContext && navigator.clipboard) {
+    navigator.clipboard.writeText(text).catch(() => {});
+    return;
+  }
+  const field = document.activeElement === keys ? keys : copying;
+  const fill = (event) => {
+    event.preventDefault();
+    event.clipboardData.setData("text/plain", text);
+  };
+  document.addEventListener("copy", fill);
+  field.focus({ preventScroll: true });
+  field.setSelectionRange(0, field.value.length);
+  document.execCommand("copy");
+  document.removeEventListener("copy", fill);
+  if (field === keys) {
+    reset();
+  } else {
+    field.blur();
+  }
 }
 
 function copy(text) {
+  const repeated = text === released;
+  released = null;
+  if (repeated) {
+    return;
+  }
   if (pending) {
     pending.fill(text);
     pending = null;
-  } else if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text).catch(() => offer(text));
   } else {
-    offer(text);
+    write(text);
+  }
+}
+
+// Only now may the page reach the clipboard, so it copies the selection the server sent, or else
+// leaves a clipboard write for the server's copy to fill
+function letGo() {
+  const text = selection;
+  selection = null;
+  released = text;
+  if (text) {
+    write(text);
+  } else {
+    expectCopy();
   }
 }
 
@@ -414,12 +450,9 @@ function expectCopy() {
   if (!window.isSecureContext || !window.ClipboardItem) {
     return;
   }
-  const waiting = { text: null };
+  const waiting = {};
   const blob = new Promise((resolve, reject) => {
-    waiting.fill = (text) => {
-      waiting.text = text;
-      resolve(new Blob([text], { type: "text/plain" }));
-    };
+    waiting.fill = (text) => resolve(new Blob([text], { type: "text/plain" }));
     waiting.drop = () => reject(new Error("nothing copied"));
   });
   // A write refused for permission never reads the item, whose rejection would go unhandled
@@ -445,9 +478,6 @@ function expectCopy() {
   navigator.clipboard.write([item]).catch(() => {
     if (pending === waiting) {
       pending = null;
-    }
-    if (waiting.text !== null) {
-      offer(waiting.text);
     }
   });
 }
@@ -532,6 +562,10 @@ function connect() {
     const message = JSON.parse(event.data);
     if (message.t === "frame") {
       frame(message);
+    } else if (message.t === "selection") {
+      // One that comes after letting go would be copied by the next tap
+      const down = pressed >= 0 || (touch && touch.holding);
+      selection = down ? message.text : null;
     } else if (message.t === "copy") {
       copy(message.text);
     } else if (message.t === "open") {
@@ -658,32 +692,69 @@ keys.addEventListener("compositionend", (event) => {
   reset();
 });
 
+// The images a paste or a drop carries
+function imagesOf(transfer) {
+  const files = transfer ? [...transfer.files] : [];
+  return files.filter((file) => file.type.startsWith("image/"));
+}
+
+function sendImage(blob) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const [, data] = String(reader.result).split(",");
+    if (data) {
+      send({ t: "image", data });
+    }
+  };
+  reader.readAsDataURL(blob);
+}
+
+// Text goes first, as a spreadsheet's cells come with a picture of them
 keys.addEventListener("paste", (event) => {
   event.preventDefault();
   const text = event.clipboardData && event.clipboardData.getData("text/plain");
   if (text) {
     send({ t: "paste", text });
+    return;
   }
+  imagesOf(event.clipboardData).forEach(sendImage);
 });
+
+async function pasteItems(items) {
+  for (const item of items) {
+    if (item.types.includes("text/plain")) {
+      const blob = await item.getType("text/plain");
+      const text = await blob.text();
+      if (text) {
+        send({ t: "paste", text });
+        return;
+      }
+    }
+    const type = item.types.find((type) => type.startsWith("image/"));
+    if (type) {
+      sendImage(await item.getType(type));
+      return;
+    }
+  }
+}
 
 // A phone's keyboard has no paste of its own, and the field it types in is hidden
 function paste() {
-  const ask = () => {
-    const area = pasting.querySelector("textarea");
-    area.value = "";
-    pasting.showModal();
-    area.focus();
-  };
-
-  if (!window.isSecureContext || !navigator.clipboard || !navigator.clipboard.readText) {
-    ask();
+  const clipboard = navigator.clipboard;
+  if (clipboard.read) {
+    clipboard.read().then(pasteItems).catch(() => {});
     return;
   }
-  navigator.clipboard.readText().then((text) => {
+  clipboard.readText().then((text) => {
     if (text) {
       send({ t: "paste", text });
     }
-  }, ask);
+  }, () => {});
+}
+
+// Plain HTTP keeps the clipboard from the page, while a keyboard's own paste still reaches it
+if (!window.isSecureContext || !navigator.clipboard) {
+  pasteButton.remove();
 }
 
 // Pressing on the bar keeps the focus, and with it the phone's keyboard
@@ -731,6 +802,7 @@ canvas.addEventListener("mousedown", (event) => {
   }
   keys.focus({ preventScroll: true });
   pressed = event.button;
+  selection = null;
   dragged = point(event);
   send({ t: "mouse", kind: "down", button: event.button, ...dragged, ...held(event) });
 });
@@ -763,7 +835,7 @@ window.addEventListener("mouseup", (event) => {
   if (pressed < 0) {
     return;
   }
-  expectCopy();
+  letGo();
   release(event);
 });
 
@@ -854,6 +926,7 @@ canvas.addEventListener("touchstart", (event) => {
   };
   started.timer = setTimeout(() => {
     started.holding = true;
+    selection = null;
     send({ t: "mouse", kind: "down", button: 0, ...started.at });
     if (navigator.vibrate) {
       navigator.vibrate(10);
@@ -918,10 +991,10 @@ const lift = (event) => {
 
   event.preventDefault();
   if (finished.holding) {
-    expectCopy();
+    letGo();
     send({ t: "mouse", kind: "up", button: 0, ...finished.at });
   } else if (tapped) {
-    expectCopy();
+    letGo();
     send({ t: "mouse", kind: "down", button: 0, ...finished.at });
     send({ t: "mouse", kind: "up", button: 0, ...finished.at });
     keys.blur();
@@ -936,26 +1009,7 @@ const lift = (event) => {
 canvas.addEventListener("touchend", lift);
 canvas.addEventListener("touchcancel", lift);
 
-copied.querySelector("button").addEventListener("click", () => copied.close());
-
-pasting.addEventListener("click", (event) => {
-  const button = event.target.closest("button");
-  if (!button) {
-    return;
-  }
-  const text = pasting.querySelector("textarea").value;
-  if (button.value === "paste" && text) {
-    send({ t: "paste", text });
-  }
-  pasting.close();
-});
-
-// Only the text boxes of the dialogs keep the browser's menu, which copying and pasting by hand need
-document.addEventListener("contextmenu", (event) => {
-  if (!event.target.closest("dialog textarea")) {
-    event.preventDefault();
-  }
-});
+document.addEventListener("contextmenu", (event) => event.preventDefault());
 
 // iOS zooms on a pinch whatever the viewport allows
 document.addEventListener("gesturestart", (event) => event.preventDefault());
@@ -966,12 +1020,17 @@ document.addEventListener("wheel", (event) => {
   }
 }, { passive: false });
 
-// A file dropped on the page would replace it
+// A file dropped on the page would replace it, so only images go in, and Safari tells a file's
+// type only at the drop
 document.addEventListener("dragover", (event) => {
   event.preventDefault();
-  event.dataTransfer.dropEffect = "none";
+  const files = event.dataTransfer.types.includes("Files");
+  event.dataTransfer.dropEffect = files ? "copy" : "none";
 });
-document.addEventListener("drop", (event) => event.preventDefault());
+document.addEventListener("drop", (event) => {
+  event.preventDefault();
+  imagesOf(event.dataTransfer).forEach(sendImage);
+});
 
 // The field's own handler still sends the ctrl chords on to the TUI
 document.addEventListener("keydown", (event) => {
@@ -983,7 +1042,7 @@ document.addEventListener("keydown", (event) => {
 
 // A hardware keyboard keeps typing to the screen after a tap elsewhere took the focus away
 document.addEventListener("keydown", (event) => {
-  if (document.activeElement !== document.body || copied.open || pasting.open) {
+  if (document.activeElement !== document.body) {
     return;
   }
   keys.focus({ preventScroll: true });

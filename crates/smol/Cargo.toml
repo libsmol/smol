@@ -13,6 +13,7 @@ categories = ["command-line-utilities"]
 [dependencies]
 agent-client-protocol-schema = { version = "1", default-features = false }
 anyhow = "1"
+arboard = "3.7"
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
@@ -36,6 +37,7 @@ ureq = { version = "3", default-features = false, features = ["platform-verifier
 url = "2"
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 signal-hook = "0.3"
 
 [target.'cfg(windows)'.dependencies]

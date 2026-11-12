@@ -312,6 +312,7 @@ pub(crate) struct Client {
     auth: Option<AuthMethodTerminal>,
     pub(crate) cwd: PathBuf,
     pub(crate) agent: Implementation,
+    pub(crate) image_prompts: bool,
 }
 
 impl Client {
@@ -512,6 +513,8 @@ impl Client {
 
         let unnamed = || Implementation::new("agent", "");
         let agent = initialized.agent_info.unwrap_or_else(unnamed);
+        let prompts = &initialized.agent_capabilities.prompt_capabilities;
+        let image_prompts = prompts.image;
 
         let mut auth = None;
         for method in initialized.auth_methods {
@@ -529,6 +532,7 @@ impl Client {
             auth,
             cwd,
             agent,
+            image_prompts,
         };
         Ok((client, inbox))
     }
