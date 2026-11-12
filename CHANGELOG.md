@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
-## Unreleased
+## 0.10.0 - 2026-11-13
 
 - Programs the code leaves running are followed after the call, with their
   children, also those in a session of their own. When one ends, the model gets
