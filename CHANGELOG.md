@@ -15,6 +15,38 @@ but their files stay in `~/.smol/projects` untouched.
   thought level option. The session keeps the choice when resumed, `:new` keeps
   it along with the model, and switching models goes back to the new model's
   `effort`.
+- Session titles lead with the specific thing the first message is about, keep
+  its names as written and stay within the 50 characters a title is cut to, and
+  a first message that gives instructions no longer steers its own title.
+- Compaction no longer turns requests found in fetched pages, files or the
+  answers of agents that `agent()` started into tasks, constraints or pending
+  steps, and keeps what the agent said it would do and hasn't done yet.
+- A task no longer waits for MCP servers that are still connecting, which held
+  the first message of a session for a few seconds, or up to the 30-second
+  handshake limit for a server that hung. It runs with the servers that are
+  ready, and the others join from the next task. Servers also start connecting
+  as soon as a session begins to open instead of after its Python worker starts.
+- The opening of the system prompt is rewritten as what happens rather than
+  what to do: a reply without a tool call is the answer and ends the task, and
+  a message the user sent during the task is part of it. It no longer
+  says that the user sees text sent with calls or when to answer, nor tells the
+  model to use loops and the standard library, to reuse what the Python session
+  holds, to put code it reruns in a function or to prefer the built-in
+  functions, which models did as well without being told.
+- A message sent during a task reaches the model as `[Task update]`, the name
+  compaction already gave it, instead of
+  `[The user wrote while you were working]`.
+- `recall()` matches each word of the query whole, where a Chinese word that
+  jieba doesn't know used to match on any of its characters, and returns only
+  the memories that match, falling back to the newest only when none do. On a
+  set of real queries, the memories that held none of the query's words fell
+  from half of what `recall()` returned to 1%.
+- The memory rules say that progress, the state of the work and what the code
+  does are not memories, and a memory that is wrong or outdated is replaced
+  only when the correct one belongs in memories. The model used to keep a
+  project's status as a memory and rewrite it after every change. A memory
+  holds at most 150 characters instead of 300, where the longest ones had
+  strung several facts or a snapshot of the work together.
 
 ## 0.8.2 - 2026-11-10
 

@@ -223,8 +223,8 @@ functions:
 | `edit(path, old, new)` | Replace text that appears exactly once in a file. |
 | `fetch(url)` | Get a web page as Markdown. |
 | `view(path)` | Show an image or video to the model (offered only when the model takes media). |
-| `remember(text, project=True)` | Keep a memory of up to 300 characters for this project, or with `project=False` a global one, and return its id. |
-| `recall(query="")` | Up to 10 of this project's and the global memories as `(id, text)`: those that best match the words of `query`, then the newest. |
+| `remember(text, project=True)` | Keep a memory of up to 150 characters for this project, or with `project=False` a global one, and return its id. |
+| `recall(query="")` | Up to 10 of this project's and the global memories as `(id, text)`: those that best match the words of `query`, or the newest if none match. |
 | `forget(id)` | Delete a memory. |
 | `agent(task)` | Give a task to a new agent and return its answer; a list of tasks runs up to 8 agents at a time, and `role=` picks one of your [roles](#roles). With `name=` it runs in the background and returns an `Agent` handle at once. |
 | `Agent.get(name)` | The handle of a background agent, whose `wait(timeout=None)`, `status()` and `stop()` return its answer, say what it is doing and stop it. |
@@ -290,7 +290,9 @@ enabled = false
 | `description` | Added to the prompt next to the server's functions. |
 | `enabled` | `false` to keep it off until `:mcp on <server>`. |
 
-An entry that can't be used is skipped with a notice.
+An entry that can't be used is skipped with a notice. Servers connect in the
+background when a session opens, and a task sent before one is ready runs
+without it; the server joins from the next task.
 
 ## Sandbox
 

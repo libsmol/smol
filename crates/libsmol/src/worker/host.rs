@@ -1580,7 +1580,7 @@ pub(crate) mod tests {
         let mut worker = fresh();
         let code = "a = remember('Deploys the café site on Fridays')\n\
              b = remember('Prefers naïve tests', project=False)\n\
-             [recall('fridays') == [(a, 'Deploys the café site on Fridays'), (b, 'Prefers naïve tests')], len(recall()), forget(a), recall('fridays') == [(b, 'Prefers naïve tests')]]";
+             [recall('fridays') == [(a, 'Deploys the café site on Fridays')], len(recall()), forget(a), recall('fridays') == [(b, 'Prefers naïve tests')]]";
         let output = worker.eval(code);
 
         assert_eq!(output.error, None, "{}", output.logs);
@@ -1591,12 +1591,12 @@ pub(crate) mod tests {
     fn memory_errors() {
         let mut worker = fresh();
         let code = "def tried(act):\n    try:\n        act()\n    except (TypeError, ValueError) as error:\n        return f'{type(error).__name__}: {error}'\n\
-             [tried(lambda: remember('é' * 301)), tried(lambda: forget(999)),\n \
+             [tried(lambda: remember('é' * 151)), tried(lambda: forget(999)),\n \
               tried(lambda: forget('7')), tried(lambda: remember(5)), tried(lambda: forget(2**70)),\n \
               tried(lambda: remember('caf\\udce9'))]";
         let output = worker.eval(code);
 
-        let expected = "['ValueError: remember: 301 characters, over the 300-character limit', \
+        let expected = "['ValueError: remember: 151 characters, over the 150-character limit', \
                         'ValueError: forget: no such memory', \
                         'TypeError: forget: id must be int, not str', 'TypeError: remember: text must be str, not int', \
                         'ValueError: forget: no such memory', \

@@ -15,7 +15,7 @@ use tracing::info;
 const DB: &str = "memory.db";
 
 /// The worker puts it in the docs of `remember()`
-pub const MAX_MEMORY_CHARS: usize = 300;
+pub const MAX_MEMORY_CHARS: usize = 150;
 /// SQLite takes integers as `i64`, and the worker puts it in the docs of `recall()`
 pub const MAX_RECALLED: i64 = 10;
 const MAX_LISTED: i64 = 10;
@@ -192,14 +192,13 @@ impl Memories {
         Ok(id)
     }
 
-    /// The best matches first, then the newest memories up to `MAX_RECALLED`
+    /// The best matches, or the newest memories when nothing matches
     async fn recall(&self, query: &str) -> Result<Vec<(i64, String)>, String> {
         let memories = self.clone();
         let query = query.to_owned();
         let searching = move || {
             let matched = matched(&query);
             let connection = opened(&memories.db)?;
-            let mut found = Vec::new();
             if !matched.is_empty() {
                 let mut best = connection.prepare(
                     "SELECT memories.id, memories.text FROM terms JOIN memories ON memories.id = terms.rowid \
@@ -207,24 +206,19 @@ impl Memories {
                      ORDER BY bm25(terms), memories.id DESC LIMIT ?3",
                 )?;
                 let rows = best.query_map(params![matched, memories.folder, MAX_RECALLED], pair)?;
-                found = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                let found = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                if !found.is_empty() {
+                    return Ok(found);
+                }
             }
 
+            // A query in other words than the memories, such as English for Chinese ones, matches none
             let mut newest = connection.prepare(
                 "SELECT id, text FROM memories WHERE folder = ?1 OR folder IS NULL \
                  ORDER BY id DESC LIMIT ?2",
             )?;
             let rows = newest.query_map(params![memories.folder, MAX_RECALLED], pair)?;
-            for row in rows {
-                let row = row?;
-                if found.len() as i64 == MAX_RECALLED {
-                    break;
-                }
-                if !found.contains(&row) {
-                    found.push(row);
-                }
-            }
-            Ok(found)
+            rows.collect::<rusqlite::Result<Vec<_>>>()
         };
         self.run(searching).await
     }
@@ -308,30 +302,44 @@ fn terms(text: &str) -> String {
     words.join(" ")
 }
 
-/// An FTS5 query for any word of `query`, each quoted to keep FTS5 syntax out
+/// An FTS5 query for any word of `query`, a word matching when the memory holds all its pieces,
+/// each quoted to keep FTS5 syntax out
 fn matched(query: &str) -> String {
     // FTS5 reads the query as a C string, which a NUL inside a quoted word would end
     let separates = |c: char| c.is_whitespace() || c.is_control();
     let mut words = Vec::new();
-    for (chinese, part) in parts(query) {
-        if !chinese {
-            words.extend(part.split(separates));
-            continue;
+    for word in query.split(separates) {
+        let mut pieces = Vec::new();
+        for (chinese, part) in parts(word) {
+            if !chinese {
+                pieces.push(part);
+                continue;
+            }
+            // Jieba cuts a Chinese word missing from its dictionary into characters,
+            // which alone would match most memories
+            let tokens = JIEBA.cut(part, false);
+            pieces.extend(tokens.iter().map(|token| token.word));
         }
-        let tokens = JIEBA.cut(part, false);
-        words.extend(tokens.iter().map(|token| token.word));
-    }
 
-    let mut quoted = Vec::new();
-    for word in words {
-        // A query of punctuation alone lists the newest instead of matching nothing
-        if !word.chars().any(char::is_alphanumeric) {
-            continue;
+        let mut quoted = Vec::new();
+        for piece in pieces {
+            // A query of punctuation alone lists the newest instead of matching nothing
+            if !piece.chars().any(char::is_alphanumeric) {
+                continue;
+            }
+            let escaped = piece.replace('"', "\"\"");
+            quoted.push(format!("\"{escaped}\""));
         }
-        let escaped = word.replace('"', "\"\"");
-        quoted.push(format!("\"{escaped}\""));
+        match quoted.len() {
+            0 => {}
+            1 => words.push(quoted.remove(0)),
+            _ => {
+                let all = quoted.join(" AND ");
+                words.push(format!("({all})"));
+            }
+        }
     }
-    quoted.join(" OR ")
+    words.join(" OR ")
 }
 
 /// Runs of Chinese characters and of everything else, since jieba splits other letters such as é one by one
@@ -407,6 +415,8 @@ mod tests {
         assert_eq!(matched("。！ ? "), "");
         let controls = "\"café\" OR \"naïve\" OR \"résumé\"";
         assert_eq!(matched("café\0naïve\u{1b}résumé"), controls);
+        let pieces = "(\"第\" AND \"4\" AND \"章\") OR (\"llama.cpp\" AND \"依赖\")";
+        assert_eq!(matched("第4章 llama.cpp依赖"), pieces);
     }
 
     #[test]
@@ -438,8 +448,7 @@ mod tests {
             recalled.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
         };
 
-        let installed = [ids[0], shared, ids[4], ids[3], ids[2], ids[1]];
-        assert_eq!(found("安装"), installed);
+        assert_eq!(found("安装"), [ids[0]]);
         assert_eq!(found("共和国")[0], ids[2]);
         assert_eq!(found("CAFE")[0], ids[3]);
         assert_eq!(found("nautilus")[0], ids[4]);
@@ -453,8 +462,8 @@ mod tests {
     }
 
     #[test]
-    fn recall_filled() {
-        let dir = temp_dir("filled");
+    fn newest_fallback() {
+        let dir = temp_dir("fallback");
         let here = opened(&dir, "/home/zoë/café");
         let saving = async {
             let mut ids = Vec::new();
@@ -478,9 +487,35 @@ mod tests {
 
         let newest: Vec<i64> = ids.iter().rev().take(10).copied().collect();
         assert_eq!(found("unknown words"), newest);
-        let mut matched = vec![ids[0]];
-        matched.extend(&newest[..9]);
-        assert_eq!(found("résumé"), matched);
+        assert_eq!(found("résumé"), [ids[0]]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Characters of a word jieba doesn't know don't match on their own
+    #[test]
+    fn words_whole() {
+        let dir = temp_dir("whole");
+        let here = opened(&dir, "/home/zoë/café");
+        let saving = async {
+            let mut ids = Vec::new();
+            for text in ["霜阶写到第三卷", "霜降那天下雨", "台阶上有青苔"] {
+                let id = here.remember(text, true).await.expect("remember");
+                ids.push(id);
+            }
+            ids
+        };
+        let ids = block_on(saving);
+
+        let found = |query: &str| {
+            let recalling = here.recall(query);
+            let recalled = block_on(recalling).expect("recall");
+            recalled.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
+        };
+
+        assert_eq!(found("霜阶"), [ids[0]]);
+        let both = found("霜阶 青苔");
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both.contains(&ids[0]) && both.contains(&ids[2]), "{both:?}");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -657,8 +692,8 @@ mod tests {
     fn remember_checked() {
         let dir = temp_dir("checked");
         let here = opened(&dir, "/home/zoë/café");
-        let longest = "é".repeat(300);
-        let longer = "é".repeat(301);
+        let longest = "é".repeat(150);
+        let longer = "é".repeat(151);
         let checking = async {
             let blank = here.remember(" \n ", true).await;
             let kept = here.remember(&longest, true).await;
@@ -670,7 +705,7 @@ mod tests {
 
         assert_eq!(blank, Err(EMPTY_MEMORY.to_owned()));
         assert!(kept.is_ok(), "{kept:?}");
-        assert_eq!(refused, Err(prompt::long_memory(301)));
+        assert_eq!(refused, Err(prompt::long_memory(151)));
     }
 
     #[test]

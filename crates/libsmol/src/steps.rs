@@ -772,8 +772,8 @@ pub(crate) mod tests {
         let text = "[Summary of your work so far, replacing earlier messages]\n\
             <summary>\ns1\n</summary>\n\n\
             [Current task]\nWrite a poem about autumn\n\n\
-            [The user wrote while you were working]\nMake it winter\n\n\
-            [The user wrote while you were working]\nOnly four lines";
+            [Task update]\nMake it winter\n\n\
+            [Task update]\nOnly four lines";
         assert_eq!(contents(&memory), [text, "a3"]);
 
         memory
@@ -1033,7 +1033,7 @@ pub(crate) mod tests {
 
         let asked = MemoryStep::Update(update);
         let messages = asked.messages(&mut 0);
-        let head = "[The user wrote while you were working]\nLook at this one";
+        let head = "[Task update]\nLook at this one";
         let file = "<file path=\"notes.txt\">\nCrème brûlée\n</file>";
         let parts = vec![
             Part::Text(head.to_owned()),

@@ -903,7 +903,7 @@ mod tests {
             "Print 1",
             "eval:\nprint(1)",
             "1",
-            "[The user wrote while you were working]\nReply in French",
+            "[Task update]\nReply in French",
             "42",
         ];
         assert_eq!(contents, expected);

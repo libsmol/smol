@@ -894,10 +894,7 @@ mod tests {
         let listed = "\nagent(task: str | list[str], *, name: str | list[str] | None = None) -> str | list[str | RuntimeError] | Agent | list[Agent]\n    # A new agent";
         assert!(main.contains(listed), "{main}");
         assert!(main.contains("\nAgent.wait(timeout"), "{main}");
-        assert!(
-            main.contains("[The user wrote while you were working]"),
-            "{main}"
-        );
+        assert!(main.contains("[Task update]"), "{main}");
         let helped = requests.iter().map(|request| content(&request[0]));
         let helper = helped
             .into_iter()
@@ -907,7 +904,7 @@ mod tests {
         assert!(!helper.contains("Agent."), "{helper}");
         assert!(!helper.contains("while you were working"), "{helper}");
         let returned =
-            "no code is needed.\n\nOnly your answer is returned to the agent that assigned this task";
+            "your answer and ends the task.\n- Only your answer is returned to the agent that assigned this task";
         assert!(helper.contains(returned), "{helper}");
     }
 

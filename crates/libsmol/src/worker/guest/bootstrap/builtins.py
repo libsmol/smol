@@ -227,7 +227,7 @@ def remember(text: str, project: bool = True) -> int:
 
 @_builtin
 def recall(query: str = "") -> list[tuple[int, str]]:
-    """(id, text) of up to {recalled} memories: those that match any word of query, best first, then the newest."""
+    """(id, text) of up to {recalled} memories: those that match any word of query, best first, or the newest if none match."""
     query = _str("recall", "query", query)
     found = _asked("recall", "recall", {"query": query})
     return [(id, text) for id, text in found]

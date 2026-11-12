@@ -244,6 +244,8 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
         let options = options(&models, &meta.settings, &servers);
 
         let copies = app.store.copies(&cwd, &meta.id)?;
+        // Servers need neither the venv nor the worker, so they connect while those start
+        let pool = McpPool::new(servers, &meta.settings, &copies, peer.clone());
         let window = built.context_window();
         let mut translator = Translator::new(peer.clone(), window, cwd.clone(), copies.clone());
         translator.replay(&memory);
@@ -306,8 +308,6 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             warn!("session: open issue, {notice}");
             peer.notice(notice, Notice::Session);
         }
-
-        let pool = McpPool::new(servers, &meta.settings, &copies, peer.clone());
         pool.report();
 
         let brief = Brief {
@@ -423,17 +423,6 @@ impl Session {
     async fn prompt(&mut self, prompt: Prompt) {
         // One the user interrupted before it started is still recorded and ends as interrupted
         self.agent.interrupt.begin(prompt.turn);
-
-        // Requests stay in the channel while MCP servers connect,
-        // and only an interrupt ends the wait
-        while self.servers.connecting() && !self.agent.interrupt.triggered() {
-            select! {
-                Some(event) = self.servers.recv() => {
-                    self.servers.handle(event, &mut self.worker).await;
-                }
-                () = self.agent.interrupt.wait() => {}
-            }
-        }
 
         // A session with no task yet gets its title from the model without waiting for it
         let untitled = self.keeper.meta.model_title.is_empty();
@@ -749,7 +738,7 @@ mod tests {
     use crate::acp::{rfc3339, App};
     use crate::history::tests::saved;
     use crate::history::{HistoryStore, Settings};
-    use crate::prompt::{NAMER, RESTARTED};
+    use crate::prompt::{namer, RESTARTED};
     use crate::steps::tests::{asked, coded, one_task, replied};
     use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::{interpreter, temp_dir};
@@ -886,13 +875,23 @@ mod tests {
             let id = self.next;
             let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
             self.send(request);
+            let reply = |message: &Value| message["id"] == id && message.get("method").is_none();
+            self.until(reply).await
+        }
+
+        /// Keeps every message in `seen` up to and including the first that `done` accepts
+        async fn until(&mut self, done: impl Fn(&Value) -> bool) -> Value {
             loop {
                 let receiving = self.output.recv();
                 let waiting = time::timeout(Duration::from_secs(60), receiving);
-                let line = waiting.await.expect("reply").expect("open").expect("line");
+                let line = waiting
+                    .await
+                    .expect("message")
+                    .expect("open")
+                    .expect("line");
                 let message: Value = serde_json::from_str(&line).expect("json");
                 self.seen.push(message.clone());
-                if message["id"] == id && message.get("method").is_none() {
+                if done(&message) {
                     return message;
                 }
             }
@@ -929,7 +928,7 @@ mod tests {
 
     fn naming(title: &'static str) -> String {
         model_server(move |body| {
-            let text = match system_prompt(body) == NAMER {
+            let text = match system_prompt(body) == namer() {
                 true => title,
                 false => "Done.",
             };
@@ -994,12 +993,13 @@ mod tests {
     #[test]
     fn refused_task_untitled() {
         let dir = temp_dir("refused");
-        // The titling request replies with the start of the task
+        // The titling request replies with the start of the task, which follows the opening tag
         let api = model_server(|body| {
             let messages = body["messages"].as_array().cloned().unwrap_or_default();
-            let text: String = match system_prompt(body) == NAMER {
+            let text: String = match system_prompt(body) == namer() {
                 true => {
-                    let task = messages[1]["content"].as_str().unwrap_or_default();
+                    let message = messages[1]["content"].as_str().unwrap_or_default();
+                    let task = message.lines().nth(1).unwrap_or_default();
                     task.chars().take(4).collect()
                 }
                 false => "Done.".to_owned(),
@@ -1029,7 +1029,7 @@ mod tests {
         let dir = temp_dir("after-close");
         // A slow reply keeps the turn running when the session closes
         let api = model_server(|body| {
-            if system_prompt(body) != NAMER {
+            if system_prompt(body) != namer() {
                 thread::sleep(Duration::from_millis(500));
             }
             Ok("Done.".to_owned())
@@ -1111,7 +1111,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
         let api = model_server(move |body| {
-            if system_prompt(body) != NAMER {
+            if system_prompt(body) != namer() {
                 let sent = body["messages"].to_string();
                 seen.lock().expect("requests").push(sent);
                 thread::sleep(Duration::from_millis(500));
@@ -1254,12 +1254,15 @@ mod tests {
         );
         fs::create_dir_all(&dir).expect("dir");
         fs::write(dir.join("agent.toml"), servers).expect("agent.toml");
-        let api = naming("Title");
+        let settled = |message: &Value| {
+            let servers = message["params"]["servers"].as_array();
+            let connecting = |server: &Value| server["state"] == "connecting";
+            message["method"] == "_smol/mcp" && !servers.into_iter().flatten().any(connecting)
+        };
         let running = async {
-            let mut connection = Connection::open(&dir, &api, "");
-            let session = connection.new_session().await;
-            // The turn starts only after the servers finish connecting
-            connection.prompt(&session, "Hello").await;
+            let mut connection = Connection::open(&dir, "http://127.0.0.1:1/v1", "");
+            connection.new_session().await;
+            connection.until(settled).await;
             connection.close().await
         };
         let seen = block_on(running);
@@ -1288,6 +1291,53 @@ mod tests {
             {"name": "off", "state": "off"},
         ]);
         assert_eq!(statuses.last(), Some(&last), "{statuses:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A turn doesn't wait for a server still connecting, which joins from the next turn
+    #[test]
+    fn servers_join_later() {
+        let dir = temp_dir("join-later");
+        let gate = dir.join("gate");
+        let python = interpreter();
+        let python = python.display();
+        let shown = gate.display();
+        let held = "import os, runpy, sys, time\n\
+                    while not os.path.exists(sys.argv[2]):\n    time.sleep(0.05)\n\
+                    runpy.run_path(sys.argv[1], run_name='__main__')";
+        let servers = format!(
+            "[mcp.slow]\ntype = \"stdio\"\ncommand = '{python}'\nargs = ['-c', \"\"\"{held}\"\"\", '{SCRIPT}', '{shown}']\n"
+        );
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("agent.toml"), servers).expect("agent.toml");
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&prompts);
+        let api = model_server(move |body| {
+            let system = system_prompt(body);
+            if system != namer() {
+                seen.lock().expect("prompts").push(system);
+            }
+            Ok("Done.".to_owned())
+        });
+        let connected = |message: &Value| {
+            let state = &message["params"]["servers"][0]["state"];
+            message["method"] == "_smol/mcp" && state == "connected"
+        };
+        let running = async {
+            let mut connection = Connection::open(&dir, &api, "");
+            let session = connection.new_session().await;
+            connection.prompt(&session, "Hello").await;
+            fs::write(&gate, "").expect("gate");
+            connection.until(connected).await;
+            connection.prompt(&session, "Hello again").await;
+            connection.close().await
+        };
+        block_on(running);
+
+        let prompts = prompts.lock().expect("prompts");
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        assert!(!prompts[0].contains("## MCP `slow`"), "{}", prompts[0]);
+        assert!(prompts[1].contains("## MCP `slow`"), "{}", prompts[1]);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1333,7 +1383,7 @@ mod tests {
         let efforts = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&efforts);
         let api = model_server(move |body| {
-            if system_prompt(body) != NAMER {
+            if system_prompt(body) != namer() {
                 let effort = body["reasoning_effort"].clone();
                 seen.lock().expect("efforts").push(effort);
             }
@@ -1473,7 +1523,7 @@ mod tests {
         let released = Arc::new(AtomicBool::new(false));
         let holding = Arc::clone(&released);
         let api = model_server(move |body| {
-            while system_prompt(body) != NAMER && !holding.load(Ordering::Relaxed) {
+            while system_prompt(body) != namer() && !holding.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(10));
             }
             Ok("Done.".to_owned())
@@ -1608,7 +1658,7 @@ mod tests {
         let seen = Arc::clone(&prompts);
         let api = model_server(move |body| {
             let system = system_prompt(body);
-            if system != NAMER {
+            if system != namer() {
                 seen.lock().expect("prompts").push(system);
             }
             Ok("Done.".to_owned())
@@ -1649,7 +1699,7 @@ mod tests {
         let seen = Arc::clone(&prompts);
         let api = model_server(move |body| {
             let system = system_prompt(body);
-            if system != NAMER {
+            if system != namer() {
                 seen.lock().expect("prompts").push(system);
             }
             Ok("Done.".to_owned())

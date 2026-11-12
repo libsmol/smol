@@ -94,11 +94,6 @@ impl McpPool {
         self.events.recv().await
     }
 
-    pub(crate) fn connecting(&self) -> bool {
-        let connecting = |server: &Mcp| matches!(server.state, McpState::Connecting { .. });
-        self.servers.iter().any(connecting)
-    }
-
     pub(crate) fn installed(&self) -> Vec<&Added> {
         let mut installed = Vec::new();
         for server in &self.servers {

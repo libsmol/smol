@@ -626,9 +626,10 @@ async fn text_reply(
 
 pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<String> {
     let task: String = task.chars().take(MAX_NAMING_CHARS).collect();
+    let message = prompt::first_message(&task);
     let request = [
-        ChatMessage::System(prompt::NAMER.to_owned()),
-        ChatMessage::user(task),
+        ChatMessage::System(prompt::namer()),
+        ChatMessage::user(message),
     ];
 
     let interrupt = Interrupt::default();

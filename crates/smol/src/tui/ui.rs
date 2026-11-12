@@ -260,11 +260,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             None => String::new(),
         };
 
-        // The agent starts the turn only after every MCP server has finished connecting
-        let connecting = |server: &&McpStatus| server.state == McpState::Connecting;
-        let connecting = app.session.mcp.iter().filter(connecting);
-        let connecting: Vec<&str> = connecting.map(|server| server.name.as_str()).collect();
-        let waiting = talk.unstarted() && !connecting.is_empty();
         let helping = talk.awaited();
         let label = match (run.interrupting, left, writing) {
             (true, _, _) => "interrupting…".to_owned(),
@@ -273,10 +268,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                 format!("retrying in {wait}s")
             }
             (false, None, _) if talk.shelling() => format!("running · {seconds}s"),
-            (false, None, _) if waiting => {
-                let names = connecting.join(", ");
-                format!("waiting for mcp {names} · {seconds}s")
-            }
             (false, None, _) if helping > 0 => {
                 let agents = match helping {
                     1 => "agent",
@@ -841,8 +832,8 @@ mod tests {
     use crate::tui::tests::{app, draw, fill};
     use crate::tui::ui::*;
     use agent_client_protocol_schema::v1::{
-        ContentBlock, ContentChunk, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
-        ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
+        SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+        ToolCallUpdateFields, UsageUpdate,
     };
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget;
@@ -999,29 +990,6 @@ mod tests {
             input.move_cursor(CursorMove::Up);
         }
         assert_eq!(shown(&input), "line 3");
-    }
-
-    #[test]
-    fn mcp_wait_shown() {
-        let mut app = app();
-        for name in ["web", "search"] {
-            let server = McpStatus {
-                name: name.to_owned(),
-                state: McpState::Connecting,
-            };
-            app.session.mcp.push(server);
-        }
-        app.submit_text("wait");
-        let rows = screen(&mut app, 80, 12);
-        let waiting = |row: &String| row.contains("waiting for mcp web, search · ");
-        assert!(rows.iter().any(waiting), "{rows:#?}");
-
-        let reply = ContentBlock::from("ok");
-        let reply = ContentChunk::new(reply);
-        let reply = SessionUpdate::AgentMessageChunk(reply);
-        app.session.conversation.update(&reply);
-        let rows = screen(&mut app, 80, 12);
-        assert!(!rows.iter().any(|row| row.contains("waiting")), "{rows:#?}");
     }
 
     #[test]
