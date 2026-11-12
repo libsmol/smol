@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
-## Unreleased
+## 0.9.0 - 2026-11-12
 
 - `:effort <level>` switches the reasoning effort for the session, among the
   levels a model lists in `efforts` in `model.toml`, and the bar and the sidebar
