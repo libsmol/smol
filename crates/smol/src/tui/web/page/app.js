@@ -36,6 +36,9 @@ const NAMED_KEYS = new Set([
 ]);
 // Option types characters on a Mac, so it is not Alt there
 const MAC = /Mac|iPhone|iPad/.test(navigator.userAgent);
+// A phone or tablet, which shows one page at a time
+const COARSE = window.matchMedia("(pointer: coarse)").matches;
+const TITLE = document.title;
 // Keeps Backspace firing in an empty field on phone keyboards
 const SENTINEL = " ";
 // With ctrl or command, the browser's find, save, print, bookmark and open, which act on the page
@@ -69,6 +72,8 @@ let chorded = false;
 let pending = null;
 // A tap on the input box that goes on as the browser's own click
 let clicking = false;
+// Whether the user looks at the page, as the server last heard
+let looked = null;
 
 function blank(width, height) {
   const rows = [];
@@ -471,6 +476,44 @@ function openLink(url) {
   notice.hidden = false;
 }
 
+// A page on a desktop may show behind another window, and Safari has it unfocused until a click
+function looking() {
+  return !document.hidden && (COARSE || document.hasFocus());
+}
+
+function report() {
+  const on = looking();
+  if (on) {
+    document.title = TITLE;
+  }
+  if (on !== looked) {
+    looked = on;
+    send({ t: "focus", on });
+  }
+}
+
+// The server sends this only while the user looks at no device, which may have changed since
+function notify(text) {
+  if (looking()) {
+    return;
+  }
+  document.title = `${text} · ${TITLE}`;
+  if (!window.Notification || Notification.permission !== "granted") {
+    return;
+  }
+  // Chrome on Android makes notifications only through a service worker
+  let shown;
+  try {
+    shown = new Notification(TITLE, { body: text });
+  } catch {
+    return;
+  }
+  shown.addEventListener("click", () => {
+    window.focus();
+    shown.close();
+  });
+}
+
 function connect() {
   const url = new URL("ws", location.href);
   url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -481,6 +524,9 @@ function connect() {
     opened = true;
     show(null);
     fit();
+    // The server knows nothing of a page that joins again
+    looked = null;
+    report();
   };
   socket.onmessage = (event) => {
     const message = JSON.parse(event.data);
@@ -490,6 +536,8 @@ function connect() {
       copy(message.text);
     } else if (message.t === "open") {
       openLink(message.url);
+    } else if (message.t === "alert") {
+      notify(message.text);
     }
   };
   socket.onclose = async (event) => {
@@ -967,11 +1015,30 @@ function watchRatio() {
   ratio.addEventListener("change", changed, { once: true });
 }
 
+window.addEventListener("focus", report);
+window.addEventListener("blur", report);
+document.addEventListener("visibilitychange", report);
+
+// Browsers ask only while they handle what the user did, which Escape doesn't count as,
+// and only on localhost and HTTPS
+function askToNotify(event) {
+  if (event.key === "Escape") {
+    return;
+  }
+  document.removeEventListener("keydown", askToNotify);
+  document.removeEventListener("pointerup", askToNotify);
+  if (window.isSecureContext && window.Notification && Notification.permission === "default") {
+    Notification.requestPermission();
+  }
+}
+document.addEventListener("keydown", askToNotify);
+document.addEventListener("pointerup", askToNotify);
+
 reset();
 anchor();
 watchRatio();
 // A phone's keyboard waits for a tap on the input box
-if (!window.matchMedia("(pointer: coarse)").matches) {
+if (!COARSE) {
   keys.focus({ preventScroll: true });
 }
 connect();

@@ -1,5 +1,5 @@
 use crate::chat::resolved;
-use crate::tui::{screen, theme};
+use crate::tui::{multiplexed, screen, theme};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use image::imageops::{self, FilterType};
@@ -158,8 +158,7 @@ pub(crate) fn set_kitty(drawn: bool) {
     KITTY.set(drawn).expect("kitty");
 }
 
-/// Kitty images are drawn only outside a multiplexer,
-/// which keeps graphics to itself unless set up to pass them through
+/// Kitty images are drawn only outside a multiplexer
 pub(crate) fn kitty_here() -> bool {
     // Tests run in whatever terminal started them
     if cfg!(test) {
@@ -169,9 +168,7 @@ pub(crate) fn kitty_here() -> bool {
     let program = env::var("TERM_PROGRAM").unwrap_or_default();
     let remote = ["SSH_TTY", "SSH_CONNECTION"].map(env::var_os);
     let ssh = remote.iter().any(Option::is_some);
-    let multiplexed = ["TMUX", "STY", "ZELLIJ"].map(env::var_os);
-    let nested = multiplexed.iter().any(Option::is_some);
-    !nested && kitty_terminal(&term, &program, ssh)
+    !multiplexed() && kitty_terminal(&term, &program, ssh)
 }
 
 /// Terminals known to draw Kitty's Unicode placeholders, by the TERM they set,

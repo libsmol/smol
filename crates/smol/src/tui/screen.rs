@@ -1,12 +1,13 @@
 use crate::tui::app::{pasted, App};
 use crate::tui::theme::{self, BG, FG};
-use crate::tui::{picture, ui, Host};
+use crate::tui::{multiplexed, picture, ui, Host};
 use anyhow::Result;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{SetCursorStyle, Show};
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::style::Print;
@@ -33,6 +34,10 @@ thread_local! {
 pub(crate) struct Screen {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     truecolor: bool,
+    /// Whether alerts go out as OSC 9 desktop notifications rather than as the bell
+    notifies: bool,
+    /// Taken to be true until the terminal reports losing focus
+    pub(crate) focused: bool,
     /// When events were last read
     listened: Instant,
 }
@@ -58,6 +63,7 @@ impl Screen {
                 EnterAlternateScreen,
                 EnableMouseCapture,
                 EnableBracketedPaste,
+                EnableFocusChange,
                 Print(colors),
                 SetCursorStyle::SteadyBlock
             )?;
@@ -76,12 +82,21 @@ impl Screen {
         let term = env::var("TERM").unwrap_or_default();
         let program = env::var("TERM_PROGRAM").unwrap_or_default();
         let truecolor = term != "linux" && program != "Apple_Terminal";
+        let notifies = !multiplexed() && notifying_terminal(&term, &program);
 
         Ok(Self {
             terminal,
             truecolor,
+            notifies,
+            focused: true,
             listened: Instant::now(),
         })
+    }
+
+    /// Tells the user of `text`, which may hold anything a session title can
+    pub(crate) fn alert(&self, text: &str) -> io::Result<()> {
+        let alert = alerted(text, self.notifies);
+        execute!(stdout(), Print(alert))
     }
 
     /// For a host that draws cells it laid out elsewhere
@@ -96,6 +111,11 @@ impl Screen {
 
 impl Host for Screen {
     fn show(&mut self, app: &mut App) -> Result<()> {
+        let alert = app.alert.take();
+        if let Some(text) = alert.filter(|_| !self.focused) {
+            self.alert(&text)?;
+        }
+
         // Images drawn last frame go out now, and their placeholders show them once they arrive
         picture::send(&mut stdout(), &app.shown)?;
         if !app.take_dirty() {
@@ -121,6 +141,11 @@ impl Host for Screen {
         self.listened = Instant::now();
 
         for event in events {
+            match event {
+                Event::FocusGained => self.focused = true,
+                Event::FocusLost => self.focused = false,
+                _ => {}
+            }
             app.on_event(event);
         }
         Ok(())
@@ -157,6 +182,23 @@ pub(crate) fn read(wait: Duration, stalled: bool) -> io::Result<Vec<Event>> {
     }
 }
 
+/// Terminals known to show OSC 9 as a desktop notification, which others ignore
+fn notifying_terminal(term: &str, program: &str) -> bool {
+    let own = matches!(term, "xterm-kitty" | "xterm-ghostty" | "wezterm");
+    let named = matches!(program, "ghostty" | "iTerm.app" | "WezTerm");
+    own || named
+}
+
+/// An OSC 9 notification without the control characters that could end it early, or else the bell
+fn alerted(text: &str, notifies: bool) -> String {
+    if !notifies {
+        return "\x07".to_owned();
+    }
+
+    let shown: String = text.chars().filter(|c| !c.is_control()).collect();
+    format!("\x1b]9;smol: {shown}\x1b\\")
+}
+
 /// The hook normally restores the terminal first, which a caught panic must skip
 pub(crate) fn caught<T>(run: impl FnOnce() -> T) -> Option<T> {
     CAUGHT.set(true);
@@ -175,6 +217,7 @@ fn restore() {
         EndSynchronizedUpdate,
         Print(OWN_COLORS),
         SetCursorStyle::DefaultUserShape,
+        DisableFocusChange,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
@@ -186,7 +229,33 @@ fn restore() {
 
 #[cfg(test)]
 mod tests {
-    use crate::tui::screen::{caught, CAUGHT};
+    use crate::tui::screen::{alerted, caught, notifying_terminal, CAUGHT};
+
+    #[test]
+    fn alerts_escaped() {
+        let text = "Café 🐍\x1b]0;owned\x07 menu\u{9c} · done";
+        let notified = "\x1b]9;smol: Café 🐍]0;owned menu · done\x1b\\";
+        assert_eq!(alerted(text, true), notified);
+        assert_eq!(alerted(text, false), "\x07");
+    }
+
+    #[test]
+    fn notifying_detected() {
+        let cases = [
+            ("xterm-ghostty", "ghostty", true),
+            ("xterm-256color", "ghostty", true),
+            ("xterm-kitty", "", true),
+            ("xterm-256color", "iTerm.app", true),
+            ("wezterm", "WezTerm", true),
+            ("tmux-256color", "tmux", false),
+            ("xterm-256color", "Apple_Terminal", false),
+            ("alacritty", "", false),
+        ];
+        for (term, program, notifies) in cases {
+            let found = notifying_terminal(term, program);
+            assert_eq!(found, notifies, "{term} {program}");
+        }
+    }
 
     #[test]
     fn panic_caught() {

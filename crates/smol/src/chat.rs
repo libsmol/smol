@@ -2,7 +2,7 @@ use crate::client::{
     chosen, offerings, Asked, Client, Incoming, McpState, McpStatus, Memory, Offering, Refusal,
     Selector,
 };
-use crate::conversation::{Conversation, Entry};
+use crate::conversation::{Conversation, Entry, Outcome};
 use agent_client_protocol_schema::v1::{
     ContentBlock, ResourceLink, SessionConfigOption, SessionInfo, SessionUpdate,
 };
@@ -27,7 +27,7 @@ pub(crate) enum Output {
     /// The states of the MCP servers changed
     Servers,
     Queued(Asked),
-    Done,
+    Done(Outcome),
 }
 
 pub(crate) struct Run {
@@ -357,8 +357,8 @@ impl Session {
 
             Incoming::Done(stop) => {
                 self.run = None;
-                self.conversation.done(stop);
-                Output::Done
+                let outcome = self.conversation.done(stop);
+                Output::Done(outcome)
             }
 
             _ => Output::Shown,
@@ -660,7 +660,7 @@ mod tests {
         let mut done = false;
         for _ in 0..500 {
             while let Some(output) = session.poll() {
-                done |= matches!(output, Output::Done);
+                done |= matches!(output, Output::Done(_));
             }
             if done {
                 break;

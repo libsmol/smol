@@ -57,6 +57,8 @@ pub(crate) enum Arrival {
 
 struct Browser {
     size: Option<Size>,
+    /// Whether the user looks at its page, as the page last said
+    focused: bool,
     outbox: SyncSender<String>,
     parting: Arc<AtomicU16>,
     /// Missed frames, so the next one it gets is the whole screen
@@ -143,7 +145,21 @@ impl Host for Web {
     }
 
     fn show(&mut self, app: &mut App) -> Result<()> {
-        if self.mirror.as_ref().is_some_and(|mirror| mirror.kitty) {
+        let mirror = self.mirror.as_ref();
+        let browsed = self.browsers.values().any(|browser| browser.focused);
+        let looked = browsed || mirror.is_some_and(|mirror| mirror.screen.focused);
+        let alert = app.alert.take();
+        if let Some(text) = alert.filter(|_| !looked) {
+            if let Some(mirror) = mirror {
+                mirror.screen.alert(&text)?;
+            }
+            let message = json!({ "t": "alert", "text": text }).to_string();
+            for browser in self.browsers.values() {
+                browser.outbox.try_send(message.clone()).ok();
+            }
+        }
+
+        if mirror.is_some_and(|mirror| mirror.kitty) {
             picture::send(&mut stdout(), &app.shown)?;
         }
 
@@ -226,6 +242,7 @@ impl Host for Web {
                 Arrival::Joined(id, outbox, parting) => {
                     let browser = Browser {
                         size: None,
+                        focused: false,
                         outbox,
                         parting,
                         behind: true,
@@ -256,6 +273,18 @@ impl Host for Web {
                     self.latest = Some(who);
                     self.fit(app);
                 }
+                Arrival::Input(who, Input::Focus(focused)) => match who {
+                    Who::Here => {
+                        if let Some(mirror) = &mut self.mirror {
+                            mirror.screen.focused = focused;
+                        }
+                    }
+                    Who::Browser(id) => {
+                        if let Some(browser) = self.browsers.get_mut(&id) {
+                            browser.focused = focused;
+                        }
+                    }
+                },
                 Arrival::Input(who, Input::Events(events)) => {
                     // Clicks and drags fall on the screen as this device last saw it,
                     // so the screen takes its size only after them
@@ -452,21 +481,25 @@ pub(crate) fn run(
                         break;
                     };
 
-                    // Only acting makes this terminal's size the screen's, which hovering is not
+                    // Only acting makes this terminal's size the screen's, which hovering and
+                    // focusing are not
                     let mut sized = None;
+                    let mut focused = None;
                     let mut acted = Vec::new();
                     for event in events {
                         match event {
                             Event::Resize(width, height) => {
                                 sized = Some(Input::Size(width, height))
                             }
+                            Event::FocusGained => focused = Some(Input::Focus(true)),
+                            Event::FocusLost => focused = Some(Input::Focus(false)),
                             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => {}
                             event => acted.push(event),
                         }
                     }
                     let acted = (!acted.is_empty()).then_some(Input::Events(acted));
 
-                    for input in sized.into_iter().chain(acted) {
+                    for input in sized.into_iter().chain(focused).chain(acted) {
                         let arrival = Arrival::Input(Who::Here, input);
                         if arrive.send(arrival).is_err() {
                             return;
@@ -667,5 +700,36 @@ mod tests {
         while to_first.try_recv().is_ok() {}
         assert_eq!(to_first.try_recv(), Err(TryRecvError::Disconnected));
         assert!(!web.browsers.contains_key(&1) && web.browsers.contains_key(&2));
+    }
+
+    #[test]
+    fn alert_unless_looked() {
+        let (mut app, mut web, arrive) = hosted();
+        let (outbox, sent) = mpsc::sync_channel(64);
+        let joined = Arrival::Joined(1, outbox, Arc::default());
+        arrive.send(joined).expect("join");
+        let alerts = |sent: &Receiver<String>| {
+            let mut alerts = Vec::new();
+            for text in sent.try_iter() {
+                let message: Value = serde_json::from_str(&text).expect("json");
+                if message["t"] == "alert" {
+                    alerts.push(message["text"].clone());
+                }
+            }
+            alerts
+        };
+
+        let looking = Arrival::Input(Who::Browser(1), Input::Focus(true));
+        arrive.send(looking).expect("focus");
+        app.alert = Some("Café menu · done".to_owned());
+        step(&mut app, &mut web);
+        assert!(alerts(&sent).is_empty());
+        assert_eq!(app.alert, None);
+
+        let away = Arrival::Input(Who::Browser(1), Input::Focus(false));
+        arrive.send(away).expect("blur");
+        app.alert = Some("Café menu · done".to_owned());
+        step(&mut app, &mut web);
+        assert_eq!(alerts(&sent), ["Café menu · done"]);
     }
 }

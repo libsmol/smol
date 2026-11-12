@@ -8,6 +8,7 @@ use ratatui::style::{Modifier, Style};
 use signal_hook::consts::{SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::{flag, low_level};
+use std::env;
 use std::io::stdout;
 #[cfg(unix)]
 use std::sync::atomic::AtomicUsize;
@@ -126,6 +127,13 @@ pub(crate) fn kilo(n: u64) -> String {
         false => &value,
     };
     format!("{value}{unit}")
+}
+
+/// Inside a multiplexer, which keeps graphics and notifications to itself unless set up to pass
+/// them through
+pub(crate) fn multiplexed() -> bool {
+    let names = ["TMUX", "STY", "ZELLIJ"].map(env::var_os);
+    names.iter().any(Option::is_some)
 }
 
 /// What shows the TUI and passes on its input

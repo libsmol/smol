@@ -157,6 +157,12 @@ Run `smol` in the directory you want to work in, then type a task.
 
 - `Esc` interrupts the running step. Typing while a task runs queues the text;
   it reaches the model as a task update after the current step.
+- A task that ends after you switched away from the terminal, with nothing you
+  queued left to run, is announced: as a desktop notification in Ghostty,
+  WezTerm, kitty and iTerm2 (once its notification settings allow alerts from
+  escape sequences), and with the bell in other terminals and inside tmux,
+  screen or Zellij. An interrupted task isn't. tmux tells smol of the switch
+  only with `set -g focus-events on`.
 - A line starting with `!` runs a shell command in the session directory
   (`$SHELL`, or `cmd` on Windows). The model sees the command and its output
   with your next message.
@@ -197,6 +203,13 @@ screen, which takes the size of the device used last, and any of them can type.
 `ctrl+d` or `:quit` in a browser leaves only that browser, while in the
 terminal it ends `smol web`. Started without a terminal, as by a service
 manager, it runs until it is stopped.
+
+A task that ends while you look at none of them, with the terminal unfocused
+and every page hidden or, on a computer, in a window without focus, is
+announced on all of them: in the terminal as above, and on each page in its
+tab title and as a desktop notification where the browser allows one, which is
+on localhost and HTTPS once you agree when the page asks at your first key or
+click.
 
 It listens on `127.0.0.1:8421`, and `--listen 0.0.0.0:8421` lets other devices
 in. Anyone with the address can run code on this machine, and the page goes

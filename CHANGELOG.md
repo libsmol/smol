@@ -7,6 +7,17 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- A task that ends after you switched away, with nothing queued to run next, is
+  announced: as a desktop notification in Ghostty, WezTerm, kitty and iTerm2,
+  and with the bell in other terminals and inside multiplexers. smol web
+  announces it on every device once you look at none of them, in each page's
+  tab title and as a browser notification on localhost and HTTPS.
+- The `:model` and `:effort` lists keep the order of `model.toml` and the `:mcp`
+  list the order of the servers, highlighting the current or exactly typed
+  choice where it stands instead of moving it to the top.
+
 ## 0.9.0 - 2026-11-12
 
 - `:effort <level>` switches the reasoning effort for the session, among the

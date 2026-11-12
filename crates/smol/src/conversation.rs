@@ -555,10 +555,16 @@ impl Conversation {
         self.settle();
     }
 
-    pub(crate) fn done(&mut self, stop: Result<StopReason>) {
+    pub(crate) fn done(&mut self, stop: Result<StopReason>) -> Outcome {
         let error = match stop {
-            Ok(StopReason::Cancelled) => return self.finish_turn(Outcome::Cancelled),
-            Ok(_) => return self.finish_turn(Outcome::Answered),
+            Ok(stop) => {
+                let outcome = match stop {
+                    StopReason::Cancelled => Outcome::Cancelled,
+                    _ => Outcome::Answered,
+                };
+                self.finish_turn(outcome);
+                return outcome;
+            }
             Err(error) => error,
         };
 
@@ -623,6 +629,7 @@ impl Conversation {
         if shown != Some(text.as_str()) {
             self.push(Entry::Failure(text));
         }
+        Outcome::Failed
     }
 }
 

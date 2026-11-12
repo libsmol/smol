@@ -51,6 +51,7 @@ pub(crate) struct App {
     pastes: Vec<String>,
     history: History,
     pub(crate) choices: Vec<Choice>,
+    /// None after the input changes, until `refresh` highlights the exact, current or first choice
     pub(crate) highlight: ListState,
     /// The highlighted choice's label and when the highlight landed on it
     pub(crate) marquee: Option<(String, Instant)>,
@@ -84,6 +85,8 @@ pub(crate) struct App {
     last_click: Option<(Point, Instant)>,
     /// `Err` holds the reason it failed
     pub(crate) flash: Option<(Result<String, String>, Instant)>,
+    /// The end of a turn nothing runs after, for the host to tell a user who looked away
+    pub(crate) alert: Option<String>,
     pub(crate) quit: bool,
     dirty: bool,
 }
@@ -302,7 +305,7 @@ impl App {
             pastes: Vec::new(),
             history: History::default(),
             choices: Vec::new(),
-            highlight: ListState::default().with_selected(Some(0)),
+            highlight: ListState::default(),
             marquee: None,
             scroll_at: None,
             forgetting: None,
@@ -326,6 +329,7 @@ impl App {
             dragging: false,
             last_click: None,
             flash: None,
+            alert: None,
             quit: false,
             dirty: true,
         }
@@ -616,7 +620,7 @@ impl App {
                         }
 
                         if self.edit(|input| input.input(key)) {
-                            self.highlight.select_first();
+                            self.highlight.select(None);
                             self.choices_closed = false;
                         }
                     }
@@ -628,7 +632,7 @@ impl App {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 let text = self.folded(text);
                 if self.edit(|input| input.insert_str(text)) {
-                    self.highlight.select_first();
+                    self.highlight.select(None);
                     self.choices_closed = false;
                 }
             }
@@ -758,7 +762,7 @@ impl App {
     pub(crate) fn pump(&mut self) {
         let mut changed = false;
         // Queued messages go out only once every output is drained
-        let mut finished = false;
+        let mut ended = None;
         while let Some(output) = self.session.poll() {
             self.dirty = true;
 
@@ -776,14 +780,27 @@ impl App {
                     self.session.answer(asked, texts);
                 }
 
-                Output::Done => {
-                    finished = true;
+                Output::Done(outcome) => {
+                    ended = Some(outcome);
                     changed = true;
                 }
             }
         }
 
-        if finished {
+        let result = match ended {
+            Some(Outcome::Answered) => Some("done"),
+            Some(Outcome::Failed) => Some("failed"),
+            Some(Outcome::Cancelled) | None => None,
+        };
+        // Worded before the queue runs, which may open another session
+        let title = &self.session.title;
+        let worded = |result: &str| match title.is_empty() {
+            true => result.to_owned(),
+            false => format!("{title} · {result}"),
+        };
+        let alert = result.map(worded);
+
+        if ended.is_some() {
             while self.session.run.is_none() && !self.quit {
                 let Some(next) = self.queued.pop_front() else {
                     break;
@@ -793,6 +810,11 @@ impl App {
         }
         if changed {
             self.refresh();
+        }
+
+        // A task the queue started is still at work
+        if alert.is_some() && self.session.run.is_none() {
+            self.alert = alert;
         }
     }
 
@@ -808,6 +830,11 @@ impl App {
 
     /// Must be called whenever the input, status or options change
     fn refresh(&mut self) {
+        let fresh = self.highlight.selected().is_none();
+        if fresh {
+            self.highlight.select_first();
+        }
+
         if self.shell {
             self.choices.clear();
             return;
@@ -950,7 +977,8 @@ impl App {
                 let completion = format!("{prefix}{switch} {name}");
                 let label = name.clone();
                 let choice = Choice::input(label, effect, completion);
-                offer(&mut self.choices, choice, lower == query);
+                let chosen = fresh && lower == query;
+                offer(&mut self.choices, &mut self.highlight, choice, chosen);
             }
             return;
         }
@@ -982,7 +1010,8 @@ impl App {
                 detail: detail.to_owned(),
                 completion: pick.completion,
             };
-            offer(&mut self.choices, choice, exact || current);
+            let chosen = fresh && (exact || current);
+            offer(&mut self.choices, &mut self.highlight, choice, chosen);
         }
     }
 
@@ -1109,7 +1138,7 @@ impl App {
                     self.input.delete_char();
                 }
                 self.input.insert_str(text);
-                self.highlight.select_first();
+                self.highlight.select(None);
             }
             Completion::Memory(_) => {}
         }
@@ -1117,7 +1146,7 @@ impl App {
 
     fn complete(&mut self, text: &str) {
         self.set_input(text);
-        self.highlight.select_first();
+        self.highlight.select(None);
         self.choices_closed = false;
         self.refresh();
     }
@@ -1485,11 +1514,11 @@ fn matching_paths<'a>(paths: impl IntoIterator<Item = &'a String>, query: &str) 
     found.into_iter().map(|(_, path)| path).collect()
 }
 
-fn offer(choices: &mut Vec<Choice>, choice: Choice, exact: bool) {
-    match exact {
-        true => choices.insert(0, choice),
-        false => choices.push(choice),
+fn offer(choices: &mut Vec<Choice>, highlight: &mut ListState, choice: Choice, chosen: bool) {
+    if chosen {
+        highlight.select(Some(choices.len()));
     }
+    choices.push(choice);
 }
 
 fn hints(input: &str) -> Vec<&'static Spec> {
@@ -1597,8 +1626,7 @@ mod tests {
     }
 
     fn labels(app: &mut App, input: &str) -> Vec<String> {
-        app.set_input(input);
-        app.refresh();
+        app.complete(input);
         let labels = app.choices.iter().map(|choice| choice.label.clone());
         labels.collect()
     }
@@ -1674,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_hint_first() {
+    fn exact_hint_highlighted() {
         let mut app = app();
         for name in ["search engine", "search"] {
             let server = McpStatus {
@@ -1685,8 +1713,9 @@ mod tests {
         }
         assert_eq!(
             labels(&mut app, ":mcp on\u{3000}search"),
-            ["search", "search engine"]
+            ["search engine", "search"]
         );
+        assert_eq!(app.highlighted(), Some(1));
     }
 
     #[test]
@@ -1793,23 +1822,62 @@ mod tests {
     }
 
     #[test]
-    fn current_model_first() {
+    fn current_model_highlighted() {
         let mut app = app();
         app.session
             .choose(Selector::Model, "m2-café")
             .expect("switch");
-        assert_eq!(labels(&mut app, ":model "), ["m2-café", "m1"]);
+        assert_eq!(labels(&mut app, ":model "), ["m1", "m2-café"]);
+        assert_eq!(app.highlighted(), Some(1));
+
+        key(&mut app, KeyCode::Up);
+        app.refresh();
+        assert_eq!(app.highlighted(), Some(0));
+
         assert_eq!(labels(&mut app, ":model m"), ["m1", "m2-café"]);
+        assert_eq!(app.highlighted(), Some(0));
     }
 
     #[test]
     fn effort_switched() {
         let mut app = app();
-        assert_eq!(labels(&mut app, ":effort "), ["high", "low"]);
+        assert_eq!(labels(&mut app, ":effort "), ["low", "high"]);
+        assert_eq!(app.highlighted(), Some(1));
 
         app.submit_text(":effort low");
         assert_eq!(shown(&mut app), ["", "  effort: low"]);
         assert_eq!(labels(&mut app, ":effort "), ["low", "high"]);
+        assert_eq!(app.highlighted(), Some(0));
+    }
+
+    #[test]
+    fn alert_once_idle() {
+        let mut app = app();
+        app.submit_text("first task");
+        app.queued.push_back("second task".to_owned());
+        settle(&mut app, |app| app.session.conversation.stats().turns == 2);
+        assert_eq!(app.alert, None);
+        settle(&mut app, |app| app.session.run.is_none());
+        assert_eq!(app.alert.as_deref(), Some("done"));
+
+        app.alert = None;
+        app.session.title = "Café menu 🐍".to_owned();
+        app.submit_text("huge");
+        settle(&mut app, |app| app.session.run.is_none());
+        assert_eq!(app.alert.as_deref(), Some("Café menu 🐍 · failed"));
+
+        app.alert = None;
+        app.submit_text("third task");
+        app.queued.push_back(":new".to_owned());
+        settle(&mut app, |app| app.alert.is_some());
+        assert_eq!(app.alert.as_deref(), Some("Café menu 🐍 · done"));
+        assert_eq!(app.session.title, "");
+
+        app.alert = None;
+        app.submit_text("wait");
+        key(&mut app, KeyCode::Esc);
+        settle(&mut app, |app| app.session.run.is_none());
+        assert_eq!(app.alert, None);
     }
 
     #[test]

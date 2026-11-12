@@ -8,6 +8,8 @@ const MAX_SIDE: u16 = 1000;
 
 pub(crate) enum Input {
     Size(u16, u16),
+    /// Whether the user looks at the device
+    Focus(bool),
     Events(Vec<Event>),
 }
 
@@ -18,6 +20,9 @@ enum Message {
     Size {
         w: u16,
         h: u16,
+    },
+    Focus {
+        on: bool,
     },
     Key {
         key: String,
@@ -82,6 +87,8 @@ pub(crate) fn decode(text: &str) -> Option<Input> {
             let sized = (1..=MAX_SIDE).contains(&w) && (1..=MAX_SIDE).contains(&h);
             return sized.then_some(Input::Size(w, h));
         }
+
+        Message::Focus { on } => return Some(Input::Focus(on)),
 
         Message::Key { key, held } => {
             let code = code(&key, held.shift)?;
@@ -213,6 +220,10 @@ mod tests {
         assert!(decode(r#"{"t":"key","key":"Unidentified"}"#).is_none());
         assert!(decode(r#"{"t":"size","w":0,"h":24}"#).is_none());
         assert!(decode("café").is_none());
+
+        let focus = decode(r#"{"t":"focus","on":false}"#);
+        assert!(matches!(focus, Some(Input::Focus(false))));
+        assert!(decode(r#"{"t":"focus"}"#).is_none());
     }
 
     #[test]
