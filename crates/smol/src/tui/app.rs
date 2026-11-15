@@ -7,6 +7,7 @@ use crate::tui::render::Target;
 use crate::tui::select::{Point, Selection};
 use crate::tui::transcript::Transcript;
 use crate::tui::ui::input_box;
+use crate::tui::{clipped, markdown};
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use ignore::WalkBuilder;
@@ -23,6 +24,7 @@ use std::path::{is_separator, Path, PathBuf, MAIN_SEPARATOR};
 use std::time::{Duration, Instant};
 
 const FLASH_WAIT: Duration = Duration::from_secs(2);
+const MAX_ALERT_COLUMNS: usize = 160;
 const DOUBLE_CLICK_WAIT: Duration = Duration::from_millis(500);
 const ANIMATE_EVERY: Duration = Duration::from_millis(100);
 /// How often the sidebar's timers of the programs the code left running advance
@@ -88,9 +90,16 @@ pub(crate) struct App {
     /// `Err` holds the reason it failed
     pub(crate) flash: Option<(Result<String, String>, Instant)>,
     /// The end of a turn nothing runs after, for the host to tell a user who looked away
-    pub(crate) alert: Option<String>,
+    pub(crate) alert: Option<Alert>,
     pub(crate) quit: bool,
     dirty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Alert {
+    /// The session's title, empty until it has one
+    pub(crate) title: String,
+    pub(crate) body: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -810,18 +819,29 @@ impl App {
             }
         }
 
-        let result = match ended {
-            Some(Outcome::Answered) => Some("done"),
-            Some(Outcome::Failed) => Some("failed"),
+        // Worded before the queue runs, which may open another session
+        let said = match &ended {
+            Some(Outcome::Answered) => {
+                let answer = self.session.conversation.answer();
+                let first = markdown::first_line(&answer);
+                match first.is_empty() {
+                    true => Some("Done".to_owned()),
+                    false => Some(first),
+                }
+            }
+            Some(Outcome::Failed(error)) => {
+                let first = error.trim().lines().next().unwrap_or_default();
+                Some(format!("Failed: {first}"))
+            }
             Some(Outcome::Cancelled) | None => None,
         };
-        // Worded before the queue runs, which may open another session
         let title = &self.session.title;
-        let worded = |result: &str| match title.is_empty() {
-            true => result.to_owned(),
-            false => format!("{title} · {result}"),
+        let alerted = |said: String| {
+            let title = title.clone();
+            let body = clipped(&said, MAX_ALERT_COLUMNS);
+            Alert { title, body }
         };
-        let alert = result.map(worded);
+        let alert = said.map(alerted);
 
         if ended.is_some() {
             while self.session.run.is_none() && !self.quit {
@@ -1951,30 +1971,39 @@ mod tests {
         ];
         assert_eq!(shown(&mut app), expected);
         assert_eq!(app.session.conversation.sent(), ["background"]);
-        assert_eq!(app.alert.as_deref(), Some("done"));
+        let alert = Alert {
+            title: String::new(),
+            body: "Brewed.".to_owned(),
+        };
+        assert_eq!(app.alert, Some(alert));
     }
 
     #[test]
     fn alert_once_idle() {
+        let alert = |title: &str, body: &str| {
+            let title = title.to_owned();
+            let body = body.to_owned();
+            Some(Alert { title, body })
+        };
         let mut app = app();
         app.submit_text("first task");
         app.queued.push_back("second task".to_owned());
         settle(&mut app, |app| app.session.conversation.stats().turns == 2);
         assert_eq!(app.alert, None);
         settle(&mut app, |app| app.session.run.is_none());
-        assert_eq!(app.alert.as_deref(), Some("done"));
+        assert_eq!(app.alert, alert("", "Done"));
 
         app.alert = None;
         app.session.title = "Café menu 🐍".to_owned();
         app.submit_text("huge");
         settle(&mut app, |app| app.session.run.is_none());
-        assert_eq!(app.alert.as_deref(), Some("Café menu 🐍 · failed"));
+        assert_eq!(app.alert, alert("Café menu 🐍", "Failed: task: too large"));
 
         app.alert = None;
         app.submit_text("third task");
         app.queued.push_back(":new".to_owned());
         settle(&mut app, |app| app.alert.is_some());
-        assert_eq!(app.alert.as_deref(), Some("Café menu 🐍 · done"));
+        assert_eq!(app.alert, alert("Café menu 🐍", "Done"));
         assert_eq!(app.session.title, "");
 
         app.alert = None;

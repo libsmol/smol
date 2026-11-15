@@ -1,4 +1,4 @@
-use crate::tui::app::{pasted, App};
+use crate::tui::app::{pasted, Alert, App};
 use crate::tui::theme::{self, BG, FG};
 use crate::tui::{multiplexed, picture, ui, Host};
 use anyhow::Result;
@@ -31,11 +31,20 @@ thread_local! {
     static CAUGHT: Cell<bool> = const { Cell::new(false) };
 }
 
+/// How a terminal tells the user of an alert
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Notifier {
+    /// OSC 777, a desktop notification with a title and a body
+    Titled,
+    /// OSC 9, a desktop notification of one text
+    Plain,
+    Bell,
+}
+
 pub(crate) struct Screen {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     truecolor: bool,
-    /// Whether alerts go out as OSC 9 desktop notifications rather than as the bell
-    notifies: bool,
+    notifier: Notifier,
     /// Taken to be true until the terminal reports losing focus
     pub(crate) focused: bool,
     /// When events were last read
@@ -82,21 +91,23 @@ impl Screen {
         let term = env::var("TERM").unwrap_or_default();
         let program = env::var("TERM_PROGRAM").unwrap_or_default();
         let truecolor = term != "linux" && program != "Apple_Terminal";
-        let notifies = !multiplexed() && notifying_terminal(&term, &program);
+        let notifier = match multiplexed() {
+            true => Notifier::Bell,
+            false => notifier(&term, &program),
+        };
 
         Ok(Self {
             terminal,
             truecolor,
-            notifies,
+            notifier,
             focused: true,
             listened: Instant::now(),
         })
     }
 
-    /// Tells the user of `text`, which may hold anything a session title can
-    pub(crate) fn alert(&self, text: &str) -> io::Result<()> {
-        let alert = alerted(text, self.notifies);
-        execute!(stdout(), Print(alert))
+    pub(crate) fn alert(&self, alert: &Alert) -> io::Result<()> {
+        let sent = alerted(alert, self.notifier);
+        execute!(stdout(), Print(sent))
     }
 
     /// For a host that draws cells it laid out elsewhere
@@ -112,8 +123,8 @@ impl Screen {
 impl Host for Screen {
     fn show(&mut self, app: &mut App) -> Result<()> {
         let alert = app.alert.take();
-        if let Some(text) = alert.filter(|_| !self.focused) {
-            self.alert(&text)?;
+        if let Some(alert) = alert.filter(|_| !self.focused) {
+            self.alert(&alert)?;
         }
 
         // Images drawn last frame go out now, and their placeholders show them once they arrive
@@ -182,21 +193,44 @@ pub(crate) fn read(wait: Duration, stalled: bool) -> io::Result<Vec<Event>> {
     }
 }
 
-/// Terminals known to show OSC 9 as a desktop notification, which others ignore
-fn notifying_terminal(term: &str, program: &str) -> bool {
+/// Terminals known to show desktop notifications, which others ignore
+fn notifier(term: &str, program: &str) -> Notifier {
     let own = matches!(term, "xterm-kitty" | "xterm-ghostty" | "wezterm");
-    let named = matches!(program, "ghostty" | "iTerm.app" | "WezTerm");
-    own || named
+    let named = matches!(program, "ghostty" | "WezTerm");
+    if own || named {
+        return Notifier::Titled;
+    }
+    match program {
+        "iTerm.app" => Notifier::Plain,
+        _ => Notifier::Bell,
+    }
 }
 
-/// An OSC 9 notification without the control characters that could end it early, or else the bell
-fn alerted(text: &str, notifies: bool) -> String {
-    if !notifies {
-        return "\x07".to_owned();
-    }
+/// The notification for `alert`, whose text may hold anything a title or an answer can
+fn alerted(alert: &Alert, notifier: Notifier) -> String {
+    // Control characters could end the sequence early, and OSC 777 splits its fields at semicolons
+    let clean = |text: &str| {
+        let mut cleaned = String::new();
+        for c in text.chars() {
+            match c {
+                ';' => cleaned.push(','),
+                c if c.is_control() => {}
+                c => cleaned.push(c),
+            }
+        }
+        cleaned
+    };
+    let title = match alert.title.is_empty() {
+        true => "smol".to_owned(),
+        false => clean(&alert.title),
+    };
+    let body = clean(&alert.body);
 
-    let shown: String = text.chars().filter(|c| !c.is_control()).collect();
-    format!("\x1b]9;smol: {shown}\x1b\\")
+    match notifier {
+        Notifier::Titled => format!("\x1b]777;notify;{title};{body}\x1b\\"),
+        Notifier::Plain => format!("\x1b]9;{title} · {body}\x1b\\"),
+        Notifier::Bell => "\x07".to_owned(),
+    }
 }
 
 /// The hook normally restores the terminal first, which a caught panic must skip
@@ -229,31 +263,45 @@ fn restore() {
 
 #[cfg(test)]
 mod tests {
-    use crate::tui::screen::{alerted, caught, notifying_terminal, CAUGHT};
+    use crate::tui::app::Alert;
+    use crate::tui::screen::{alerted, caught, notifier, Notifier, CAUGHT};
 
     #[test]
     fn alerts_escaped() {
-        let text = "Café 🐍\x1b]0;owned\x07 menu\u{9c} · done";
-        let notified = "\x1b]9;smol: Café 🐍]0;owned menu · done\x1b\\";
-        assert_eq!(alerted(text, true), notified);
-        assert_eq!(alerted(text, false), "\x07");
+        let alert = Alert {
+            title: "Café; 🐍\x1b]0;owned\x07 menu\u{9c}".to_owned(),
+            body: "Fixed the naïve parser; 3 tests pass".to_owned(),
+        };
+        let titled =
+            "\x1b]777;notify;Café, 🐍]0,owned menu;Fixed the naïve parser, 3 tests pass\x1b\\";
+        assert_eq!(alerted(&alert, Notifier::Titled), titled);
+        let plain = "\x1b]9;Café, 🐍]0,owned menu · Fixed the naïve parser, 3 tests pass\x1b\\";
+        assert_eq!(alerted(&alert, Notifier::Plain), plain);
+        assert_eq!(alerted(&alert, Notifier::Bell), "\x07");
+
+        let untitled = Alert {
+            title: String::new(),
+            body: "Done".to_owned(),
+        };
+        let titled = "\x1b]777;notify;smol;Done\x1b\\";
+        assert_eq!(alerted(&untitled, Notifier::Titled), titled);
     }
 
     #[test]
-    fn notifying_detected() {
+    fn notifier_detected() {
         let cases = [
-            ("xterm-ghostty", "ghostty", true),
-            ("xterm-256color", "ghostty", true),
-            ("xterm-kitty", "", true),
-            ("xterm-256color", "iTerm.app", true),
-            ("wezterm", "WezTerm", true),
-            ("tmux-256color", "tmux", false),
-            ("xterm-256color", "Apple_Terminal", false),
-            ("alacritty", "", false),
+            ("xterm-ghostty", "ghostty", Notifier::Titled),
+            ("xterm-256color", "ghostty", Notifier::Titled),
+            ("xterm-kitty", "", Notifier::Titled),
+            ("xterm-256color", "iTerm.app", Notifier::Plain),
+            ("wezterm", "WezTerm", Notifier::Titled),
+            ("tmux-256color", "tmux", Notifier::Bell),
+            ("xterm-256color", "Apple_Terminal", Notifier::Bell),
+            ("alacritty", "", Notifier::Bell),
         ];
-        for (term, program, notifies) in cases {
-            let found = notifying_terminal(term, program);
-            assert_eq!(found, notifies, "{term} {program}");
+        for (term, program, expected) in cases {
+            let found = notifier(term, program);
+            assert_eq!(found, expected, "{term} {program}");
         }
     }
 

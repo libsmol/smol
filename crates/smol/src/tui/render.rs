@@ -735,6 +735,7 @@ impl Render {
                                 marker,
                                 indent,
                                 copy_marker: false,
+                                heading: false,
                                 spans: vec![(note, LINK)],
                                 links: Vec::new(),
                             };

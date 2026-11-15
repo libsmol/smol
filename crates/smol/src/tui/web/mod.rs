@@ -167,11 +167,12 @@ impl Host for Web {
         let browsed = self.browsers.values().any(|browser| browser.focused);
         let looked = browsed || mirror.is_some_and(|mirror| mirror.screen.focused);
         let alert = app.alert.take();
-        if let Some(text) = alert.filter(|_| !looked) {
+        if let Some(alert) = alert.filter(|_| !looked) {
             if let Some(mirror) = mirror {
-                mirror.screen.alert(&text)?;
+                mirror.screen.alert(&alert)?;
             }
-            let message = json!({ "t": "alert", "text": text }).to_string();
+            let message = json!({ "t": "alert", "title": alert.title, "body": alert.body });
+            let message = message.to_string();
             for browser in self.browsers.values() {
                 browser.outbox.try_send(message.clone()).ok();
             }
@@ -589,7 +590,7 @@ pub(crate) fn run(
 mod tests {
     use crate::chat::Session;
     use crate::tests::fake;
-    use crate::tui::app::App;
+    use crate::tui::app::{Alert, App};
     use crate::tui::clipboard::UNREACHABLE;
     use crate::tui::tests::{fill, written};
     use crate::tui::web::grid::Grid;
@@ -817,23 +818,30 @@ mod tests {
             for text in sent.try_iter() {
                 let message: Value = serde_json::from_str(&text).expect("json");
                 if message["t"] == "alert" {
-                    alerts.push(message["text"].clone());
+                    alerts.push((message["title"].clone(), message["body"].clone()));
                 }
             }
             alerts
         };
+        let alert = Alert {
+            title: "Café menu".to_owned(),
+            body: "Fixed the naïve parser 🐍".to_owned(),
+        };
 
         let looking = Arrival::Input(Who::Browser(1), Input::Focus(true));
         arrive.send(looking).expect("focus");
-        app.alert = Some("Café menu · done".to_owned());
+        app.alert = Some(alert.clone());
         step(&mut app, &mut web);
         assert!(alerts(&sent).is_empty());
         assert_eq!(app.alert, None);
 
         let away = Arrival::Input(Who::Browser(1), Input::Focus(false));
         arrive.send(away).expect("blur");
-        app.alert = Some("Café menu · done".to_owned());
+        app.alert = Some(alert);
         step(&mut app, &mut web);
-        assert_eq!(alerts(&sent), ["Café menu · done"]);
+        assert_eq!(
+            alerts(&sent),
+            [("Café menu".into(), "Fixed the naïve parser 🐍".into())]
+        );
     }
 }

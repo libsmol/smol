@@ -561,7 +561,7 @@ mod tests {
         let reply = message("Working on it");
         talk.update(&reply);
         end_step(&mut talk, 10, 1);
-        talk.finish_turn(Outcome::Failed);
+        talk.finish_turn(Outcome::Failed("model: busy".to_owned()));
         talk.task("Second");
 
         let mut transcript = Transcript::default();

@@ -24,6 +24,7 @@ pub(crate) struct Text {
     pub(crate) indent: String,
     /// Copying keeps list markers but drops the bars of quotes and code blocks
     pub(crate) copy_marker: bool,
+    pub(crate) heading: bool,
     pub(crate) spans: Spans,
     /// Clickable URLs, with ranges as byte offsets into the joined text of `spans`
     pub(crate) links: Vec<(Range<usize>, String)>,
@@ -71,6 +72,7 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
                 Tag::Heading { .. } => {
                     builder.gap();
                     builder.styles.push(HEADING);
+                    builder.heading = true;
                 }
                 Tag::BlockQuote(_) => {
                     builder.gap();
@@ -160,6 +162,7 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
                 TagEnd::Heading(_) => {
                     builder.flush();
                     builder.styles.pop();
+                    builder.heading = false;
                 }
                 TagEnd::BlockQuote(_) => {
                     builder.flush();
@@ -177,6 +180,7 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
                             marker: format!("{lead}│ "),
                             indent: format!("{indent}│ "),
                             copy_marker: false,
+                            heading: false,
                             spans,
                             links: Vec::new(),
                         });
@@ -294,6 +298,31 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
     builder.blocks
 }
 
+/// The first line of text that `text` shows below its headings, without its Markdown,
+/// or its first heading when nothing else has text
+pub(crate) fn first_line(text: &str) -> String {
+    let mut first_heading = None;
+    for block in blocks(text) {
+        let (shown, heading) = match block {
+            Block::Text(text) => (joined(&text.spans), text.heading),
+            Block::Image { alt, .. } => (alt, false),
+            Block::Table { .. } | Block::Diagram { .. } => continue,
+        };
+
+        let shown = shown.trim();
+        if shown.is_empty() {
+            continue;
+        }
+        if !heading {
+            return shown.to_owned();
+        }
+        if first_heading.is_none() {
+            first_heading = Some(shown.to_owned());
+        }
+    }
+    first_heading.unwrap_or_default()
+}
+
 enum Prefix {
     Quote,
     Indent(usize),
@@ -320,6 +349,7 @@ struct Builder {
     links: Vec<Linking>,
     table: Option<Vec<Vec<Spans>>>,
     aligns: Vec<Alignment>,
+    heading: bool,
     /// The address of an image that started its line, until the image ends
     image: Option<String>,
     /// An ended image with nothing after it on its line so far, and its alt text
@@ -518,6 +548,7 @@ impl Builder {
             marker,
             indent,
             copy_marker,
+            heading: self.heading,
             spans,
             links,
         }));
@@ -582,6 +613,24 @@ mod tests {
             "",
         ];
         assert_eq!(lines(text), expected);
+    }
+
+    #[test]
+    fn first_line_plain() {
+        let answer = "\n**Done**: the naïve `menu` lists [3 dishes](https://x.io).\n\nMore below";
+        assert_eq!(
+            first_line(answer),
+            "Done: the naïve menu lists 3 dishes (https://x.io)."
+        );
+        assert_eq!(
+            first_line("![](chart.png)\n\n- 🐍 café fixed"),
+            "🐍 café fixed"
+        );
+        assert_eq!(first_line("  \n"), "");
+
+        let summary = "## Summary\n\n### Menu\nFixed the naïve café menu.";
+        assert_eq!(first_line(summary), "Fixed the naïve café menu.");
+        assert_eq!(first_line("# Résumé 🐍\n\n## Done"), "Résumé 🐍");
     }
 
     #[test]

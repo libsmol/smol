@@ -62,11 +62,12 @@ pub(crate) struct Shell {
     pub(crate) interrupted: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum Outcome {
     Answered,
     Cancelled,
-    Failed,
+    /// With the error the conversation shows
+    Failed(String),
 }
 
 #[derive(Debug, Default)]
@@ -249,6 +250,24 @@ impl Conversation {
 
         let writes = |item: &Item| matches!(item, Item::Message { .. } | Item::Call(_));
         step.items.iter().any(writes)
+    }
+
+    /// What the latest turn answered, empty when it gave no answer
+    pub(crate) fn answer(&self) -> String {
+        let entries = self.entries.iter().chain(&self.held).rev();
+        let turn = entries.take_while(|entry| !entry.opens_turn());
+        let mut steps = turn.filter_map(Entry::step);
+        let Some(last) = steps.next() else {
+            return String::new();
+        };
+
+        let mut texts = Vec::new();
+        for item in &last.items {
+            if let Item::Message { text, answer: true } = item {
+                texts.push(text.as_str());
+            }
+        }
+        texts.join("\n")
     }
 
     pub(crate) fn sent(&self) -> Vec<String> {
@@ -561,7 +580,7 @@ impl Conversation {
             match outcome {
                 Outcome::Cancelled => step.interrupted = true,
                 Outcome::Answered if !step.interrupted => step.mark_answer(),
-                Outcome::Answered | Outcome::Failed => {}
+                Outcome::Answered | Outcome::Failed(_) => {}
             }
         }
         self.settle();
@@ -574,7 +593,7 @@ impl Conversation {
                     StopReason::Cancelled => Outcome::Cancelled,
                     _ => Outcome::Answered,
                 };
-                self.finish_turn(outcome);
+                self.finish_turn(outcome.clone());
                 return outcome;
             }
             Err(error) => error,
@@ -620,7 +639,7 @@ impl Conversation {
                 self.live = Some(step);
             }
         }
-        self.finish_turn(Outcome::Failed);
+        self.finish_turn(Outcome::Failed(text.clone()));
 
         // Compaction in the turn's last step may have shown this error already
         let mut last = None;
@@ -639,9 +658,9 @@ impl Conversation {
             _ => None,
         };
         if shown != Some(text.as_str()) {
-            self.push(Entry::Failure(text));
+            self.push(Entry::Failure(text.clone()));
         }
-        Outcome::Failed
+        Outcome::Failed(text)
     }
 }
 
@@ -1115,6 +1134,27 @@ mod tests {
         let nested = "````python\nnote = '''\n```\ncafé\n```\n'''\n````";
         let code = "note = '''\n```\ncafé\n```\n'''";
         assert_eq!(fenced(nested), Some(("python", code)));
+    }
+
+    /// A thought splits an answer into lines, and a turn that opened since has no answer yet
+    #[test]
+    fn answer_lines_joined() {
+        let mut talk = Conversation::default();
+        talk.task("Fix the menu");
+        talk.update(&message("An old answer"));
+        end_step(&mut talk, 10, 1);
+        talk.task("Fix the café menu");
+        talk.update(&message("Fixed the café menu."));
+        let thought = chunk("One more thing");
+        talk.update(&SessionUpdate::AgentThoughtChunk(thought));
+        talk.update(&message("Next, run the naïve tests."));
+        end_step(&mut talk, 10, 1);
+        talk.finish_turn(Outcome::Answered);
+        let expected = "Fixed the café menu.\nNext, run the naïve tests.";
+        assert_eq!(talk.answer(), expected);
+
+        talk.task("Wait");
+        assert_eq!(talk.answer(), "");
     }
 
     #[test]

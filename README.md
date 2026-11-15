@@ -160,9 +160,10 @@ Run `smol` in the directory you want to work in, then type a task.
 - A task that ends after you switched away from the terminal, with nothing you
   queued left to run, is announced: as a desktop notification in Ghostty,
   WezTerm, kitty and iTerm2 (once its notification settings allow alerts from
-  escape sequences), and with the bell in other terminals and inside tmux,
-  screen or Zellij. An interrupted task isn't. tmux tells smol of the switch
-  only with `set -g focus-events on`.
+  escape sequences), titled with the session's title and saying the first line
+  of the answer or the error, and with the bell in other terminals and inside
+  tmux, screen or Zellij. An interrupted task isn't. tmux tells smol of the
+  switch only with `set -g focus-events on`.
 - A line starting with `!` runs a shell command in the session directory
   (`$SHELL`, or `cmd` on Windows). The model sees the command and its output
   with your next message.
@@ -287,8 +288,9 @@ on after the call and don't keep the turn open. The model hears of each one
 that ends, with its pid, its command and what was printed since its last call:
 at the next step while it works, or else in a turn smol starts for it, which
 the conversation opens with `◇ programs ended`. Those still running are listed
-in the sidebar with the time since smol first saw them, or counted above the
-conversation on a narrow screen. This covers the programs the code started and
+at the bottom of the sidebar with the time since smol first saw them, those
+that don't fit counted in its last row, or counted above the conversation on a
+narrow screen. This covers the programs the code started and
 their children, also those in a session of their own, but not daemons that
 leave the process tree. Programs that an agent from `agent()` leaves running
 end when it answers.

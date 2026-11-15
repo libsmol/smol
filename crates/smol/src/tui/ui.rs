@@ -194,24 +194,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             lines.push(agents);
         }
 
-        if !app.session.programs.is_empty() {
-            let section = Span::styled("Programs", HEADING);
-            let section = Line::from(section);
-            lines.extend([Line::default(), section]);
-        }
-        for program in &app.session.programs {
-            let pid = format!("{} ", program.pid);
-            let elapsed = lasted(program.since.elapsed());
-            // A command ends with what tells programs apart, such as the script it runs
-            let room = width.saturating_sub(pid.width() + 1 + elapsed.width());
-            let command = one_line(&program.command, &app.session.client.cwd);
-            let command = tail(&command, room);
-            let left = vec![Span::styled(pid, DIM), Span::raw(command)];
-            let right = vec![Span::styled(elapsed, DIM)];
-            let line = spread(left, right, width);
-            lines.push(line);
-        }
-
         if !app.session.mcp.is_empty() {
             let section = Span::styled("MCP", HEADING);
             let section = Line::from(section);
@@ -236,6 +218,36 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             let name = vec![dot, name];
             let line = spread(name, vec![state], width);
             lines.push(line);
+        }
+
+        let programs = &app.session.programs;
+        if !programs.is_empty() {
+            let section = vec![Span::styled("Programs", HEADING)];
+            let count = vec![Span::styled(programs.len().to_string(), DIM)];
+            let section = spread(section, count, width);
+            lines.extend([Line::default(), section]);
+        }
+        let free = usize::from(inner.height).saturating_sub(lines.len());
+        let shown = match programs.len() > free {
+            true => free.saturating_sub(1),
+            false => programs.len(),
+        };
+        for program in &programs[..shown] {
+            let pid = format!("{} ", program.pid);
+            let elapsed = lasted(program.since.elapsed());
+            // A command ends with what tells programs apart, such as the script it runs
+            let room = width.saturating_sub(pid.width() + 1 + elapsed.width());
+            let command = one_line(&program.command, &app.session.client.cwd);
+            let command = tail(&command, room);
+            let left = vec![Span::styled(pid, DIM), Span::raw(command)];
+            let right = vec![Span::styled(elapsed, DIM)];
+            let line = spread(left, right, width);
+            lines.push(line);
+        }
+        let hidden = programs.len() - shown;
+        if hidden > 0 {
+            let more = format!("… +{hidden} more");
+            lines.push(Line::styled(more, DIM));
         }
 
         frame.render_widget(side, sidebar);
@@ -1058,10 +1070,16 @@ mod tests {
         assert!(top.ends_with(" ⇡0 ⇣0 · mcp 1 failed ╮"), "{top}");
     }
 
-    /// A long command keeps its end, and a narrow screen only counts them
+    /// Programs follow the MCP servers, a long command keeps its end, and a narrow screen only
+    /// counts them
     #[test]
     fn programs_listed() {
         let mut app = app();
+        let server = McpStatus {
+            name: "web".to_owned(),
+            state: McpState::Connected { tools: 3 },
+        };
+        app.session.mcp.push(server);
         let command = format!("/opt/{}/python3 brew.py --café", "naïve".repeat(8));
         let program = Program {
             pid: 4321,
@@ -1071,16 +1089,49 @@ mod tests {
         app.session.programs.push(program);
 
         let rows = screen(&mut app, 120, 24);
-        assert!(
-            rows.iter().any(|row| row.contains("│ Programs ")),
-            "{rows:#?}"
-        );
+        let row = |text: &str| rows.iter().position(|row| row.contains(text));
+        let mcp = row("│ MCP ").expect("mcp");
+        let programs = row("│ Programs ").expect("programs");
+        assert!(mcp < programs, "{rows:#?}");
+        assert!(rows[programs].ends_with(" 1 │"), "{rows:#?}");
         let listed =
             |row: &String| row.contains("│ 4321 …") && row.contains(" brew.py --café 0s │");
         assert!(rows.iter().any(listed), "{rows:#?}");
 
         let rows = screen(&mut app, 80, 24);
         assert!(rows[0].contains(" · programs 1 "), "{rows:#?}");
+    }
+
+    /// The programs that don't fit are counted in the last row
+    #[test]
+    fn programs_overflow() {
+        let mut app = app();
+        for pid in 1..=12 {
+            let program = Program {
+                pid,
+                command: format!("sleep {pid}0 # café"),
+                since: Instant::now(),
+            };
+            app.session.programs.push(program);
+        }
+
+        let rows = screen(&mut app, 120, 20);
+        let sidebar: Vec<&str> = rows
+            .iter()
+            .map(|row| row.split("││").nth(1).unwrap_or_default())
+            .collect();
+        let heading = sidebar.iter().position(|row| row.contains(" Programs "));
+        let heading = heading.expect("heading");
+        assert!(sidebar[heading].ends_with(" 12 │"), "{sidebar:#?}");
+        let shown = sidebar.iter().filter(|row| row.contains(" # café")).count();
+        assert_eq!(shown, 3, "{sidebar:#?}");
+        assert!(sidebar[heading + 4].contains("… +9 more"), "{sidebar:#?}");
+
+        // A program that just fits takes the row the count would
+        app.session.programs.truncate(4);
+        let rows = screen(&mut app, 120, 20);
+        let last = rows[heading + 4].split("││").nth(1).unwrap_or_default();
+        assert!(last.contains("4 sleep 40 # café"), "{rows:#?}");
     }
 
     #[test]

@@ -7,6 +7,17 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- The desktop notification of a task that ended while you looked away is titled
+  with the session's title and says the first line of the answer, or the error
+  of a failed task, where it said only `smol: <title> · done`. Ghostty, WezTerm
+  and kitty get it as OSC 777 with a title and a body, iTerm2 still as OSC 9 on
+  one line, and smol web's browser notifications match.
+- The sidebar lists the programs the code left running below the MCP servers,
+  which stay put as programs come and go, with their count by the heading and
+  `… +N more` in the last row when they don't all fit.
+
 ## 0.10.0 - 2026-11-13
 
 - Programs the code leaves running are followed after the call, with their

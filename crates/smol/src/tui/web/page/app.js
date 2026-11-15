@@ -523,18 +523,19 @@ function report() {
 }
 
 // The server sends this only while the user looks at no device, which may have changed since
-function notify(text) {
+function notify(title, body) {
   if (looking()) {
     return;
   }
-  document.title = `${text} · ${TITLE}`;
+  const heading = title || TITLE;
+  document.title = `${title || body} · ${TITLE}`;
   if (!window.Notification || Notification.permission !== "granted") {
     return;
   }
   // Chrome on Android makes notifications only through a service worker
   let shown;
   try {
-    shown = new Notification(TITLE, { body: text });
+    shown = new Notification(heading, { body });
   } catch {
     return;
   }
@@ -571,7 +572,7 @@ function connect() {
     } else if (message.t === "open") {
       openLink(message.url);
     } else if (message.t === "alert") {
-      notify(message.text);
+      notify(message.title, message.body);
     }
   };
   socket.onclose = async (event) => {
