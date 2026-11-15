@@ -17,6 +17,11 @@ but their files stay in `~/.smol/projects` untouched.
 - The sidebar lists the programs the code left running below the MCP servers,
   which stay put as programs come and go, with their count by the heading and
   `… +N more` in the last row when they don't all fit.
+- On Linux and macOS, programs smol ends, such as those a `!` command or the
+  code leaves running when the session closes, get SIGTERM and a second to
+  clean up before SIGKILL, also when libsmol is killed. A program started with
+  `sudo` now gets the SIGTERM through sudo, where before it kept running as
+  root.
 
 ## 0.10.0 - 2026-11-13
 

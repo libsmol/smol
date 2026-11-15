@@ -166,7 +166,10 @@ Run `smol` in the directory you want to work in, then type a task.
   switch only with `set -g focus-events on`.
 - A line starting with `!` runs a shell command in the session directory
   (`$SHELL`, or `cmd` on Windows). The model sees the command and its output
-  with your next message.
+  with your next message. Programs it leaves in the background end with the
+  session: on Linux and macOS they get SIGTERM, and SIGKILL a second later if
+  they are still running. A program run with `sudo` gets the SIGTERM only
+  through sudo, and one that ignores it keeps running as root.
 - Paths written as `@path` are attached to the message.
 - `ctrl+v` (`alt+v` on Windows, where the terminal keeps `ctrl+v`) pastes the
   image on the clipboard into the message as `[image #1]`, and the model gets

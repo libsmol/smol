@@ -5,7 +5,6 @@ use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::{self, PipeWriter, Read, Write};
-#[cfg(target_os = "macos")]
 use std::mem;
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
@@ -18,16 +17,18 @@ use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::process;
 use std::process::Command;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ptr;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-#[cfg(target_os = "linux")]
 use std::thread;
+use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const KILL_WAIT: Duration = Duration::from_secs(1);
+const CHECK_EVERY: Duration = Duration::from_millis(20);
 
 /// Processes that started a new session left the group and are found by this inherited variable
 #[cfg(target_os = "linux")]
@@ -38,7 +39,7 @@ const MAX_SWEEPS: usize = 3;
 #[cfg(target_os = "linux")]
 const SWEEP_EVERY: Duration = Duration::from_millis(50);
 
-static GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+static GROUPS: Mutex<Vec<Known>> = Mutex::new(Vec::new());
 #[cfg(target_os = "linux")]
 static NEXT_MARK: AtomicU64 = AtomicU64::new(1);
 #[cfg(target_os = "linux")]
@@ -53,6 +54,12 @@ pub struct Mark(u64);
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone, Copy)]
 pub struct Mark(());
+
+struct Known {
+    id: i32,
+    /// A second SIGTERM makes some programs skip their cleanup
+    termed: bool,
+}
 
 /// What /proc tells of a process
 #[cfg(target_os = "linux")]
@@ -114,9 +121,10 @@ pub fn guard() {
         }
     }
 
-    for group in groups {
-        kill(group);
+    for &group in &groups {
+        kill(group, libc::SIGTERM);
     }
+    wait_out(groups, false);
     #[cfg(target_os = "linux")]
     {
         let prefix = instance();
@@ -180,7 +188,8 @@ pub fn prepare(command: &mut Command) -> Mark {
 pub struct Group {
     id: i32,
     mark: Mark,
-    released: AtomicBool,
+    /// Released or ending, after which this handle signals nothing more
+    settled: AtomicBool,
 }
 
 impl Group {
@@ -192,19 +201,19 @@ impl Group {
         }
 
         let id = pid as i32;
-        GROUPS.lock().expect("groups lock").push(id);
+        let known = Known { id, termed: false };
+        GROUPS.lock().expect("groups lock").push(known);
         tell(id);
 
         Ok(Group {
             id,
             mark,
-            released: AtomicBool::new(false),
+            settled: AtomicBool::new(false),
         })
     }
 
     pub fn alive(&self) -> bool {
-        // SAFETY: Signal 0 only checks whether the group still has a process
-        unsafe { libc::killpg(self.id, 0) == 0 }
+        alive(self.id)
     }
 
     /// Includes descendants in a session of their own, which leaves the group but not the tree,
@@ -356,18 +365,35 @@ impl Group {
         Ok(members)
     }
 
-    /// After `release` the group id may already be reused, so it is never killed
+    /// Sends SIGTERM, then SIGKILL to what is left after `KILL_WAIT`, but never signals a released
+    /// group, whose id may already be reused
     pub fn kill(&self) {
-        if self.released.load(Ordering::SeqCst) {
+        if self.settled.swap(true, Ordering::SeqCst) {
             return;
         }
-        kill(self.id);
-        sweep(self.mark);
+
+        // Held while signaling, as `kill_all` must not send a second SIGTERM
+        let mut groups = GROUPS.lock().expect("groups lock");
+        let found = groups.iter_mut().find(|known| known.id == self.id);
+        if let Some(known) = found.filter(|known| !known.termed) {
+            known.termed = true;
+            kill(self.id, libc::SIGTERM);
+        }
+        drop(groups);
+
+        // Waiting and reading /proc must not hold up the caller's thread
+        let (id, mark) = (self.id, self.mark);
+        let finishing = move || finish(id, mark);
+        let spawned = thread::Builder::new().spawn(finishing);
+        // At the process limit no thread can start, and a panic in Drop would abort
+        if spawned.is_err() {
+            finish(id, mark);
+        }
     }
 
     /// Forgets the group without killing it, since its id gets reused once the group is empty
     pub fn release(&self) {
-        if self.released.swap(true, Ordering::SeqCst) {
+        if self.settled.swap(true, Ordering::SeqCst) {
             return;
         }
         forget(self.id);
@@ -376,17 +402,28 @@ impl Group {
 
 impl Drop for Group {
     fn drop(&mut self) {
-        if self.released.load(Ordering::SeqCst) {
-            return;
-        }
-        forget(self.id);
         self.kill();
     }
 }
 
+/// Ends every registered group as `Group::kill` does but in place, reaping their first processes,
+/// which nothing else may still wait for
 pub fn kill_all() {
-    for group in GROUPS.lock().expect("groups lock").drain(..) {
-        kill(group);
+    let mut registered = GROUPS.lock().expect("groups lock");
+    let known = mem::take(&mut *registered);
+    drop(registered);
+
+    let mut groups = Vec::new();
+    for known in known {
+        if !known.termed {
+            kill(known.id, libc::SIGTERM);
+        }
+        groups.push(known.id);
+    }
+    wait_out(groups.clone(), true);
+    // Their ids may be reused once this process exits and the watchdog runs
+    for group in groups {
+        tell(-group);
     }
 
     // Nothing to sweep in /proc if no program was ever started
@@ -397,30 +434,60 @@ pub fn kill_all() {
     }
 }
 
+fn finish(group: i32, mark: Mark) {
+    wait_out(vec![group], false);
+    // Before the sweep, which may hang reading /proc, as an empty group's id can be reused
+    forget(group);
+    sweep(mark);
+}
+
+/// Waits up to `KILL_WAIT` for the groups to end, then sends SIGKILL to what is left of them
+fn wait_out(mut groups: Vec<i32>, reaping: bool) {
+    let deadline = Instant::now() + KILL_WAIT;
+    loop {
+        // An unreaped zombie keeps its group alive
+        if reaping {
+            for &group in &groups {
+                let status = ptr::null_mut();
+                // SAFETY: Only collects the status of children in the group that already ended
+                while unsafe { libc::waitpid(-group, status, libc::WNOHANG) } > 0 {}
+            }
+        }
+        groups.retain(|group| alive(*group));
+        if groups.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(CHECK_EVERY);
+    }
+
+    for group in groups {
+        kill(group, libc::SIGKILL);
+    }
+}
+
 fn forget(group: i32) {
     let mut groups = GROUPS.lock().expect("groups lock");
-    groups.retain(|known| *known != group);
+    groups.retain(|known| known.id != group);
     tell(-group);
 }
 
 #[cfg(target_os = "linux")]
 fn sweep(mark: Mark) {
-    // Reading /proc can hang, so it must not hold up the caller's thread
     let text = mark_text(mark.0);
-    let spawned = thread::Builder::new().spawn(move || kill_marked(&text));
-    // At the process limit no thread can start, and a panic in Drop would abort
-    if spawned.is_err() {
-        let text = mark_text(mark.0);
-        kill_marked(&text);
-    }
+    kill_marked(&text);
 }
 
 #[cfg(not(target_os = "linux"))]
 fn sweep(_: Mark) {}
 
-fn kill(group: i32) {
+fn alive(group: i32) -> bool {
+    // SAFETY: Signal 0 only checks whether the group still has a process
+    unsafe { libc::killpg(group, 0) == 0 }
+}
+
+fn kill(group: i32, signal: libc::c_int) {
     // SAFETY: Only sends a signal and touches no memory
-    unsafe { libc::killpg(group, libc::SIGKILL) };
+    unsafe { libc::killpg(group, signal) };
 }
 
 /// A positive id registers a group and a negative one drops it, in four-byte records
@@ -577,14 +644,14 @@ fn marked(environ: &[u8], text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::unix::{arguments, prepare, Group};
+    use crate::unix::{arguments, prepare, Group, KILL_WAIT};
     #[cfg(target_os = "linux")]
     use crate::unix::{marked, sweep};
     #[cfg(target_os = "linux")]
     use std::fs;
-    use std::process::Command;
-    #[cfg(target_os = "linux")]
-    use std::process::Stdio;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -635,6 +702,48 @@ mod tests {
 
         drop(group);
         child.wait().ok();
+    }
+
+    /// The group gets SIGTERM first, and a program that handles it ends cleanly
+    #[test]
+    fn term_first() {
+        let script = "trap 'echo cleaned; exit 0' TERM; echo ready; sleep 30 & wait";
+        let mut command = Command::new("sh");
+        command.args(["-c", script]).stdout(Stdio::piped());
+        let mark = prepare(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        let group = Group::new(child.id(), mark).expect("group");
+        let mut said = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut line = String::new();
+        said.read_line(&mut line).expect("ready");
+
+        drop(group);
+        let status = child.wait().expect("wait");
+        said.read_line(&mut line).expect("cleaned");
+        assert_eq!(line, "ready\ncleaned\n");
+        assert_eq!(status.code(), Some(0));
+    }
+
+    /// A program that ignores SIGTERM gets SIGKILL once `KILL_WAIT` passed
+    #[test]
+    fn killed_after_wait() {
+        let script = "trap '' TERM; echo ready; exec sleep 30";
+        let mut command = Command::new("sh");
+        command.args(["-c", script]).stdout(Stdio::piped());
+        let mark = prepare(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        let group = Group::new(child.id(), mark).expect("group");
+        let mut said = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut line = String::new();
+        said.read_line(&mut line).expect("ready");
+
+        let started = Instant::now();
+        group.kill();
+        let status = child.wait().expect("wait");
+        let waited = started.elapsed();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(waited >= KILL_WAIT, "{waited:?}");
+        assert!(waited < KILL_WAIT * 5, "{waited:?}");
     }
 
     #[test]
