@@ -528,7 +528,8 @@ function notify(title, body) {
     return;
   }
   const heading = title || TITLE;
-  document.title = `${title || body} · ${TITLE}`;
+  const said = title ? `${title} · ${body}` : body;
+  document.title = `${said} · ${TITLE}`;
   if (!window.Notification || Notification.permission !== "granted") {
     return;
   }
