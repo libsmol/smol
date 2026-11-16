@@ -67,6 +67,7 @@ pub(crate) struct ModelSpec {
     pub(crate) effort: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) efforts: Vec<String>,
+    pub(crate) summary: Option<String>,
     pub(crate) context: Option<u64>,
     /// DeepSeek counts reasoning toward it, and a small value cuts the reply off mid-reasoning
     pub(crate) max_tokens: Option<u64>,
@@ -76,10 +77,12 @@ pub(crate) struct ModelSpec {
     pub(crate) video: bool,
 }
 
-#[derive(Deserialize, Serialize)]
-enum Kind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) enum Kind {
     #[serde(rename = "openai-completions")]
-    OpenAI,
+    Completions,
+    #[serde(rename = "openai-responses")]
+    Responses,
 }
 
 /// Model names are `provider/id`
@@ -97,14 +100,14 @@ impl Models {
         names
     }
 
-    fn find(&self, name: &str) -> Option<(&Provider, &ModelSpec)> {
+    fn find(&self, name: &str) -> Option<(&str, &Provider, &ModelSpec)> {
         for (prefix, provider) in &self.0 {
             let rest = name.strip_prefix(prefix.as_str());
             let Some(id) = rest.and_then(|rest| rest.strip_prefix('/')) else {
                 continue;
             };
             if let Some(model) = provider.models.iter().find(|model| model.id == id) {
-                return Some((provider, model));
+                return Some((prefix, provider, model));
             }
         }
         None
@@ -112,7 +115,7 @@ impl Models {
 
     /// `effort` replaces the one model.toml gives
     pub(crate) fn make(&self, name: &str, effort: Option<&str>) -> Result<Box<dyn Model>> {
-        let Some((provider, model)) = self.find(name) else {
+        let Some((prefix, provider, model)) = self.find(name) else {
             let names = self.names().join(", ");
             let message = format!("model: {name}: not in model.toml (models: {names})");
             return Err(Error::InvalidParams(message));
@@ -125,21 +128,19 @@ impl Models {
 
         let api = provider.api.clone();
         let key = provider.api_key.clone();
-        let built = match provider.kind {
-            Kind::OpenAI => OpenAIModel::new(&spec, api, key)?,
-        };
+        let built = OpenAIModel::new(prefix, &spec, provider.kind, api, key)?;
         Ok(Box::new(built))
     }
 
     /// The one model.toml gives
     pub(crate) fn effort(&self, name: &str) -> Option<&str> {
-        let (_, spec) = self.find(name)?;
+        let (_, _, spec) = self.find(name)?;
         spec.effort.as_deref()
     }
 
     /// The efforts a session can switch among, only its own without a list
     pub(crate) fn offered(&self, name: &str) -> Vec<String> {
-        let Some((_, spec)) = self.find(name) else {
+        let Some((_, _, spec)) = self.find(name) else {
             return Vec::new();
         };
 
@@ -215,6 +216,16 @@ pub(crate) fn models(dir: &Path) -> Result<Models> {
                 let problem = format!("[model.{name}]: {id}: context below {MIN_CONTEXT}");
                 return Err(invalid(problem));
             }
+            if model.video && provider.kind == Kind::Responses {
+                let problem =
+                    format!("[model.{name}]: {id}: video: openai-responses takes no videos");
+                return Err(invalid(problem));
+            }
+            if model.summary.is_some() && provider.kind == Kind::Completions {
+                let problem =
+                    format!("[model.{name}]: {id}: summary: openai-completions sends no summary");
+                return Err(invalid(problem));
+            }
             for (index, effort) in model.efforts.iter().enumerate() {
                 if model.efforts[..index].contains(effort) {
                     let problem = format!("[model.{name}]: {id}: efforts: {effort}: duplicate");
@@ -242,6 +253,7 @@ pub(crate) fn models(dir: &Path) -> Result<Models> {
 pub(crate) fn save_model(
     dir: &Path,
     name: &str,
+    kind: Kind,
     api: &str,
     key: &str,
     spec: &ModelSpec,
@@ -258,7 +270,7 @@ pub(crate) fn save_model(
         false => key,
     };
     let provider = Provider {
-        kind: Kind::OpenAI,
+        kind,
         api: Some(api.to_owned()),
         api_key: Some(key.to_owned()),
         models: vec![spec.clone()],
@@ -917,7 +929,7 @@ fn without_value(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        agent, front_matter, instructions, models, roles, save_model, scalar, skills, Access,
+        agent, front_matter, instructions, models, roles, save_model, scalar, skills, Access, Kind,
         McpConfig, McpKind, ModelSpec, Skill, MODEL_EXAMPLE,
     };
     use crate::model::MediaKind;
@@ -954,8 +966,8 @@ models = [
 ]
 
 [model.slow]
-type = "openai-completions"
-models = [{ id = "m3", effort = "max" }]
+type = "openai-responses"
+models = [{ id = "m3", effort = "max", summary = "auto", image = true }]
 "#;
         let (dir, _) = written(text);
         let read = models(&dir).expect("load");
@@ -963,6 +975,8 @@ models = [{ id = "m3", effort = "max" }]
         let built = read.make("über/piñata-2", Some("low")).expect("make");
         assert_eq!(built.context_window(), Some(8000));
         assert!(built.takes(MediaKind::Image) && built.takes(MediaKind::Video));
+        let built = read.make("slow/m3", None).expect("make");
+        assert!(built.takes(MediaKind::Image) && !built.takes(MediaKind::Video));
 
         let missing = read.make("über", None).err().expect("missing").to_string();
         let names = "über/m1, über/piñata-2, slow/m3";
@@ -1008,6 +1022,18 @@ models = [{ id = "m3", effort = "max" }]
             (
                 "[model.\"jalapeño\"]\ntype = \"openai-completions\"\nmodels = [{ id = \"m\", context = 0 }]\n",
                 "[model.jalapeño]: m: context below 1024",
+            ),
+            (
+                "[model.\"jalapeño\"]\ntype = \"openai-responses\"\nmodels = [{ id = \"m\", video = true }]\n",
+                "[model.jalapeño]: m: video: openai-responses takes no videos",
+            ),
+            (
+                "[model.\"jalapeño\"]\ntype = \"openai-completions\"\nmodels = [{ id = \"m\", summary = \"auto\" }]\n",
+                "[model.jalapeño]: m: summary: openai-completions sends no summary",
+            ),
+            (
+                "[model.\"jalapeño\"]\ntype = \"openai-chat\"\nmodels = [{ id = \"m\" }]\n",
+                "[model.jalapeño]: unknown variant `openai-chat`, expected `openai-completions` or `openai-responses`",
             ),
             (
                 "[model.\"café\"]\ntype = \"openai-completions\"\nmodels = [{ id = \"m\", efforts = [\"low\", \"high\"] }]\n",
@@ -1091,7 +1117,7 @@ models = [{ id = "m3", effort = "max" }]
             ..ModelSpec::default()
         };
         let api = "http://127.0.0.1:1/v1";
-        save_model(&dir, "über café.v2", api, tricky, &spec).expect("save");
+        save_model(&dir, "über café.v2", Kind::Responses, api, tricky, &spec).expect("save");
 
         let read = models(&dir).expect("load");
         assert_eq!(read.names(), ["über café.v2/piñata-2"]);
@@ -1100,8 +1126,9 @@ models = [{ id = "m3", effort = "max" }]
         assert!(built.takes(MediaKind::Image) && !built.takes(MediaKind::Video));
         let text = fs::read_to_string(&path).expect("read");
         let parsed: toml::Table = toml::from_str(&text).expect("parse");
-        let key = parsed["model"]["über café.v2"]["api_key"].as_str();
-        assert_eq!(key, Some(tricky));
+        let provider = &parsed["model"]["über café.v2"];
+        assert_eq!(provider["api_key"].as_str(), Some(tricky));
+        assert_eq!(provider["type"].as_str(), Some("openai-responses"));
 
         #[cfg(unix)]
         fs::set_permissions(&path, Permissions::from_mode(0o644)).expect("chmod");
@@ -1109,7 +1136,7 @@ models = [{ id = "m3", effort = "max" }]
             id: "qwen3:32b".to_owned(),
             ..ModelSpec::default()
         };
-        save_model(&dir, "local-1", api, "", &spec).expect("save");
+        save_model(&dir, "local-1", Kind::Completions, api, "", &spec).expect("save");
 
         let text = fs::read_to_string(&path).expect("read");
         let expected = "[model.local-1]\ntype = \"openai-completions\"\napi = \"http://127.0.0.1:1/v1\"\napi_key = \"none\"\nmodels = [{ id = \"qwen3:32b\" }]\n";
@@ -1130,7 +1157,7 @@ models = [{ id = "m3", effort = "max" }]
             fs::create_dir_all(dir.join("dotfiles")).expect("dir");
             fs::rename(&path, &real).expect("move");
             symlink(&real, &path).expect("link");
-            save_model(&dir, "local-1", api, "", &spec).expect("save");
+            save_model(&dir, "local-1", Kind::Completions, api, "", &spec).expect("save");
             let linked = fs::symlink_metadata(&path).expect("link").file_type();
             assert!(linked.is_symlink());
             assert_eq!(fs::read_to_string(&real).expect("read"), expected);

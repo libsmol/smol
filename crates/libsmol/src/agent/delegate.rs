@@ -376,6 +376,13 @@ impl Agent {
             }
         };
 
+        // Records are only shown, never sent back
+        for step in &mut memory.steps {
+            if let MemoryStep::Action(action) = step {
+                action.sealed = None;
+            }
+        }
+
         let helper = Helper {
             end,
             memory,
@@ -802,6 +809,7 @@ mod tests {
     use crate::utils::{block_on, Interrupt};
     use crate::worker::host::Added;
     use crate::worker::{AgentCall, Asked};
+    use serde_json::json;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::Semaphore;
@@ -810,7 +818,8 @@ mod tests {
     type Requests = Arc<Mutex<Vec<Vec<ChatMessage>>>>;
 
     /// The main agent starts four agents, which answer with their task, except one that crashes,
-    /// and agents that start an agent or add with the MCP server answer with what happened
+    /// and agents that start an agent or add with the MCP server answer with what happened,
+    /// each reply with a reasoning item
     struct Teamed(Requests);
 
     impl Model for Teamed {
@@ -843,6 +852,13 @@ mod tests {
             };
 
             Box::pin(async move {
+                let item =
+                    json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-café" });
+                let sealed = StreamDelta::Sealed {
+                    provider: "mock",
+                    item: &item,
+                };
+                on_delta(sealed);
                 match code {
                     Some(code) => {
                         on_delta(StreamDelta::CallCode(code));
@@ -872,6 +888,7 @@ mod tests {
         let MemoryStep::Action(step) = &memory.steps[1] else {
             panic!("{:?}", memory.steps);
         };
+        assert!(step.sealed.is_some());
         let result = step.calls[0].result.as_ref().expect("ran");
         let nested = "NameError: name 'agent' is not defined\n  line 1: print(agent('deeper'))";
         let crashed = "RuntimeError('agent: stopped before it answered')";
@@ -893,6 +910,11 @@ mod tests {
             assert!(matches!(helper.end, Ending::Answer(_)), "{helper:?}");
             let (usage, _) = helper.memory.spent();
             assert!(usage.tokens.is_some(), "{helper:?}");
+            for step in &helper.memory.steps {
+                if let MemoryStep::Action(action) = step {
+                    assert!(action.sealed.is_none(), "{action:?}");
+                }
+            }
         }
 
         // Agents started by agent() don't see it or task updates, and answer the code

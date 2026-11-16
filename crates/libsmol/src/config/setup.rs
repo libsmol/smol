@@ -1,4 +1,4 @@
-use crate::config::{self, parse_url, ModelSpec, MIN_CONTEXT, MODEL_FILE};
+use crate::config::{self, parse_url, Kind, ModelSpec, MIN_CONTEXT, MODEL_FILE};
 use crate::model::{listed, ListError, DEFAULT_API};
 use crate::utils::block_on;
 use crate::{Error, Result};
@@ -31,6 +31,16 @@ impl fmt::Display for Ask {
     }
 }
 
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Kind::Completions => "Chat Completions",
+            Kind::Responses => "Responses",
+        };
+        f.write_str(text)
+    }
+}
+
 pub fn run() -> Result<()> {
     // The prompts draw on stderr
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
@@ -54,6 +64,16 @@ pub fn run() -> Result<()> {
         }
     }
 
+    let kinds = vec![Kind::Completions, Kind::Responses];
+    let kind = Select::new("API", kinds)
+        .with_help_message("Responses suits OpenAI's reasoning models, Chat Completions the rest")
+        .prompt()
+        .map_err(failed)?;
+    let served = match kind {
+        Kind::Completions => "Any OpenAI-compatible endpoint serving /chat/completions",
+        Kind::Responses => "Any OpenAI-compatible endpoint serving /responses",
+    };
+
     let mut api = String::new();
     let mut key = String::new();
     let mut next = Ask::Address;
@@ -61,7 +81,7 @@ pub fn run() -> Result<()> {
         match next {
             Ask::Address => {
                 let question = Text::new("API base URL")
-                    .with_help_message("Any OpenAI-compatible chat completions endpoint")
+                    .with_help_message(served)
                     .with_validator(validator(parse_url));
                 // A prefilled value can only be erased key by key
                 let question = match api.is_empty() {
@@ -157,7 +177,7 @@ pub fn run() -> Result<()> {
         context,
         ..ModelSpec::default()
     };
-    config::save_model(&dir, &name, &api, &key, &spec)?;
+    config::save_model(&dir, &name, kind, &api, &key, &spec)?;
     eprintln!("Wrote {shown}, edit it to add models or set max_tokens, effort, image and video");
 
     Ok(())

@@ -169,6 +169,17 @@ impl Turn<'_> {
             previous = Some(text);
         }
 
+        // Summarized steps never go back, so they keep no items of their provider
+        let mut recent = kept;
+        for step in self.memory.steps.iter_mut().rev() {
+            match step {
+                MemoryStep::Summary(_) => {}
+                _ if recent > 0 => recent -= 1,
+                MemoryStep::Action(action) => action.sealed = None,
+                _ => {}
+            }
+        }
+
         let summary = previous.expect("summary");
         // Covers every chunk and the time spent waiting to retry
         usage.duration = started.elapsed().as_secs_f64();
@@ -226,6 +237,7 @@ mod tests {
     use crate::steps::tests::{asked, coded, metered, replied};
     use crate::steps::{AgentMemory, AgentStep, Attachment, Exit, ShellStep, StepError, TaskStep};
     use crate::tests::content;
+    use serde_json::json;
     use std::sync::{Arc, Mutex};
 
     fn agent(window: Option<u64>, replies: Vec<Result<Script, ModelError>>) -> Run {
@@ -331,7 +343,13 @@ mod tests {
 
     #[test]
     fn older_steps_summarized() {
-        let (mut run, events) = watched(Some(1000), filling());
+        let mut replies = filling();
+        for script in replies.iter_mut().flatten() {
+            let item =
+                json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-café" });
+            script.sealed = vec![item];
+        }
+        let (mut run, events) = watched(Some(1000), replies);
         let mut memory = AgentMemory::default();
         let answer = run.agent.turn(&mut memory, "Add 1 to x").expect("run");
         assert_eq!(answer, Some("42".to_owned()));
@@ -362,11 +380,15 @@ mod tests {
         );
 
         let mut kinds = Vec::new();
+        let mut sealed = Vec::new();
         for step in &memory.steps {
             let kind = match step {
                 MemoryStep::Task(_) => "task",
                 MemoryStep::Update(_) => "update",
-                MemoryStep::Action(_) => "action",
+                MemoryStep::Action(action) => {
+                    sealed.push(action.sealed.is_some());
+                    "action"
+                }
                 MemoryStep::Summary(_) => "summary",
                 MemoryStep::Shell(_) => "shell",
                 MemoryStep::Restarted => "restarted",
@@ -375,6 +397,7 @@ mod tests {
             kinds.push(kind);
         }
         assert_eq!(kinds, ["task", "action", "action", "summary", "action"]);
+        assert_eq!(sealed, [false, true, true]);
 
         let events = events.lock().expect("events");
         assert_eq!(*events, ["compact", "summary: x holds 41."]);

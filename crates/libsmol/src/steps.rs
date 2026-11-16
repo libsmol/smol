@@ -1,4 +1,4 @@
-use crate::model::{ChatMessage, Media, MediaKind, Part, TokenUsage, ToolCall};
+use crate::model::{ChatMessage, Media, MediaKind, Part, Sealed, TokenUsage, ToolCall};
 use crate::prompt;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -72,6 +72,8 @@ impl Usage {
 pub(crate) struct AgentStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sealed: Option<Sealed>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -347,6 +349,7 @@ impl MemoryStep {
             let reply = ChatMessage::Assistant {
                 text: text.to_owned(),
                 reasoning: step.reasoning.clone(),
+                sealed: step.sealed.clone(),
                 calls: sent,
             };
             messages.push(reply);
@@ -606,7 +609,7 @@ pub(crate) struct Visible<'a> {
     pub(crate) steps: Vec<&'a MemoryStep>,
 }
 
-/// Reasoning goes back as `reasoning_content` too,
+/// Reasoning goes back as `reasoning_content` or sealed items, counted by its text,
 /// and media the model takes converts to bytes from a fixed token count
 pub(crate) fn bytes(messages: &[ChatMessage], takes: &dyn Fn(MediaKind) -> bool) -> usize {
     let mut bytes = 0;
@@ -620,6 +623,7 @@ pub(crate) fn bytes(messages: &[ChatMessage], takes: &dyn Fn(MediaKind) -> bool)
                 text,
                 reasoning,
                 calls,
+                ..
             } => {
                 let reasoning = reasoning.as_deref().unwrap_or_default();
                 bytes += text_bytes(reasoning) + text_bytes(text);
@@ -672,6 +676,7 @@ pub(crate) mod tests {
     use crate::model::tests::png;
     use crate::steps::*;
     use crate::tests::content;
+    use serde_json::json;
 
     pub(crate) fn metered(input: u64, output: u64) -> Usage {
         Usage {
@@ -931,6 +936,37 @@ pub(crate) mod tests {
         let again = serde_json::to_value(&result).expect("serialize");
         let saved: serde_json::Value = serde_json::from_str(saved).expect("parse");
         assert_eq!(again, saved);
+    }
+
+    #[test]
+    fn sealed_replayed() {
+        let thought =
+            json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-café" });
+        let said = json!({ "type": "message", "id": "msg_1", "phase": "final_answer" });
+        let sealed = Sealed {
+            provider: "openai".to_owned(),
+            items: vec![thought, said],
+        };
+        let step = AgentStep {
+            sealed: Some(sealed.clone()),
+            ..replied("Voilà, the café")
+        };
+        let saved = serde_json::to_value(&step).expect("serialize");
+        assert_eq!(saved["sealed"]["provider"], "openai");
+        assert_eq!(saved["sealed"]["items"][1]["phase"], "final_answer");
+        let loaded: AgentStep = serde_json::from_value(saved).expect("deserialize");
+        assert_eq!(loaded, step);
+
+        let mut calls = 0;
+        let action = MemoryStep::Action(Box::new(step));
+        let messages = action.messages(&mut calls);
+        let ChatMessage::Assistant { sealed: sent, .. } = &messages[0] else {
+            panic!("{messages:?}");
+        };
+        assert_eq!(sent.as_ref(), Some(&sealed));
+
+        let plain = serde_json::to_value(replied("Voilà")).expect("serialize");
+        assert!(plain.get("sealed").is_none(), "{plain}");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::agent::delegate::Records;
 use crate::agent::{generate, retry, Event, Failure, Streamed, Turn, MAX_RETRIES};
 use crate::model::{
-    ChatMessage, Finish, ModelError, Part, Purpose, StreamDelta, Unread, MAX_NAME_CHARS,
+    ChatMessage, Finish, ModelError, Part, Purpose, Sealed, StreamDelta, Unread, MAX_NAME_CHARS,
 };
 use crate::prompt::{self, TOOL};
 use crate::spawn::SHOWN_EVERY;
@@ -75,6 +75,13 @@ impl Turn<'_> {
                     }
                     StreamDelta::CallCode(code) => reply.push_code(code, &mut shown),
                     StreamDelta::CallEnd(ended) => reply.end_call(ended, &mut shown),
+                    StreamDelta::Sealed { provider, item } => {
+                        let first = Sealed {
+                            provider: provider.to_owned(),
+                            items: Vec::new(),
+                        };
+                        reply.sealed.get_or_insert(first).items.push(item.clone());
+                    }
                 }
 
                 // Some models repeat closing tags after the code for minutes until the output limit
@@ -95,6 +102,7 @@ impl Turn<'_> {
             // However the stream ended, the code it left unshown still shows
             reply.show_code(&mut shown);
             step.reasoning = reply.reasoning;
+            step.sealed = reply.sealed;
             step.usage.duration = started.elapsed().as_secs_f64();
 
             step.text = reply.text.trim_end().to_owned();
@@ -254,6 +262,7 @@ impl Turn<'_> {
 #[derive(Default)]
 struct Reply {
     reasoning: Option<String>,
+    sealed: Option<Sealed>,
     text: String,
     calls: Vec<Call>,
     /// The last call is still streaming
@@ -366,6 +375,7 @@ mod tests {
     use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::{content, Temp};
     use crate::utils::{new_id, Interrupt};
+    use serde_json::json;
     use std::fs;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
@@ -831,14 +841,43 @@ mod tests {
             reasoning: Some("I only think and never write a reply".to_owned()),
             ..reply("")
         };
-        let replies = vec![Ok(thinking); 4];
-        let model = ScriptedModel::new(replies);
-        let mut thoughtful = scripted(model, Box::new(|_| {}));
+        let sealed = Script {
+            sealed: vec![
+                json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-café" }),
+            ],
+            ..reply("")
+        };
+        for script in [thinking, sealed] {
+            let replies = vec![Ok(script); 4];
+            let model = ScriptedModel::new(replies);
+            let mut thoughtful = scripted(model, Box::new(|_| {}));
+            let mut memory = AgentMemory::default();
+            let error = thoughtful.turn(&mut memory, "task").expect_err("gives up");
+            let error = error.to_string();
+            let named = "stopped after reasoning without replying";
+            assert!(error.contains(named), "{error}");
+        }
+    }
+
+    #[test]
+    fn sealed_items_kept() {
+        let items = vec![
+            json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-café" }),
+            json!({ "type": "message", "id": "msg_1", "phase": "final_answer" }),
+        ];
+        let answered = Script {
+            sealed: items.clone(),
+            ..reply("Voilà.")
+        };
+        let mut agent = agent(vec![answered]);
         let mut memory = AgentMemory::default();
-        let error = thoughtful.turn(&mut memory, "task").expect_err("gives up");
-        let error = error.to_string();
-        let named = "stopped after reasoning without replying";
-        assert!(error.contains(named), "{error}");
+        agent.turn(&mut memory, "task").expect("run");
+
+        let sealed = Sealed {
+            provider: "mock".to_owned(),
+            items,
+        };
+        assert_eq!(only(&memory).sealed, Some(sealed));
     }
 
     #[test]

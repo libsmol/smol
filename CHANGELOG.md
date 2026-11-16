@@ -22,6 +22,13 @@ but their files stay in `~/.smol/projects` untouched.
   clean up before SIGKILL, also when libsmol is killed. A program started with
   `sudo` now gets the SIGTERM through sudo, where before it kept running as
   root.
+- `type = "openai-responses"` in model.toml reaches a model through OpenAI's
+  Responses API. The whole conversation goes with every request and the server
+  stores nothing; each reply's output items, its reasoning included, are saved
+  with the session and go back in their order to the provider that wrote them.
+  `summary`, such as `"auto"`, has the model stream a summary of its reasoning.
+  Images that `view()` shows stay in the tool output. `libsmol setup` asks
+  which API to use.
 
 ## 0.10.0 - 2026-11-13
 

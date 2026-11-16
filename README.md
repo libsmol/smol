@@ -98,8 +98,9 @@ Configuration lives in `~/.smol` (or the directory in `SMOL_CONFIG_DIR`). It is
 read each time a session opens, so `:new` picks up changes.
 
 When `~/.smol/model.toml` doesn't exist, `smol` first runs `libsmol setup`. It
-asks for the base URL of an OpenAI-compatible endpoint, its API key and a model,
-picked from the endpoint's model list or typed in, and writes the file. The
+asks for the API (Chat Completions or Responses), the base URL of an
+OpenAI-compatible endpoint, its API key and a model, picked from the endpoint's
+model list or typed in, and writes the file. The
 context window is filled in when the list reports it. Run `libsmol setup` again
 to replace it. Other ACP clients that support terminal authentication offer the
 same setup; with the rest, run it in a terminal.
@@ -118,7 +119,7 @@ Base URLs of some common providers:
 | Ollama (local) | `http://localhost:11434/v1` |
 
 `~/.smol/model.toml` lists the models. Each `[model.<provider>]` table is one
-OpenAI-compatible chat completions endpoint:
+OpenAI-compatible endpoint, reached through Chat Completions or Responses:
 
 ```toml
 [model.deepseek]
@@ -126,6 +127,11 @@ type = "openai-completions"
 api = "https://api.deepseek.com/v1"
 api_key = "sk-..."
 models = [{ id = "deepseek-chat", context = 65536 }]
+
+[model.openai]
+type = "openai-responses"
+api_key = "sk-..."
+models = [{ id = "gpt-5-mini", context = 400000, effort = "medium", image = true }]
 
 [model.local]
 type = "openai-completions"
@@ -139,15 +145,16 @@ first one is the default.
 
 | Field | Meaning |
 | --- | --- |
-| `type` | Only `openai-completions` for now. |
+| `type` | `openai-completions` for `/chat/completions`, or `openai-responses` for `/responses`. Through Responses each reply's output items, its reasoning included, go back in their order to the provider that wrote them; nothing is stored on the server. |
 | `api` | Base URL. Without it the model goes to `https://api.openai.com/v1` and `OPENAI_API_KEY` is used when `api_key` is missing. |
 | `api_key` | Sent as a bearer token. `"none"` or empty sends no key. |
 | `id` | The model name the endpoint expects. |
 | `context` | Context window in tokens. With it, older steps are summarized before the window fills; without it, nothing is compacted. |
-| `max_tokens` | Output limit per reply. Some providers count reasoning in it, so a small value can cut a reply off mid-thought. OpenAI's reasoning models (o-series, gpt-5) refuse it; leave it out for them. |
-| `effort` | Sent as `reasoning_effort`, shown after the model's name. |
+| `max_tokens` | Output limit per reply, sent to Responses as `max_output_tokens`. Some providers count reasoning in it, so a small value can cut a reply off mid-thought. OpenAI's reasoning models (o-series, gpt-5) refuse it through Chat Completions; leave it out there. |
+| `effort` | Sent as `reasoning_effort`, or to Responses as `reasoning.effort`, and shown after the model's name. |
 | `efforts` | The efforts `:effort` can switch among, such as `["low", "high", "max"]`; they must include `effort`. Without it the effort stays as set. |
-| `image`, `video` | `true` if the model accepts images or videos. Then `view()` and attached media are sent to it; otherwise it gets a note that the media is not shown. |
+| `summary` | Responses only. Sent as `reasoning.summary`, such as `"auto"`, so the model streams a summary of its reasoning. OpenAI may first require verifying your organization. |
+| `image`, `video` | `true` if the model accepts images or videos. Then `view()` and attached media are sent to it; otherwise it gets a note that the media is not shown. Responses takes no videos. |
 
 Keys are stored in plain text, so keep `model.toml` readable only by you.
 
@@ -512,7 +519,8 @@ the default is `warn,libsmol=info,rmcp=off`, `SMOL_LOG=warn` keeps only problems
   long call inside a C extension, or reading a pipe or socket on Windows) gets 3
   seconds, then the Python process is restarted and its variables are lost.
   The model is told when that happens.
-- **Only OpenAI-compatible chat completions endpoints** are supported for now.
+- **Only OpenAI-compatible endpoints** are supported for now, through Chat
+  Completions or Responses.
 - **The prompts have mostly been tuned with DeepSeek models.** Other models
   should work, but expect rough edges.
 - **0.x releases can change the session format.** Sessions saved in an older

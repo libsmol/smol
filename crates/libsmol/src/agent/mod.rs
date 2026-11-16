@@ -557,6 +557,7 @@ async fn generate(
             StreamDelta::Content(text) => blank &= text.trim().is_empty(),
             StreamDelta::CallCode(_) | StreamDelta::CallEnd(_) => blank = false,
             StreamDelta::Reasoning(text) => reasoned |= !text.is_empty(),
+            StreamDelta::Sealed { item, .. } => reasoned |= item["type"] == "reasoning",
         }
         on_delta(delta);
     };
@@ -685,7 +686,7 @@ pub(crate) mod tests {
     use crate::worker::workplace::tests::opened;
     use crate::worker::{Delegation, MemoryCall, Service};
     use crate::Result;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::fs;
     use std::future;
@@ -700,6 +701,8 @@ pub(crate) mod tests {
     #[derive(Debug, Clone)]
     pub(crate) struct Script {
         pub(crate) reasoning: Option<String>,
+        /// Output items of provider `mock`, which come before the content
+        pub(crate) sealed: Vec<Value>,
         pub(crate) content: String,
         pub(crate) calls: Vec<Result<String, Unreadable>>,
         pub(crate) usage: Option<TokenUsage>,
@@ -729,6 +732,12 @@ pub(crate) mod tests {
 
                 if let Some(reasoning) = &script.reasoning {
                     on_delta(StreamDelta::Reasoning(reasoning));
+                }
+                for item in &script.sealed {
+                    on_delta(StreamDelta::Sealed {
+                        provider: "mock",
+                        item,
+                    });
                 }
                 // Yields after every line so cancels and early cutoffs can land
                 for line in script.content.split_inclusive('\n') {
@@ -807,6 +816,7 @@ pub(crate) mod tests {
     pub(crate) fn reply(content: &str) -> Script {
         Script {
             reasoning: None,
+            sealed: Vec::new(),
             content: content.to_owned(),
             calls: Vec::new(),
             usage: None,
