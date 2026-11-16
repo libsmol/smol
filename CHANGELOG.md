@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
-## Unreleased
+## 0.11.0 - 2026-11-16
 
 - The desktop notification of a task that ended while you looked away is titled
   with the session's title and says the first line of the answer, or the error
