@@ -125,6 +125,7 @@ pub fn guard() {
         kill(group, libc::SIGTERM);
     }
     wait_out(groups, false);
+
     #[cfg(target_os = "linux")]
     {
         let prefix = instance();
@@ -421,6 +422,7 @@ pub fn kill_all() {
         groups.push(known.id);
     }
     wait_out(groups.clone(), true);
+
     // Their ids may be reused once this process exits and the watchdog runs
     for group in groups {
         tell(-group);
@@ -436,6 +438,7 @@ pub fn kill_all() {
 
 fn finish(group: i32, mark: Mark) {
     wait_out(vec![group], false);
+
     // Before the sweep, which may hang reading /proc, as an empty group's id can be reused
     forget(group);
     sweep(mark);

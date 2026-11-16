@@ -227,6 +227,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             let section = spread(section, count, width);
             lines.extend([Line::default(), section]);
         }
+
         let free = usize::from(inner.height).saturating_sub(lines.len());
         let shown = match programs.len() > free {
             true => free.saturating_sub(1),
@@ -244,6 +245,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             let line = spread(left, right, width);
             lines.push(line);
         }
+
         let hidden = programs.len() - shown;
         if hidden > 0 {
             let more = format!("… +{hidden} more");
