@@ -1,8 +1,8 @@
 use crate::model::{
-    error_text, merged, Call, ChatMessage, Finish, ModelError, OpenAIModel, Purpose, Stream,
-    StreamDelta, TokenUsage,
+    error_text, merged, tool_parameters, Call, ChatMessage, Finish, ModelError, OpenAIModel,
+    Purpose, Stream, StreamDelta, TokenUsage,
 };
-use crate::prompt::{self, ARGUMENT, TOOL};
+use crate::prompt::{self, TOOL};
 use serde_json::{json, Map, Value};
 use std::mem;
 
@@ -65,6 +65,7 @@ pub(crate) fn body(
                     }
                     input.push(item);
                 }
+
                 if !said {
                     let message = json!({ "role": "assistant", "content": text });
                     input.push(message);
@@ -78,6 +79,7 @@ pub(crate) fn body(
                     });
                     input.push(item);
                 }
+
                 // Servers refuse reasoning not followed by the item it led to
                 while input.last().is_some_and(|item| item["type"] == "reasoning") {
                     input.pop();
@@ -93,8 +95,7 @@ pub(crate) fn body(
     }
 
     let mut reasoning = Map::new();
-    // Leaving out the effort still has the server reason at its default effort
-    if let Some(effort) = model.effort.as_ref().filter(|_| purpose != Purpose::Title) {
+    if let Some(effort) = model.effort_for(purpose) {
         reasoning.insert("effort".into(), json!(effort));
     }
     // Only steps show the reasoning
@@ -114,12 +115,12 @@ pub(crate) fn body(
     body.insert("stream".into(), json!(true));
     body.insert("store".into(), json!(false));
     if purpose == Purpose::Step {
-        let code = json!({ "type": "string", "description": prompt::ARGUMENT_DOC });
-        let parameters = json!({
-            "type": "object",
-            "properties": { ARGUMENT: code },
-            "required": [ARGUMENT],
-        });
+        // With nothing stored, a server reads the reasoning items it gets back only from their
+        // encrypted content
+        let sealed = json!(["reasoning.encrypted_content"]);
+        body.insert("include".into(), sealed);
+
+        let parameters = tool_parameters();
         // Strict mode would refuse a schema that allows other properties
         let tool = json!({
             "type": "function",
@@ -157,6 +158,7 @@ impl Stream {
                     fields.remove(*field);
                 }
             }
+
             let sealed = StreamDelta::Sealed {
                 provider: &self.provider,
                 item: &kept,
@@ -492,7 +494,7 @@ mod tests {
         );
         assert_eq!(body["max_output_tokens"], 65536);
         assert_eq!(body["store"], false);
-        assert!(body.get("include").is_none(), "{body}");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         let tool = json!({
             "type": "function",
             "name": "eval",
@@ -508,6 +510,7 @@ mod tests {
         let (_, summary) = served(Kind::Responses, DONE, &spec, &greeting, Purpose::Summary);
         assert_eq!(summary["reasoning"], json!({ "effort": "high" }));
         assert!(summary.get("tools").is_none(), "{summary}");
+        assert!(summary.get("include").is_none(), "{summary}");
         let (_, title) = served(Kind::Responses, DONE, &spec, &greeting, Purpose::Title);
         assert!(title.get("reasoning").is_none(), "{title}");
         assert_eq!(

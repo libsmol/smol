@@ -1,8 +1,8 @@
 use crate::model::{
-    error_text, merged, retryable, Call, ChatMessage, Finish, ModelError, OpenAIModel, Purpose,
-    Stream, StreamDelta, TokenUsage,
+    error_text, merged, retryable, tool_parameters, Call, ChatMessage, Finish, ModelError,
+    OpenAIModel, Purpose, Stream, StreamDelta, TokenUsage,
 };
-use crate::prompt::{self, ARGUMENT, TOOL};
+use crate::prompt::{self, TOOL};
 use serde_json::{json, Map, Value};
 use std::mem;
 
@@ -78,9 +78,7 @@ pub(crate) fn body(
     }
 
     let mut body = Map::new();
-    // Leaving out the effort still has the server reason at its default effort
-    let effort = model.effort.as_ref().filter(|_| purpose != Purpose::Title);
-    if let Some(effort) = effort {
+    if let Some(effort) = model.effort_for(purpose) {
         body.insert("reasoning_effort".into(), json!(effort));
     }
     body.insert("model".into(), json!(model.id));
@@ -91,12 +89,7 @@ pub(crate) fn body(
     body.insert("stream".into(), json!(true));
     body.insert("stream_options".into(), json!({ "include_usage": true }));
     if purpose == Purpose::Step {
-        let code = json!({ "type": "string", "description": prompt::ARGUMENT_DOC });
-        let parameters = json!({
-            "type": "object",
-            "properties": { ARGUMENT: code },
-            "required": [ARGUMENT],
-        });
+        let parameters = tool_parameters();
         let function =
             json!({ "name": TOOL, "description": prompt::TOOL_DOC, "parameters": parameters });
         let tool = json!({ "type": "function", "function": function });

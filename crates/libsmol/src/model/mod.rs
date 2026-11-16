@@ -309,6 +309,11 @@ impl OpenAIModel {
         })
     }
 
+    /// Leaving it out still has the server reason at its default effort
+    fn effort_for(&self, purpose: Purpose) -> Option<&str> {
+        self.effort.as_deref().filter(|_| purpose != Purpose::Title)
+    }
+
     /// Media follows the tag naming it, and `attached` takes images a tool message can't hold
     fn content(&self, messages: &[&[Part]], mut attached: Option<&mut Vec<Value>>) -> Value {
         let text_type = match self.kind {
@@ -364,6 +369,7 @@ impl OpenAIModel {
                         json!({ "type": "input_image", "image_url": url, "detail": "auto" })
                     }
                 };
+
                 if let Some(attached) = attached.as_deref_mut() {
                     attached.push(json!({ "type": text_type, "text": tag }));
                     attached.push(block);
@@ -530,6 +536,15 @@ fn merged(group: &[ChatMessage]) -> Vec<&[Part]> {
         }
     }
     merged
+}
+
+fn tool_parameters() -> Value {
+    let code = json!({ "type": "string", "description": prompt::ARGUMENT_DOC });
+    json!({
+        "type": "object",
+        "properties": { ARGUMENT: code },
+        "required": [ARGUMENT],
+    })
 }
 
 /// Whether the key, the address or something else made listing fail
