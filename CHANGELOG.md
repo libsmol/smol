@@ -9,6 +9,14 @@ but their files stay in `~/.smol/projects` untouched.
 
 ## Unreleased
 
+- The system prompt says calls have no time limit, so models run a command
+  they wait for in the call itself, where some started it in the background
+  and checked on it every few seconds, each check another request to the
+  model. It also says that the `[Program done]` message about a program left
+  running still comes once the model has answered, as a new message in smol
+  and with the user's next message in other clients. A model asked to reply
+  at once and report a result later now answers and waits for that message,
+  where some started an agent only to wait.
 - `grep()` results print like ripgrep, with the number of matches first and
   each file's matching lines under its path, where they printed as a list of
   tuples that repeated every path. `grep(..., context=N)` also prints the N

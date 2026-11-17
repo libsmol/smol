@@ -316,6 +316,7 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             skills,
             listed,
             images_shown: app.peer.images(),
+            background: app.peer.background(),
         };
         let agent = Agent {
             model: Arc::from(built),

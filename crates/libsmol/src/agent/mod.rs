@@ -219,6 +219,8 @@ pub(crate) struct Brief {
     pub(crate) skills: Vec<Skill>,
     pub(crate) listed: Listed,
     pub(crate) images_shown: bool,
+    /// The client declared `_smol/background`, so programs that end after an answer get a turn
+    pub(crate) background: bool,
 }
 
 pub(crate) type Delegating<'a> = dyn FnMut(AgentCall) -> Calling + Send + 'a;

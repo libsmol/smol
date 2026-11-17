@@ -229,6 +229,13 @@ pub(crate) fn system(
             " until you answer",
         ),
     };
+    let reported = match (place, brief.background) {
+        (Place::Main { .. }, true) => ", as a new message if you have already answered",
+        (Place::Main { .. }, false) => {
+            ", with the user's next message if you have already answered"
+        }
+        (Place::Delegated(_), _) => "",
+    };
 
     let mut entries = Vec::new();
     for role in roles {
@@ -356,7 +363,8 @@ Each reply either calls `{TOOL}` or answers.
 # Running code
 
 - All calls share one Python session, which keeps variables, functions and imports.
-- Programs your code leaves running go on after the call{lasting}, and a `[{PROGRAM_DONE}]` message lists each one that ends by pid and command, with the output printed since the last call.
+- Calls have no time limit, so wait for a command by running it in the call.
+- Programs your code leaves running go on after the call{lasting}, and a `[{PROGRAM_DONE}]` message tells you when each one ends{reported}.
 - A call returns what it printed plus the value of each top-level expression that is not `None` (strings as is, others as `repr`).
 - Output over {MAX_OBSERVATION_CHARS} characters, or one `print()` over {MAX_PRINT_CHARS}, is cut in the middle; variables keep their full values.
 - Do as much as you can per call, and print only what you need: read large or many files in parts, or search them with `grep()`.
@@ -1249,7 +1257,7 @@ mod tests {
         };
         let mut briefs = Vec::new();
         for listed in &listings {
-            for flags in 0..8 {
+            for flags in 0..16 {
                 let instructions = match flags & 1 {
                     0 => Vec::new(),
                     _ => vec!["Reply in French".to_owned()],
@@ -1263,6 +1271,7 @@ mod tests {
                     skills,
                     listed: listed.clone(),
                     images_shown: flags & 4 != 0,
+                    background: flags & 8 != 0,
                 };
                 briefs.push(brief);
             }
@@ -1291,7 +1300,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(cases.len(), 3072);
+        assert_eq!(cases.len(), 6144);
 
         for (place, servers, writable, brief, (image, video)) in cases {
             let takes = |kind| match kind {
@@ -1345,6 +1354,10 @@ mod tests {
             );
             assert_eq!(text.contains("\nview(path)"), image || video, "{text}");
             assert_eq!(text.contains(SHOWN_IMAGES), brief.images_shown, "{text}");
+            let resumed = text.contains("as a new message if you have already answered.");
+            assert_eq!(resumed, main && brief.background, "{text}");
+            let waits = text.contains("with the user's next message if you have already answered.");
+            assert_eq!(waits, main && !brief.background, "{text}");
             assert_eq!(text.contains("\n- Sandbox: "), writable.is_some(), "{text}");
             assert_eq!(text.contains("/.cargo/registry`"), registered, "{text}");
         }

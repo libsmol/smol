@@ -120,6 +120,10 @@ impl Peer {
     pub(crate) fn set_background(&self, background: bool) {
         self.background.store(background, Ordering::Relaxed);
     }
+
+    pub(crate) fn background(&self) -> bool {
+        self.background.load(Ordering::Relaxed)
+    }
 }
 
 /// Sends what concerns one session, with its id
@@ -172,7 +176,7 @@ impl SessionPeer {
 
     /// The client declared `BACKGROUND`
     pub(crate) fn background(&self) -> bool {
-        self.peer.background.load(Ordering::Relaxed)
+        self.peer.background()
     }
 
     /// Tells a client that declared `BACKGROUND` that programs the code left running ended
