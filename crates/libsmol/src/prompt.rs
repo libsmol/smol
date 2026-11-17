@@ -28,12 +28,14 @@ const RULES: &str = "- Never make up data or functions; check unfamiliar ones wi
 - Do the task instead of describing it.
 - Report only results you obtained, and say what failed or is uncertain.";
 /// Only for agents whose worker offers `remember()`
+const OUTLASTING: &str = "Memories outlast the session: project ones reach this project's later sessions, global ones every session.";
 const REMEMBERING: &str = "## Rules
 
-- `remember()` what the user asks you to, their preferences and rules, and hard-won lessons such as pitfalls, as bare facts.
-- Progress, the state of the work and what the code does go stale and are in the files, so they are not memories.
-- One fact per memory, kept for this project unless the user says it holds everywhere (`project=False`).
-- When a memory is wrong or outdated, `forget()` it, and `remember()` the correct one only if it belongs in memories.";
+- `remember()` what the user asks you to, the lasting preferences they state, and what took you tries to find out, such as how to build or test.
+- Skip progress, results, what is installed and what the code does: they are in the files or go stale.
+- Write each as one instruction a later session can follow without this conversation, in the user's language, as soon as you learn it.
+- Make it global (`project=False`) if it is about the user, project if it is about this project.
+- Trust what you see over memories: `forget()` any memory, listed or recalled, that is wrong, outdated, repeated or against these rules, and save the correct one, if any.";
 
 /// Worded against view_summary, without which models take view() as showing the user
 const SHOWN_IMAGES: &str = "To show the user an image, such as a chart you saved, put `![alt](path)` on a line of its own.";
@@ -311,6 +313,9 @@ pub(crate) fn system(
         lines.push(line);
     }
     let mut kept = Vec::new();
+    if place.remembers() {
+        kept.push(OUTLASTING.to_owned());
+    }
     if !lines.is_empty() {
         let shown = lines.len();
         let heading = match memories.global > shown {
@@ -899,7 +904,7 @@ mod tests {
     use crate::model::{Media, MediaKind};
     use crate::prompt::{
         call_error, done, media_tag, shell, step_error, system, transcript, unseen, HANDED_BACK,
-        SHOWN_IMAGES,
+        OUTLASTING, SHOWN_IMAGES,
     };
     use crate::steps::{
         AgentStep, Call, CallError, CodeResult, DoneStep, Exit, MemoryStep, Program, ShellStep,
@@ -996,7 +1001,7 @@ mod tests {
              When a task matches a skill, read and follow its `SKILL.md`; paths in it are relative to its folder.\n\n\
              - `weekly`: Write the weekly report (`/home/zoë/.smol/skills/weekly/SKILL.md`)\n\n# Sub-agents\n\n";
         assert!(text.contains(skill), "{text}");
-        let files = "only if it belongs in memories.\n\n# Instructions\n\n\
+        let files = "and save the correct one, if any.\n\n# Instructions\n\n\
                      Follow these instructions:\n\n\
                      <instructions>\nReply in French\n</instructions>\n\n\
                      <instructions>\nIndent with tabs\n</instructions>\n\n# Environment\n\n";
@@ -1049,15 +1054,17 @@ mod tests {
 
         let functions = [remember];
         let text = system(&functions, &[], &brief, cwd, None, &main, &|_| false);
-        let section = "`agent([part1, part2, ...])`.\n\n# Memories\n\n\
-                       Global memories:\n\
-                       - [7] Writes résumés in French\n\
-                       - [3] Prefers tabs over spaces\n\n\
-                       This project has 12 memories of its own, not listed here; \
-                       before you start a task, `recall()` its key words.\n\n\
-                       ## Rules\n\n- `remember()` what the user asks you to, their preferences and rules, ";
-        assert!(text.contains(section), "{text}");
-        let rules = "only if it belongs in memories.\n\n# Environment\n\n";
+        let section = format!(
+            "`agent([part1, part2, ...])`.\n\n# Memories\n\n{OUTLASTING}\n\n\
+             Global memories:\n\
+             - [7] Writes résumés in French\n\
+             - [3] Prefers tabs over spaces\n\n\
+             This project has 12 memories of its own, not listed here; \
+             before you start a task, `recall()` its key words.\n\n\
+             ## Rules\n\n- `remember()` what the user asks you to, the lasting preferences they state, "
+        );
+        assert!(text.contains(&section), "{text}");
+        let rules = "and save the correct one, if any.\n\n# Environment\n\n";
         assert!(text.contains(rules), "{text}");
 
         let listed = Listed {
@@ -1070,16 +1077,19 @@ mod tests {
             ..Brief::default()
         };
         let text = system(&functions, &[], &more, cwd, None, &main, &|_| false);
-        let heading = "# Memories\n\n\
-                       Global memories, the newest 2 of 14 (`recall()` finds the rest):\n\
-                       - [7] Writes résumés in French\n";
-        assert!(text.contains(heading), "{text}");
+        let heading = format!(
+            "# Memories\n\n{OUTLASTING}\n\n\
+             Global memories, the newest 2 of 14 (`recall()` finds the rest):\n\
+             - [7] Writes résumés in French\n"
+        );
+        assert!(text.contains(&heading), "{text}");
 
         let empty = Brief::default();
         let bare = system(&functions, &[], &empty, cwd, None, &main, &|_| false);
-        let rules =
-            "`agent([part1, part2, ...])`.\n\n# Memories\n\n## Rules\n\n- `remember()` what";
-        assert!(bare.contains(rules), "{bare}");
+        let rules = format!(
+            "`agent([part1, part2, ...])`.\n\n# Memories\n\n{OUTLASTING}\n\n## Rules\n\n- `remember()`"
+        );
+        assert!(bare.contains(&rules), "{bare}");
 
         let listed = Listed {
             here: 1,
@@ -1114,12 +1124,14 @@ mod tests {
         let place = main_place(roles);
         let empty = Brief::default();
         let main = system(&[], &[], &empty, cwd, None, &place, &|_| false);
-        let listed = "\n\n## Roles\n\n\
-                      To give a task to an agent in one of these roles, call `agent(task, role=\"reviewer\")`. \
-                      For a list of tasks, `role` is one role for all of them or a list with one role per task.\n\n\
-                      - `reviewer`: Reviews the café's code. # Checklist - real bugs only\n\
-                      - `tester`: Writes naïve tests\n\n# Memories\n\n## Rules\n\n";
-        assert!(main.contains(listed), "{main}");
+        let listed = format!(
+            "\n\n## Roles\n\n\
+             To give a task to an agent in one of these roles, call `agent(task, role=\"reviewer\")`. \
+             For a list of tasks, `role` is one role for all of them or a list with one role per task.\n\n\
+             - `reviewer`: Reviews the café's code. # Checklist - real bugs only\n\
+             - `tester`: Writes naïve tests\n\n# Memories\n\n{OUTLASTING}\n\n## Rules\n\n"
+        );
+        assert!(main.contains(&listed), "{main}");
         assert!(!main.contains("# Role\n"), "{main}");
         assert!(main.contains("- Your answer goes to the user;"), "{main}");
 

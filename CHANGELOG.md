@@ -9,6 +9,15 @@ but their files stay in `~/.smol/projects` untouched.
 
 ## Unreleased
 
+- The memory rules tell the model that memories outlast the session, to save
+  one as soon as it learns something, as an instruction a later session can
+  follow, in the user's language, global when it is about the user, and to
+  forget a listed or recalled memory that is wrong, outdated, repeated or
+  that the rules would not keep, such as a result. In tests where a user
+  states a preference, corrects the model or asks it to remember something,
+  models saved the right memory in the right scope 30 times of 36 where they
+  did 14 before, keeping preferences about the user for the project and
+  writing English memories for a user who wrote Chinese.
 - The system prompt says calls have no time limit, so models run a command
   they wait for in the call itself, where some started it in the background
   and checked on it every few seconds, each check another request to the
