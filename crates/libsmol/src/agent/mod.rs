@@ -669,7 +669,7 @@ pub(crate) mod tests {
         title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Records, Sink,
         Streamed, Task, Turn, Unseen, RETRY_WAIT,
     };
-    use crate::config::{Access, Role};
+    use crate::config::{Access, Kind, Role};
     use crate::history::MAX_TITLE_CHARS;
     use crate::model::{
         ChatMessage, Finish, Finished, Generating, MediaKind, Model, ModelError, Purpose,
@@ -701,7 +701,7 @@ pub(crate) mod tests {
     #[derive(Debug, Clone)]
     pub(crate) struct Script {
         pub(crate) reasoning: Option<String>,
-        /// Output items of provider `mock`, which come before the content
+        /// Output items of provider `mock` through Responses, which come before the content
         pub(crate) sealed: Vec<Value>,
         pub(crate) content: String,
         pub(crate) calls: Vec<Result<String, Unreadable>>,
@@ -736,6 +736,7 @@ pub(crate) mod tests {
                 for item in &script.sealed {
                     on_delta(StreamDelta::Sealed {
                         provider: "mock",
+                        kind: Kind::Responses,
                         item,
                     });
                 }

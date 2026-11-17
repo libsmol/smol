@@ -7,6 +7,18 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- Through the Responses API, a reply that holds several messages, such as a
+  commentary before the final answer, shows each as a paragraph of its own and
+  sends each back to the model with its own text and phase. Before, their text
+  ran together and all of it went back in the first message.
+- Through Chat Completions, what a provider sends beyond the standard fields of
+  a reply and its calls goes back to it with the history, such as the
+  `reasoning_details` of OpenRouter and the thought signatures that Gemini 3
+  puts in `extra_content`, whose calls failed from the second step on. Calls
+  that carry such fields go back under the ids the provider gave them.
+
 ## 0.11.0 - 2026-11-16
 
 - The desktop notification of a task that ended while you looked away is titled

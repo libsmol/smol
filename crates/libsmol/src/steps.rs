@@ -346,10 +346,19 @@ impl MemoryStep {
             sent.push(called);
         }
         if !sent.is_empty() || !text.is_empty() {
+            // The ends of sealed items count from where the text the model sees starts
+            let lead = step.text.len() - step.text.trim_start().len();
+            let mut sealed = step.sealed.clone();
+            if let Some(sealed) = &mut sealed {
+                for end in &mut sealed.ends {
+                    *end = end.saturating_sub(lead);
+                }
+            }
+
             let reply = ChatMessage::Assistant {
                 text: text.to_owned(),
                 reasoning: step.reasoning.clone(),
-                sealed: step.sealed.clone(),
+                sealed,
                 calls: sent,
             };
             messages.push(reply);
@@ -673,6 +682,7 @@ pub(crate) fn estimate(bytes: usize) -> u64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::config::Kind;
     use crate::model::tests::png;
     use crate::steps::*;
     use crate::tests::content;
@@ -943,13 +953,16 @@ pub(crate) mod tests {
         let thought =
             json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-café" });
         let said = json!({ "type": "message", "id": "msg_1", "phase": "final_answer" });
+        let text = "\n\nVoilà, the café";
         let sealed = Sealed {
             provider: "openai".to_owned(),
+            kind: Kind::Responses,
             items: vec![thought, said],
+            ends: vec![2, text.len()],
         };
         let step = AgentStep {
             sealed: Some(sealed.clone()),
-            ..replied("Voilà, the café")
+            ..replied(text)
         };
         let saved = serde_json::to_value(&step).expect("serialize");
         assert_eq!(saved["sealed"]["provider"], "openai");
@@ -960,10 +973,20 @@ pub(crate) mod tests {
         let mut calls = 0;
         let action = MemoryStep::Action(Box::new(step));
         let messages = action.messages(&mut calls);
-        let ChatMessage::Assistant { sealed: sent, .. } = &messages[0] else {
+        let ChatMessage::Assistant {
+            text: seen,
+            sealed: sent,
+            ..
+        } = &messages[0]
+        else {
             panic!("{messages:?}");
         };
-        assert_eq!(sent.as_ref(), Some(&sealed));
+        let moved = Sealed {
+            ends: vec![0, text.len() - 2],
+            ..sealed
+        };
+        assert_eq!(seen, "Voilà, the café");
+        assert_eq!(sent.as_ref(), Some(&moved));
 
         let plain = serde_json::to_value(replied("Voilà")).expect("serialize");
         assert!(plain.get("sealed").is_none(), "{plain}");

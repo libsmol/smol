@@ -36,23 +36,32 @@ pub(crate) fn body(
             } => {
                 // The provider's own items go back in their order with the text and calls in them,
                 // and what they lack follows
-                let items = match sealed {
-                    Some(sealed) if sealed.provider == model.provider => &sealed.items[..],
-                    _ => &[],
+                let (items, ends) = match model.opens(sealed.as_ref()) {
+                    Some(sealed) => (&sealed.items[..], &sealed.ends[..]),
+                    None => (&[][..], &[][..]),
                 };
-                let mut said = text.is_empty();
+                let last = items.iter().rposition(|item| item["type"] == "message");
+                let mut placed = 0;
                 let mut calls = calls.iter();
-                for kept in items {
+                for (index, kept) in items.iter().enumerate() {
                     let mut item = kept.clone();
                     match kept["type"].as_str() {
-                        Some("message") if !said => {
+                        Some("message") => {
+                            // Items saved without ends give the first message all the text
+                            let end = match ends.get(index) {
+                                Some(&end) if Some(index) != last => end.clamp(placed, text.len()),
+                                _ => text.len(),
+                            };
+                            let said = text.get(placed..end).unwrap_or_default().trim();
+                            placed = end;
+                            if said.is_empty() {
+                                continue;
+                            }
+
                             let part =
-                                json!({ "type": "output_text", "text": text, "annotations": [] });
+                                json!({ "type": "output_text", "text": said, "annotations": [] });
                             item["content"] = json!([part]);
-                            said = true;
                         }
-                        // The first one holds all the text
-                        Some("message") => continue,
                         Some("function_call") => {
                             let Some(call) = calls.next() else {
                                 continue;
@@ -66,8 +75,9 @@ pub(crate) fn body(
                     input.push(item);
                 }
 
-                if !said {
-                    let message = json!({ "role": "assistant", "content": text });
+                let rest = text.get(placed..).unwrap_or_default().trim();
+                if !rest.is_empty() {
+                    let message = json!({ "role": "assistant", "content": rest });
                     input.push(message);
                 }
                 for call in calls {
@@ -161,16 +171,22 @@ impl Stream {
 
             let sealed = StreamDelta::Sealed {
                 provider: &self.provider,
+                kind: self.kind,
                 item: &kept,
             };
             on_delta(sealed);
         }
 
         match kind {
+            // Each message, reasoning item and summary part gets a paragraph of its own
+            "response.output_item.added" if item["type"] == "message" => self.opened = true,
             "response.output_text.delta" | "response.refusal.delta" if !delta.is_empty() => {
+                if mem::take(&mut self.opened) && self.said {
+                    on_delta(StreamDelta::Content("\n\n"));
+                }
+                self.said = true;
                 on_delta(StreamDelta::Content(delta));
             }
-            // Each summary part and reasoning item gets a paragraph of its own
             "response.reasoning_summary_part.added" => self.parted = true,
             "response.output_item.added" if item["type"] == "reasoning" => self.parted = true,
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta"
@@ -283,6 +299,7 @@ mod tests {
         let bare = json!({ "type": "reasoning", "id": "rs_2", "summary": [] });
         let said = json!({ "type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "phase": "commentary", "content": [{ "type": "output_text", "text": "Hello, world 🍕" }] });
         let plain = json!({ "type": "reasoning", "id": "rs_3", "summary": [], "content": [{ "type": "reasoning_text", "text": "Check the résumé" }] });
+        let answered = json!({ "type": "message", "id": "msg_2", "role": "assistant", "status": "completed", "phase": "final_answer", "content": [{ "type": "output_text", "text": "Bon appétit" }] });
         let done =
             |item: &Value| format!(r#"data: {{"type":"response.output_item.done","item":{item}}}"#);
         let (finished, content, reasoning) = parsed(
@@ -304,14 +321,18 @@ mod tests {
                 r#"data: {"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_3","summary":[]}}"#,
                 r#"data: {"type":"response.reasoning_text.delta","delta":"Check the résumé"}"#,
                 &done(&plain),
+                r#"data: {"type":"response.output_item.added","item":{"type":"message","id":"msg_2","role":"assistant","content":[]}}"#,
+                r#"data: {"type":"response.output_text.delta","delta":"Bon appétit"}"#,
+                &done(&answered),
                 r#"data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":8}}}}"#,
             ],
         );
 
         let mut kept = said.clone();
         kept.as_object_mut().expect("item").remove("content");
-        let items =
-            format!("[mock {encrypted}][mock {bare}]Hello, world 🍕[mock {kept}][mock {plain}]");
+        let mut answer = answered.clone();
+        answer.as_object_mut().expect("item").remove("content");
+        let items = format!("[mock {encrypted}][mock {bare}]Hello, world 🍕[mock {kept}][mock {plain}]\n\nBon appétit[mock {answer}]");
         assert_eq!(content, items);
         assert_eq!(
             reasoning,
@@ -419,9 +440,11 @@ mod tests {
         let call = |id: &str, code: &str| ToolCall::eval(id.to_owned(), code);
         let theirs = Sealed {
             provider: "other".to_owned(),
+            kind: Kind::Responses,
             items: vec![
                 json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-naïve" }),
             ],
+            ends: Vec::new(),
         };
         let conversation = [
             ChatMessage::System("Be brief in the café".to_owned()),
@@ -542,16 +565,22 @@ mod tests {
             called("fc_2"),
             thought("rs_3"),
         ];
+        let first = "Counting both.";
+        let text = format!("{first}\n\nThen the naïve way.");
+        let (spoken, whole) = (first.len(), text.len());
+        let ends = vec![0, spoken, spoken, spoken, whole, whole, whole];
         // A reply interrupted before its message and call finished
         let interrupted = vec![thought("rs_4")];
         let conversation = [
             ChatMessage::user("Count the cafés"),
             ChatMessage::Assistant {
-                text: "Counting both, then the naïve way.".to_owned(),
+                text: text.clone(),
                 reasoning: None,
                 sealed: Some(Sealed {
                     provider: "mock".to_owned(),
+                    kind: Kind::Responses,
                     items,
+                    ends,
                 }),
                 calls: vec![call("call_1", "print(1)"), call("call_2", "print(2)")],
             },
@@ -562,7 +591,9 @@ mod tests {
                 reasoning: None,
                 sealed: Some(Sealed {
                     provider: "mock".to_owned(),
+                    kind: Kind::Responses,
                     items: interrupted,
+                    ends: vec![0],
                 }),
                 calls: vec![call("call_3", "print(3)")],
             },
@@ -571,15 +602,18 @@ mod tests {
 
         let spec = ModelSpec::default();
         let (_, body) = served(Kind::Responses, DONE, &spec, &conversation, Purpose::Step);
-        let text = json!([{ "type": "output_text", "text": "Counting both, then the naïve way.", "annotations": [] }]);
+        let said_first = json!([{ "type": "output_text", "text": first, "annotations": [] }]);
+        let said_then =
+            json!([{ "type": "output_text", "text": "Then the naïve way.", "annotations": [] }]);
         let output =
             |id: &str| json!({ "type": "function_call_output", "call_id": id, "output": "café" });
         let expected = json!([
             { "role": "user", "content": "Count the cafés" },
             thought("rs_1"),
-            { "type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "phase": "commentary", "content": text },
+            { "type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "phase": "commentary", "content": said_first },
             { "type": "function_call", "id": "fc_1", "status": "completed", "call_id": "call_1", "name": "eval", "arguments": "{\"code\":\"print(1)\"}" },
             thought("rs_2"),
+            { "type": "message", "id": "msg_2", "role": "assistant", "status": "completed", "phase": "commentary", "content": said_then },
             { "type": "function_call", "id": "fc_2", "status": "completed", "call_id": "call_2", "name": "eval", "arguments": "{\"code\":\"print(2)\"}" },
             output("call_1"),
             output("call_2"),
@@ -589,5 +623,42 @@ mod tests {
             output("call_3"),
         ]);
         assert_eq!(body["input"], expected);
+    }
+
+    #[test]
+    fn messages_split() {
+        let said = |id: &str, phase: &str| json!({ "type": "message", "id": id, "role": "assistant", "status": "completed", "phase": phase });
+        let items = vec![said("msg_1", "commentary"), said("msg_2", "final_answer")];
+        let first = "Checking the café menu.";
+        let text = format!("{first}\n\nCrème brûlée it is.");
+        let spec = ModelSpec::default();
+        let sent = |ends: Vec<usize>| {
+            let sealed = Sealed {
+                provider: "mock".to_owned(),
+                kind: Kind::Responses,
+                items: items.clone(),
+                ends,
+            };
+            let answered = ChatMessage::Assistant {
+                text: text.clone(),
+                reasoning: None,
+                sealed: Some(sealed),
+                calls: Vec::new(),
+            };
+            let conversation = [ChatMessage::user("Pick a dessert"), answered];
+            let (_, body) = served(Kind::Responses, DONE, &spec, &conversation, Purpose::Step);
+            body["input"].clone()
+        };
+        let output =
+            |text: &str| json!([{ "type": "output_text", "text": text, "annotations": [] }]);
+
+        let split = sent(vec![first.len(), text.len()]);
+        assert_eq!(split[1]["content"], output(first));
+        assert_eq!(split[2]["content"], output("Crème brûlée it is."));
+        assert_eq!(split[2]["phase"], "final_answer");
+
+        let older = sent(Vec::new());
+        assert_eq!(older[1]["content"], output(&text));
+        assert_eq!(older.as_array().map(Vec::len), Some(2));
     }
 }

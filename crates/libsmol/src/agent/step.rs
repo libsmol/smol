@@ -75,12 +75,20 @@ impl Turn<'_> {
                     }
                     StreamDelta::CallCode(code) => reply.push_code(code, &mut shown),
                     StreamDelta::CallEnd(ended) => reply.end_call(ended, &mut shown),
-                    StreamDelta::Sealed { provider, item } => {
+                    StreamDelta::Sealed {
+                        provider,
+                        kind,
+                        item,
+                    } => {
                         let first = Sealed {
                             provider: provider.to_owned(),
+                            kind,
                             items: Vec::new(),
+                            ends: Vec::new(),
                         };
-                        reply.sealed.get_or_insert(first).items.push(item.clone());
+                        let sealed = reply.sealed.get_or_insert(first);
+                        sealed.items.push(item.clone());
+                        sealed.ends.push(reply.text.len());
                     }
                 }
 
@@ -371,6 +379,7 @@ mod tests {
     use crate::agent::step::*;
     use crate::agent::tests::{called, recorded, reply, scripted, Script, ScriptedModel, Tested};
     use crate::agent::Task;
+    use crate::config::Kind;
     use crate::model::{ModelError, TokenUsage};
     use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::{content, Temp};
@@ -875,7 +884,9 @@ mod tests {
 
         let sealed = Sealed {
             provider: "mock".to_owned(),
+            kind: Kind::Responses,
             items,
+            ends: vec![0, 0],
         };
         assert_eq!(only(&memory).sealed, Some(sealed));
     }

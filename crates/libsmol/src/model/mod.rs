@@ -7,7 +7,7 @@ use base64::Engine;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::env;
 use std::future::Future;
 use std::mem;
@@ -54,13 +54,23 @@ pub(crate) enum ChatMessage {
     },
 }
 
-/// A reply's output items in order, which only the provider that wrote them reads back,
-/// without the text and calls the step holds itself
+/// The output items of a Responses reply, or one item shaped like a Chat Completions reply,
+/// without the text and calls the step holds itself, which only their provider reads back
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Sealed {
     /// The `[model.<name>]` table, since no other provider can open them
     pub(crate) provider: String,
+    /// Sessions saved before Chat Completions sealed anything hold only items of Responses
+    #[serde(default = "responses")]
+    pub(crate) kind: Kind,
     pub(crate) items: Vec<Value>,
+    /// Bytes of reply text received as each item ended, which give each message its own text back
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) ends: Vec<usize>,
+}
+
+fn responses() -> Kind {
+    Kind::Responses
 }
 
 impl ChatMessage {
@@ -190,9 +200,10 @@ pub(crate) enum StreamDelta<'a> {
     /// The code of an `eval` tool call, decoded as it streams in
     CallCode(&'a str),
     CallEnd(Result<(), Unread<'a>>),
-    /// An output item of the reply, without the text and call it holds
+    /// What the reply holds beyond its text and calls, which only its provider reads
     Sealed {
         provider: &'a str,
+        kind: Kind,
         item: &'a Value,
     },
 }
@@ -312,6 +323,13 @@ impl OpenAIModel {
     /// Leaving it out still has the server reason at its default effort
     fn effort_for(&self, purpose: Purpose) -> Option<&str> {
         self.effort.as_deref().filter(|_| purpose != Purpose::Title)
+    }
+
+    /// Sealed items go back only to the provider and API that wrote them
+    fn opens<'a>(&self, sealed: Option<&'a Sealed>) -> Option<&'a Sealed> {
+        let sealed = sealed?;
+        let ours = sealed.provider == self.provider && sealed.kind == self.kind;
+        ours.then_some(sealed)
     }
 
     /// Media follows the tag naming it, and `attached` takes images a tool message can't hold
@@ -507,6 +525,7 @@ impl Model for OpenAIModel {
                 stream.finish = Some(Finish::Stop);
                 stream.hand_over(on_delta);
             }
+            stream.seal(on_delta);
             stream.finished()
         })
     }
@@ -650,6 +669,13 @@ struct Stream {
     reasoned: bool,
     /// A summary part or reasoning item started after the last reasoning text
     parted: bool,
+    said: bool,
+    /// A message item started after the last text
+    opened: bool,
+    /// Fields of the reply that only its provider reads
+    extras: Map<String, Value>,
+    /// The calls handed over, each with its id and the fields that only its provider reads
+    called: Vec<Map<String, Value>>,
 }
 
 #[derive(Default)]
@@ -659,6 +685,7 @@ struct Call {
     name: String,
     arguments: String,
     code: Decoding,
+    extras: Map<String, Value>,
 }
 
 #[derive(Default)]
@@ -679,6 +706,10 @@ impl Stream {
             call: None,
             reasoned: false,
             parted: false,
+            said: false,
+            opened: false,
+            extras: Map::new(),
+            called: Vec::new(),
         }
     }
 
@@ -789,6 +820,12 @@ impl Stream {
             let delta = StreamDelta::CallCode(&rest);
             on_delta(delta);
         }
+        let mut kept = mem::take(&mut call.extras);
+        if !call.id.is_empty() {
+            kept.insert("id".to_owned(), json!(call.id));
+        }
+        self.called.push(kept);
+
         let ended = match read {
             true => Ok(()),
             false => Err(Unread {
@@ -798,6 +835,29 @@ impl Stream {
         };
         let delta = StreamDelta::CallEnd(ended);
         on_delta(delta);
+    }
+
+    /// Hands over the fields the protocol doesn't define as one item shaped like the reply,
+    /// whose `tool_calls` hold those of every call in order
+    fn seal(&mut self, on_delta: &mut dyn FnMut(StreamDelta)) {
+        let extra = |call: &Map<String, Value>| call.keys().any(|key| key != "id");
+        if self.extras.is_empty() && !self.called.iter().any(extra) {
+            return;
+        }
+
+        let mut reply = mem::take(&mut self.extras);
+        let called = mem::take(&mut self.called);
+        if !called.is_empty() {
+            let called = called.into_iter().map(Value::Object).collect();
+            reply.insert("tool_calls".to_owned(), Value::Array(called));
+        }
+        let item = Value::Object(reply);
+        let sealed = StreamDelta::Sealed {
+            provider: &self.provider,
+            kind: self.kind,
+            item: &item,
+        };
+        on_delta(sealed);
     }
 
     fn finished(self) -> Result<Finished, ModelError> {
@@ -1003,7 +1063,7 @@ pub(crate) mod tests {
                 let end = format!("[{} {}]", unread.name, unread.arguments);
                 content.push_str(&end);
             }
-            StreamDelta::Sealed { provider, item } => {
+            StreamDelta::Sealed { provider, item, .. } => {
                 let mark = format!("[{provider} {item}]");
                 content.push_str(&mark);
             }
@@ -1015,6 +1075,9 @@ pub(crate) mod tests {
             if !matches!(fed, Ok(false)) {
                 break;
             }
+        }
+        if fed.is_ok() {
+            stream.seal(&mut on_delta);
         }
         let finished = fed.and_then(|_| stream.finished());
 

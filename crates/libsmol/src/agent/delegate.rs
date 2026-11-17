@@ -797,7 +797,7 @@ mod tests {
     };
     use crate::agent::tests::{scripted, streamed, with_roles};
     use crate::agent::{Event, HelperView, Helpers, Sink, Status, Task, Unseen};
-    use crate::config::Role;
+    use crate::config::{Kind, Role};
     use crate::model::{
         ChatMessage, Finish, Finished, Generating, Model, ModelError, Purpose, StreamDelta,
         TokenUsage,
@@ -856,6 +856,7 @@ mod tests {
                     json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-café" });
                 let sealed = StreamDelta::Sealed {
                     provider: "mock",
+                    kind: Kind::Responses,
                     item: &item,
                 };
                 on_delta(sealed);

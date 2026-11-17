@@ -4,7 +4,18 @@ use crate::model::{
 };
 use crate::prompt::{self, TOOL};
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::mem;
+
+/// Fields the protocol defines, which the request rebuilds from the step
+const MESSAGE_FIELDS: [&str; 5] = [
+    "role",
+    "content",
+    "reasoning_content",
+    "reasoning",
+    "tool_calls",
+];
+const CALL_FIELDS: [&str; 4] = ["index", "id", "type", "function"];
 
 pub(crate) fn body(
     model: &OpenAIModel,
@@ -14,6 +25,8 @@ pub(crate) fn body(
     let mut sent = Vec::new();
     // Tool messages can't hold images, which go in a user message after all the step's replies
     let mut attached = Vec::new();
+    // Calls that go back under the ids their provider gave
+    let mut renamed = HashMap::new();
     let together = |a: &ChatMessage, b: &ChatMessage| {
         matches!((a, b), (ChatMessage::User(_), ChatMessage::User(_)))
     };
@@ -37,8 +50,8 @@ pub(crate) fn body(
             ChatMessage::Assistant {
                 text,
                 reasoning,
+                sealed,
                 calls,
-                ..
             } => {
                 let content = match text.is_empty() && !calls.is_empty() {
                     true => Value::Null,
@@ -49,11 +62,32 @@ pub(crate) fn body(
                     message["reasoning_content"] = json!(reasoning);
                 }
 
+                // The provider's own fields go back on the message and calls they came with
+                let sealed = model.opens(sealed.as_ref());
+                let mut own = match sealed.and_then(|sealed| sealed.items.first()) {
+                    Some(Value::Object(fields)) => fields.clone(),
+                    _ => Map::new(),
+                };
+                let theirs = own.shift_remove("tool_calls").unwrap_or_default();
+                for (key, value) in own {
+                    message[key] = value;
+                }
+
                 let mut called = Vec::new();
-                for call in calls {
+                for (index, call) in calls.iter().enumerate() {
                     let function = json!({ "name": call.name, "arguments": call.arguments });
-                    let call = json!({ "id": call.id, "type": "function", "function": function });
-                    called.push(call);
+                    let mut item =
+                        json!({ "id": call.id, "type": "function", "function": function });
+                    // Their fields may name the id the provider gave, which replaces ours
+                    if let Some(Value::Object(fields)) = theirs.get(index) {
+                        for (key, value) in fields {
+                            item[key] = value.clone();
+                        }
+                    }
+                    if item["id"] != call.id.as_str() {
+                        renamed.insert(call.id.as_str(), item["id"].clone());
+                    }
+                    called.push(item);
                 }
                 if !called.is_empty() {
                     message["tool_calls"] = Value::Array(called);
@@ -62,6 +96,10 @@ pub(crate) fn body(
             }
             ChatMessage::Tool { id, parts } => {
                 let content = model.content(&[parts.as_slice()], Some(&mut attached));
+                let id = renamed
+                    .get(id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| json!(id));
                 json!({ "role": "tool", "content": content, "tool_call_id": id })
             }
         };
@@ -158,6 +196,7 @@ impl Stream {
         for streamed in deltas.into_iter().flatten() {
             on_delta(streamed);
         }
+        add_fields(&mut self.extras, delta, &MESSAGE_FIELDS);
 
         if let Some(parts) = delta["tool_calls"].as_array() {
             for part in parts {
@@ -193,6 +232,7 @@ impl Stream {
                 if call.name != name {
                     call.name.push_str(name);
                 }
+                add_fields(&mut call.extras, part, &CALL_FIELDS);
                 self.add_arguments(arguments, on_delta);
             }
         }
@@ -204,12 +244,90 @@ impl Stream {
     }
 }
 
+/// Adds the fields that only this provider reads,
+/// whose pieces a stream sends over several chunks
+fn add_fields(held: &mut Map<String, Value>, piece: &Value, known: &[&str]) {
+    let Some(fields) = piece.as_object() else {
+        return;
+    };
+
+    for (key, value) in fields {
+        if known.contains(&key.as_str()) || value.is_null() {
+            continue;
+        }
+
+        let entry = held.entry(key.as_str());
+        match (key.as_str(), value) {
+            ("reasoning_details", Value::Array(pieces)) => {
+                let details = entry.or_insert_with(|| json!([]));
+                let Value::Array(details) = details else {
+                    continue;
+                };
+                for piece in pieces {
+                    add_detail(details, piece);
+                }
+            }
+            _ => {
+                let field = entry.or_insert(Value::Null);
+                merge(field, value);
+            }
+        }
+    }
+}
+
+/// Strings and arrays add up, objects merge key by key and anything else is replaced
+fn merge(held: &mut Value, piece: &Value) {
+    match (held, piece) {
+        (Value::Object(held), Value::Object(piece)) => {
+            for (key, value) in piece {
+                let field = held.entry(key.as_str()).or_insert(Value::Null);
+                merge(field, value);
+            }
+        }
+        (Value::String(held), Value::String(piece)) => held.push_str(piece),
+        (Value::Array(held), Value::Array(piece)) => held.extend(piece.iter().cloned()),
+        (held, piece) => *held = piece.clone(),
+    }
+}
+
+/// Builds `reasoning_details` as OpenRouter's own client does, since its `index` doesn't tell
+/// the pieces of one detail apart and a detail sent back in pieces breaks the next request
+fn add_detail(details: &mut Vec<Value>, piece: &Value) {
+    let unset = |value: &Value| value.as_str().is_none_or(str::is_empty);
+    let field = match piece["type"].as_str() {
+        Some("reasoning.text") => Some("text"),
+        Some("reasoning.summary") => Some("summary"),
+        _ => None,
+    };
+    // Text and summaries join the last detail of their type until a signature closes it
+    let (field, last) = match (field, details.last_mut()) {
+        (Some(field), Some(last)) if last["type"] == piece["type"] && unset(&last["signature"]) => {
+            (field, last)
+        }
+        _ => {
+            details.push(piece.clone());
+            return;
+        }
+    };
+
+    let held = last[field].as_str().unwrap_or_default();
+    let added = piece[field].as_str().unwrap_or_default();
+    let joined = format!("{held}{added}");
+    last[field] = json!(joined);
+    for key in ["signature", "format"] {
+        if unset(&last[key]) && !unset(&piece[key]) {
+            last[key] = piece[key].clone();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::{Kind, ModelSpec};
+    use crate::model::completions::add_detail;
     use crate::model::tests::{hello, parsed, png, served, DONE};
     use crate::model::{
-        ChatMessage, Finish, Media, MediaKind, Part, Purpose, Stream, StreamDelta, ToolCall,
+        ChatMessage, Finish, Media, MediaKind, Part, Purpose, Sealed, Stream, StreamDelta, ToolCall,
     };
     use crate::tests::{temp_dir, write_file};
     use serde_json::json;
@@ -620,5 +738,131 @@ mod tests {
         let mut stream = Stream::new(Kind::Completions, "mock/m1");
         stream.feed(lines.as_bytes(), &mut on_delta).expect("feed");
         assert_eq!(thoughts, ["", "Hmm"]);
+    }
+
+    #[test]
+    fn fields_sealed() {
+        let (_, content, reasoning) = parsed(
+            Kind::Completions,
+            &[
+                r#"data: {"choices":[{"delta":{"role":"assistant","content":null,"refusal":null,"reasoning":"Weigh the café","reasoning_details":[{"type":"reasoning.text","text":"Weigh the ","index":0,"format":"anthropic-claude-v1"}]}}]}"#,
+                r#"data: {"choices":[{"delta":{"reasoning":"","reasoning_details":[{"type":"reasoning.text","text":"café","index":0}]}}]}"#,
+                r#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"","signature":"sig-1","index":0},{"type":"reasoning.encrypted","data":"gAAAA-naïve","id":"tool_1","index":1}]}}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tool_1","type":"function","function":{"name":"eval","arguments":"{\"code\": \"print('crème')\"}"},"extra_content":{"google":{"thought_signature":"c2ln"}}}]}}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"tool_2","type":"function","function":{"name":"eval","arguments":"{\"code\": \"print(1)\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                "data: [DONE]",
+            ],
+        );
+        let details = json!([
+            { "type": "reasoning.text", "text": "Weigh the café", "index": 0, "format": "anthropic-claude-v1", "signature": "sig-1" },
+            { "type": "reasoning.encrypted", "data": "gAAAA-naïve", "id": "tool_1", "index": 1 },
+        ]);
+        let signed = json!({ "google": { "thought_signature": "c2ln" } });
+        let sealed = json!({
+            "reasoning_details": details,
+            "tool_calls": [{ "extra_content": signed, "id": "tool_1" }, { "id": "tool_2" }],
+        });
+        let expected = format!("print('crème')[end]print(1)[end][mock {sealed}]");
+        assert_eq!(content, expected);
+        assert_eq!(reasoning, "Weigh the café");
+
+        // As DeepSeek and llama.cpp send them
+        let (_, plain, _) = parsed(
+            Kind::Completions,
+            &[
+                r#"data: {"id":"d1","object":"chat.completion.chunk","system_fingerprint":"fp","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"Résumé first"},"logprobs":null,"finish_reason":null}],"usage":null}"#,
+                r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_00_x","type":"function","function":{"name":"eval","arguments":"{\"code\": \"1\"}"}}]},"finish_reason":"tool_calls"}],"timings":{"predicted_n":3}}"#,
+                "data: [DONE]",
+            ],
+        );
+        assert_eq!(plain, "1[end]");
+    }
+
+    #[test]
+    fn details_built() {
+        let pieces = [
+            json!({ "type": "reasoning.summary", "summary": "Plan the ", "index": 0 }),
+            json!({ "type": "reasoning.summary", "summary": "café visit", "index": 0, "format": "openai-responses-v1" }),
+            json!({ "type": "reasoning.text", "text": "Check ", "index": 0 }),
+            json!({ "type": "reasoning.text", "text": "the menu", "index": 0, "signature": "" }),
+            json!({ "type": "reasoning.text", "text": "", "signature": "sig-1", "index": 0 }),
+            json!({ "type": "reasoning.text", "text": "Then the piñata", "index": 1 }),
+            json!({ "type": "reasoning.encrypted", "data": "gAAAA", "index": 2 }),
+            json!({ "type": "reasoning.encrypted", "data": "gBBBB", "index": 2 }),
+        ];
+        let mut details = Vec::new();
+        for piece in &pieces {
+            add_detail(&mut details, piece);
+        }
+
+        let expected = [
+            json!({ "type": "reasoning.summary", "summary": "Plan the café visit", "index": 0, "format": "openai-responses-v1" }),
+            json!({ "type": "reasoning.text", "text": "Check the menu", "index": 0, "signature": "sig-1" }),
+            json!({ "type": "reasoning.text", "text": "Then the piñata", "index": 1 }),
+            json!({ "type": "reasoning.encrypted", "data": "gAAAA", "index": 2 }),
+            json!({ "type": "reasoning.encrypted", "data": "gBBBB", "index": 2 }),
+        ];
+        assert_eq!(details, expected);
+    }
+
+    #[test]
+    fn fields_replayed() {
+        let call = |id: &str, code: &str| ToolCall::eval(id.to_owned(), code);
+        let printed = |id: &str| ChatMessage::Tool {
+            id: id.to_owned(),
+            parts: vec![Part::Text("café".to_owned())],
+        };
+        let details = json!([{ "type": "reasoning.encrypted", "data": "gAAAA-naïve", "id": "tool_1", "index": 0 }]);
+        let signed = json!({ "google": { "thought_signature": "c2ln" } });
+        let items = vec![json!({
+            "reasoning_details": details,
+            "tool_calls": [{ "extra_content": signed, "id": "tool_1" }, { "id": "tool_2" }],
+        })];
+        let replied = |provider: &str, kind| {
+            let sealed = Sealed {
+                provider: provider.to_owned(),
+                kind,
+                items: items.clone(),
+                ends: Vec::new(),
+            };
+            let asked = ChatMessage::Assistant {
+                text: String::new(),
+                reasoning: Some("Weigh the café".to_owned()),
+                sealed: Some(sealed),
+                calls: vec![call("call_1", "print('crème')"), call("call_2", "print(1)")],
+            };
+            let conversation = [asked, printed("call_1"), printed("call_2")];
+            let spec = ModelSpec::default();
+            let (_, body) = served(Kind::Completions, DONE, &spec, &conversation, Purpose::Step);
+            body["messages"].clone()
+        };
+
+        let ours = replied("mock", Kind::Completions);
+        let function =
+            |code: &str| json!({ "name": "eval", "arguments": format!("{{\"code\":\"{code}\"}}") });
+        let expected = json!([
+            {
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "Weigh the café",
+                "reasoning_details": details,
+                "tool_calls": [
+                    { "id": "tool_1", "type": "function", "function": function("print('crème')"), "extra_content": signed },
+                    { "id": "tool_2", "type": "function", "function": function("print(1)") },
+                ],
+            },
+            { "role": "tool", "content": "café", "tool_call_id": "tool_1" },
+            { "role": "tool", "content": "café", "tool_call_id": "tool_2" },
+        ]);
+        assert_eq!(ours, expected);
+
+        for theirs in [
+            replied("other", Kind::Completions),
+            replied("mock", Kind::Responses),
+        ] {
+            assert!(theirs[0].get("reasoning_details").is_none(), "{theirs}");
+            assert_eq!(theirs[0]["tool_calls"][0]["id"], "call_1");
+            assert_eq!(theirs[2]["tool_call_id"], "call_2");
+        }
     }
 }
