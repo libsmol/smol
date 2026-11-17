@@ -9,6 +9,11 @@ but their files stay in `~/.smol/projects` untouched.
 
 ## Unreleased
 
+- `grep()` results print like ripgrep, with the number of matches first and
+  each file's matching lines under its path, where they printed as a list of
+  tuples that repeated every path. `grep(..., context=N)` also prints the N
+  lines before and after each match, which took the model another call to
+  read before. The result is still a list of `(path, line, text)` tuples.
 - Through the Responses API, a reply that holds several messages, such as a
   commentary before the final answer, shows each as a paragraph of its own and
   sends each back to the model with its own text and phase. Before, their text

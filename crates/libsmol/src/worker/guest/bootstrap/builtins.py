@@ -174,9 +174,60 @@ def ls(path: str | _os.PathLike = ".", recursive: bool = False) -> list[str]:
     recursive = bool(recursive)
     return _ls(path, recursive)
 
+class _Found(list):
+    """The matching lines grep() returns, which print as ripgrep shows them"""
+
+    def __init__(self, matched, around, context):
+        super().__init__(matched)
+        # {path: {line number: line}} of the context lines, which the list doesn't hold
+        self._around = around
+        self._context = context
+
+    def __getitem__(self, index):
+        item = super().__getitem__(index)
+        if isinstance(index, slice):
+            return _Found(item, self._around, self._context)
+        return item
+
+    # Another process gets a plain list, as it has no _Found to rebuild
+    def __reduce__(self):
+        return (list, (list(self),))
+
+    def __repr__(self):
+        # The code can put other items in the list
+        if not all(isinstance(item, tuple) and len(item) == 3 for item in self):
+            return super().__repr__()
+
+        files = {}
+        for path, number, line in self:
+            files.setdefault(path, {})[number] = line
+
+        matches = "match" if len(self) == 1 else "matches"
+        named = "file" if len(files) == 1 else "files"
+        blocks = [f"{len(self)} {matches} in {len(files)} {named}"]
+        for path, matched in files.items():
+            shown = dict(matched)
+            around = self._around.get(path, {})
+            for number in matched:
+                for near in range(number - self._context, number + self._context + 1):
+                    if near in around:
+                        shown.setdefault(near, around[near])
+
+            rows = [path]
+            previous = None
+            for number in sorted(shown):
+                if self._context and previous is not None and number > previous + 1:
+                    rows.append("--")
+                mark = ":" if number in matched else "-"
+                rows.append(f"{number}{mark}{shown[number]}")
+                previous = number
+            blocks.append("\n".join(rows))
+        return "\n\n".join(blocks)
+
 @_builtin
-def grep(pattern: str, path: str | _os.PathLike = ".", glob: str | None = None) -> list[tuple[str, int, str]]:
-    """(path, line number from 1, line) for each matching line.
+def grep(pattern: str, path: str | _os.PathLike = ".", glob: str | None = None, context: int = 0) -> list[tuple[str, int, str]]:
+    """(path, line number from 1, line) for each matching line, printed grouped by file.
+    context=N also prints the N lines before and after each match.
     pattern is a Rust regex without lookaround or backreferences.
     Skips .gitignore'd and binary files.
 
@@ -184,14 +235,28 @@ def grep(pattern: str, path: str | _os.PathLike = ".", glob: str | None = None) 
     - Its syntax is that of Python re, without lookaround or backreferences; (?i) ignores case.
     - Below a directory it skips .git, symbolic links, .gitignore'd and binary files.
     - Returns the matching lines; paths work with open() and lines are counted from 1.
+    - The list prints like ripgrep: the number of matches, then each file's path and its lines as number:line, with number-line for context lines.
 
     Args:
         glob: Only search files whose names match this glob
+        context: Lines printed before and after each match, which the list doesn't hold
     """
     pattern = _str("grep", "pattern", pattern)
     path = "." if path is None else _path("grep", "path", path)
     glob = None if glob is None else _str("grep", "glob", glob)
-    return _grep(pattern, path, glob)
+    if isinstance(context, bool) or not isinstance(context, int):
+        kind = type(context).__name__
+        raise TypeError(f"grep: context must be int, not {kind}")
+    if context < 0:
+        raise ValueError(f"grep: context must be 0 or more, not {context}")
+
+    matched, around = [], {}
+    for name, number, line, hit in _grep(pattern, path, glob, context):
+        if hit:
+            matched.append((name, number, line))
+        else:
+            around.setdefault(name, {})[number] = line
+    return _Found(matched, around, context)
 
 @_builtin
 def fetch(url: str) -> str:

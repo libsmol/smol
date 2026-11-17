@@ -2,7 +2,7 @@ use crate::prompt;
 use crate::tools::ToolError;
 use grep_matcher::LineTerminator;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use regex_syntax::Parser;
@@ -58,13 +58,15 @@ pub fn ls(root: &Path, recursive: bool, stop: &AtomicBool) -> Result<Vec<OsStrin
     Ok(names)
 }
 
-/// Once `stop` is set it returns early with a result nobody reads
+/// Rows are (path, line number, line, whether it matched) for the matching lines and the `context`
+/// lines around them, and once `stop` is set it returns early with a result nobody reads
 pub fn grep(
     pattern: &str,
     root: &Path,
     glob: Option<&str>,
+    context: usize,
     stop: &AtomicBool,
-) -> Result<Vec<(OsString, u64, String)>, ToolError> {
+) -> Result<Vec<(OsString, u64, String, bool)>, ToolError> {
     let invalid = |argument: &str, e: &dyn Display| {
         let reason = e.to_string();
         let message = prompt::failure("grep", argument, &reason);
@@ -102,6 +104,8 @@ pub fn grep(
     let mut searcher = SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(0))
         .line_terminator(LineTerminator::crlf())
+        .before_context(context)
+        .after_context(context)
         .build();
     let mut found = Vec::new();
     let mut bytes = 0;
@@ -142,8 +146,8 @@ pub fn grep(
         }
 
         bytes = matches.bytes;
-        for (number, line) in matches.lines {
-            found.push((matches.name.clone(), number, line));
+        for (number, line, matched) in matches.lines {
+            found.push((matches.name.clone(), number, line, matched));
         }
         if bytes > MAX_GREP_BYTES {
             let limit = MAX_GREP_BYTES >> 20;
@@ -156,25 +160,38 @@ pub fn grep(
     Ok(found)
 }
 
-/// Matching lines of one file, all dropped when a later NUL shows the file is binary
+/// Lines of one file, all dropped when a later NUL shows the file is binary
 struct Matches {
     name: OsString,
-    lines: Vec<(u64, String)>,
+    lines: Vec<(u64, String, bool)>,
     /// Bytes collected so far, earlier files included
     bytes: usize,
     binary: bool,
+}
+
+impl Matches {
+    /// Returns false once the lines collected pass the limit
+    fn add(&mut self, number: Option<u64>, bytes: &[u8], matched: bool) -> bool {
+        let line = String::from_utf8_lossy(bytes);
+        let line = line.trim_end_matches(['\n', '\r']);
+        self.bytes += self.name.len() + line.len();
+        let number = number.unwrap_or_default();
+        self.lines.push((number, line.to_owned(), matched));
+        self.bytes <= MAX_GREP_BYTES
+    }
 }
 
 impl Sink for Matches {
     type Error = io::Error;
 
     fn matched(&mut self, _: &Searcher, matched: &SinkMatch<'_>) -> io::Result<bool> {
-        let number = matched.line_number().unwrap_or_default();
-        let line = String::from_utf8_lossy(matched.bytes());
-        let line = line.trim_end_matches(['\n', '\r']);
-        self.bytes += self.name.len() + line.len();
-        self.lines.push((number, line.to_owned()));
-        Ok(self.bytes <= MAX_GREP_BYTES)
+        let added = self.add(matched.line_number(), matched.bytes(), true);
+        Ok(added)
+    }
+
+    fn context(&mut self, _: &Searcher, context: &SinkContext<'_>) -> io::Result<bool> {
+        let added = self.add(context.line_number(), context.bytes(), false);
+        Ok(added)
     }
 
     fn binary_data(&mut self, _: &Searcher, _: u64) -> io::Result<bool> {
@@ -292,7 +309,7 @@ mod tests {
         let root = dir.clone();
         thread::spawn(move || {
             let stopped = AtomicBool::new(true);
-            let found = grep("one", &root, None, &stopped);
+            let found = grep("one", &root, None, 0, &stopped);
             let empty = found.is_ok_and(|rows| rows.is_empty());
             sender.send(empty).ok();
         });
@@ -324,9 +341,9 @@ mod tests {
 
         let going = AtomicBool::new(false);
         let found = |pattern: &str, root: &Path, glob: Option<&str>| {
-            let rows = grep(pattern, root, glob, &going).expect("grep");
+            let rows = grep(pattern, root, glob, 0, &going).expect("grep");
             let mut shown = Vec::new();
-            for (name, number, line) in rows {
+            for (name, number, line, _) in rows {
                 let path = Path::new(&name);
                 let relative = path.strip_prefix(&dir).unwrap_or(path);
                 let relative = slashed(relative);
@@ -347,11 +364,44 @@ mod tests {
         assert_eq!(found(r"\s+$", &crlf, None), ["deep/crlf.txt:1:déjà vu "]);
 
         // Points at the parenthesis as written, not the one grep-regex adds
-        let unclosed = grep("café(", &dir, None, &going).expect_err("invalid");
+        let unclosed = grep("café(", &dir, None, 0, &going).expect_err("invalid");
         let message = unclosed.to_string();
         let expected =
             "grep: pattern: regex parse error:\n    café(\n        ^\nerror: unclosed group";
         assert!(message.starts_with(expected), "{message}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn context_rows() {
+        let dir = temp_dir("context");
+        let menu = dir.join("menu.txt");
+        let lines = "café\r\ncrème\r\nbrûlée\r\nnaïve\r\ncafé au lait\r\nrésumé\r\npiñata\r\n";
+        write_file(&menu, lines.as_bytes());
+
+        let going = AtomicBool::new(false);
+        let shown = |pattern: &str, context: usize| {
+            let rows = grep(pattern, &menu, None, context, &going).expect("grep");
+            let mut shown = Vec::new();
+            for (_, number, line, matched) in rows {
+                let mark = if matched { ':' } else { '-' };
+                shown.push(format!("{number}{mark}{line}"));
+            }
+            shown
+        };
+
+        let around = ["1:café", "2-crème", "4-naïve", "5:café au lait", "6-résumé"];
+        assert_eq!(shown("café", 1), around);
+        let joined = [
+            "1:café",
+            "2:crème",
+            "3-brûlée",
+            "4-naïve",
+            "5:café au lait",
+            "6-résumé",
+        ];
+        assert_eq!(shown("café|crème", 1), joined);
+        assert_eq!(shown("piñata", 0), ["7:piñata"]);
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -253,7 +253,7 @@ functions:
 | Function | |
 | --- | --- |
 | `ls(path=".", recursive=False)` | List a directory; recursive listing skips `.git` and `.gitignore`d paths. |
-| `grep(pattern, path=".", glob=None)` | Search files with a Rust regex, skipping `.gitignore`d and binary files. |
+| `grep(pattern, path=".", glob=None, context=0)` | Search files with a Rust regex, skipping `.gitignore`d and binary files; results print grouped by file like ripgrep, with `context` lines around each match. |
 | `edit(path, old, new)` | Replace text that appears exactly once in a file. |
 | `fetch(url)` | Get a web page as Markdown. |
 | `view(path)` | Show an image or video to the model (offered only when the model takes media). |

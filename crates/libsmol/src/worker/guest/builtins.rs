@@ -54,14 +54,15 @@ fn list(py: Python<'_>, path: PathBuf, recursive: bool) -> PyResult<Vec<OsString
 }
 
 #[pyfunction]
-#[pyo3(signature = (pattern, path, glob))]
+#[pyo3(signature = (pattern, path, glob, context))]
 fn search(
     py: Python<'_>,
     pattern: String,
     path: PathBuf,
     glob: Option<String>,
-) -> PyResult<Vec<(OsString, u64, String)>> {
-    let searching = move |stop: &AtomicBool| grep(&pattern, &path, glob.as_deref(), stop);
+    context: usize,
+) -> PyResult<Vec<(OsString, u64, String, bool)>> {
+    let searching = move |stop: &AtomicBool| grep(&pattern, &path, glob.as_deref(), context, stop);
     let found = blocking(py, searching)?;
     finish(py, found)
 }

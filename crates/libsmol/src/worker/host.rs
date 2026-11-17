@@ -1780,6 +1780,14 @@ pub(crate) mod tests {
                 "TypeError: edit: old must be str, not int",
             ),
             ("grep(1)", "TypeError: grep: pattern must be str, not int"),
+            (
+                "grep('a', context='1')",
+                "TypeError: grep: context must be int, not str",
+            ),
+            (
+                "grep('a', context=-1)",
+                "ValueError: grep: context must be 0 or more, not -1",
+            ),
         ];
         for (code, expected) in invalid {
             let output = worker.eval(code);
@@ -2909,17 +2917,39 @@ pub(crate) mod tests {
     #[test]
     fn grep_rows() {
         let (mut worker, dir) = workspace("grep");
-        let code = "fn main() {}\nconst CAFÉ: u8 = 1;\n";
+        let code = "fn main() {}\nconst CAFÉ: u8 = 1;\nconst NAÏVE: u8 = 2;\n";
         write_file(&dir.join("deep/café.rs"), code.as_bytes());
+        let menu = "const crème\nbrûlée\nflan\nmatcha\nconst piñata\n";
+        write_file(&dir.join("menu.txt"), menu.as_bytes());
 
-        let output = worker.eval("grep('const')");
+        let mut run = |code: &str| worker.eval(code).logs;
+        let found = run("grep('const')");
+        let around = run("found = grep('const', context=1)\nfound");
+        let sliced = run("found[3:]");
+        let kept = run("import pickle\nlist(found[:1]), type(pickle.loads(pickle.dumps(found)))");
+        let none = run("grep('flan', 'deep')");
+        let mixed = run("found[:1] + ['café']");
+        let added = run("found.append('café')\nfound[-2:]");
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(output.error, None);
+        let expected = "4 matches in 2 files\n\n\
+            deep/café.rs\n2:const CAFÉ: u8 = 1;\n3:const NAÏVE: u8 = 2;\n\n\
+            menu.txt\n1:const crème\n5:const piñata\n";
+        assert_eq!(found, expected);
+        let expected = "4 matches in 2 files\n\n\
+            deep/café.rs\n1-fn main() {}\n2:const CAFÉ: u8 = 1;\n3:const NAÏVE: u8 = 2;\n\n\
+            menu.txt\n1:const crème\n2-brûlée\n--\n4-matcha\n5:const piñata\n";
+        assert_eq!(around, expected);
         assert_eq!(
-            output.logs,
-            "[('deep/café.rs', 2, 'const CAFÉ: u8 = 1;')]\n"
+            sliced,
+            "1 match in 1 file\n\nmenu.txt\n4-matcha\n5:const piñata\n"
         );
+        let expected = "([('deep/café.rs', 2, 'const CAFÉ: u8 = 1;')], <class 'list'>)\n";
+        assert_eq!(kept, expected);
+        assert_eq!(none, "0 matches in 0 files\n");
+        let expected = "[('deep/café.rs', 2, 'const CAFÉ: u8 = 1;'), 'café']\n";
+        assert_eq!(mixed, expected);
+        assert_eq!(added, "[('menu.txt', 5, 'const piñata'), 'café']\n");
     }
 
     /// A search interrupted halfway stops in place without waiting for the worker to be killed
@@ -2993,7 +3023,7 @@ pub(crate) mod tests {
             folder.lines().next(),
             Some(format!("{denied}: 'closed'").as_str())
         );
-        assert_eq!(skipped, "[]\n");
+        assert_eq!(skipped, "0 matches in 0 files\n");
     }
 
     #[test]
