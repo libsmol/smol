@@ -5,7 +5,7 @@ use agent_client_protocol_schema::v1::{
 use anyhow::Result;
 use reaper::wire::{
     AGENT, BACKGROUND, DECODE_DURATION, DURATION, ERROR, ESTIMATED_OUTPUT, INPUT_TOKENS,
-    INTERRUPTED, NAME, OUTPUT_TOKENS, PARENT, ROLE, SHELL, STEPS, TASK, UPDATE,
+    INTERRUPTED, NAME, OUTPUT_TOKENS, PARENT, SHELL, STEPS, TASK, UPDATE, WAITING,
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -196,10 +196,13 @@ impl Conversation {
     /// Agents the turn waits for, which are those the running code waits for
     /// or, after an answer, every one still at work
     pub(crate) fn awaited(&self) -> usize {
-        // Agents started in the background don't hold up the code
         if let Some(step) = &self.live {
-            let blocking = |helper: &&Helper| helper.waiting() && helper.name.is_none();
-            return step.helpers().filter(blocking).count();
+            let waited: Vec<&String> = step.calls().flat_map(|call| &call.waiting).collect();
+            let awaited = |helper: &&Helper| {
+                let named = helper.name.as_ref();
+                helper.waiting() && named.is_some_and(|name| waited.contains(&name))
+            };
+            return self.helpers().filter(awaited).count();
         }
 
         // A message the turn took after the answer is what the model works on next
@@ -222,6 +225,39 @@ impl Conversation {
             true => self.helping(),
             false => 0,
         }
+    }
+
+    /// The agents the code started, in the order they took their first task, with each unnamed
+    /// one of an older session on its own
+    pub(crate) fn agents(&self) -> Vec<Agent<'_>> {
+        let mut agents: Vec<Agent> = Vec::new();
+        for helper in self.helpers() {
+            let (input, output) = helper.tokens.unwrap_or_default();
+            let named =
+                |agent: &&mut Agent| helper.name.is_some() && agent.latest.name == helper.name;
+            match agents.iter_mut().find(named) {
+                Some(agent) => {
+                    agent.latest = helper;
+                    agent.tokens.0 += input;
+                    agent.tokens.1 += output;
+                }
+                None => agents.push(Agent {
+                    latest: helper,
+                    tokens: (input, output),
+                }),
+            }
+        }
+        agents
+    }
+
+    /// Every task the code sent an agent, oldest first
+    fn helpers(&self) -> impl Iterator<Item = &Helper> {
+        let steps = self
+            .entries
+            .iter()
+            .chain(&self.held)
+            .filter_map(Entry::step);
+        steps.chain(&self.live).flat_map(Step::helpers)
     }
 
     /// The steps that may hold agents at work, oldest first
@@ -292,6 +328,7 @@ impl Conversation {
         if let SessionUpdate::ToolCallUpdate(call) = update {
             let id = &*call.tool_call_id.0;
             let mut place = None;
+            let mut named = None;
             let mut taken = Vec::new();
             for (spot, step) in self.working() {
                 for (at, item) in step.items.iter().enumerate() {
@@ -301,6 +338,7 @@ impl Conversation {
                     for (index, helper) in started.helpers.iter().enumerate() {
                         if helper.id == id {
                             place = Some((spot, at, index));
+                            named = helper.name.clone().filter(|_| helper.started.is_none());
                         }
                         if helper.state() == State::Running {
                             taken.push(helper.hue);
@@ -309,6 +347,12 @@ impl Conversation {
                 }
             }
 
+            // An agent keeps the hue of its earlier tasks, which only a task yet to start looks for
+            let same = |helper: &&Helper| helper.started.is_some() && helper.name == named;
+            let earlier = match named {
+                Some(_) => self.helpers().filter(same).last().map(|helper| helper.hue),
+                None => None,
+            };
             if let Some((spot, at, index)) = place {
                 let step = match spot {
                     Spot::Settled(entry) => self.entries.get_mut(entry).and_then(Entry::step_mut),
@@ -325,13 +369,14 @@ impl Conversation {
 
                 let fields = &call.fields;
                 if let Some(status) = fields.status {
-                    // The hue at its place in its call, or the lowest free one when a running agent holds that
+                    // The hue of its agent's earlier tasks or at its place in its call,
+                    // or the lowest free one when a running agent holds that
                     if status == ToolCallStatus::InProgress && helper.started.is_none() {
-                        let place = index % HUES;
+                        let wanted = earlier.unwrap_or(index % HUES);
                         let free = (0..HUES).find(|hue| !taken.contains(hue));
-                        helper.hue = match taken.contains(&place) {
-                            true => free.unwrap_or(place),
-                            false => place,
+                        helper.hue = match taken.contains(&wanted) {
+                            true => free.unwrap_or(wanted),
+                            false => wanted,
                         };
                         helper.started = Some(Instant::now());
                     }
@@ -716,8 +761,10 @@ pub(crate) struct Call {
     pub(crate) attachments: Vec<Attachment>,
     /// Retries of the request that compaction makes
     pub(crate) retries: Vec<Retry>,
-    /// Agents its code started, in the order it started them
+    /// The tasks its code sent agents, in the order it sent them
     pub(crate) helpers: Vec<Helper>,
+    /// The agents its code waits for
+    pub(crate) waiting: Vec<String>,
     /// Grows with every update of one of its agents
     pub(crate) revision: u64,
 }
@@ -726,8 +773,7 @@ pub(crate) struct Call {
 pub(crate) struct Helper {
     pub(crate) id: String,
     pub(crate) task: String,
-    pub(crate) role: Option<String>,
-    /// Given to one started in the background
+    /// The agent's, which older sessions may lack
     pub(crate) name: Option<String>,
     pub(crate) status: ToolCallStatus,
     /// What it is doing while it runs, then its answer or why it failed
@@ -737,12 +783,20 @@ pub(crate) struct Helper {
     pub(crate) interrupted: bool,
     /// Unknown on replay, which reports the duration instead
     pub(crate) started: Option<Instant>,
-    /// Chosen at its start from the hues no running agent holds, which no later frame can work out
+    /// Its agent's, or chosen at its start from the hues no running agent holds,
+    /// which no later frame can work out
     pub(crate) hue: usize,
     /// Input and output tokens so far
     pub(crate) tokens: Option<(u64, u64)>,
     /// Known once it ends
     pub(crate) totals: Option<Totals>,
+}
+
+/// An agent the code started, as its tasks show it
+pub(crate) struct Agent<'a> {
+    pub(crate) latest: &'a Helper,
+    /// Input and output tokens of all its tasks
+    pub(crate) tokens: (u64, u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -851,12 +905,10 @@ impl Step {
                     let given = |key: &str| asked.and_then(|asked| asked.get(key));
                     let given = |key: &str| given(key).and_then(Value::as_str);
                     let task = given(TASK).unwrap_or_default();
-                    let role = given(ROLE).map(str::to_owned);
                     let name = given(NAME).map(str::to_owned);
                     owner.helpers.push(Helper {
                         id,
                         task: task.to_owned(),
-                        role,
                         name,
                         status: call.status,
                         text: String::new(),
@@ -879,6 +931,7 @@ impl Step {
                     attachments,
                     retries: Vec::new(),
                     helpers: Vec::new(),
+                    waiting: Vec::new(),
                     revision: 0,
                 };
                 self.items.push(Item::Call(call));
@@ -894,6 +947,11 @@ impl Step {
                     if let Some(content) = &fields.content {
                         (call.content, call.attachments) = contents(content);
                     }
+                    let waiting = update.meta.as_ref().and_then(|meta| meta.get(WAITING));
+                    if let Some(Value::Array(names)) = waiting {
+                        let names = names.iter().filter_map(Value::as_str);
+                        call.waiting = names.map(str::to_owned).collect();
+                    }
                 }
             }
 
@@ -901,7 +959,7 @@ impl Step {
         }
     }
 
-    /// Agents its code started that are still queued or running
+    /// Tasks its code sent that are still queued or running
     fn helping(&self) -> usize {
         self.helpers().filter(|helper| helper.waiting()).count()
     }
@@ -910,7 +968,7 @@ impl Step {
         self.items.iter().filter_map(Item::call)
     }
 
-    /// The agents its code started
+    /// The tasks its code sent
     fn helpers(&self) -> impl Iterator<Item = &Helper> {
         self.calls().flat_map(|call| &call.helpers)
     }
@@ -1213,6 +1271,48 @@ mod tests {
         let hues: Vec<usize> = call.helpers.iter().map(|helper| helper.hue).collect();
         assert_eq!(hues, [0, 1, 2, 3, 4, 5, 6, 7, 2, 0]);
         assert_eq!(call.helpers[0].name.as_deref(), Some("cafés"));
+    }
+
+    /// A later task of an agent keeps its hue, and the agent counts once with all its tokens
+    #[test]
+    fn agent_hue_kept() {
+        let mut talk = Conversation::default();
+        started(&mut talk, 3);
+        moved(&mut talk, 2, ToolCallStatus::InProgress);
+        moved(&mut talk, 1, ToolCallStatus::InProgress);
+        let spent = |n: usize, input: u64| {
+            let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+            let meta = json!({ "inputTokens": input, "outputTokens": 5 });
+            let update = ToolCallUpdate::new(format!("call_1.{n}"), fields);
+            SessionUpdate::ToolCallUpdate(update.meta(meta.as_object().cloned()))
+        };
+        talk.update(&spent(1, 100));
+        moved(&mut talk, 3, ToolCallStatus::InProgress);
+
+        let marked = json!({ "_smol/agent": true, "parent": "call_1" });
+        let asked = json!({ "task": "Count the naïve ones", "name": "cafés" });
+        let again = ToolCall::new("call_1.4", "agent: Count the naïve ones")
+            .raw_input(asked)
+            .meta(marked.as_object().cloned());
+        talk.update(&SessionUpdate::ToolCall(again));
+        moved(&mut talk, 4, ToolCallStatus::InProgress);
+        talk.update(&spent(4, 20));
+
+        let step = talk.live().expect("live");
+        let [Item::Call(call)] = &step.items[..] else {
+            panic!("{:?}", step.items);
+        };
+        let hues: Vec<usize> = call.helpers.iter().map(|helper| helper.hue).collect();
+        assert_eq!(hues, [0, 1, 2, 0]);
+        let agents = talk.agents();
+        let named: Vec<(Option<&str>, (u64, u64))> = agents
+            .iter()
+            .map(|agent| (agent.latest.name.as_deref(), agent.tokens))
+            .collect();
+        assert_eq!(
+            named,
+            [(Some("cafés"), (120, 10)), (None, (0, 0)), (None, (0, 0))]
+        );
     }
 
     /// An agent keeps updating under its call after the step that started it has ended

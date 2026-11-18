@@ -16,8 +16,11 @@ pub const PROGRAMS: &str = "_smol/programs";
 pub const UPDATE: &str = "_smol/update";
 /// Replied to like a prompt, and marks its tool calls with `true`
 pub const SHELL: &str = "_smol/shell";
-/// Marks the tool calls of agents the code starts, whose `rawInput` is what they were given
+/// Marks the tool calls of the tasks the code sends agents, whose `rawInput` is what they were given
 pub const AGENT: &str = "_smol/agent";
+/// Set on an update of a call's tool call to the names of the agents its code waits for, and to none
+/// once it stops waiting
+pub const WAITING: &str = "_smol/waiting";
 pub const MEMORIES: &str = "_smol/memories";
 pub const FORGET: &str = "_smol/forget";
 
@@ -26,8 +29,7 @@ pub const MCP_PREFIX: &str = "mcp.";
 
 // Keys in the `rawInput` of `AGENT` calls
 pub const TASK: &str = "task";
-pub const ROLE: &str = "role";
-/// Given to one started in the background
+/// The agent's, which older sessions may lack
 pub const NAME: &str = "name";
 
 // Keys in `_meta`

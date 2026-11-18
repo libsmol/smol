@@ -1055,7 +1055,7 @@ fn spans_width(spans: &[(String, Style)]) -> usize {
 }
 
 /// The symbol of the state an agent is in, in the style its rows take
-fn signal(helper: &Helper) -> (char, Style) {
+pub(crate) fn signal(helper: &Helper) -> (char, Style) {
     match helper.state() {
         State::Queued => ('◌', DIM),
         State::Running => {
@@ -1121,18 +1121,11 @@ fn summary(helpers: &[&Helper], seconds: Option<u64>) -> String {
     parts.join(" · ")
 }
 
-/// The role and name an agent goes by, which come before its title
+/// The name an agent goes by, which comes before its title
 fn tag(helper: &Helper) -> String {
-    let mut tags = Vec::new();
-    if let Some(role) = &helper.role {
-        tags.push(role.as_str());
-    }
-    if let Some(name) = &helper.name {
-        tags.push(name.as_str());
-    }
-    match tags.is_empty() {
-        true => String::new(),
-        false => format!("{} ", tags.join(" · ")),
+    match &helper.name {
+        Some(name) => format!("{name} "),
+        None => String::new(),
     }
 }
 
@@ -1226,6 +1219,7 @@ mod tests {
             attachments: Vec::new(),
             retries: Vec::new(),
             helpers: Vec::new(),
+            waiting: Vec::new(),
             revision: 0,
         }
     }
@@ -1238,7 +1232,6 @@ mod tests {
     #[test]
     fn pinned_fits_screen() {
         let running = Helper {
-            role: Some("counter".to_owned()),
             name: Some("cafés".to_owned()),
             preview: "print(len(cafés))".to_owned(),
             tokens: Some((1200, 300)),
@@ -1262,10 +1255,7 @@ mod tests {
         assert_eq!(rows_queued[1], "  ◌ agents · 1 queued");
 
         assert!(rows[2].starts_with("  ╰ "), "{rows:?}");
-        assert!(
-            rows[2].ends_with(" counter · cafés Count the cafés"),
-            "{rows:?}"
-        );
+        assert!(rows[2].ends_with(" cafés Count the cafés"), "{rows:?}");
         assert_eq!(rows[3], "      │ print(len(cafés))");
         assert_eq!(rows[4], "      running len · 0s");
 
@@ -1276,7 +1266,7 @@ mod tests {
         let tokens = in_out(2400, 600);
         let summary = format!(" agents · 2 running · 0s · {tokens}");
         assert!(rows[1].ends_with(&summary), "{rows:?}");
-        let row = " counter · cafés Count the cafés · running len · 0s";
+        let row = " cafés Count the cafés · running len · 0s";
         assert!(
             rows[2].starts_with("  ├ ") && rows[2].ends_with(row),
             "{rows:?}"
@@ -1339,12 +1329,12 @@ mod tests {
         assert_eq!(expanded[1].joint.as_deref(), Some(" "));
     }
 
-    /// The role goes in front of the title, which still wraps within the width
+    /// The name goes in front of the title, which still wraps within the width
     #[test]
-    fn helper_role_tagged() {
+    fn helper_name_tagged() {
         let title = "Review the café menu parser in menu.py and the naïve rounding of its prices";
         let tagged = Helper {
-            role: Some("reviewer".to_owned()),
+            name: Some("menu".to_owned()),
             ..helper(title, ToolCallStatus::Pending, "")
         };
         let step = helped(tagged);
@@ -1353,13 +1343,14 @@ mod tests {
         let end = render.rows.len() - 1;
         let rows = text(&render.rows[3..end]);
 
-        assert!(rows[0].starts_with("      ◌ reviewer Review"), "{rows:#?}");
+        let tagged = "      ◌ menu Review";
+        assert!(rows[0].starts_with(tagged), "{rows:#?}");
         for row in &rows {
             assert!(row.width() <= 50, "{rows:#?}");
         }
         let parts = rows.iter().map(|row| row.trim_start_matches([' ', '◌']));
         let joined: Vec<&str> = parts.map(str::trim_end).collect();
-        assert_eq!(joined.join(" "), format!("reviewer {title}"));
+        assert_eq!(joined.join(" "), format!("menu {title}"));
     }
 
     /// What the code printed shows after its agents like any call's output

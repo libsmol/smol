@@ -250,7 +250,7 @@ done
             let marked = json!({ "_smol/agent": true, "parent": "call_1" });
             let task = format!("Count the cafés in menu {n}");
             let name = (n == 1).then_some("cafés");
-            let asked = json!({ "task": task, "role": null, "name": name });
+            let asked = json!({ "task": task, "name": name });
             let id = format!("call_1.{n}");
             let opened = ToolCall::new(id, format!("agent: {task}"))
                 .raw_input(asked)

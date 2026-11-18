@@ -1,4 +1,4 @@
-use crate::config::{Role, Skill};
+use crate::config::Skill;
 use crate::history::MAX_TITLE_CHARS;
 use crate::model::{
     ChatMessage, Finish, Finished, MediaKind, Model, ModelError, Purpose, StreamDelta,
@@ -30,7 +30,7 @@ mod compact;
 mod delegate;
 mod step;
 
-use crate::agent::delegate::{Records, Team};
+pub(crate) use crate::agent::delegate::{Records, Team};
 
 pub use crate::agent::delegate::MAX_PARALLEL_AGENTS;
 
@@ -102,6 +102,9 @@ pub(crate) trait Queue: Send + Sync {
 /// and each opens with the record it keeps until it ends
 pub(crate) trait Helpers: Send + Sync {
     fn open(&self, number: usize, helper: &Helper) -> Box<dyn HelperView>;
+
+    /// The agents the call's code waits for, none once it stops waiting
+    fn waiting(&self, names: &[String]);
 }
 
 pub(crate) trait HelperView: Send {
@@ -130,6 +133,8 @@ impl Helpers for Unseen {
     fn open(&self, _: usize, _: &Helper) -> Box<dyn HelperView> {
         Box::new(Unseen)
     }
+
+    fn waiting(&self, _: &[String]) {}
 }
 
 impl HelperView for Unseen {
@@ -150,6 +155,7 @@ impl Sink for Logged<'_> {
                 match &step.error {
                     None => info!("step: done {counted}"),
                     Some(StepError::Interrupted) => info!("step: interrupted {counted}"),
+                    Some(StepError::Stopped) => info!("step: stopped {counted}"),
                     Some(error) => warn!("step: failed, {error} {counted}"),
                 }
             }
@@ -227,39 +233,35 @@ pub(crate) type Delegating<'a> = dyn FnMut(AgentCall) -> Calling + Send + 'a;
 
 #[derive(Clone)]
 pub(crate) enum Place {
-    /// The session's own agent, with the roles `agent()` can give tasks to,
-    /// the agents its code started in the background and what the user queues meanwhile
+    /// The session's own agent, with the agents its code started and what the user queues meanwhile
     Main {
-        roles: Vec<Role>,
         team: Arc<Team>,
         queue: Arc<dyn Queue>,
     },
-    /// Started by `agent()`, which it can't call itself
-    Delegated(Option<Role>),
+    /// Started by `agent()`, which it can't call itself, with what the code sends it meanwhile
+    Delegated { queue: Arc<dyn Queue> },
 }
 
 impl Place {
-    /// The one it plays, which the session's own agent never has
-    pub(crate) fn role(&self) -> Option<&Role> {
-        match self {
-            Place::Main { .. } => None,
-            Place::Delegated(role) => role.as_ref(),
-        }
-    }
-
     pub(crate) fn team(&self) -> Option<&Arc<Team>> {
         match self {
             Place::Main { team, .. } => Some(team),
-            Place::Delegated(_) => None,
+            Place::Delegated { .. } => None,
         }
     }
 
-    /// Which `agent()` its worker offers
+    /// What arrives for the task at work, as `[Task update]`
+    pub(crate) fn queue(&self) -> &dyn Queue {
+        match self {
+            Place::Main { queue, .. } | Place::Delegated { queue } => queue.as_ref(),
+        }
+    }
+
+    /// Whether its worker offers `agent()`
     pub(crate) fn delegation(&self) -> Delegation {
         match self {
-            Place::Main { roles, .. } if roles.is_empty() => Delegation::On,
-            Place::Main { .. } => Delegation::Roles,
-            Place::Delegated(_) => Delegation::Off,
+            Place::Main { .. } => Delegation::On,
+            Place::Delegated { .. } => Delegation::Off,
         }
     }
 
@@ -310,13 +312,13 @@ impl Agent {
             sink: &mut logged,
         };
         let ran = turn.run(task).await;
-        // However the turn ends, no agent its code started in the background keeps running
+        // However the turn ends, no agent its code started keeps working
         turn.stopped().await;
         ran
     }
 
     /// Answers what the code of one call asks of the agent,
-    /// and keeps the record of each agent it starts in `records`
+    /// and keeps the record of each task it sends in `records`
     pub(crate) fn serving<'a>(
         &'a self,
         servers: &'a [&'a Added],
@@ -429,7 +431,7 @@ impl Turn<'_> {
             self.sink.event(Event::StepEnd(step));
             self.sink.saved(self.memory);
 
-            // An answer ends the turn only once no agent started in the background runs,
+            // An answer ends the turn only once no agent works,
             // while programs the code left running never hold it open
             let (updates, done, exited) = loop {
                 // An interrupt that arrives after the answer still ends the turn as interrupted
@@ -477,10 +479,7 @@ impl Turn<'_> {
 
     /// Stays interruptible when the client never replies
     async fn queued(&mut self) -> Vec<Task> {
-        let Place::Main { queue, .. } = &self.agent.place else {
-            return Vec::new();
-        };
-        let asking = queue.queued();
+        let asking = self.agent.place.queue().queued();
         select! {
             // The client already dequeued these, so they win over a cancel arriving with them
             biased;
@@ -671,7 +670,7 @@ pub(crate) mod tests {
         title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Records, Sink,
         Streamed, Task, Turn, Unseen, RETRY_WAIT,
     };
-    use crate::config::{Access, Kind, Role};
+    use crate::config::{Access, Kind};
     use crate::history::MAX_TITLE_CHARS;
     use crate::model::{
         ChatMessage, Finish, Finished, Generating, MediaKind, Model, ModelError, Purpose,
@@ -946,40 +945,33 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn scripted(
-        model: impl Model + 'static,
-        events: Box<dyn FnMut(Event) + Send>,
-    ) -> Temp<Tested> {
-        with_roles(model, events, Vec::new())
-    }
-
-    pub(crate) fn main_place(roles: Vec<Role>) -> Place {
+    pub(crate) fn main_place() -> Place {
         Place::Main {
-            roles,
             team: Arc::default(),
             queue: Arc::new(Pending::default()),
         }
     }
 
-    pub(crate) fn with_roles(
+    pub(crate) fn delegated_place() -> Place {
+        Place::Delegated {
+            queue: Arc::new(Pending::default()),
+        }
+    }
+
+    pub(crate) fn scripted(
         model: impl Model + 'static,
         events: Box<dyn FnMut(Event) + Send>,
-        roles: Vec<Role>,
     ) -> Temp<Tested> {
         let interrupt = Interrupt::default();
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let dir = temp_dir("session");
         let workplace = Arc::new(opened(&cwd, &dir, &Access::default()));
-        let delegation = match roles.is_empty() {
-            true => Delegation::On,
-            false => Delegation::Roles,
-        };
         let restarted = false;
         let starting = Worker::new(
             &interrupt,
             Arc::clone(&workplace),
             &[],
-            delegation,
+            Delegation::On,
             restarted,
         );
         let worker = block_on(starting).expect("worker");
@@ -987,7 +979,6 @@ pub(crate) mod tests {
 
         let queue = Arc::new(Pending::default());
         let place = Place::Main {
-            roles,
             team: Arc::default(),
             queue: Arc::clone(&queue) as Arc<dyn Queue>,
         };
@@ -1195,7 +1186,7 @@ pub(crate) mod tests {
     fn helpers_only_recall() {
         let tested = scripted(ScriptedModel::new(Vec::new()), Box::new(|_| {}));
         let helper = Agent {
-            place: Place::Delegated(None),
+            place: delegated_place(),
             ..tested.agent.clone()
         };
         let asked = |agent: &Agent, call: MemoryCall| {

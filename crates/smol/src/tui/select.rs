@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn agent_status_skipped() {
         let counting = Helper {
-            role: Some("counter".to_owned()),
+            name: Some("counter".to_owned()),
             preview: "print(len(cafés))".to_owned(),
             ..helper("Count the cafés", ToolCallStatus::InProgress, "thinking")
         };
@@ -287,6 +287,7 @@ mod tests {
                     "It has a diaeresis.",
                 ),
             ],
+            waiting: Vec::new(),
             revision: 0,
         };
         let step = Step {
@@ -321,6 +322,7 @@ mod tests {
             attachments: Vec::new(),
             retries: Vec::new(),
             helpers: vec![reviewing],
+            waiting: Vec::new(),
             revision: 0,
         };
         let step = Step {

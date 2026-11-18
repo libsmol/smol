@@ -2,8 +2,8 @@ use crate::acp::rpc::{Notice, SessionPeer};
 use crate::agent::{Event, Failure, HelperView, Helpers, Status, Unseen};
 use crate::prompt::{SKIPPED, TOOL};
 use crate::steps::{
-    estimate, text_bytes, AgentMemory, AgentStep, Call, CallError, DoneStep, Ending, Exit, Helper,
-    MemoryStep, Program, ShellStep, StepError, SummaryStep, TaskStep, Usage,
+    estimate, spent, text_bytes, AgentMemory, AgentStep, Call, CallError, DoneStep, Ending, Exit,
+    Helper, MemoryStep, Program, ShellStep, StepError, SummaryStep, TaskStep, Usage,
 };
 use agent_client_protocol_schema::v1::{
     ContentBlock, ContentChunk, MessageId, Meta, ResourceLink, SessionUpdate, ToolCall,
@@ -12,7 +12,7 @@ use agent_client_protocol_schema::v1::{
 use reaper::one_line;
 use reaper::wire::{
     AGENT, BACKGROUND, DECODE_DURATION, DURATION, ERROR, ESTIMATED_OUTPUT, INPUT_TOKENS,
-    INTERRUPTED, NAME, OUTPUT_TOKENS, PARENT, ROLE, SHELL, STEPS, TASK, UPDATE,
+    INTERRUPTED, NAME, OUTPUT_TOKENS, PARENT, SHELL, STEPS, TASK, UPDATE, WAITING,
 };
 use reqwest::Url;
 use serde_json::json;
@@ -588,7 +588,7 @@ impl Helpers for HelperCalls {
     fn open(&self, number: usize, helper: &Helper) -> Box<dyn HelperView> {
         let id = format!("{}.{number}", self.parent);
         let title = agent_title(&helper.task, &self.cwd);
-        let asked = json!({ TASK: helper.task, ROLE: helper.role, NAME: helper.name });
+        let asked = json!({ TASK: helper.task, NAME: helper.name });
         let marked = (AGENT.to_owned(), json!(true));
         let parent = (PARENT.to_owned(), json!(self.parent));
         let meta = Meta::from_iter([marked, parent]);
@@ -607,6 +607,14 @@ impl Helpers for HelperCalls {
         };
         Box::new(view)
     }
+
+    fn waiting(&self, names: &[String]) {
+        let fields = ToolCallUpdateFields::new();
+        let waiting = (WAITING.to_owned(), json!(names));
+        let meta = Meta::from_iter([waiting]);
+        let update = ToolCallUpdate::new(self.parent.clone(), fields).meta(meta);
+        self.peer.update(SessionUpdate::ToolCallUpdate(update));
+    }
 }
 
 impl HelperCall {
@@ -623,7 +631,7 @@ impl HelperCall {
             Err(text) => (ToolCallStatus::Failed, text),
         };
 
-        let (usage, steps) = memory.spent();
+        let (usage, steps) = spent(&memory.steps);
         let mut meta = usage_meta(&usage);
         meta.insert(STEPS.to_owned(), steps.into());
         // The client recognizes interrupts by this key, which matches the one on usage updates
@@ -1369,16 +1377,16 @@ mod tests {
         assert_eq!(updates[1]["content"], json!([]));
     }
 
-    /// Each agent the code starts is a tool call of its own, the same live and on replay
+    /// Each task the code sends an agent is a tool call of its own, the same live and on replay
     #[test]
     fn helpers_shown() {
         let (mut live, mut sent) = translator(1000);
         live.translate(Event::Code(
             0,
-            streamed("print(agent('Count the cafés'))\n"),
+            streamed("agent('cafés', 'Count the cafés')\n"),
         ));
         let running = Call {
-            code: "print(agent('Count the cafés'))".to_owned(),
+            code: "agent('cafés', 'Count the cafés')".to_owned(),
             ..Call::default()
         };
         live.translate(Event::Run(0, &running));
@@ -1395,10 +1403,10 @@ mod tests {
         };
         let helper = Helper {
             task: "Count the cafés\nin menu.txt".to_owned(),
-            role: Some("counter".to_owned()),
-            name: None,
+            name: Some("cafés".to_owned()),
             end: Ending::Answer("3 cafés".to_owned()),
             memory,
+            resendable: true,
         };
         let mut call = started.open(1, &helper);
         let status = |doing: &str, preview: &str| Status {
@@ -1445,8 +1453,7 @@ mod tests {
         let opened = updates[2];
         assert_eq!(opened["toolCallId"], "call_1.1");
         assert_eq!(opened["title"], "agent: Count the cafés in menu.txt");
-        let asked =
-            json!({ "task": "Count the cafés\nin menu.txt", "role": "counter", "name": null });
+        let asked = json!({ "task": "Count the cafés\nin menu.txt", "name": "cafés" });
         assert_eq!(opened["rawInput"], asked);
         let marked = json!({ "_smol/agent": true, "parent": "call_1" });
         assert_eq!(opened["_meta"], marked);
@@ -1476,13 +1483,13 @@ mod tests {
         // An interrupted agent is marked like an interrupted command
         let stopped = Helper {
             task: "Count the cafés".to_owned(),
-            role: None,
             name: Some("counter".to_owned()),
             end: Ending::Interrupted {},
             memory: AgentMemory::default(),
+            resendable: true,
         };
         let (mut stopping, mut sent) = translator(1000);
-        let code = streamed("agent('Count the cafés', name='counter')\n");
+        let code = streamed("agent('counter', 'Count the cafés')\n");
         stopping.translate(Event::Code(0, code));
         let started = stopping.helpers(0);
         let mut call = started.open(1, &stopped);
@@ -1491,7 +1498,6 @@ mod tests {
         // One aborted before it closes still ends, and so does one replayed while running
         let running = Helper {
             task: "Spell naïve".to_owned(),
-            name: None,
             end: Ending::Running {},
             ..stopped.clone()
         };
@@ -1500,9 +1506,16 @@ mod tests {
         let mut replayed = started.open(3, &running);
         replayed.close(&running);
 
+        // The code's call says which agents it waits for, until it stops waiting
+        started.waiting(&["counter".to_owned()]);
+        started.waiting(&[]);
+
         let messages = drained(&mut sent);
-        let named = &messages[1]["params"]["update"]["rawInput"]["name"];
-        assert_eq!(named, "counter");
+        let opened = &messages[1]["params"]["update"]["rawInput"];
+        assert_eq!(
+            *opened,
+            json!({ "task": "Count the cafés", "name": "counter" })
+        );
         let closed = &messages[2]["params"]["update"];
         assert_eq!(closed["status"], "failed");
         assert_eq!(closed["_meta"]["interrupted"], true);
@@ -1515,7 +1528,12 @@ mod tests {
         assert_eq!(unfinished["status"], "failed");
         assert_eq!(unfinished["content"], aborted["content"]);
         assert_eq!(unfinished["_meta"], aborted["_meta"]);
-        assert_eq!(messages.len(), 7, "{messages:?}");
+        let waiting = &messages[7]["params"]["update"];
+        assert_eq!(waiting["toolCallId"], "call_1");
+        assert_eq!(waiting["_meta"], json!({ "_smol/waiting": ["counter"] }));
+        let waited = &messages[8]["params"]["update"];
+        assert_eq!(waited["_meta"], json!({ "_smol/waiting": [] }));
+        assert_eq!(messages.len(), 9, "{messages:?}");
     }
 
     #[test]

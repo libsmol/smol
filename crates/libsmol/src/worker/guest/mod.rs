@@ -1,5 +1,5 @@
 use crate::agent::MAX_PARALLEL_AGENTS;
-use crate::prompt::{DONE, NO_AGENT, NO_MEMORY, SURROGATE};
+use crate::prompt::{DONE, NO_MEMORY, SURROGATE};
 use crate::tools::memories::{MAX_MEMORY_CHARS, MAX_RECALLED};
 use crate::tools::ToolError;
 use crate::utils::{block_on, Waiting};
@@ -110,18 +110,18 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
     let marker = end_marker(token);
 
     let globals = PyDict::new(py);
+    let delegates = !agents.is_empty();
     let copies = PathBuf::from(copies);
     for (name, function) in builtins(py, copies, cwd)? {
         globals.set_item(name, function)?;
     }
     globals.set_item("_OUTPUT", output)?;
-    globals.set_item("_AGENTS", agents)?;
+    globals.set_item("_AGENTS", delegates)?;
     globals.set_item("_MAX_AGENTS", MAX_PARALLEL_AGENTS)?;
     globals.set_item("_MAX_RECALLED", MAX_RECALLED)?;
     globals.set_item("_MAX_MEMORY_CHARS", MAX_MEMORY_CHARS)?;
     globals.set_item("_MAX_PRINT_CHARS", MAX_PRINT_CHARS)?;
     globals.set_item("_DONE", DONE)?;
-    globals.set_item("_NO_AGENT", NO_AGENT)?;
     globals.set_item("_NO_MEMORY", NO_MEMORY)?;
 
     let builtin = py.import("builtins")?;

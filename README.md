@@ -20,8 +20,8 @@ A real run with DeepSeek on smol's own source:
 - **Orchestration in code.** MCP servers show up as Python objects, so the
   model chains, batches, loops over and retries their tools with ordinary
   code, and keeps the results around for the next step. `agent()` hands tasks
-  to fresh agents the same way, several at once, and returns only their
-  answers.
+  to named agents the same way, several at once, and `agent.wait()` returns
+  only their answers.
 - **One tool.** The model sees a single `eval(code)` tool. There is no menu of
   tools to choose from or route between; its attention goes to the task.
 - **Python.** The language models write most fluently, with a standard library
@@ -260,8 +260,9 @@ functions:
 | `remember(text, project=True)` | Keep a memory of up to 150 characters for this project, or with `project=False` a global one, and return its id. |
 | `recall(query="")` | Up to 10 of this project's and the global memories as `(id, text)`: those that best match the words of `query`, or the newest if none match. |
 | `forget(id)` | Delete a memory. |
-| `agent(task)` | Give a task to a new agent and return its answer; a list of tasks runs up to 8 agents at a time, and `role=` picks one of your [roles](#roles). With `name=` it runs in the background and returns an `Agent` handle at once. |
-| `Agent.get(name)` | The handle of a background agent, whose `wait(timeout=None)`, `status()` and `stop()` return its answer, say what it is doing and stop it. |
+| `agent(name, task)` | Send a task to the agent with this name and return at once; a new name starts an agent, and up to 8 work at a time. |
+| `agent.wait(*names, timeout=None)` | The answers of the named agents, or of all not yet taken, by name, once they end, after `timeout` seconds or when you send a message; prints what each one still at work is doing. |
+| `agent.stop(name)` | Interrupt an agent's task; it keeps its conversation for the next one. |
 | `help(name)` | Print a function's signature and docs, including code defined in earlier steps. |
 
 MCP tools appear as Python objects named after their server, for example
@@ -276,22 +277,26 @@ Agents that `agent()` starts can only recall. In smol, `:memory` lists the
 memories a session sees, and `del` then `enter` forgets the selected one;
 deleting the file forgets everything.
 
-An agent started by `agent()` gets its own Python session and the same files,
+An agent started by `agent()` works in a context of its own: it reads,
+searches, reviews and judges, and reports back, while the agent that started it
+makes the changes. It gets its own Python session and the same files,
 functions, skills, instructions and MCP servers, but not the variables or the
 conversation of the agent that started it, and it can't start agents itself.
 Only its answer goes back; everything it did is saved with the session and
-shown as its own call, and its tokens are counted apart from the session's.
-A task that fails gives a `RuntimeError` in its place in the list.
+shown as its own call, and its tokens are counted apart from the session's. A
+task that fails gives a `RuntimeError` in place of its answer.
 
-An agent started with a name runs in the background, so the model can answer
-while it works. `Agent.get(name)` finds it again, also after Python restarts;
-`wait()` returns its answer, or `None` if it is still running after `timeout`
-seconds, and raises `RuntimeError` if it failed or was stopped. The turn stays
-open until every background agent has ended. When one ends before code took
-its answer, the model gets an "[Agent done]" message, and what you type
-meanwhile reaches it as a task update. smol shows running agents under the
-call that started them, and pins them below the conversation while their rows
-are scrolled out of view.
+An agent works while the code goes on, so the model can do other work or
+answer meanwhile. Its name finds it again, also after Python restarts or the
+session is resumed. A task sent to an agent at work reaches it as a task update
+after its current call, and one sent to an agent that answered continues its
+conversation, on the same Python if it is among the 4 agents used last and
+went unused for less than 30 minutes. The turn stays open until every agent
+has ended. When one ends before code took its answer, the model gets it in an
+"[Agent done]" message, and what you type meanwhile reaches it as a task
+update, which also ends a wait for agents early. smol shows each task under
+the call that sent it, pins the running ones below the conversation while
+their rows are scrolled out of view, and lists the agents in the sidebar.
 
 Programs the code leaves running, such as a build, a download or a server, go
 on after the call and don't keep the turn open. The model hears of each one
@@ -305,8 +310,8 @@ their children, also those in a session of their own, but not daemons that
 leave the process tree. Programs that an agent from `agent()` leaves running
 end when it answers.
 
-A real run with DeepSeek: four agents write and test a tool each in the
-background while the main agent answers a question, then it checks their work:
+A real run with DeepSeek: four agents write and test a tool each while the
+main agent answers a question, then it checks their work:
 
 ![four background agents writing tools in parallel](https://raw.githubusercontent.com/libsmol/smol/main/docs/agents.gif)
 
@@ -430,26 +435,6 @@ They are read from `~/.smol/skills/<skill>/SKILL.md` and from
 directory; a deeper one wins over one with the same name. Only the name,
 description and path go into the prompt; the model reads the file when it
 needs it.
-
-## Roles
-
-A role is an agent that `agent(task, role="reviewer")` can give a task to; a
-list of tasks takes one role for all of them or a list with one per task, as in
-`agent([review, tests], role=["reviewer", "tester"])`. Each table in
-`~/.smol/roles.toml` is one role:
-
-```toml
-[reviewer]
-description = "Reviews code changes and lists real bugs with the lines they are on"
-# Optional, a model from model.toml; without it the role uses the session's model
-model = "deepseek/deepseek-chat"
-```
-
-The system prompt lists each role's name and description, and an agent started
-with a role is told its own. Roles are also read from `.smol/roles.toml` in
-each directory down to the working directory; a deeper one wins over one with
-the same name. A file or role that can't be used is skipped with a notice.
-Without roles, `agent()` takes no `role`.
 
 ## Zed and other ACP clients
 

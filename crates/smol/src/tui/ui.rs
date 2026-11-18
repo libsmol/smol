@@ -2,7 +2,7 @@ use crate::client::{tool_count, McpState, McpStatus};
 use crate::conversation::Stats;
 use crate::tui::app::App;
 use crate::tui::picture;
-use crate::tui::render::{wrap_ranges, Target};
+use crate::tui::render::{signal, wrap_ranges, Target};
 use crate::tui::{
     clipped, fitted, in_out, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG,
     YELLOW,
@@ -220,7 +220,49 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             lines.push(line);
         }
 
+        let mut team = Vec::new();
+        let agents = talk.agents();
+        if !agents.is_empty() {
+            let section = vec![Span::styled("Agents", HEADING)];
+            let count = vec![Span::styled(agents.len().to_string(), DIM)];
+            let section = spread(section, count, width);
+            team.extend([Line::default(), section]);
+        }
+        for agent in &agents {
+            let latest = agent.latest;
+            let (symbol, tint) = signal(latest);
+            let name = latest.name.as_deref().unwrap_or("agent");
+            let (input, output) = agent.tokens;
+            let spent = match input + output {
+                0 => String::new(),
+                _ => in_out(input, output),
+            };
+            let room = width.saturating_sub(2 + 1 + spent.width());
+            let name = clipped(name, room);
+            let left = vec![Span::styled(format!("{symbol} "), tint), Span::raw(name)];
+            let right = vec![Span::styled(spent, DIM)];
+            let line = spread(left, right, width);
+            team.push(line);
+        }
+
+        let height = usize::from(inner.height);
         let programs = &app.session.programs;
+        // The programs keep their gap, heading and a row
+        let reserved = match programs.is_empty() {
+            true => 0,
+            false => 3,
+        };
+        let free = height.saturating_sub(lines.len() + reserved);
+        if team.len() > free {
+            // The gap and heading stay, and the last row that fits says how many are left out
+            let shown = free.saturating_sub(1).max(2);
+            let hidden = agents.len() - (shown - 2);
+            team.truncate(shown);
+            let more = format!("… +{hidden} more");
+            team.push(Line::styled(more, DIM));
+        }
+        lines.extend(team);
+
         if !programs.is_empty() {
             let section = vec![Span::styled("Programs", HEADING)];
             let count = vec![Span::styled(programs.len().to_string(), DIM)];
@@ -228,7 +270,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             lines.extend([Line::default(), section]);
         }
 
-        let free = usize::from(inner.height).saturating_sub(lines.len());
+        let free = height.saturating_sub(lines.len());
         let shown = match programs.len() > free {
             true => free.saturating_sub(1),
             false => programs.len(),
@@ -875,6 +917,7 @@ fn scroll_top(top: u16, row: u16, height: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use crate::client::{Program, Selector};
+    use crate::tests::started;
     use crate::tui::tests::{app, draw, fill};
     use crate::tui::ui::*;
     use agent_client_protocol_schema::v1::{
@@ -1104,6 +1147,33 @@ mod tests {
         assert!(rows[0].contains(" · programs 1 "), "{rows:#?}");
     }
 
+    /// The agents that don't fit are counted in the last row, and the programs keep theirs
+    #[test]
+    fn agents_overflow() {
+        let mut app = app();
+        started(&mut app.session.conversation, 12);
+        let program = Program {
+            pid: 42,
+            command: "sleep 60 # café".to_owned(),
+            since: Instant::now(),
+        };
+        app.session.programs.push(program);
+
+        let rows = screen(&mut app, 120, 24);
+        let sidebar: Vec<&str> = rows
+            .iter()
+            .map(|row| row.split("││").nth(1).unwrap_or_default())
+            .collect();
+        let heading = sidebar.iter().position(|row| row.contains(" Agents "));
+        let heading = heading.expect("heading");
+        assert!(sidebar[heading].ends_with(" 12 │"), "{sidebar:#?}");
+        let shown = sidebar.iter().filter(|row| row.contains("◌ ")).count();
+        let more = format!("… +{} more", 12 - shown);
+        assert!(sidebar[heading + shown + 1].contains(&more), "{sidebar:#?}");
+        let listed = |row: &String| row.contains("│ 42 sleep 60 # café");
+        assert!(rows.iter().any(listed), "{rows:#?}");
+    }
+
     /// The programs that don't fit are counted in the last row
     #[test]
     fn programs_overflow() {
@@ -1278,10 +1348,11 @@ mod tests {
             "Review café.py",
             "Review menu.py",
         ];
-        for (offset, task) in tasks.iter().enumerate() {
+        let names = ["prices", "names", "dates", "café", "menu"];
+        for (offset, (task, name)) in tasks.iter().zip(names).enumerate() {
             let id = format!("call_1.{}", offset + 1);
             let meta = json!({ "_smol/agent": true, "parent": "call_1" });
-            let asked = json!({ "task": task, "role": null, "name": null });
+            let asked = json!({ "task": task, "name": name });
             let opened = ToolCall::new(id, format!("agent: {task}"))
                 .raw_input(asked)
                 .meta(meta.as_object().cloned());
@@ -1289,6 +1360,13 @@ mod tests {
                 .conversation
                 .update(&SessionUpdate::ToolCall(opened));
         }
+        // The code waits for all of them, of which two still work
+        let waiting = json!({ "_smol/waiting": names });
+        let fields = ToolCallUpdateFields::new();
+        let update = ToolCallUpdate::new("call_1", fields).meta(waiting.as_object().cloned());
+        app.session
+            .conversation
+            .update(&SessionUpdate::ToolCallUpdate(update));
 
         let marked = json!({});
         let preview = "prices = load('prices.csv')\nprint(prices[:3])\nprint(total(prices))\nprint(sum(prices))\nprint('café', len(prices))";
@@ -1346,17 +1424,17 @@ mod tests {
         // Ended agents keep a row, or two when they failed,
         // and a running one shows the end of its work above its status
         let group = [
-            "Review prices.py",
+            "prices Review prices.py",
             "│ print(prices[:3])",
             "│ print(total(prices))",
             "│ print(sum(prices))",
             "│ print('café', len(prices))",
             "writing prices = load('prices.csv') · 0s",
-            "◆ Review names.py",
-            "✗ Review dates.py",
+            "◆ names Review names.py",
+            "✗ dates Review dates.py",
             "model: http 503: busy",
-            "✗ Review café.py",
-            "◌ Review menu.py",
+            "✗ café Review café.py",
+            "◌ menu Review menu.py",
             "queued",
         ];
         let header = panel.iter().position(|row| row.contains("╰ agents"));
@@ -1367,24 +1445,34 @@ mod tests {
         }
         let start = |row: &str, text: &str| row.find(text).map(|at| row[..at].width());
         let menu = header + group.len() - 1;
-        let column = start(&panel[menu], "Review");
+        let column = start(&panel[menu], "menu");
         assert_eq!(start(&panel[menu + 1], "queued"), column, "{panel:#?}");
         assert!(wide.contains("waiting for 2 agents · "), "{wide}");
         let sidebar = |row: &&str| row.contains("││ agents ") && row.ends_with(" ⇡1.2k ⇣340 │");
         assert!(wide.lines().any(|row| sidebar(&row)), "{wide}");
+        // Each agent has a row in the sidebar, with its tokens
+        let listed = [
+            "││ Agents                     5 │",
+            "││ ◆ names           ⇡1.2k ⇣340 │",
+            "││ ✗ dates                      │",
+            "││ ◌ menu                       │",
+        ];
+        for listed in listed {
+            assert!(wide.contains(listed), "{wide}");
+        }
 
         app.expanded = true;
         let expanded = screen(&mut app, 120, 40);
         let title = expanded
             .iter()
-            .position(|row| row.contains(" Review prices.py"));
+            .position(|row| row.contains(" prices Review prices.py"));
         let title = title.expect("title");
         assert!(
             expanded[title + 5].contains("writing prices = load('prices.csv') · 0s"),
             "{expanded:#?}"
         );
         assert!(
-            expanded[title + 6].contains("◆ Review names.py"),
+            expanded[title + 6].contains("◆ names Review names.py"),
             "{expanded:#?}"
         );
         let stats = expanded
@@ -1398,7 +1486,7 @@ mod tests {
         let gap = expanded[stats + 1].split("││").next().unwrap_or_default();
         assert_eq!(gap.trim_matches([' ', '│']), "", "{expanded:#?}");
         assert!(
-            expanded[stats + 2].contains("✗ Review dates.py"),
+            expanded[stats + 2].contains("✗ dates Review dates.py"),
             "{expanded:#?}"
         );
 
@@ -1421,7 +1509,7 @@ mod tests {
         for (offset, task) in ["Review café.py", "Review naïve.py"].iter().enumerate() {
             let id = format!("call_1.{}", offset + 1);
             let meta = json!({ "_smol/agent": true, "parent": "call_1" });
-            let asked = json!({ "task": task, "role": null, "name": null });
+            let asked = json!({ "task": task, "name": null });
             let opened = ToolCall::new(id.clone(), format!("agent: {task}"))
                 .raw_input(asked)
                 .meta(meta.as_object().cloned());

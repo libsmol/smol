@@ -9,6 +9,36 @@ but their files stay in `~/.smol/projects` untouched.
 
 ## Unreleased
 
+- Agents have names and keep their conversations. `agent(name, task)` sends a
+  task and returns at once: a new name starts an agent, one at work gets the
+  task as a `[Task update]` after its current call, and one that answered
+  continues its conversation with it, on the same Python, which the 4 agents
+  used last keep for up to 30 minutes unused.
+  `agent.wait(*names, timeout=None)` returns their answers by name and prints
+  what each one still at work is doing, also early when the user sends a
+  message, which then reaches the model at once, and `agent.stop(name)`
+  interrupts one, which is told so. Answers the code didn't take come in the
+  `[Agent done]` message, and agents of a resumed session take tasks again.
+  `Agent`, `Agent.get()`, lists of tasks and `name=` are gone.
+- The system prompt describes an agent as a worker that reads, searches,
+  reviews and judges in a context of its own while the model makes the
+  changes, suggests one for reviewing the model's changes or conclusions, for
+  many independent items that each need judgment and for reading whose details
+  the model won't need again, tells the model to do everything else itself and
+  never to redo an agent's work, and asks for each new task with its goal,
+  context, limits and the answer it needs. An agent is told to report what it
+  finds and to change files only when its task asks it to.
+- smol lists the agents in the sidebar between the MCP servers and the
+  programs, each with its state and tokens, tags a task with its agent's name,
+  gives an agent's later tasks its color, and counts as awaited only the agents
+  the code waits for.
+- Roles are gone: `roles.toml` is no longer read and `agent()` takes no
+  `role`, so agents run on the session's model and their tasks say what they
+  should do. Sessions with agents that had roles still open.
+- For ACP clients: the `rawInput` of `_smol/agent` calls always has `name`
+  and no longer `role`, and the call running the code carries
+  `_smol/waiting`, the names of the agents it waits for, empty once it stops
+  waiting.
 - The memory rules tell the model that memories outlast the session, to save
   one as soon as it learns something, as an instruction a later session can
   follow, in the user's language, global when it is about the user, and to

@@ -289,7 +289,6 @@ mod tests {
         Helper {
             id: "call_1.1".to_owned(),
             task: task.to_owned(),
-            role: None,
             name: None,
             status,
             text: text.to_owned(),

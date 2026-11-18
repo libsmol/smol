@@ -79,15 +79,9 @@ def _bound(signature, header, args, kwargs):
     except TypeError as exc:
         raise TypeError(f"{header}: {exc}") from None
 
-def _builtin(function, header=None):
+def _builtin(function):
     signature = _inspect.signature(function)
-    if header is None:
-        shown = signature
-        # Methods are listed as Class.method without self or cls
-        if "." in function.__qualname__:
-            parameters = list(signature.parameters.values())[1:]
-            shown = signature.replace(parameters=parameters)
-        header = f"{function.__qualname__}{shown}"
+    header = f"{function.__qualname__}{signature}"
 
     def builtin(*args, **kwargs):
         bound = _bound(signature, header, args, kwargs)
@@ -314,136 +308,62 @@ def _handed(function, result):
         return result["answer"]
     return RuntimeError(f"{function}: {error}")
 
-def _texts(function, name, value, count=None):
-    texts = [value] if isinstance(value, str) else value
-    if not isinstance(texts, list):
-        kind = type(value).__name__
-        raise TypeError(f"{function}: {name} must be str or a list of str, not {kind}")
-    for item in texts:
-        if not isinstance(item, str):
-            kind = type(item).__name__
-            raise TypeError(f"{function}: {name} must be str or a list of str, not a list holding {kind}")
-    if count is not None and len(texts) != count:
-        raise ValueError(f"{function}: {name}: needs one {name} per task ({count}), not {len(texts)}")
-    return texts
+def agent(name: str, task: str) -> None:
+    """Sends task to the agent with this name, starting one for a new name, and returns at once.
+    An agent at work gets the task after its current call.
 
-_FIELDS = ".name, .task and .role" if _AGENTS == "roles" else ".name and .task"
-
-class Agent:
-    __doc__ = f"The handle of an agent started with a name.\n{_FIELDS} hold what it was started with."
-
-    _smol_header = "class Agent"
-
-    def __init__(self, id, name, task, role):
-        if isinstance(id, bool) or not isinstance(id, int):
-            kind = type(id).__name__
-            raise TypeError(f"Agent: id must be int, not {kind}")
-        # The agent numbers agents from 0 in 64 bits, so another id names none
-        if not 0 <= id < 2**64:
-            raise ValueError(f"Agent: {_NO_AGENT}")
-        self._id = id
-        self.name = name
-        self.task = task
-        self.role = role
-
-    def __repr__(self):
-        return f"<Agent {self.name}>"
-
-    def get(cls, name: str) -> Agent | None:
-        """The handle of the agent last started with this name, also after Python restarts.
-
-        Returns the handle of the agent last started with this name in this session, also after Python restarts, or None if there is none."""
-        name = _str("Agent.get", "name", name)
-        found = _asked("Agent.get", "find", {"name": name})
-        if found is None:
-            return None
-        return cls(**found)
-
-    def wait(self, timeout: float | None = None) -> str | None:
-        """Its answer once it ends, or None if it is still running after timeout seconds.
-        Raises RuntimeError if it failed or was stopped.
-
-        Waits until the agent ends and returns its answer.
-        - With timeout, returns None if it is still running after that many seconds; timeout=None waits until it ends.
-        - Raises RuntimeError if the agent failed or was stopped.
-        - Once the code has its result, no "[{done}]" message is sent for it."""
-        if timeout is not None:
-            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-                kind = type(timeout).__name__
-                raise TypeError(f"Agent.wait: timeout must be a number or None, not {kind}")
-            if not timeout >= 0:
-                raise ValueError(f"Agent.wait: timeout must be 0 or more, not {timeout}")
-            # JSON has no infinity, and waiting that long is waiting until it ends
-            timeout = None if timeout == float("inf") else float(timeout)
-
-        result = _asked("Agent.wait", "wait", {"id": self._id, "timeout": timeout})
-        if result is None:
-            return None
-        answer = _handed("Agent.wait", result)
-        if isinstance(answer, RuntimeError):
-            raise answer
-        return answer
-
-    def status(self) -> str:
-        """What it is doing now and the end of what it is writing or printing, or how it ended.
-
-        Returns how long it has run and what it is doing now, followed by the last lines it is writing or printing; once it has ended, returns how it ended."""
-        return _asked("Agent.status", "status", {"id": self._id})
-
-    def stop(self) -> None:
-        """Stops it and returns once it has stopped.
-
-        Stops the agent and returns once it has stopped; no "[{done}]" message is sent for it."""
-        _asked("Agent.stop", "stop", {"id": self._id})
-
-# Wrapped once the class exists, which their annotations name
-for _method in [Agent.get, Agent.wait, Agent.status, Agent.stop]:
-    setattr(Agent, _method.__name__, _builtin(_method))
-Agent.get = classmethod(Agent.get)
-
-def agent(task: str | list[str], role: str | list[str] | None = None, *, name: str | list[str] | None = None) -> str | list[str | RuntimeError] | Agent | list[Agent]:
-    """A new agent does each task and returns its answer, or with name its handle at once.
-    A list of tasks takes a list of names, one per task.
-
-    Gives each task to a new agent.
-    - Without name: returns its answer, or raises RuntimeError if the agent fails. A list of tasks runs up to {agents} agents at a time and returns their answers in order, with the exception in place of each task that failed.
-    - With name: the agent runs in the background and agent() returns its Agent handle at once. A list of tasks takes one name per task and returns a list of handles. A name cannot be given again while its agent is running.
-
-    The agent has its own Python session and the same files, built-in functions, MCP servers, skills and instructions as you, but not your variables or this conversation, so the task must state everything it needs. Agents started this way cannot call agent(), remember() or forget()."""
-    single = isinstance(task, str)
-    tasks = _texts("agent", "task", task)
-    if not tasks or not all(item.strip() for item in tasks):
-        raise ValueError("agent: task is empty")
-    roles = [role] * len(tasks) if role is None or isinstance(role, str) else _texts("agent", "role", role, len(tasks))
-
-    if name is None:
-        asked = [{"task": task, "role": role, "name": None} for task, role in zip(tasks, roles)]
-        results = _asked("agent", "ask", {"agents": asked})
-        answers = [_handed("agent", result) for result in results]
-        if not single:
-            return answers
-        if isinstance(answers[0], RuntimeError):
-            raise answers[0]
-        return answers[0]
-
-    names = _texts("agent", "name", name, len(tasks))
-    if not all(item.strip() for item in names):
+    - A new name starts a new agent with your files, built-in functions, MCP servers, skills and instructions, but not your Python session or this conversation.
+    - An agent at work gets task as "[Task update]" after its current call, and one that has answered continues its conversation with it.
+    - Up to {agents} agents work at a time, and the rest wait for a slot.
+    - Answers come from agent.wait(), or as an "[{done}]" message after your next call.
+    - Agents started this way cannot call agent(), remember() or forget()."""
+    name = _str("agent", "name", name)
+    task = _str("agent", "task", task)
+    if not name.strip():
         raise ValueError("agent: name is empty")
-    for at, item in enumerate(names):
-        if item in names[:at]:
-            raise ValueError(f"agent: name: {item}: given twice")
+    if not task.strip():
+        raise ValueError("agent: task is empty")
+    _asked("agent", "send", {"name": name, "task": task})
 
-    asked = [{"task": task, "role": role, "name": name} for task, role, name in zip(tasks, roles, names)]
-    handles = _asked("agent", "start", {"agents": asked})
-    handles = [Agent(**handle) for handle in handles]
-    return handles[0] if single else handles
+def _wait(*names: str, timeout: float | None = None) -> dict[str, str | RuntimeError]:
+    """The answers of the named agents, or of all not yet taken, once they end or after timeout seconds.
+    Returns early when the user sends a message, and prints what each one still at work is doing.
 
-# Without roles the parameter is left out, so passing one fails like any unknown argument
-if _AGENTS != "roles":
-    _signature = _inspect.signature(agent)
-    _parameters = [_signature.parameters["task"], _signature.parameters["name"]]
-    agent.__signature__ = _signature.replace(parameters=_parameters)
+    - Without names it waits for every agent at work, and returns their answers with the earlier ones not yet taken.
+    - A named agent that has answered gives its latest answer, again if it was taken.
+    - After timeout seconds, or once the user sends a message, which comes as "[Task update]" after your current call, it returns the answers so far and prints what each agent it waits for and still at work is doing.
+    - An agent that failed or was stopped gives a RuntimeError in place of its answer.
+    - An answer taken here comes in no "[{done}]" message."""
+    for name in names:
+        _str("agent.wait", "name", name)
+    if timeout is not None:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            kind = type(timeout).__name__
+            raise TypeError(f"agent.wait: timeout must be a number or None, not {kind}")
+        if not timeout >= 0:
+            raise ValueError(f"agent.wait: timeout must be 0 or more, not {timeout}")
+        # JSON has no infinity, and waiting that long is waiting until they end
+        timeout = None if timeout == float("inf") else float(timeout)
+
+    waited = _asked("agent.wait", "wait", {"names": list(names), "timeout": timeout})
+    for name, status in waited["working"]:
+        print(f"{name}: {status}")
+    return {name: _handed("agent.wait", result) for name, result in waited["answers"]}
+
+def _stop(name: str) -> None:
+    """Interrupts the agent, as Esc does; it keeps its conversation for the next task.
+
+    Interrupts the task the agent with this name works on and returns once it has stopped, and no "[{done}]" message comes for it; an agent not at work stays as it is."""
+    name = _str("agent.stop", "name", name)
+    _asked("agent.stop", "stop", {"name": name})
+
 agent = _builtin(agent)
+
+# Under agent, where the code's own wait or stop can't hide them
+for _function in [_wait, _stop]:
+    _function.__name__ = _function.__name__.removeprefix("_")
+    _function.__qualname__ = f"agent.{_function.__name__}"
+    setattr(agent, _function.__name__, _builtin(_function))
 
 @_builtin
 def help(request: object) -> None:
@@ -511,22 +431,22 @@ def help(request: object) -> None:
     doc = source or _inspect.getdoc(target)
     if doc:
         parts.append(doc)
-    if isinstance(target, type) and hasattr(target, "_smol_header"):
-        for member in vars(target):
-            method = getattr(target, member)
-            if callable(method) and hasattr(method, "_smol_header"):
-                summary = _inspect.getdoc(method).split("\n\n")[0]
+    # A builtin lists the ones under it, as agent does
+    if hasattr(target, "_smol_header"):
+        for member in vars(target).values():
+            if callable(member) and hasattr(member, "_smol_header"):
+                summary = _inspect.getdoc(member).split("\n\n")[0]
                 indented = summary.replace("\n", "\n    ")
-                parts.append(f"\n{method._smol_header}\n    {indented}")
+                parts.append(f"\n{member._smol_header}\n    {indented}")
 
     text = "\n".join(parts)
     print(text, limit=None)
 
-# _AGENTS is empty in the workers of agents that agent() starts, which only recall memories
+# _AGENTS is false in the workers of agents that agent() starts, which only recall memories
 _MEMORY = [remember, recall, forget] if _AGENTS else [recall]
 _BUILTINS = [edit, ls, grep, fetch, view, *_MEMORY, help]
 if _AGENTS:
-    _BUILTINS[-1:-1] = [agent, Agent, Agent.get, Agent.wait, Agent.status, Agent.stop]
+    _BUILTINS[-1:-1] = [agent, agent.wait, agent.stop]
 
 _FUNCTIONS = []
 for _function in _BUILTINS:
@@ -534,6 +454,6 @@ for _function in _BUILTINS:
     _header = _function._smol_header
     _summary = _inspect.getdoc(_function).split("\n\n")[0]
     _FUNCTIONS.append((_name, _header, _summary))
-    # Methods come with their class
+    # The ones under another come with it
     if "." not in _name:
         vars(_builtins)[_name] = _function

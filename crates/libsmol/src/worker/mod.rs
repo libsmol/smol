@@ -12,7 +12,7 @@ pub(crate) mod workplace;
 /// Holds the `address/token` the agent listens on
 pub const CONTROL_ENV: &str = "SMOL_CONTROL";
 pub const COPIES_ENV: &str = "SMOL_COPIES";
-/// Holds `on`, or `roles` when `agent()` takes a role, and is unset for workers without `agent()`
+/// Holds `on`, and is unset for workers without `agent()`
 pub const AGENTS_ENV: &str = "SMOL_AGENTS";
 /// Starts libsmol's executable as a session's worker, followed by the venv it runs as
 pub(crate) const WORKER_ARG: &str = "--worker";
@@ -128,50 +128,34 @@ pub enum MemoryCall {
     Forget { id: i64 },
 }
 
-/// A call to `agent()` or to a handle it returned, where a handle is `{"id", "name", "task", "role"}`
+/// A call to `agent()`, `agent.wait()` or `agent.stop()`, which name agents
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AgentCall {
-    /// Answered with `{"answer"}` or `{"error"}` for each agent, in order, once all have ended
-    Ask {
-        agents: Vec<Asked>,
-    },
-    /// Answered at once with the handle of each agent, which runs in the background
-    Start {
-        agents: Vec<Asked>,
-    },
-    /// Answered with the handle of the agent last started with the name, or null
-    Find {
-        name: String,
-    },
-    /// Answered with `{"answer"}` or `{"error"}` once it ends, or null after `timeout` seconds
+    /// Answered with null at once
+    Send(Asked),
+    /// Answered once the agents end or after `timeout` seconds with `{"answers", "working"}`,
+    /// `[name, {"answer"} or {"error"}]` for each that ended and `[name, status]` for the rest
     Wait {
-        id: usize,
+        names: Vec<String>,
         timeout: Option<f64>,
     },
-    Status {
-        id: usize,
-    },
-    /// Answered once it has stopped
-    Stop {
-        id: usize,
-    },
+    /// Answered with null once it has stopped
+    Stop { name: String },
 }
 
-/// An agent for `agent()` to start
+/// A task for the agent named `name`
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Asked {
+    pub(crate) name: String,
     pub(crate) task: String,
-    pub(crate) role: Option<String>,
-    pub(crate) name: Option<String>,
 }
 
-/// Which `agent()` a worker offers
+/// Whether a worker offers `agent()`
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Delegation {
     Off,
     On,
-    Roles,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

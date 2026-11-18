@@ -3,7 +3,7 @@ use crate::acp::rpc::{Notice, Peer, SessionPeer};
 use crate::acp::translator::Translator;
 use crate::acp::{rfc3339, task_of, to_value, App};
 use crate::agent::{
-    title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Sink, Task,
+    title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Sink, Task, Team,
 };
 use crate::config::{self, Access, McpConfig, Models, Skipped};
 use crate::history::{Lock, SessionMeta, Settings};
@@ -204,11 +204,6 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             let notice = problem.to_string();
             notices.push(notice);
         }
-        let (roles, skipped) = config::roles(&app.config, &cwd, &models);
-        for problem in skipped {
-            let notice = problem.to_string();
-            notices.push(notice);
-        }
         for entry in &mcp_skipped {
             let notice = entry.problem.to_string();
             notices.push(notice);
@@ -272,9 +267,10 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             peer: peer.clone(),
             enqueued,
         };
+        // Agents the code started in earlier turns take further tasks
+        let team = Team::restored(&memory.steps);
         let place = Place::Main {
-            roles,
-            team: Arc::default(),
+            team: Arc::new(team),
             queue: Arc::new(queue),
         };
 
@@ -655,6 +651,12 @@ impl Sink for Keeper {
 impl Queue for ClientQueue {
     fn queued(&self) -> Asking<'_> {
         Box::pin(async move {
+            // The notices of the messages this takes would otherwise wake a later wait for none
+            select! {
+                biased;
+                () = self.enqueued.notified() => {}
+                () = future::ready(()) => {}
+            }
             let Some(result) = self.peer.queued().await else {
                 return Vec::new();
             };
@@ -758,11 +760,12 @@ fn update_session(peer: &SessionPeer, meta: &SessionMeta) {
 
 #[cfg(test)]
 mod tests {
-    use crate::acp::rpc::{Lines, Out, Peer};
+    use crate::acp::rpc::{Lines, Out, Peer, SessionPeer};
     use crate::acp::serve::serve;
-    use crate::acp::session::Unsaved;
+    use crate::acp::session::{ClientQueue, Unsaved};
     use crate::acp::tests::drained;
     use crate::acp::{rfc3339, App};
+    use crate::agent::Queue;
     use crate::history::tests::saved;
     use crate::history::{HistoryStore, Settings};
     use crate::prompt::{namer, RESTARTED};
@@ -778,6 +781,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::fs;
+    use std::future;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
@@ -785,6 +789,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+    use tokio::select;
     use tokio::sync::mpsc::{self, UnboundedSender};
     use tokio::task::{self, JoinHandle};
     use tokio::time;
@@ -1682,53 +1687,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// Roles reach the prompt and the signature, and one with an unknown model is skipped
-    #[test]
-    fn roles_read() {
-        let dir = temp_dir("roles");
-        fs::create_dir_all(&dir).expect("dir");
-        let roles =
-            "[reviewer]\ndescription = \"Reviews the café's code\"\nmodel = \"mock/m1\"\n\n\
-            [critic]\ndescription = \"Critiques\"\nmodel = \"mock/gone\"\n";
-        fs::write(dir.join("roles.toml"), roles).expect("write");
-        let prompts = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&prompts);
-        let api = model_server(move |body| {
-            let system = system_prompt(body);
-            if system != namer() {
-                seen.lock().expect("prompts").push(system);
-            }
-            Ok("Done.".to_owned())
-        });
-        let running = async {
-            let mut connection = Connection::open(&dir, &api, "");
-            let session = connection.new_session().await;
-            connection.prompt(&session, "Review it").await;
-            connection.close().await
-        };
-        let seen = block_on(running);
-
-        let mut notices = Vec::new();
-        for message in seen {
-            if message["method"] == "_smol/notice" {
-                let text = message["params"]["text"].as_str().unwrap_or_default();
-                notices.push(text.to_owned());
-            }
-        }
-        let shown = tilde(&dir.join("roles.toml"));
-        let skipped = format!("config: {shown}: [critic]: model: mock/gone: not in model.toml (models: mock/m1), skipped");
-        assert_eq!(notices, [skipped]);
-
-        let prompts = prompts.lock().expect("prompts");
-        let prompt = &prompts[0];
-        let header =
-            "\nagent(task: str | list[str], role: str | list[str] | None = None, *, name: ";
-        assert!(prompt.contains(header), "{prompt}");
-        let listed = "with one role per task.\n\n- `reviewer`: Reviews the café's code\n\n";
-        assert!(prompt.contains(listed), "{prompt}");
-        fs::remove_dir_all(&dir).ok();
-    }
-
     #[test]
     fn images_declared() {
         let dir = temp_dir("images");
@@ -1908,5 +1866,32 @@ mod tests {
         assert!(reloaded.get("error").is_some(), "{reloaded}");
         assert_eq!(answered["result"]["stopReason"], "end_turn", "{answered}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Taking the queued messages takes the notices of their arrival, which leave none behind
+    #[test]
+    fn notices_taken() {
+        let (lines, _sent) = mpsc::unbounded_channel();
+        let peer = Peer::new(Out::Lines(lines));
+        let queue = ClientQueue {
+            peer: SessionPeer::new(peer, "session-1"),
+            enqueued: Arc::default(),
+        };
+        let noticed = |queue: &ClientQueue| {
+            let checking = async {
+                select! {
+                    biased;
+                    () = queue.enqueued() => true,
+                    () = future::ready(()) => false,
+                }
+            };
+            block_on(checking)
+        };
+
+        queue.enqueued.notify_one();
+        assert!(noticed(&queue));
+        queue.enqueued.notify_one();
+        block_on(queue.queued());
+        assert!(!noticed(&queue));
     }
 }
