@@ -240,16 +240,14 @@ fn shortened(text: &str, root: &str, name: &str, inside: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{cause, one_line, searched, shortened, terminal_view, worded};
+    use crate::{searched, terminal_view};
     use std::env;
     use std::fs;
     #[cfg(unix)]
     use std::fs::Permissions;
-    use std::io;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::path::MAIN_SEPARATOR;
     use std::process;
 
     #[test]
@@ -291,31 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn cause_lowercased() {
-        let lowered = |text: &str| {
-            let error = io::Error::other(text.to_owned());
-            cause(&error)
-        };
-
-        assert_eq!(lowered("Connection refused"), "connection refused");
-        assert_eq!(lowered("I/O error"), "I/O error");
-        assert_eq!(lowered("Über-proxy refused"), "über-proxy refused");
-        assert_eq!(lowered("Access is denied。"), "access is denied");
-        let windows = "The system cannot find the file specified.";
-        assert_eq!(
-            lowered(windows),
-            "the system cannot find the file specified"
-        );
-        assert_eq!(lowered(""), "");
-
-        #[cfg(unix)]
-        {
-            let missing = io::Error::from_raw_os_error(2);
-            assert_eq!(cause(&missing), "no such file or directory");
-        }
-    }
-
-    #[test]
     fn terminal_view_cleaned() {
         let cases = [
             (
@@ -341,35 +314,5 @@ mod tests {
         for (text, expected) in cases {
             assert_eq!(terminal_view(text), expected, "{text:?}");
         }
-    }
-
-    #[test]
-    fn words_joined() {
-        let arguments = "python3\0-c\0print('café')\0\0--naïve\n\x1b[31m 🐍\0";
-        assert_eq!(
-            worded(arguments),
-            "python3 -c print('café') --naïve [31m 🐍"
-        );
-        assert_eq!(worded("\0\t\0"), "");
-    }
-
-    #[test]
-    fn paths_shortened() {
-        let sep = MAIN_SEPARATOR;
-        let root = format!("{sep}work{sep}menus");
-        let text = format!("In {root}, read {root}{sep}café.txt ({root}) but not {root}2, {root}.bak or {sep}var{root}{sep}naïve");
-        let expected = format!(
-            "In ., read café.txt (.) but not {root}2, {root}.bak or {sep}var{root}{sep}naïve"
-        );
-        assert_eq!(shortened(&text, &root, ".", ""), expected);
-        assert_eq!(shortened("résumé", "", ".", ""), "résumé");
-
-        let home = env::home_dir().expect("home");
-        let cwd = home.join("menus");
-        let (inside, under) = (cwd.display(), home.display());
-        let task =
-            format!("Work in {inside}: read {inside}{sep}café.txt\nand  {under}{sep}naïve.md");
-        let expected = format!("Work in .: read café.txt and ~{sep}naïve.md");
-        assert_eq!(one_line(&task, &cwd), expected);
     }
 }

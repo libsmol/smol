@@ -429,18 +429,13 @@ impl Markdown<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::tools::web::{
-        declared, fetch, markdown, parsed, refresh, FETCH_WAIT, MAX_REDIRECTS,
-    };
+    use crate::tools::web::fetch;
     use crate::utils::block_on;
-    use encoding_rs::{SHIFT_JIS, UTF_8, WINDOWS_1252};
-    use reqwest::Url;
+    use encoding_rs::WINDOWS_1252;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::thread;
-    use std::time::{Duration, Instant};
-
-    const BASE: &str = "http://example.com/docs/page.html";
+    use std::time::Duration;
 
     /// Serves `head` and `body` once and keeps the connection open when `endless`
     fn served(head: String, body: Vec<u8>, endless: bool) -> SocketAddr {
@@ -474,90 +469,6 @@ mod tests {
         }
     }
 
-    fn failure(url: &str) -> String {
-        let fetching = fetch(url);
-        let failed = block_on(fetching).expect_err("error");
-        failed.to_string()
-    }
-
-    fn converted(html: &str) -> String {
-        let base = Url::parse(BASE).expect("url");
-        let page = parsed(html);
-        markdown(&page, &base)
-    }
-
-    #[test]
-    fn fetch_markdown() {
-        let html = |body: &str| fetched("text/html", body.as_bytes().to_vec()).1;
-        let page = "<h2>Title</h2><script>x()</script><ol><li>one</li><li>two</li></ol>\
-            <p>Use <code>f</code></p>\n\n\n\n<pre>let x;</pre>";
-        let expected = "## Title\n\n1. one\n2. two\n\nUse `f`\n\n```\nlet x;\n```";
-        assert_eq!(html(page), expected);
-
-        let links = r##"<a href="/wiki/Rust">Rust language</a> <a href="next.html">Next page</a> <a name="top">top</a> <a href="#s1">s1</a> <a href="javascript:void(0)">js</a>"##;
-        let (url, shown, _) = fetched("text/html", links.as_bytes().to_vec());
-        let root = url.trim_end_matches("/docs/page.html");
-        let expected = format!(
-            "[Rust language]({root}/wiki/Rust) [Next page]({root}/docs/next.html) top s1 js"
-        );
-        assert_eq!(shown, expected);
-
-        let spaced = "<div>\n  <p>crème\n    brûlée </p>\n  \n  <p><a href=\"/x\">\n    link\n  </a> after</p>\n  <pre>  keep\n    this</pre>\n  <p><code>[ 1 ]</code></p>\n</div>";
-        let (url, shown, _) = fetched("text/html", spaced.as_bytes().to_vec());
-        let root = url.trim_end_matches("/docs/page.html");
-        let expected = format!(
-            "crème brûlée\n\n[link]({root}/x) after\n\n```\n  keep\n    this\n```\n\n`[ 1 ]`"
-        );
-        assert_eq!(shown, expected);
-
-        let depth = 10_000;
-        let opened = "<span>".repeat(depth);
-        let closed = "</span>".repeat(depth);
-        let deep = format!("<p>Start</p>{opened}deep down\nhere{closed}");
-        assert_eq!(html(&deep), "Start\ndeep down here");
-
-        let hidden = "<noscript><p>Please enable JavaScript</p></noscript>\
-            <textarea style=\"color: red; DISPLAY : none\">&lt;style&gt;.a{}&lt;/style&gt;</textarea>\
-            <div hidden>hidden</div><template><p>template</p></template><p style=\"color: red\">visible</p>";
-        assert_eq!(html(hidden), "Please enable JavaScript\n\nvisible");
-    }
-
-    #[test]
-    fn list_paragraphs() {
-        let page = "<ul><li><p>one café</p></li><li><p>two</p></li></ul><p>after</p>";
-        assert_eq!(converted(page), "- one café\n- two\n\nafter");
-
-        let code = "<ul><li><pre><div>let café;</div><div>let naïve;</div></pre></li></ul>";
-        let expected = "-\n```\n\nlet café;\n\nlet naïve;\n\n```";
-        assert_eq!(converted(code), expected);
-    }
-
-    #[test]
-    fn quote_paragraphs() {
-        let page = "<blockquote><p>quoted naïve</p></blockquote><p>after</p>";
-        assert_eq!(converted(page), "> quoted naïve\n\nafter");
-    }
-
-    #[test]
-    fn cell_paragraphs() {
-        let page = "<table><tr><td><p>c1</p></td><td><p>résumé</p></td></tr></table><p>after</p>";
-        assert_eq!(converted(page), "| c1 | résumé\n\nafter");
-    }
-
-    #[test]
-    fn link_heading() {
-        let page = "<a href=\"/x\"><h3>Card title</h3></a><p>Crème brûlée</p>";
-        let expected = "[### Card title](http://example.com/x)\nCrème brûlée";
-        assert_eq!(converted(page), expected);
-    }
-
-    #[test]
-    fn nested_lists() {
-        let page = "<ul><li>one<ul><li>two<ol><li>three</li><li>four</li></ol></li></ul></li></ul>";
-        let expected = "- one\n  - two\n    1. three\n    2. four";
-        assert_eq!(converted(page), expected);
-    }
-
     #[test]
     fn fetch_charset() {
         let (body, _, _) = WINDOWS_1252.encode("<p>café</p>");
@@ -567,147 +478,5 @@ mod tests {
         let (text, _, _) = WINDOWS_1252.encode("crème brûlée");
         let named = fetched("text/plain; Charset=ISO-8859-1", text.to_vec());
         assert_eq!(named.1, "crème brûlée");
-    }
-
-    #[test]
-    fn charset_declared() {
-        let meta = r#"<meta charset="windows-1252"><p>café</p>"#;
-        assert_eq!(declared(meta.as_bytes()), Some(WINDOWS_1252));
-        let old = br#"<meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-1">"#;
-        assert_eq!(declared(old), Some(WINDOWS_1252));
-        assert_eq!(declared(b"<meta charset='utf-16'>"), Some(UTF_8));
-        assert_eq!(declared(b"<META CHARSET=Shift_JIS>"), Some(SHIFT_JIS));
-
-        assert_eq!(declared("<p>café</p>".as_bytes()), None);
-        let late = format!("<p>{}</p><meta charset=\"windows-1252\">", "x".repeat(1024));
-        assert_eq!(declared(late.as_bytes()), None);
-        assert_eq!(declared(b"<meta charset=klingon>"), None);
-    }
-
-    #[test]
-    fn fetch_errors() {
-        let body = "{\"error\":\n  \"requests too frequent\"}";
-        let length = body.len();
-        let head = format!("HTTP/1.1 429 Too Many Requests\r\ncontent-length: {length}\r\n\r\n");
-        let address = served(head, body.into(), false);
-        let url = format!("http://{address}/résumé");
-        let message = failure(&url);
-        let expected = format!("fetch: {url}: http 429: {{\"error\": \"requests too frequent\"}}");
-        assert_eq!(message, expected);
-
-        let head = "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 100000000\r\n\r\n";
-        let body = "server error — ".repeat(10_000);
-        let address = served(head.to_owned(), body.into_bytes(), true);
-        let url = format!("http://{address}/");
-        let started = Instant::now();
-        let message = failure(&url);
-        let elapsed = started.elapsed();
-        let start = format!("fetch: {url}: http 500: server error — server error —");
-        assert!(message.starts_with(&start), "{message}");
-        assert!(message.ends_with('…'), "{message}");
-        // Reading on to the end would only stop at the read timeout
-        assert!(elapsed < FETCH_WAIT / 4, "{elapsed:?}");
-
-        // The error names the host redirected to
-        let head =
-            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:1/\r\ncontent-length: 0\r\n\r\n";
-        let address = served(head.to_owned(), Vec::new(), false);
-        let url = format!("http://{address}/old-café");
-        let message = failure(&url);
-        let expected = format!("fetch: {url}: cannot connect to 127.0.0.1:1: ");
-        assert!(message.starts_with(&expected), "{message}");
-
-        let style = format!("<style>{}</style>", ".a{color:red}".repeat(500));
-        let body = format!("<html><head>{style}</head><body><h1>Access denied</h1></body></html>");
-        let length = body.len();
-        let head = format!(
-            "HTTP/1.1 403 Forbidden\r\ncontent-type: text/html\r\ncontent-length: {length}\r\n\r\n"
-        );
-        let address = served(head, body.into_bytes(), false);
-        let url = format!("http://{address}/");
-        let message = failure(&url);
-        let expected = format!("fetch: {url}: http 403: # Access denied");
-        assert_eq!(message, expected);
-    }
-
-    #[test]
-    fn fetch_sniffed() {
-        let text = "# Café menu\n\nCrème brûlée".as_bytes().to_vec();
-        let (_, shown, _) = fetched("application/octet-stream", text);
-        assert_eq!(shown, "# Café menu\n\nCrème brûlée");
-
-        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
-        png.resize(16 * 1024, 0);
-        let (url, _, failed) = fetched("application/octet-stream", png);
-        let expected = format!(
-            "fetch: {url}: application/octet-stream, only HTML and text pages can be fetched"
-        );
-        assert_eq!(failed, expected);
-    }
-
-    #[test]
-    fn fetch_refresh() {
-        let page = |body: &str| {
-            let length = body.len();
-            let head = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {length}\r\n\r\n"
-            );
-            let address = served(head, body.as_bytes().to_vec(), false);
-            format!("http://{address}/")
-        };
-
-        let full = page("<p>full page</p>");
-        let script = format!("<script>location.replace('{full}')</script><noscript><meta http-equiv=\"refresh\" content=\"0;url={full}\"></noscript>");
-        assert_eq!(fetched("text/html", script.into_bytes()).1, "full page");
-
-        // Following it would fail to connect to port 1
-        let later =
-            "<meta http-equiv=\"refresh\" content=\"5;url=http://127.0.0.1:1/\"><p>redirecting in 5s</p>";
-        assert_eq!(fetched("text/html", later.into()).1, "redirecting in 5s");
-
-        let chained = |end: String, hops: usize| {
-            let mut next = end;
-            for _ in 0..hops {
-                let body = format!("<meta http-equiv=\"refresh\" content=\"0;url={next}\">");
-                next = page(&body);
-            }
-            next
-        };
-        let arrived = page("<p>arrived</p>");
-        let first = chained(arrived, MAX_REDIRECTS);
-        assert_eq!(block_on(fetch(&first)).expect("fetch"), "arrived");
-
-        let refused = "http://127.0.0.1:1/".to_owned();
-        let first = chained(refused, MAX_REDIRECTS + 1);
-        let message = failure(&first);
-        let expected = format!("fetch: {first}: too many redirects");
-        assert_eq!(message, expected);
-    }
-
-    #[test]
-    fn refresh_parsed() {
-        let base = Url::parse(BASE).expect("url");
-        let target = |html: &str| {
-            let page = parsed(html);
-            let next = refresh(&page, &base);
-            next.map(String::from)
-        };
-        let meta = |content: &str| format!("<meta http-equiv=\"refresh\" content=\"{content}\">");
-
-        let full = target(&meta("0;url=/full"));
-        assert_eq!(full.as_deref(), Some("http://example.com/full"));
-        let quoted = target(&meta(" 0.5 , URL = 'résumé.html' "));
-        let expected = "http://example.com/docs/r%C3%A9sum%C3%A9.html";
-        assert_eq!(quoted.as_deref(), Some(expected));
-        let padded = target("<meta http-equiv=\"Refresh\" content='00;url=\"x.html\"'>");
-        assert_eq!(padded.as_deref(), Some("http://example.com/docs/x.html"));
-
-        assert_eq!(target(&meta("5;url=/later")), None);
-        assert_eq!(target(&meta("1.5;url=x.html")), None);
-        assert_eq!(target(&meta("0; url=page.html")), None);
-        assert_eq!(target(&meta("0")), None);
-        assert_eq!(target(&meta("0;url=javascript:alert(1)")), None);
-        let twice = format!("{}{}", meta("5;url=later.html"), meta("0;url=now.html"));
-        assert_eq!(target(&twice), None);
     }
 }

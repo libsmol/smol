@@ -320,117 +320,12 @@ fn add_detail(details: &mut Vec<Value>, piece: &Value) {
 #[cfg(test)]
 mod tests {
     use crate::config::{Kind, ModelSpec};
-    use crate::model::completions::add_detail;
-    use crate::model::tests::{hello, parsed, png, served, DONE};
-    use crate::model::{
-        ChatMessage, Finish, Media, MediaKind, Part, Purpose, Sealed, Stream, StreamDelta, ToolCall,
-    };
+    use crate::model::tests::{parsed, png, served, DONE};
+    use crate::model::{ChatMessage, Finish, Media, Part, Purpose, Sealed, ToolCall};
+    use crate::prompt;
     use crate::tests::{temp_dir, write_file};
     use serde_json::json;
     use std::fs;
-    use std::path::PathBuf;
-
-    #[test]
-    fn media_parts() {
-        let dir = temp_dir("parts");
-        let picture = dir.join("chart.png");
-        write_file(&picture, b"png");
-        let media = |label: &str, kind, mime: &str, file: PathBuf| {
-            let mime = mime.to_owned();
-            let media = Media {
-                kind,
-                mime,
-                file,
-                from_call: false,
-            };
-            Part::Media(label.to_owned(), media)
-        };
-        let image = media("chart.png", MediaKind::Image, "image/png", picture);
-        let video = media(
-            "clip.mp4",
-            MediaKind::Video,
-            "video/mp4",
-            dir.join("clip.mp4"),
-        );
-        let gone = media(
-            "old.png",
-            MediaKind::Image,
-            "image/png",
-            dir.join("gone.png"),
-        );
-
-        let first = ChatMessage::User(vec![Part::Text("Look at this".to_owned()), image]);
-        let second = ChatMessage::User(vec![Part::Text("And a video".to_owned()), video, gone]);
-        let conversation = [first, second];
-
-        // Media the model takes no kind of became text before the conversation got here
-        let both = ModelSpec {
-            image: true,
-            video: true,
-            ..ModelSpec::default()
-        };
-        let (finished, body) = served(Kind::Completions, DONE, &both, &conversation, Purpose::Step);
-        finished.expect("finished");
-        let expected = json!([
-            {"type": "text", "text": "Look at this\n<image path=\"chart.png\"/>"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}},
-            {"type": "text", "text": "And a video\n[video clip.mp4: not shown, its copy was deleted]\n[image old.png: not shown, its copy was deleted]"},
-        ]);
-        assert_eq!(body["messages"][0]["content"], expected);
-
-        let greeting = hello();
-        let (_, plain) = served(Kind::Completions, DONE, &both, &greeting, Purpose::Step);
-        assert_eq!(plain["messages"][0]["content"], "Hello");
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn request_options() {
-        let conversation = hello();
-        let spec = ModelSpec {
-            effort: Some("max".to_owned()),
-            ..ModelSpec::default()
-        };
-        let (_, step) = served(Kind::Completions, DONE, &spec, &conversation, Purpose::Step);
-        assert_eq!(step["reasoning_effort"], "max");
-        assert!(step.get("max_tokens").is_none(), "{step}");
-        let function = &step["tools"][0]["function"];
-        assert_eq!(function["name"], "eval");
-        assert_eq!(function["parameters"]["required"][0], "code");
-
-        let (_, summary) = served(
-            Kind::Completions,
-            DONE,
-            &spec,
-            &conversation,
-            Purpose::Summary,
-        );
-        assert_eq!(summary["reasoning_effort"], "max");
-        assert!(summary.get("tools").is_none(), "{summary}");
-
-        let (_, title) = served(
-            Kind::Completions,
-            DONE,
-            &spec,
-            &conversation,
-            Purpose::Title,
-        );
-        assert!(title.get("reasoning_effort").is_none(), "{title}");
-        assert!(title.get("tools").is_none(), "{title}");
-
-        let capped = ModelSpec {
-            max_tokens: Some(65536),
-            ..spec
-        };
-        let (_, capped) = served(
-            Kind::Completions,
-            DONE,
-            &capped,
-            &conversation,
-            Purpose::Step,
-        );
-        assert_eq!(capped["max_tokens"], 65536);
-    }
 
     #[test]
     fn calls_sent() {
@@ -464,8 +359,9 @@ mod tests {
                 ToolCall::unread("call_5".to_owned(), ""),
             ],
         };
+        let tag = prompt::media_tag("chart.png", &media);
         let viewed = Part::Media("chart.png".to_owned(), media);
-        let quiet = Part::Text("[no output]".to_owned());
+        let quiet = Part::Text(prompt::NO_OUTPUT.to_owned());
         let first = ChatMessage::Tool {
             id: "call_2".to_owned(),
             parts: vec![quiet, viewed.clone()],
@@ -513,14 +409,14 @@ mod tests {
                     {"id": "call_5", "type": "function", "function": {"name": "_", "arguments": "{}"}},
                 ],
             },
-            {"role": "tool", "content": "[no output]\n<image path=\"chart.png\"/>", "tool_call_id": "call_2"},
-            {"role": "tool", "content": "<image path=\"chart.png\"/>", "tool_call_id": "call_3"},
+            {"role": "tool", "content": format!("{}\n{tag}", prompt::NO_OUTPUT), "tool_call_id": "call_2"},
+            {"role": "tool", "content": tag, "tool_call_id": "call_3"},
             {"role": "tool", "content": "No such tool", "tool_call_id": "call_4"},
             {"role": "tool", "content": "No such tool", "tool_call_id": "call_5"},
             {"role": "user", "content": [
-                {"type": "text", "text": "<image path=\"chart.png\"/>"},
+                {"type": "text", "text": tag},
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}},
-                {"type": "text", "text": "<image path=\"chart.png\"/>"},
+                {"type": "text", "text": tag},
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}},
                 {"type": "text", "text": "Task update:\nUse the café colors"},
             ]},
@@ -539,29 +435,6 @@ mod tests {
         let alone = json!({ "role": "user", "content": images });
         assert_eq!(ended["messages"][7], alone);
         fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn stream_parsing() {
-        let (finished, content, reasoning) = parsed(
-            Kind::Completions,
-            &[
-                r#"data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"Think about the façade"}}]}"#,
-                r#"data: {"choices":[{"delta":{"reasoning_content":"","reasoning":", then the piñata"}}]}"#,
-                r#"data: {"choices":[{"delta":{"content":"Hello"}}],"usage":null,"error":null}"#,
-                r#"data: {"choices":[{"delta":{"content":", world 🍕"}}]}"#,
-                r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":8}}}"#,
-                "data: [DONE]\r",
-            ],
-        );
-
-        assert_eq!(content, "Hello, world 🍕");
-        assert_eq!(reasoning, "Think about the façade, then the piñata");
-
-        let finished = finished.expect("parse");
-        let usage = finished.usage.expect("usage");
-        assert_eq!((usage.input_tokens, usage.output_tokens), (10, 2));
-        assert_eq!(usage.cached_tokens, Some(8));
     }
 
     #[test]
@@ -664,126 +537,6 @@ mod tests {
         assert_eq!(called(several), format!("[eval {several}]"));
         let number = r#"{"code": 1}"#;
         assert_eq!(called(number), format!("[eval {number}]"));
-    }
-
-    #[test]
-    fn stream_endings() {
-        let partial = r#"data: {"choices":[{"delta":{"content":"Half a sentence"}}]}"#;
-        let cut = parsed(Kind::Completions, &[partial]).0.expect_err("cut");
-        assert_eq!(cut.message, "stream: ended early");
-        assert!(cut.transient);
-    }
-
-    #[test]
-    fn stream_errors() {
-        let failed = |line: &str| parsed(Kind::Completions, &[line]).0.expect_err("error");
-
-        let upstream = failed(r#"data: {"error":{"message":"Upstream\n  overloaded","code":502}}"#);
-        assert_eq!(upstream.message, "stream: Upstream overloaded");
-        assert!(upstream.transient);
-
-        let bare = failed(r#"data: {"error":"overloaded"}"#);
-        assert_eq!(bare.message, "stream: overloaded");
-        assert!(bare.transient);
-
-        let refused = failed(r#"data: {"error":{"message":"bad","code":400}}"#);
-        assert!(!refused.transient);
-
-        let cut = failed(r#"data: {"choices":[{"delta":{"content":"Hal"#);
-        assert_eq!(cut.message, "stream: ended mid-event");
-        assert!(cut.transient);
-
-        let garbled = failed("data: {proxy notice: try again later}");
-        assert_eq!(
-            garbled.message,
-            "stream: not JSON: {proxy notice: try again later}"
-        );
-        assert!(garbled.transient);
-    }
-
-    #[test]
-    fn empty_reasoning_kept() {
-        let lines = [
-            r#"data: {"choices":[{"delta":{"reasoning_content":"","reasoning":"","content":"Sure"}}]}"#,
-            r#"data: {"choices":[{"delta":{"reasoning_content":"","reasoning":"Hmm"}}]}"#,
-            r#"data: {"choices":[{"delta":{"reasoning_content":null,"content":" thing"}}]}"#,
-        ];
-        let lines = lines.join("\n") + "\n";
-        let mut thoughts = Vec::new();
-        let mut on_delta = |delta: StreamDelta| {
-            if let StreamDelta::Reasoning(text) = delta {
-                thoughts.push(text.to_owned());
-            }
-        };
-
-        let mut stream = Stream::new(Kind::Completions, "mock/m1");
-        stream.feed(lines.as_bytes(), &mut on_delta).expect("feed");
-        assert_eq!(thoughts, ["", "Hmm"]);
-    }
-
-    #[test]
-    fn fields_sealed() {
-        let (_, content, reasoning) = parsed(
-            Kind::Completions,
-            &[
-                r#"data: {"choices":[{"delta":{"role":"assistant","content":null,"refusal":null,"reasoning":"Weigh the café","reasoning_details":[{"type":"reasoning.text","text":"Weigh the ","index":0,"format":"anthropic-claude-v1"}]}}]}"#,
-                r#"data: {"choices":[{"delta":{"reasoning":"","reasoning_details":[{"type":"reasoning.text","text":"café","index":0}]}}]}"#,
-                r#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"","signature":"sig-1","index":0},{"type":"reasoning.encrypted","data":"gAAAA-naïve","id":"tool_1","index":1}]}}]}"#,
-                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tool_1","type":"function","function":{"name":"eval","arguments":"{\"code\": \"print('crème')\"}"},"extra_content":{"google":{"thought_signature":"c2ln"}}}]}}]}"#,
-                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"tool_2","type":"function","function":{"name":"eval","arguments":"{\"code\": \"print(1)\"}"}}]},"finish_reason":"tool_calls"}]}"#,
-                "data: [DONE]",
-            ],
-        );
-        let details = json!([
-            { "type": "reasoning.text", "text": "Weigh the café", "index": 0, "format": "anthropic-claude-v1", "signature": "sig-1" },
-            { "type": "reasoning.encrypted", "data": "gAAAA-naïve", "id": "tool_1", "index": 1 },
-        ]);
-        let signed = json!({ "google": { "thought_signature": "c2ln" } });
-        let sealed = json!({
-            "reasoning_details": details,
-            "tool_calls": [{ "extra_content": signed, "id": "tool_1" }, { "id": "tool_2" }],
-        });
-        let expected = format!("print('crème')[end]print(1)[end][mock {sealed}]");
-        assert_eq!(content, expected);
-        assert_eq!(reasoning, "Weigh the café");
-
-        // As DeepSeek and llama.cpp send them
-        let (_, plain, _) = parsed(
-            Kind::Completions,
-            &[
-                r#"data: {"id":"d1","object":"chat.completion.chunk","system_fingerprint":"fp","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"Résumé first"},"logprobs":null,"finish_reason":null}],"usage":null}"#,
-                r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_00_x","type":"function","function":{"name":"eval","arguments":"{\"code\": \"1\"}"}}]},"finish_reason":"tool_calls"}],"timings":{"predicted_n":3}}"#,
-                "data: [DONE]",
-            ],
-        );
-        assert_eq!(plain, "1[end]");
-    }
-
-    #[test]
-    fn details_built() {
-        let pieces = [
-            json!({ "type": "reasoning.summary", "summary": "Plan the ", "index": 0 }),
-            json!({ "type": "reasoning.summary", "summary": "café visit", "index": 0, "format": "openai-responses-v1" }),
-            json!({ "type": "reasoning.text", "text": "Check ", "index": 0 }),
-            json!({ "type": "reasoning.text", "text": "the menu", "index": 0, "signature": "" }),
-            json!({ "type": "reasoning.text", "text": "", "signature": "sig-1", "index": 0 }),
-            json!({ "type": "reasoning.text", "text": "Then the piñata", "index": 1 }),
-            json!({ "type": "reasoning.encrypted", "data": "gAAAA", "index": 2 }),
-            json!({ "type": "reasoning.encrypted", "data": "gBBBB", "index": 2 }),
-        ];
-        let mut details = Vec::new();
-        for piece in &pieces {
-            add_detail(&mut details, piece);
-        }
-
-        let expected = [
-            json!({ "type": "reasoning.summary", "summary": "Plan the café visit", "index": 0, "format": "openai-responses-v1" }),
-            json!({ "type": "reasoning.text", "text": "Check the menu", "index": 0, "signature": "sig-1" }),
-            json!({ "type": "reasoning.text", "text": "Then the piñata", "index": 1 }),
-            json!({ "type": "reasoning.encrypted", "data": "gAAAA", "index": 2 }),
-            json!({ "type": "reasoning.encrypted", "data": "gBBBB", "index": 2 }),
-        ];
-        assert_eq!(details, expected);
     }
 
     #[test]

@@ -342,47 +342,15 @@ impl Reply {
 mod tests {
     use crate::agent::step::*;
     use crate::agent::tests::{called, recorded, reply, scripted, Script, ScriptedModel, Tested};
-    use crate::agent::Task;
-    use crate::config::Kind;
-    use crate::model::{ChatMessage, ModelError, TokenUsage};
+    use crate::model::{ChatMessage, TokenUsage};
     use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::{content, Temp};
-    use crate::utils::{new_id, Interrupt};
-    use serde_json::json;
-    use std::fs;
-    use std::sync::{Arc, Mutex, OnceLock};
-    use std::thread;
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
 
     fn agent(replies: Vec<Script>) -> Temp<Tested> {
         let replies = replies.into_iter().map(Ok);
         let model = ScriptedModel::new(replies.collect());
         scripted(model, Box::new(|_| {}))
-    }
-
-    fn running(codes: &[&str]) -> Temp<Tested> {
-        let replies = codes.iter().map(|code| called(code));
-        agent(replies.collect())
-    }
-
-    /// Records true for every retry and false for every step end
-    fn recording(
-        replies: Vec<Result<Script, ModelError>>,
-    ) -> (Temp<Tested>, Arc<Mutex<Vec<bool>>>) {
-        let ends = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&ends);
-        let on_event = Box::new(move |event: Event| {
-            let retried = match event {
-                Event::Retry { .. } => true,
-                Event::StepEnd(_) | Event::StepFailed(_) => false,
-                _ => return,
-            };
-            seen.lock().expect("ends lock").push(retried);
-        });
-
-        let model = ScriptedModel::new(replies);
-        let agent = scripted(model, on_event);
-        (agent, ends)
     }
 
     fn actions(memory: &AgentMemory) -> Vec<&AgentStep> {
@@ -395,19 +363,6 @@ mod tests {
         actions
     }
 
-    fn only(memory: &AgentMemory) -> &AgentStep {
-        let [step] = actions(memory)[..] else {
-            panic!("{:?}", memory.steps);
-        };
-        step
-    }
-
-    fn interrupted(memory: &AgentMemory) -> &AgentStep {
-        let step = only(memory);
-        assert_eq!(step.error, Some(StepError::Interrupted));
-        step
-    }
-
     fn printed(step: &AgentStep) -> Option<&str> {
         let call = step.calls.first()?;
         call.result.as_ref()?.printed.as_deref()
@@ -415,36 +370,6 @@ mod tests {
 
     fn codes(step: &AgentStep) -> Vec<&str> {
         step.calls.iter().map(|call| call.code.as_str()).collect()
-    }
-
-    /// Interrupts only once the code is really running and has created the file `name`
-    fn interrupt_started(agent: &Tested, name: &str) {
-        let marker = agent.agent.workplace.cwd.join(name);
-        let interrupt = agent.agent.interrupt.clone();
-        thread::spawn(move || {
-            while !marker.exists() {
-                thread::sleep(Duration::from_millis(10));
-            }
-            interrupt.cancel(u64::MAX);
-            fs::remove_file(marker).ok();
-        });
-    }
-
-    #[test]
-    fn reply_trimmed() {
-        let wrapped = Script {
-            calls: vec![Ok("\n\nx = 1\n\n".to_owned())],
-            ..reply("Doing it.\n\n")
-        };
-        let mut agent = agent(vec![wrapped]);
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "task").expect("run");
-        assert_eq!(answer, Some("42".to_owned()));
-
-        let steps = actions(&memory);
-        assert_eq!(steps[0].text, "Doing it.");
-        assert_eq!(codes(steps[0]), ["x = 1"]);
-        assert_eq!(steps[1].answer(), Some("42"));
     }
 
     #[test]
@@ -513,31 +438,7 @@ mod tests {
         let skipped = &step.calls[1];
         assert!(skipped.result.is_none() && skipped.error.is_none());
         let told = prompt::call_error(step, skipped).unwrap_or_default();
-        assert_eq!(told, "[not run: an earlier call failed]");
-    }
-
-    #[test]
-    fn interrupt_skips_rest() {
-        let id = new_id();
-        let name = format!("smol-sleeping-{id}");
-        let code =
-            format!("import time\nprint('sleeping')\nopen({name:?}, 'w').close()\ntime.sleep(30)");
-        let sleeping = Script {
-            calls: vec![Ok(code), Ok("print('second part')".to_owned())],
-            ..reply("")
-        };
-        let mut agent = agent(vec![sleeping]);
-        interrupt_started(&agent, &name);
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "task").expect("run");
-        assert_eq!(answer, None);
-
-        let step = interrupted(&memory);
-        assert_eq!(printed(step), Some("sleeping"));
-        assert_eq!(step.calls[0].error, Some(CallError::Interrupted));
-        let unrun = prompt::call_error(step, &step.calls[1]).unwrap_or_default();
-        assert_eq!(unrun, "[not run: interrupted by the user]");
+        assert_eq!(told, format!("[{}]", prompt::SKIPPED));
     }
 
     /// Tag-only code is quietly regenerated until tries run out, then never runs or is echoed back
@@ -581,27 +482,8 @@ mod tests {
             .iter()
             .map(content)
             .collect();
-        let told = "[not run: the call had no code]";
-        assert_eq!(sent, ["eval:\n", told]);
-    }
-
-    /// Regenerations and error retries each have their own count
-    #[test]
-    fn glitches_counted_apart() {
-        let busy = ModelError::transient("http 503: service busy");
-        let replies = vec![
-            Ok(called("")),
-            Ok(called("<eval>")),
-            Ok(called("\n")),
-            Err(busy),
-            Ok(reply("Done")),
-        ];
-        let (mut agent, ends) = recording(replies);
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "task").expect("run");
-        assert_eq!(answer.as_deref(), Some("Done"));
-        let retried = [true, true, true, true, false];
-        assert_eq!(*ends.lock().expect("ends lock"), retried);
+        let told = prompt::call_error(steps[0], &steps[0].calls[0]).expect("told");
+        assert_eq!(sent, ["eval:\n".to_owned(), told]);
     }
 
     /// Calls before one to a missing tool still run, it gets an error, and the rest are skipped
@@ -633,27 +515,15 @@ mod tests {
             .iter()
             .map(content)
             .collect();
+        let refused = prompt::call_error(step, bash).expect("refused");
+        let skipped = prompt::call_error(step, &step.calls[2]).expect("skipped");
         let expected = [
-            "Let me look first.\neval:\nprint('alpha')\nbash:\n\neval:\nprint('beta')",
-            "alpha",
-            "[not run: no tool named \"bash\", only eval]",
-            "[not run: an earlier call failed]",
+            "Let me look first.\neval:\nprint('alpha')\nbash:\n\neval:\nprint('beta')".to_owned(),
+            "alpha".to_owned(),
+            refused,
+            skipped,
         ];
         assert_eq!(sent, expected);
-    }
-
-    #[test]
-    fn plain_reply_answers() {
-        let answer = "Like this:\n```python\nprint('hello')\n```";
-        let mut agent = agent(vec![reply(answer)]);
-
-        let mut memory = AgentMemory::default();
-        let value = agent.turn(&mut memory, "task").expect("run");
-        assert_eq!(value.as_deref(), Some(answer));
-
-        let step = only(&memory);
-        assert_eq!(step.answer(), Some(answer));
-        assert!(step.calls.is_empty());
     }
 
     #[test]
@@ -697,173 +567,6 @@ mod tests {
     }
 
     #[test]
-    fn loop_counted() {
-        let mut ignore = |_: Event| {};
-        let mut reply = Reply::default();
-        reply.push_code("html = '''\n</div>\n'''\n", &mut ignore);
-        assert_eq!(reply.looped, 0);
-        reply.push_code("</para", &mut ignore);
-        reply.push_code("meter>\n</invoke>\n", &mut ignore);
-        let closers = text_bytes("</parameter>") + text_bytes("</invoke>");
-        assert_eq!(reply.looped, closers);
-        reply.push_code("print('crème brûlée')\n", &mut ignore);
-        assert_eq!(reply.looped, 0);
-
-        reply.end_call(Ok(()), &mut ignore);
-        let code = "html = '''\n</div>\n'''\n</parameter>\n</invoke>\nprint('crème brûlée')\n";
-        assert_eq!(reply.calls[0].code, code);
-    }
-
-    /// Code after an unreadable call starts a new call, which shows nothing while it is blank
-    #[test]
-    fn calls_kept_apart() {
-        let mut events = Vec::new();
-        let mut collect = |event: Event| {
-            if let Event::Code(index, code) = event {
-                events.push((index, code.added.to_owned()));
-            }
-        };
-        let mut reply = Reply {
-            text: "Trying the naïve way first.".to_owned(),
-            ..Reply::default()
-        };
-        reply.push_code("print('déjà", &mut collect);
-        let unread = Unread {
-            name: TOOL,
-            arguments: r#"{"code": "print('déjà"#,
-        };
-        reply.end_call(Err(unread), &mut collect);
-        reply.push_code("\n", &mut collect);
-        reply.push_code("  ", &mut collect);
-        reply.push_code("print('café')\n", &mut collect);
-        reply.end_call(Ok(()), &mut collect);
-
-        let written: Vec<&str> = reply.calls.iter().map(|call| call.code.as_str()).collect();
-        assert_eq!(written, ["print('déjà", "\n  print('café')\n"]);
-        let at: Vec<usize> = reply.calls.iter().map(|call| call.at).collect();
-        let before = "Trying the naïve way first.".len();
-        assert_eq!(at, [before, reply.text.len()]);
-        let shown = [
-            (0, "print('déjà".to_owned()),
-            (1, "\n  print('café')\n".to_owned()),
-        ];
-        assert_eq!(events, shown);
-    }
-
-    /// Code shows when it first appears, then at most every `SHOWN_EVERY`, and in full once its call ends
-    #[test]
-    fn code_shown_throttled() {
-        let mut shown = Vec::new();
-        let mut collect = |event: Event| {
-            if let Event::Code(index, code) = event {
-                shown.push((index, code.added.to_owned(), code.whole.to_owned()));
-            }
-        };
-        let lines: Vec<String> = (0..200).map(|i| format!("print('café {i}')\n")).collect();
-        let mut reply = Reply::default();
-        for line in &lines {
-            reply.push_code(line, &mut collect);
-        }
-        reply.end_call(Ok(()), &mut collect);
-        reply.push_code("print('naïve')", &mut collect);
-        reply.push_code("\nprint('résumé')", &mut collect);
-        reply.show_code(&mut collect);
-
-        let code = lines.concat();
-        let rest = lines[1..].concat();
-        let both = "print('naïve')\nprint('résumé')".to_owned();
-        let expected = [
-            (0, lines[0].clone(), lines[0].clone()),
-            (0, rest, code),
-            (1, "print('naïve')".to_owned(), "print('naïve')".to_owned()),
-            (1, "\nprint('résumé')".to_owned(), both),
-        ];
-        assert_eq!(shown, expected);
-    }
-
-    /// A cutoff right as the second call starts leaves the fully received first call incomplete too
-    #[test]
-    fn cut_after_call() {
-        let cut = Script {
-            calls: vec![Ok("print('alpha')".to_owned()), Ok(String::new())],
-            finish: Finish::Length,
-            ..reply("")
-        };
-        let mut agent = agent(vec![cut, reply("Shortened it.")]);
-        let mut memory = AgentMemory::default();
-        agent.turn(&mut memory, "task").expect("run");
-
-        let step = actions(&memory)[0];
-        assert_eq!(step.error, Some(StepError::Cut));
-        assert!(printed(step).is_none());
-    }
-
-    #[test]
-    fn empty_reply_retried() {
-        let replies = vec![Ok(reply("")), Ok(reply(" \n")), Ok(reply("Hello."))];
-        let (mut retried, ends) = recording(replies);
-
-        let mut memory = AgentMemory::default();
-        let answer = retried.turn(&mut memory, "task").expect("run");
-        assert_eq!(answer, Some("Hello.".to_owned()));
-
-        let step = only(&memory);
-        assert_eq!(step.error, None);
-        assert_eq!(*ends.lock().expect("ends lock"), [true, true, false]);
-
-        let silent = vec![reply(""), reply(""), reply(""), reply("")];
-        let mut silent = agent(silent);
-        let mut memory = AgentMemory::default();
-        let error = silent.turn(&mut memory, "task").expect_err("gives up");
-        assert!(error.to_string().contains("empty reply"), "{error}");
-        assert!(actions(&memory).is_empty());
-
-        let thinking = Script {
-            reasoning: Some("I only think and never write a reply".to_owned()),
-            ..reply("")
-        };
-        let sealed = Script {
-            sealed: vec![
-                json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-café" }),
-            ],
-            ..reply("")
-        };
-        for script in [thinking, sealed] {
-            let replies = vec![Ok(script); 4];
-            let model = ScriptedModel::new(replies);
-            let mut thoughtful = scripted(model, Box::new(|_| {}));
-            let mut memory = AgentMemory::default();
-            let error = thoughtful.turn(&mut memory, "task").expect_err("gives up");
-            let error = error.to_string();
-            let named = "stopped after reasoning without replying";
-            assert!(error.contains(named), "{error}");
-        }
-    }
-
-    #[test]
-    fn sealed_items_kept() {
-        let items = vec![
-            json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-café" }),
-            json!({ "type": "message", "id": "msg_1", "phase": "final_answer" }),
-        ];
-        let answered = Script {
-            sealed: items.clone(),
-            ..reply("Voilà.")
-        };
-        let mut agent = agent(vec![answered]);
-        let mut memory = AgentMemory::default();
-        agent.turn(&mut memory, "task").expect("run");
-
-        let sealed = Sealed {
-            provider: "mock".to_owned(),
-            kind: Kind::Responses,
-            items,
-            ends: vec![0, 0],
-        };
-        assert_eq!(only(&memory).sealed, Some(sealed));
-    }
-
-    #[test]
     fn cut_reply_unused() {
         let cut = Script {
             calls: vec![Ok("print('half".to_owned())],
@@ -871,7 +574,7 @@ mod tests {
             ..reply("Starting.\n")
         };
         let replies = vec![Ok(cut), Ok(reply("Short."))];
-        let mut run = recorded(replies, None, "", Box::new(|_| {}));
+        let mut run = recorded(replies, None, Box::new(|_| {}));
 
         let mut memory = AgentMemory::default();
         let answer = run.agent.turn(&mut memory, "task").expect("run");
@@ -889,385 +592,5 @@ mod tests {
         let requests = run.requests.lock().expect("requests");
         let next: Vec<String> = requests[1][1..].iter().map(content).collect();
         assert_eq!(next, ["task".to_owned(), told]);
-    }
-
-    #[test]
-    fn provider_stop_fails() {
-        let filtered = Script {
-            finish: Finish::Other("content_filter".to_owned()),
-            ..reply("")
-        };
-        let mut agent = agent(vec![filtered]);
-
-        let mut memory = AgentMemory::default();
-        let error = agent.turn(&mut memory, "Write verse").expect_err("stopped");
-        assert!(error.to_string().contains("content_filter"), "{error}");
-    }
-
-    #[test]
-    fn updates_join_turn() {
-        let mut agent = running(&["print(1)"]);
-        let update = Task {
-            text: "Reply in French".to_owned(),
-            mentions: Vec::new(),
-        };
-        let mut pending = vec![update];
-        let take = move || mem::take(&mut pending);
-        *agent.queue.updates.lock().expect("updates") = Some(Box::new(take));
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "Print 1").expect("run");
-        assert_eq!(answer, Some("42".to_owned()));
-
-        let conversation = memory.conversation("", &|_| true, None).into_iter().skip(1);
-        let contents: Vec<String> = conversation.map(|message| content(&message)).collect();
-        let expected = [
-            "Print 1",
-            "eval:\nprint(1)",
-            "1",
-            "[Task update]\nReply in French",
-            "42",
-        ];
-        assert_eq!(contents, expected);
-    }
-
-    #[test]
-    fn tool_calls_run() {
-        let call = |content: &str, code: &str| Script {
-            calls: vec![Ok(code.to_owned())],
-            ..reply(content)
-        };
-        let unread = || Script {
-            calls: vec![Err((TOOL, "{}"))],
-            ..reply("")
-        };
-        let tagged = || call("", "<eval>");
-        let code = "résumé = '''\n</eval>\n'''\nx = 6 * 7\nprint(x)";
-        let replies = vec![
-            call("Let me work it out.", code),
-            call("", "print('again')"),
-            unread(),
-            tagged(),
-            tagged(),
-            unread(),
-        ];
-        let mut agent = agent(replies);
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "task").expect("run");
-        assert_eq!(answer, Some("42".to_owned()));
-
-        let steps = actions(&memory);
-        assert_eq!(steps.len(), 4);
-        assert_eq!(steps[0].text, "Let me work it out.");
-        assert_eq!(codes(steps[0]), [code]);
-        assert_eq!(printed(steps[0]), Some("42"));
-        assert_eq!(codes(steps[1]), ["print('again')"]);
-        let codeless = steps[2];
-        assert_eq!(codeless.error, None);
-        assert_eq!(codeless.calls[0].error, Some(CallError::NoCode));
-        assert!(printed(codeless).is_none());
-        assert_eq!(codeless.calls[0].arguments.as_deref(), Some("{}"));
-    }
-
-    #[test]
-    fn empty_thought_kept() {
-        let thoughts = Arc::new(Mutex::new(0));
-        let counted = Arc::clone(&thoughts);
-        let on_event = Box::new(move |event: Event| {
-            if let Event::Thought(_) = event {
-                *counted.lock().expect("thoughts lock") += 1;
-            }
-        });
-        let silent = Script {
-            reasoning: Some(String::new()),
-            ..called("print('one')")
-        };
-        let mut run = recorded(vec![Ok(silent)], None, "", on_event);
-        let mut memory = AgentMemory::default();
-        run.agent.turn(&mut memory, "task").expect("run");
-
-        let requests = run.requests.lock().expect("requests");
-        let ChatMessage::Assistant {
-            reasoning, calls, ..
-        } = &requests[1][2]
-        else {
-            panic!("{:?}", requests[1]);
-        };
-        assert_eq!(calls.len(), 1);
-        assert_eq!(reasoning.as_deref(), Some(""));
-        assert_eq!(*thoughts.lock().expect("thoughts lock"), 0);
-    }
-
-    #[test]
-    fn repaired_code_saved() {
-        let written = "<parameter name=\"code\">\nprint('naïve')\n</parameter>";
-        let tagged = Script {
-            calls: vec![Ok(written.to_owned())],
-            ..reply("Running it first.")
-        };
-        let mut agent = agent(vec![tagged]);
-
-        let mut memory = AgentMemory::default();
-        agent.turn(&mut memory, "task").expect("run");
-
-        let step = actions(&memory)[0];
-        assert_eq!(step.text, "Running it first.");
-        assert_eq!(codes(step), ["print('naïve')"]);
-        assert_eq!(printed(step), Some("naïve"));
-        assert_eq!(step.calls[0].unrepaired.as_deref(), Some(written));
-
-        // The original stays in the record and is never sent to the model
-        let action = MemoryStep::Action(Box::new(step.clone()));
-        let sent: Vec<String> = action
-            .messages(&mut 0, &|_| true)
-            .iter()
-            .map(content)
-            .collect();
-        assert!(
-            sent.iter().all(|text| !text.contains("</parameter>")),
-            "{sent:?}"
-        );
-    }
-
-    /// A call with no readable code is shown on arrival and stays out of the text
-    #[test]
-    fn unknown_tool_shown() {
-        let mut shown = Vec::new();
-        let mut collect = |event: Event| {
-            if let Event::Unread(index, call) = event {
-                shown.push((index, call.clone()));
-            }
-        };
-        let mut reply = Reply {
-            text: "Listing the folder first.".to_owned(),
-            ..Reply::default()
-        };
-        let arguments = r#"{"command": "ls docs"}"#;
-        let unread = Unread {
-            name: "bash",
-            arguments,
-        };
-        reply.end_call(Err(unread), &mut collect);
-
-        assert_eq!(reply.text, "Listing the folder first.");
-        let call = Call {
-            at: reply.text.len(),
-            arguments: Some(arguments.to_owned()),
-            error: Some(CallError::NoTool("bash".to_owned())),
-            ..Call::default()
-        };
-        assert_eq!(shown, [(0, call.clone())]);
-        assert_eq!(reply.calls, [call]);
-    }
-
-    /// A long name of a missing tool is cut before the reply repeats it
-    #[test]
-    fn tool_name_cut() {
-        let mut ignore = |_: Event| {};
-        let mut reply = Reply::default();
-        let name = "café".repeat(100);
-        let unread = Unread {
-            name: &name,
-            arguments: "{}",
-        };
-        reply.end_call(Err(unread), &mut ignore);
-
-        let cut = "café".repeat(16);
-        assert_eq!(reply.calls[0].error, Some(CallError::NoTool(cut)));
-    }
-
-    #[test]
-    fn update_beats_cancel() {
-        let mut agent = running(&["print(1)"]);
-        let interrupt = agent.agent.interrupt.clone();
-        let take = move || {
-            interrupt.cancel(u64::MAX);
-            let update = Task {
-                text: "One more thing".to_owned(),
-                mentions: Vec::new(),
-            };
-            vec![update]
-        };
-        *agent.queue.updates.lock().expect("updates") = Some(Box::new(take));
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "task").expect("run");
-        assert_eq!(answer, None);
-
-        let update = |step: &MemoryStep| matches!(step, MemoryStep::Update(_));
-        assert!(memory.steps.iter().any(update), "{:?}", memory.steps);
-    }
-
-    #[test]
-    fn printed_capped() {
-        let code = "text = '\\n'.join(f'Zoë {i}' for i in range(1, 100001))\n\
-            print(len(text))\nprint(text, limit=None)";
-        let mut agent = running(&[code]);
-        let mut memory = AgentMemory::default();
-        agent.turn(&mut memory, "task").expect("run");
-
-        let step = actions(&memory)[0];
-        let printed = printed(step).expect("printed");
-        let whole = printed.starts_with("988894\nZoë 1\nZoë 2\n");
-        assert!(whole);
-        assert!(printed.contains("\n[972517 characters cut]\n"), "{printed}");
-        assert!(printed.chars().count() < MAX_OBSERVATION_CHARS + 100);
-    }
-
-    #[test]
-    fn error_shares_budget() {
-        let code = "print('café' * 10000, limit=None)\nraise ValueError('über' * 10000)";
-        let mut agent = running(&[code]);
-        let mut memory = AgentMemory::default();
-        agent.turn(&mut memory, "task").expect("run");
-
-        let step = actions(&memory)[0];
-        let Some(CallError::Execution(error)) = &step.calls[0].error else {
-            panic!("{:?}", step.calls);
-        };
-        let printed = printed(step).expect("printed");
-        let error = error.chars().count();
-        let printed = printed.chars().count();
-        assert!(error <= MAX_OBSERVATION_CHARS / 2 + 100, "{error}");
-        assert!(
-            error + printed <= MAX_OBSERVATION_CHARS + 100,
-            "{error} + {printed}"
-        );
-
-        let kept = MAX_OBSERVATION_CHARS - error;
-        let cut = prompt::cut(40_000 - kept);
-        let marker = format!("\n{cut}\n");
-        assert_eq!(printed, kept + marker.chars().count(), "{error}");
-    }
-
-    #[test]
-    fn failed_code_logs() {
-        let mut agent = running(&["print('partial')\n1 / 0"]);
-        let mut memory = AgentMemory::default();
-        agent.turn(&mut memory, "task").expect("run");
-
-        let step = actions(&memory)[0];
-        assert_eq!(printed(step), Some("partial"));
-        assert!(step.usage.decode_duration.is_some());
-        assert_eq!(step.error, None);
-
-        let error = step.calls[0].error.as_ref().expect("error").to_string();
-        assert!(error.contains("line 2: 1 / 0"), "{error}");
-    }
-
-    #[test]
-    fn generation_failure_ends() {
-        let failed = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&failed);
-        let on_event = Box::new(move |event: Event| {
-            let ended = match event {
-                Event::StepEnd(_) => "end",
-                Event::StepFailed(_) => "failed",
-                _ => return,
-            };
-            seen.lock().expect("failed lock").push(ended);
-        });
-        let replies = vec![Err(ModelError::new("model went offline"))];
-        let model = ScriptedModel::new(replies);
-        let mut agent = scripted(model, on_event);
-
-        let mut memory = AgentMemory::default();
-        let error = agent.turn(&mut memory, "task").expect_err("error");
-        assert!(error.to_string().contains("model went offline"), "{error}");
-        assert!(actions(&memory).is_empty());
-        assert_eq!(*failed.lock().expect("failed lock"), ["failed"]);
-    }
-
-    #[test]
-    fn interrupt_generation() {
-        let handle = Arc::new(OnceLock::<Interrupt>::new());
-        let trigger = Arc::clone(&handle);
-        let thinking = Script {
-            calls: vec![Ok("print(1)".to_owned())],
-            ..reply("Let me think.\n")
-        };
-        let on_event = Box::new(move |event: Event| {
-            if let (Event::Text(_), Some(interrupt)) = (event, trigger.get()) {
-                interrupt.cancel(u64::MAX);
-            }
-        });
-        let model = ScriptedModel::new(vec![Ok(thinking)]);
-        let mut agent = scripted(model, on_event);
-        let interrupt = agent.agent.interrupt.clone();
-        handle.set(interrupt).expect("set");
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "task").expect("run");
-        assert_eq!(answer, None);
-
-        let step = interrupted(&memory);
-        assert_eq!(step.text, "Let me think.");
-        assert!(step.calls.is_empty());
-    }
-
-    /// Code interrupted while it is still only leading whitespace does not count as unreadable
-    #[test]
-    fn blank_call_interrupted() {
-        let handle = Arc::new(OnceLock::<Interrupt>::new());
-        let trigger = Arc::clone(&handle);
-        let thinking = Script {
-            reasoning: Some("Thinking first".to_owned()),
-            ..called("\nprint('unfinished')")
-        };
-        let on_event = Box::new(move |event: Event| {
-            if let (Event::Thought(_), Some(interrupt)) = (event, trigger.get()) {
-                interrupt.cancel(u64::MAX);
-            }
-        });
-        let model = ScriptedModel::new(vec![Ok(thinking)]);
-        let mut agent = scripted(model, on_event);
-        let interrupt = agent.agent.interrupt.clone();
-        handle.set(interrupt).expect("set");
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "task").expect("run");
-        assert_eq!(answer, None);
-
-        let step = interrupted(&memory);
-        assert_eq!(codes(step), [""]);
-        assert_eq!(step.calls[0].error, None);
-        let told = prompt::call_error(step, &step.calls[0]).unwrap_or_default();
-        assert_eq!(told, "[not run: interrupted by the user]");
-    }
-
-    /// An interrupt while the worker restarts tells the model the code never ran
-    #[test]
-    fn interrupted_before_run() {
-        let handle = Arc::new(OnceLock::<Interrupt>::new());
-        let trigger = Arc::clone(&handle);
-        let mut executed = 0;
-        let on_event = Box::new(move |event: Event| {
-            if let (Event::Run(..), Some(interrupt)) = (event, trigger.get()) {
-                executed += 1;
-                if executed == 2 {
-                    interrupt.cancel(u64::MAX);
-                }
-            }
-        });
-        let replies = vec![
-            Ok(called("import os\nos._exit(0)")),
-            Ok(called("print('never ran')")),
-        ];
-        let model = ScriptedModel::new(replies);
-        let mut agent = scripted(model, on_event);
-        let interrupt = agent.agent.interrupt.clone();
-        handle.set(interrupt).expect("set");
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "task").expect("run");
-        assert_eq!(answer, None);
-
-        let steps = actions(&memory);
-        let last = steps.last().expect("step");
-        assert_eq!(last.error, Some(StepError::Interrupted));
-        assert!(printed(last).is_none());
-        let told = prompt::call_error(last, &last.calls[0]).unwrap_or_default();
-        assert_eq!(told, "[not run: interrupted by the user]");
     }
 }

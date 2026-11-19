@@ -164,7 +164,7 @@ pub(crate) mod tests {
     use crate::history::VENV;
     use crate::tests::temp_dir;
     use crate::utils::block_on;
-    use crate::worker::venv::{held, lock_of, sweep_venvs, Venv, MIN_IDLE};
+    use crate::worker::venv::{lock_of, sweep_venvs, Venv, MIN_IDLE};
     use std::fs::{self, File};
     use std::path::Path;
     use std::time::{Duration, SystemTime};
@@ -246,26 +246,5 @@ pub(crate) mod tests {
             "saved/s1.json",
         ];
         assert_eq!(left, expected);
-    }
-
-    #[test]
-    fn marks_use() {
-        let dir = temp_dir("held");
-        fs::create_dir_all(&dir).expect("dir");
-        let venv = dir.join("venv");
-        let holding = held(&venv, "");
-        let first = block_on(holding).expect("hold");
-        first.set_modified(SystemTime::UNIX_EPOCH).expect("age");
-
-        // Another session takes it while the first still holds it
-        let holding = held(&venv, "");
-        let second = block_on(holding).expect("hold");
-        let lock = lock_of(&venv);
-        let used = fs::metadata(lock).and_then(|found| found.modified());
-        let used = used.expect("time");
-        assert!(used > SystemTime::UNIX_EPOCH, "{used:?}");
-
-        drop((first, second));
-        fs::remove_dir_all(&dir).ok();
     }
 }

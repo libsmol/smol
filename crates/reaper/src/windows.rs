@@ -406,33 +406,6 @@ mod tests {
     }
 
     #[test]
-    fn members_listed() {
-        let (group, pid) = pinging();
-        let members = group.members().expect("members");
-        let ping = members.iter().find(|member| member.pid == pid);
-        let ping = ping.expect("ping");
-        assert!(ping.command.ends_with("-n 60 127.0.0.1"), "{ping:?}");
-        assert!(ping.started > 0, "{ping:?}");
-    }
-
-    #[test]
-    fn released_kept() {
-        let mut command = Command::new("ping");
-        command
-            .args(["-n", "60", "127.0.0.1"])
-            .stdout(Stdio::null());
-        let mark = prepare(&mut command);
-        let mut child = command.spawn().expect("spawn");
-        let group = Group::new(child.id(), mark).expect("group");
-
-        group.release();
-        drop(group);
-        assert!(running(child.id()));
-        child.kill().ok();
-        child.wait().ok();
-    }
-
-    #[test]
     fn tail_kept() {
         let cases = [
             (

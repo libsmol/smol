@@ -93,13 +93,6 @@ fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::conversation::Conversation;
-    use agent_client_protocol_schema::v1::{
-        ContentBlock, ContentChunk, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
-        ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
-    };
-    use reaper::wire::Notice;
-    use serde_json::json;
     use std::ffi::OsString;
 
     const FAKE_AGENT: &str = r#"
@@ -197,72 +190,5 @@ done
 
     pub(crate) fn fake() -> Vec<OsString> {
         shell(FAKE_AGENT)
-    }
-
-    pub(crate) fn chunk(text: &str) -> ContentChunk {
-        let block = ContentBlock::from(text);
-        ContentChunk::new(block)
-    }
-
-    pub(crate) fn content(text: &str) -> ToolCallContent {
-        let block = ContentBlock::from(text);
-        ToolCallContent::from(block)
-    }
-
-    pub(crate) fn message(text: &str) -> SessionUpdate {
-        let chunk = chunk(text);
-        SessionUpdate::AgentMessageChunk(chunk)
-    }
-
-    pub(crate) fn end_step(talk: &mut Conversation, input: u64, output: u64) {
-        let meta = json!({
-            "inputTokens": input,
-            "outputTokens": output,
-            "decodeDuration": 0.5,
-            "duration": 0.25,
-        });
-        let meta = meta.as_object().cloned();
-        let usage = UsageUpdate::new(input + output, 100).meta(meta);
-        let ended = talk.update(&SessionUpdate::UsageUpdate(usage));
-        assert!(ended);
-    }
-
-    pub(crate) fn told(text: &str) -> Notice {
-        Notice {
-            text: text.to_owned(),
-            retry_in: None,
-            step: false,
-            unsaved: false,
-        }
-    }
-
-    pub(crate) fn retrying(text: &str) -> Notice {
-        Notice {
-            retry_in: Some(2.0),
-            ..told(text)
-        }
-    }
-
-    /// Starts a call that starts `count` agents, the first of them named
-    pub(crate) fn started(talk: &mut Conversation, count: usize) {
-        let code = ToolCall::new("call_1", "eval").status(ToolCallStatus::InProgress);
-        talk.update(&SessionUpdate::ToolCall(code));
-        for n in 1..=count {
-            let marked = json!({ "_smol/agent": true, "parent": "call_1" });
-            let task = format!("Count the cafés in menu {n}");
-            let name = (n == 1).then_some("cafés");
-            let asked = json!({ "task": task, "name": name });
-            let id = format!("call_1.{n}");
-            let opened = ToolCall::new(id, format!("agent: {task}"))
-                .raw_input(asked)
-                .meta(marked.as_object().cloned());
-            talk.update(&SessionUpdate::ToolCall(opened));
-        }
-    }
-
-    pub(crate) fn moved(talk: &mut Conversation, n: usize, status: ToolCallStatus) {
-        let fields = ToolCallUpdateFields::new().status(status);
-        let update = ToolCallUpdate::new(format!("call_1.{n}"), fields);
-        talk.update(&SessionUpdate::ToolCallUpdate(update));
     }
 }

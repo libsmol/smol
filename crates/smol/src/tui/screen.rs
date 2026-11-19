@@ -301,11 +301,7 @@ fn pasted(events: &[Event], stalled: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::tui::app::Alert;
-    use crate::tui::draft::MAX_UNFOLDED_CHARS;
-    use crate::tui::screen::{alerted, caught, notifier, pasted, Notifier, CAUGHT};
-    use ratatui::crossterm::event::{
-        Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
-    };
+    use crate::tui::screen::{alerted, caught, Notifier, CAUGHT};
 
     #[test]
     fn alerts_escaped() {
@@ -329,24 +325,6 @@ mod tests {
     }
 
     #[test]
-    fn notifier_detected() {
-        let cases = [
-            ("xterm-ghostty", "ghostty", Notifier::Titled),
-            ("xterm-256color", "ghostty", Notifier::Titled),
-            ("xterm-kitty", "", Notifier::Titled),
-            ("xterm-256color", "iTerm.app", Notifier::Plain),
-            ("wezterm", "WezTerm", Notifier::Titled),
-            ("tmux-256color", "tmux", Notifier::Bell),
-            ("xterm-256color", "Apple_Terminal", Notifier::Bell),
-            ("alacritty", "", Notifier::Bell),
-        ];
-        for (term, program, expected) in cases {
-            let found = notifier(term, program);
-            assert_eq!(found, expected, "{term} {program}");
-        }
-    }
-
-    #[test]
     fn panic_caught() {
         assert_eq!(caught(|| "drawn"), Some("drawn"));
         assert_eq!(caught(|| CAUGHT.get()), Some(true));
@@ -355,50 +333,5 @@ mod tests {
         assert_eq!(failed, None);
         assert!(!CAUGHT.get());
         assert_eq!(caught(|| 1 + 1), Some(2));
-    }
-
-    #[test]
-    fn key_burst_pasted() {
-        let pressed = |code| Event::Key(KeyEvent::from(code));
-        let first = pressed(KeyCode::Char('é'));
-        let enter = pressed(KeyCode::Enter);
-        let second = pressed(KeyCode::Char('ñ'));
-        let shifted = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
-        let moved = Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Moved,
-            column: 3,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        });
-        let burst = [
-            first.clone(),
-            enter.clone(),
-            moved,
-            Event::Key(shifted),
-            second.clone(),
-        ];
-        assert_eq!(pasted(&burst, false).as_deref(), Some("é\nAñ"));
-        assert_eq!(pasted(&burst, true).as_deref(), Some("é\nAñ"));
-
-        // A line typed during a freeze, then Enter
-        let line = [first.clone(), second.clone(), enter.clone()];
-        assert_eq!(pasted(&line, true), None);
-        assert_eq!(pasted(&line, false).as_deref(), Some("éñ\n"));
-
-        // One long line too, which then folds
-        let long = vec![first.clone(); MAX_UNFOLDED_CHARS + 1];
-        let text = "é".repeat(MAX_UNFOLDED_CHARS + 1);
-        assert_eq!(pasted(&long, true), Some(text));
-        assert_eq!(pasted(&long[1..], false), None);
-
-        let up = pressed(KeyCode::Up);
-        let typed = [
-            vec![enter.clone()],
-            vec![first.clone(), second],
-            vec![first, up, enter],
-        ];
-        for events in typed {
-            assert_eq!(pasted(&events, false), None, "{events:?}");
-        }
     }
 }

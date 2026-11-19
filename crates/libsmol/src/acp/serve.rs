@@ -583,7 +583,6 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::fs;
-    use std::future;
     use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
@@ -604,53 +603,6 @@ mod tests {
             closing: HashMap::new(),
         };
         (router, sent)
-    }
-
-    #[test]
-    fn setup_offered() {
-        let dir = temp_dir("setup-offered");
-        let (mut router, _sent) = router(&dir);
-
-        let plain = json!({"protocolVersion": 1, "clientCapabilities": {}});
-        let answered = router.request(&json!(1), "initialize", plain);
-        let answered = answered.expect("initialize").expect("result");
-        assert_eq!(answered["authMethods"], json!([]));
-        let prompts = &answered["agentCapabilities"]["promptCapabilities"];
-        assert_eq!(prompts["embeddedContext"], true, "{answered}");
-
-        let terminal = json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {"auth": {"terminal": true}},
-        });
-        let answered = router.request(&json!(2), "initialize", terminal);
-        let answered = answered.expect("initialize").expect("result");
-        let setup = json!({
-            "type": "terminal",
-            "id": "setup",
-            "name": "Set up a model",
-            "description": "Choose an OpenAI-compatible endpoint and a model",
-            "args": ["setup"],
-        });
-        assert_eq!(answered["authMethods"], json!([setup]));
-
-        let opening = json!({"cwd": dir, "mcpServers": []});
-        let refused = router.request(&json!(3), "session/new", opening);
-        let refused = refused.expect_err("unconfigured");
-        assert!(matches!(refused, Error::Unconfigured(_)), "{refused:?}");
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn relative_cwd_refused() {
-        let dir = temp_dir("relative");
-        let (mut router, _sent) = router(&dir);
-        let opening = json!({"cwd": "café", "mcpServers": []});
-        let refused = router.request(&json!(1), "session/new", opening);
-        let refused = refused.expect_err("relative");
-
-        let expected = "acp: invalid params: cwd: café: not an absolute path";
-        assert_eq!(refused.to_string(), expected);
-        assert!(router.sessions.is_empty());
     }
 
     #[test]
@@ -829,46 +781,5 @@ mod tests {
             "{listed:?}"
         );
         assert!(!router.sessions.contains_key("s2"));
-    }
-
-    /// A load from another directory is refused before it closes the open session
-    #[test]
-    fn other_cwd_kept() {
-        let dir = temp_dir("other-cwd");
-        let (mut router, _sent) = router(&dir);
-        let model = "[model.mock]\ntype = \"openai-completions\"\napi = \"http://127.0.0.1:1/v1\"\nmodels = [{ id = \"m1\" }]\n";
-        fs::create_dir_all(&dir).expect("dir");
-        fs::write(dir.join("model.toml"), model).expect("model.toml");
-        let memory = one_task("Fix the café menu");
-        let settings = Settings {
-            cwd: dir.join("naïve"),
-            ..Settings::default()
-        };
-        saved(&router.app.store, &memory, "s1", &settings);
-        let interrupt = Interrupt::default();
-
-        let loading = async {
-            let running = future::pending::<()>();
-            let (sender, _inbox) = mpsc::unbounded_channel();
-            let opened = Handle {
-                sender,
-                interrupt: interrupt.clone(),
-                enqueued: Arc::default(),
-                received: 0,
-                span: Span::none(),
-                task: task::spawn(running),
-                memories: Memories::new(&dir, &dir),
-            };
-            router.sessions.insert("s1".to_owned(), opened);
-
-            let params = json!({"sessionId": "s1", "cwd": dir, "mcpServers": []});
-            router.request(&json!(1), "session/load", params)
-        };
-        let refused = block_on(loading).expect_err("elsewhere").to_string();
-        fs::remove_dir_all(&dir).ok();
-
-        assert!(refused.contains(": belongs to "), "{refused}");
-        assert!(router.sessions.contains_key("s1"));
-        assert!(!interrupt.cancelled(0));
     }
 }

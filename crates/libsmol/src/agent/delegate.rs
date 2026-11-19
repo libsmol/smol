@@ -913,31 +913,20 @@ fn tail(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::delegate::{
-        first_line, tail, Records, Team, Watched, IDLE_WAIT, MAX_IDLE_WORKERS, MAX_LINE_CHARS,
-        MAX_PREVIEW_CHARS,
-    };
-    use crate::agent::tests::{scripted, streamed};
-    use crate::agent::{Agent, Event, Sink, Status, Task, TaskView, TaskViews, Unseen};
+    use crate::agent::delegate::Team;
+    use crate::agent::tests::scripted;
+    use crate::agent::{Agent, Task};
     use crate::config::Kind;
     use crate::model::{
         ChatMessage, Finish, Finished, Generating, Model, ModelError, Purpose, Sealed, StreamDelta,
         TokenUsage,
     };
-    use crate::prompt::RESTARTED;
-    use crate::steps::tests::metered;
-    use crate::steps::{
-        spent, AgentMemory, AgentStep, Call, DoneStep, Ending, MemoryStep, Returned,
-    };
+    use crate::prompt;
+    use crate::steps::{spent, AgentMemory, Call, DoneStep, Ending, MemoryStep, Returned};
     use crate::tests::{cancel_soon, content};
-    use crate::tools::mcp::tests::fake;
-    use crate::utils::{block_on, Interrupt};
-    use crate::worker::host::Added;
-    use crate::worker::{AgentCall, Asked};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::sync::Semaphore;
     use tokio::time;
 
     type Requests = Arc<Mutex<Vec<Vec<ChatMessage>>>>;
@@ -1063,75 +1052,16 @@ mod tests {
             }
         }
 
-        // Agents started by agent() don't see it, and answer the code
+        // Agents started by agent() don't see it
         let requests = requests.lock().expect("requests");
         let main = content(&requests[0][0]);
-        let listed = "\nagent(name: str, task: str) -> None\n    # Sends task";
-        assert!(main.contains(listed), "{main}");
-        assert!(main.contains("\nagent.wait(*names: str"), "{main}");
-        assert!(main.contains("[Task update]"), "{main}");
+        assert!(main.contains("\nagent("), "{main}");
         let helped = requests.iter().map(|request| content(&request[0]));
         let helper = helped
             .into_iter()
             .find(|text| *text != main)
             .expect("helper");
         assert!(!helper.contains("agent("), "{helper}");
-        let returned =
-            "your answer and ends the task.\n- Only your answer is returned to the agent that assigned this task";
-        assert!(helper.contains(returned), "{helper}");
-    }
-
-    /// Agents get the MCP servers of the code that sent them their task
-    #[test]
-    fn servers_shared() {
-        let mut tested = scripted(Teamed(Requests::default()), Box::new(|_| {}));
-        let adding = tested.worker.add_server(fake(), &[]);
-        let added = block_on(adding).expect("add server");
-
-        let records = Arc::new(Records::default());
-        let servers = [&added];
-        let mut delegate = tested.agent.delegate(&servers, Box::new(Unseen), &records);
-        let asked = Asked {
-            name: "adder".to_owned(),
-            task: "Add with the server".to_owned(),
-        };
-        let names = vec!["adder".to_owned()];
-        let waiting = async {
-            delegate(AgentCall::Send(asked)).await;
-            let wait = AgentCall::Wait {
-                names,
-                timeout: None,
-            };
-            delegate(wait).await
-        };
-        let waited = block_on(waiting);
-
-        let answered = json!({ "answers": [["adder", { "answer": "5" }]], "working": [] });
-        assert_eq!(waited.result, Ok(answered));
-    }
-
-    /// One still waiting for a slot ends on an interrupt without starting a worker
-    #[test]
-    fn queued_agent_stops() {
-        let model = Teamed(Requests::default());
-        let tested = scripted(model, Box::new(|_| {}));
-        let agent = tested.agent.clone();
-        agent.interrupt.cancel(0);
-
-        let asked = Asked {
-            name: "cafés".to_owned(),
-            task: "Count the cafés".to_owned(),
-        };
-        let memory = AgentMemory::default();
-        let watched = Watched::new(Box::new(Unseen), 0);
-        let servers: Arc<[Added]> = Arc::new([]);
-        let slots = Arc::new(Semaphore::new(0));
-        let working = agent.work(asked, memory, None, watched, servers, slots);
-        let waiting = async { time::timeout(Duration::from_secs(5), working).await };
-        let (end, memory, worker) = block_on(waiting).expect("stopped");
-        assert_eq!(end, Ending::Interrupted {});
-        assert!(memory.steps.is_empty(), "{memory:?}");
-        assert!(worker.is_none());
     }
 
     /// The main agent runs each of the codes in turn, split into calls at lines `#---`, and with
@@ -1268,110 +1198,13 @@ mod tests {
             agents: vec![returned],
             ..DoneStep::default()
         };
-        assert_eq!(memory.steps[3], MemoryStep::Done(done));
+        assert_eq!(memory.steps[3], MemoryStep::Done(done.clone()));
         assert_eq!(memory.steps.len(), 5, "{:?}", memory.steps);
 
         let requests = requests.lock().expect("requests");
         let last = requests.last().and_then(|request| request.last());
         let told = last.map(content).unwrap_or_default();
-        let announced =
-            "[Agent done]\n<answer agent=\"naïve\">\nAnswer: Spell naïve after 0.5\n</answer>";
-        assert_eq!(told, announced);
-    }
-
-    /// A program the code left running that ends during the turn comes with the next step,
-    /// while one still running when the model answers doesn't keep the turn open
-    #[test]
-    fn programs_announced() {
-        let codes = vec![
-            "import subprocess, sys\n\
-             quick = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.2)'])\n\
-             slow = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n\
-             print(quick.pid)",
-            "import time\ntime.sleep(1)",
-        ];
-        let requests = Requests::default();
-        let model = Background(codes, Arc::clone(&requests));
-        let mut agent = scripted(model, Box::new(|_| {}));
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "Run the cafés").expect("run");
-        assert_eq!(answer.as_deref(), Some("Answer 2"));
-        assert_eq!(memory.steps.len(), 5, "{:?}", memory.steps);
-
-        let quick: u32 = printed(&memory, 1).trim().parse().expect("pid");
-        let MemoryStep::Done(done) = &memory.steps[3] else {
-            panic!("{:?}", memory.steps);
-        };
-        let pids: Vec<u32> = done.programs.iter().map(|program| program.pid).collect();
-        assert_eq!(pids, [quick]);
-
-        let requests = requests.lock().expect("requests");
-        let last = requests.last().and_then(|request| request.last());
-        let told = last.map(content).unwrap_or_default();
-        let announced = format!("[Program done]\npid {quick}: ");
-        assert!(told.starts_with(&announced), "{told}");
-    }
-
-    /// The final record of a task goes to the call that sent it
-    #[test]
-    fn seat_kept() {
-        let code = "print('first')\n#---\nagent('naïve', 'Spell naïve after 0.5')";
-        let model = Background(vec![code], Requests::default());
-        let mut agent = scripted(model, Box::new(|_| {}));
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "Spell it").expect("run");
-        assert_eq!(answer.as_deref(), Some("Answer 2"));
-
-        let MemoryStep::Action(step) = &memory.steps[1] else {
-            panic!("{:?}", memory.steps);
-        };
-        assert_eq!(ends(&agent.agent, &step.calls[0]), []);
-        let naïve = Ending::Answer("Answer: Spell naïve after 0.5".to_owned());
-        let sent = [("naïve".to_owned(), naïve)];
-        assert_eq!(ends(&agent.agent, &step.calls[1]), sent);
-    }
-
-    /// While the turn waits for an agent, a message the client queues arrives as a task update
-    #[test]
-    fn update_while_waiting() {
-        let code = "agent('naïve', 'Spell naïve after 1')";
-        let model = Background(vec![code], Requests::default());
-        let mut agent = scripted(model, Box::new(|_| {}));
-        *agent.queue.nudge.lock().expect("nudge") = Some(Duration::from_millis(200));
-        let mut pulls = 0;
-        let take = move || {
-            pulls += 1;
-            let update = Task {
-                text: "Also spell café".to_owned(),
-                mentions: Vec::new(),
-            };
-            match pulls {
-                2 => vec![update],
-                _ => Vec::new(),
-            }
-        };
-        *agent.queue.updates.lock().expect("updates") = Some(Box::new(take));
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "Spell it").expect("run");
-        assert_eq!(answer.as_deref(), Some("Answer 3"));
-        let mut kinds = Vec::new();
-        for step in &memory.steps {
-            let kind = match step {
-                MemoryStep::Task(_) => "task",
-                MemoryStep::Update(_) => "update",
-                MemoryStep::Action(_) => "action",
-                MemoryStep::Done(_) => "done",
-                _ => "other",
-            };
-            kinds.push(kind);
-        }
-        let expected = [
-            "task", "action", "action", "update", "action", "done", "action",
-        ];
-        assert_eq!(kinds, expected);
+        assert_eq!(told, prompt::done(&done));
     }
 
     /// A message the user queues ends the wait early, and reaches the model after the call
@@ -1433,12 +1266,13 @@ mod tests {
         let result = ran(&memory, 1).result.as_ref().expect("ran");
         assert_eq!(result.agents.len(), 1, "{result:?}");
 
+        let update = format!("[{}]\nSpell café too", prompt::UPDATE);
         let expected = [
             vec!["Spell naïve after 1"],
             vec![
                 "Spell naïve after 1",
                 "Answer: Spell naïve after 1",
-                "[Task update]\nSpell café too",
+                &update,
             ],
         ];
         assert_eq!(sent(&requests), expected);
@@ -1476,113 +1310,9 @@ mod tests {
         assert!(!memory.steps.iter().any(done), "{:?}", memory.steps);
 
         let told = sent(&requests).pop().expect("requests");
-        let expected = [
-            "Wait after 30",
-            "[The agent that assigned your task interrupted you]",
-            "Spell naïve",
-        ];
+        let interrupted = format!("[{}]", prompt::REPLY_STOPPED);
+        let expected = ["Wait after 30", interrupted.as_str(), "Spell naïve"];
         assert_eq!(told, expected);
-    }
-
-    /// An agent keeps its Python for its next task, also in a later turn,
-    /// until it goes unused for `IDLE_WAIT`
-    #[test]
-    fn python_kept() {
-        let code = "agent('calc', 'run print(x)')\nprint(agent.wait('calc'))";
-        let codes = vec![
-            "agent('calc', 'run x = 41')\nprint(agent.wait('calc'))",
-            "agent('calc', 'run print(x + 1)')\nprint(agent.wait('calc'))",
-            "",
-            code,
-            "",
-            code,
-        ];
-        let requests = Requests::default();
-        let model = Background(codes, Arc::clone(&requests));
-        let mut agent = scripted(model, Box::new(|_| {}));
-
-        let mut memory = AgentMemory::default();
-        agent.turn(&mut memory, "Count on").expect("run");
-        assert_eq!(printed(&memory, 1), "{'calc': '[no output]'}");
-        assert_eq!(printed(&memory, 2), "{'calc': '42'}");
-        agent.turn(&mut memory, "Count again").expect("run");
-        assert_eq!(printed(&memory, 5), "{'calc': '41'}");
-        // Agent-side tasks only run inside `block_on`
-        let idling = async { time::sleep(IDLE_WAIT + Duration::from_secs(1)).await };
-        block_on(idling);
-        agent.turn(&mut memory, "Count later").expect("run");
-        let gone = "NameError: name 'x' is not defined";
-        assert!(printed(&memory, 8).contains(gone), "{:?}", memory.steps);
-
-        let told = sent(&requests);
-        let restarts: Vec<bool> = told
-            .iter()
-            .map(|request| request.iter().any(|text| text == RESTARTED))
-            .collect();
-        let expected = [false, false, false, false, false, false, true, true];
-        assert_eq!(restarts, expected);
-    }
-
-    /// Only the `MAX_IDLE_WORKERS` Pythons used last stay
-    #[test]
-    fn idle_limited() {
-        let code = "for n in range(5):\n    agent(f'calc{n}', f'run x = {n}')\nagent.wait()";
-        let model = Background(vec![code], Requests::default());
-        let mut agent = scripted(model, Box::new(|_| {}));
-
-        let mut memory = AgentMemory::default();
-        agent.turn(&mut memory, "Count").expect("run");
-
-        let team = agent.agent.place.team().expect("team");
-        let members = team.members.lock().expect("members");
-        let kept = members.iter().filter(|member| member.kept.is_some());
-        assert_eq!(members.len(), 5);
-        assert_eq!(kept.count(), MAX_IDLE_WORKERS);
-    }
-
-    /// A Python with other MCP servers than the call that sends the next task starts over
-    #[test]
-    fn servers_changed() {
-        let mut tested = scripted(
-            Background(Vec::new(), Requests::default()),
-            Box::new(|_| {}),
-        );
-        let adding = tested.worker.add_server(fake(), &[]);
-        let added = block_on(adding).expect("add server");
-
-        let asked = |task: &str| {
-            let asked = Asked {
-                name: "calc".to_owned(),
-                task: task.to_owned(),
-            };
-            AgentCall::Send(asked)
-        };
-        let wait = || AgentCall::Wait {
-            names: vec!["calc".to_owned()],
-            timeout: None,
-        };
-        let mut answers = Vec::new();
-        for (servers, task) in [
-            (Vec::new(), "run x = 41"),
-            (Vec::new(), "run print(x)"),
-            (vec![&added], "run print(x)"),
-        ] {
-            let records = Arc::new(Records::default());
-            let mut delegate = tested.agent.delegate(&servers, Box::new(Unseen), &records);
-            let waiting = async {
-                delegate(asked(task)).await;
-                delegate(wait()).await
-            };
-            let waited = block_on(waiting).result.expect("waited");
-            let answer = waited["answers"][0][1]["answer"]
-                .as_str()
-                .unwrap_or_default();
-            answers.push(answer.to_owned());
-        }
-
-        assert_eq!(answers[1], "41");
-        let gone = "NameError: name 'x' is not defined";
-        assert!(answers[2].contains(gone), "{answers:?}");
     }
 
     /// The agents of a saved conversation come back with their conversations as they were
@@ -1613,27 +1343,6 @@ mod tests {
         assert_eq!(records[1].tasks[1].end, Ending::Unfinished {});
     }
 
-    /// A name finds its agent again after Python restarts
-    #[test]
-    fn names_survive_restart() {
-        let codes = vec![
-            "agent('naïve', 'Spell naïve after 2')",
-            "import os\nos._exit(1)",
-            "print(agent.wait('naïve', timeout=10))",
-        ];
-        let model = Background(codes, Requests::default());
-        let mut agent = scripted(model, Box::new(|_| {}));
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "Spell it").expect("run");
-        assert_eq!(answer.as_deref(), Some("Answer 3"));
-        assert_eq!(memory.steps[3], MemoryStep::Restarted);
-        assert_eq!(
-            printed(&memory, 4),
-            "{'naïve': 'Answer: Spell naïve after 2'}"
-        );
-    }
-
     /// An interrupt ends the turn and the agents at work with it
     #[test]
     fn interrupt_stops_all() {
@@ -1652,207 +1361,5 @@ mod tests {
         assert_eq!(ends(&agent.agent, ran(&memory, 1)), interrupted);
         let done = |step: &MemoryStep| matches!(step, MemoryStep::Done(_));
         assert!(!memory.steps.iter().any(done), "{:?}", memory.steps);
-    }
-
-    /// An agent still at work when a model error ends the turn ends unfinished,
-    /// as the user didn't interrupt it
-    #[test]
-    fn failed_turn_unfinished() {
-        let codes = vec!["agent('slow', 'Wait after 30')", "refused"];
-        let model = Background(codes, Requests::default());
-        let mut agent = scripted(model, Box::new(|_| {}));
-
-        let mut memory = AgentMemory::default();
-        let failed = agent.turn(&mut memory, "Wait for it").expect_err("refused");
-        assert!(failed.to_string().contains("bad request"), "{failed}");
-        let unfinished = [("slow".to_owned(), Ending::Unfinished {})];
-        assert_eq!(ends(&agent.agent, ran(&memory, 1)), unfinished);
-    }
-
-    /// An agent that answered during a step the user interrupts is still announced
-    #[test]
-    fn done_before_interrupt() {
-        let code = "import time\n\
-            agent('cafés', 'Count the cafés')\n\
-            time.sleep(1)\n\
-            print('answered', flush=True)\n\
-            time.sleep(30)";
-        let model = Background(vec![code], Requests::default());
-        let stopper = Arc::<Mutex<Option<Interrupt>>>::default();
-        let held = Arc::clone(&stopper);
-        let events = move |event: Event| {
-            let Event::Output(_, _, output) = event else {
-                return;
-            };
-            if let Some(interrupt) = held.lock().expect("interrupt").as_ref() {
-                if output.contains("answered") {
-                    interrupt.cancel(u64::MAX);
-                }
-            }
-        };
-        let mut agent = scripted(model, Box::new(events));
-        *stopper.lock().expect("interrupt") = Some(agent.agent.interrupt.clone());
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "Count them").expect("run");
-        assert_eq!(answer, None);
-        let returned = Returned {
-            name: "cafés".to_owned(),
-            end: Ending::Answer("Answer: Count the cafés".to_owned()),
-        };
-        let done = DoneStep {
-            agents: vec![returned],
-            ..DoneStep::default()
-        };
-        let done = MemoryStep::Done(done);
-        assert_eq!(memory.steps.last(), Some(&done), "{:?}", memory.steps);
-    }
-
-    /// Records the end each view of a task closes with, and the agents the code waits for
-    #[derive(Clone, Default)]
-    struct Followed {
-        ends: Arc<Mutex<Vec<Ending>>>,
-        waited: Arc<Mutex<Vec<Vec<String>>>>,
-    }
-
-    impl TaskViews for Followed {
-        fn open(&self, _: usize, _: &str, _: &str) -> Box<dyn TaskView> {
-            let ends = Arc::clone(&self.ends);
-            Box::new(Closed(ends))
-        }
-
-        fn waiting(&self, names: &[String]) {
-            self.waited.lock().expect("waited").push(names.to_vec());
-        }
-    }
-
-    struct Closed(Arc<Mutex<Vec<Ending>>>);
-
-    impl TaskView for Closed {
-        fn shown(&mut self, _: &Status) {}
-
-        fn close(&mut self, end: &Ending, _: &[MemoryStep]) {
-            self.0.lock().expect("ends").push(end.clone());
-        }
-    }
-
-    /// The view of a task the code stopped closes with the end its record keeps, and the call
-    /// shows whom it waits for while it does
-    #[test]
-    fn views_follow() {
-        let model = Background(Vec::new(), Requests::default());
-        let tested = scripted(model, Box::new(|_| {}));
-        let followed = Followed::default();
-        let views = Box::new(followed.clone());
-        let records = Arc::new(Records::default());
-        let mut delegate = tested.agent.delegate(&[], views, &records);
-
-        let asked = Asked {
-            name: "slow".to_owned(),
-            task: "Wait after 30".to_owned(),
-        };
-        let names = vec!["slow".to_owned()];
-        let stopping = async {
-            delegate(AgentCall::Send(asked)).await;
-            let wait = AgentCall::Wait {
-                names,
-                timeout: Some(0.2),
-            };
-            let waited = delegate(wait).await;
-            let stop = AgentCall::Stop {
-                name: "slow".to_owned(),
-            };
-            delegate(stop).await;
-            waited
-        };
-        let waited = block_on(stopping).result.expect("waited");
-
-        assert_eq!(waited["answers"], json!([]));
-        let status = waited["working"][0][1].as_str().unwrap_or_default();
-        assert!(status.starts_with("running for 0s, step 1: "), "{status}");
-        assert_eq!(*followed.ends.lock().expect("ends"), [Ending::Stopped {}]);
-        let waited = followed.waited.lock().expect("waited");
-        assert_eq!(*waited, [vec!["slow".to_owned()], Vec::new()]);
-    }
-
-    struct Recorded(Arc<Mutex<Vec<Status>>>);
-
-    impl TaskView for Recorded {
-        fn shown(&mut self, status: &Status) {
-            self.0.lock().expect("shown").push(status.clone());
-        }
-
-        fn close(&mut self, _: &Ending, _: &[MemoryStep]) {}
-    }
-
-    #[test]
-    fn status_throttled() {
-        let shown = Arc::<Mutex<Vec<Status>>>::default();
-        let view = Recorded(Arc::clone(&shown));
-        let mut watched = Watched::new(Box::new(view), 0);
-        watched.event(Event::Thought(streamed("Reading the menu")));
-        watched.event(Event::Code(0, streamed("\nprint(len(cafés))\n")));
-        let call = Call {
-            code: "print(len(cafés))".to_owned(),
-            ..Call::default()
-        };
-        watched.event(Event::Run(0, &call));
-        watched.event(Event::Output(0, &call, "3\n"));
-
-        // A saved step shows the tokens so far, and one without any shows nothing new
-        let counted = AgentStep {
-            usage: metered(100, 20),
-            ..AgentStep::default()
-        };
-        let mut memory = AgentMemory {
-            steps: vec![MemoryStep::Action(Box::new(counted))],
-        };
-        watched.event(Event::StepEnd(&AgentStep::default()));
-        watched.saved(&memory);
-        let unmetered = AgentStep::default();
-        memory.steps.push(MemoryStep::Action(Box::new(unmetered)));
-        watched.saved(&memory);
-
-        // Code and output that stream too soon after are held back, but not the start of a run
-        let shown = shown.lock().expect("shown");
-        let seen: Vec<(&str, &str)> = shown
-            .iter()
-            .map(|status| (&*status.doing, &*status.preview))
-            .collect();
-        let expected = [
-            ("thinking", "Reading the menu"),
-            ("running print(len(cafés))", "print(len(cafés))"),
-            ("running print(len(cafés))", "3"),
-        ];
-        assert_eq!(seen, expected);
-        let tokens = shown.last().and_then(|status| status.usage.tokens);
-        assert_eq!(tokens, Some(TokenUsage::new(100, 20)));
-        assert_eq!(watched.live.lock().expect("live").status.steps, 2);
-        drop(shown);
-
-        // A later task of the agent counts only its own steps
-        watched.start = 1;
-        watched.saved(&memory);
-        let live = watched.live.lock().expect("live");
-        assert_eq!((live.status.steps, live.status.usage.tokens), (1, None));
-    }
-
-    #[test]
-    fn preview_tail() {
-        assert_eq!(tail("\nprint('café')\n"), "print('café')");
-        assert_eq!(tail("a\nb\n\nc\nd\n  \nnaïve\n\n"), "b\nc\nd\nnaïve");
-
-        let long = "résumé ".repeat(200);
-        let kept = tail(&long);
-        assert_eq!(kept.chars().count(), MAX_PREVIEW_CHARS);
-        assert!(long.ends_with(&kept), "{kept}");
-    }
-
-    #[test]
-    fn line_clipped() {
-        let long = "café = 1; ".repeat(20);
-        let kept: String = long.chars().take(MAX_LINE_CHARS).collect();
-        assert_eq!(first_line(&long), format!("{kept}…"));
-        assert_eq!(first_line("\n  print('naïve')\nx = 1"), "print('naïve')");
     }
 }

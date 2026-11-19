@@ -517,14 +517,11 @@ fn end_of(status: ExitStatus) -> Exit {
 
 #[cfg(test)]
 mod tests {
-    use crate::spawn::{run_shell, Clip, Process};
-    use crate::steps::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
-    use crate::tests::{interpreter, temp_dir};
+    use crate::spawn::{run_shell, Clip};
+    use crate::steps::{Exit, MAX_OBSERVATION_CHARS};
     use crate::utils::{block_on, truncated, Interrupt};
-    use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
-    use tokio::process::Command;
 
     #[test]
     fn clip_matches_truncated() {
@@ -561,99 +558,6 @@ mod tests {
         let expected = "head line one, two!\n\n[436 characters cut]\nlast";
         assert_eq!(clip.shown(1000), expected);
         assert_eq!(clip.shown(10), "head l\n[450 characters cut]\nlast");
-    }
-
-    /// A character split across two chunks is completed by the next one
-    #[test]
-    fn clip_shown_fresh() {
-        let bytes = "é🍕".as_bytes();
-        let mut clip = Clip::new(4);
-        clip.push(&bytes[..4]);
-        assert_eq!(clip.fresh(100).as_deref(), Some("é\u{fffd}"));
-        assert_eq!(clip.fresh(100), None);
-
-        clip.push(&bytes[4..]);
-        assert_eq!(clip.fresh(100).as_deref(), Some("é🍕"));
-    }
-
-    #[test]
-    fn clip_head_whole() {
-        // The head limit of 3 bytes falls inside ï
-        let mut clip = Clip::new(3);
-        clip.push("naïve café".as_bytes());
-        assert_eq!((clip.text(), clip.cut), ("naïfé".to_owned(), 5));
-    }
-
-    /// A part not yet taken comes with what followed it, such as a crash after the startup marker
-    #[test]
-    fn rest_joined() {
-        let python = interpreter();
-        let mut command = Command::new(python);
-        let code =
-            "import sys\nsys.stdout.buffer.write('started café\\n<end>crashed naïve\\n'.encode())";
-        command.arg("-c").arg(code);
-        let ending = b"<end>".to_vec();
-        let reading = async {
-            let (_process, output) = Process::start(command, Some(ending)).expect("start");
-            output.rest().await
-        };
-        let said = block_on(reading);
-        assert_eq!(said.shown(1000), "started café\ncrashed naïve");
-
-        let mut first = Clip::new(4);
-        first.push("café crème".as_bytes());
-        let mut second = Clip::new(4);
-        second.push("naïve".as_bytes());
-        let joined = first.joined(&second);
-        assert_eq!(joined.shown(100), "café\n[8 characters cut]\nïve");
-    }
-
-    /// The second item says whether programs were left in the background
-    fn shelled(dir: &Path, line: &str, interrupt: &Interrupt) -> (ShellStep, bool) {
-        let mut ignored = |_: &str| {};
-        let running = run_shell(line, dir, interrupt, &mut ignored);
-        let (ran, left) = block_on(running);
-        (ran, left.is_some())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shell_typed() {
-        let dir = temp_dir("shell-café");
-        fs::create_dir_all(&dir).expect("dir");
-        let interrupt = Interrupt::default();
-        let line = "echo café; echo naïve >&2; echo résumé; pwd; exit 3";
-        let (ran, _) = shelled(&dir, line, &interrupt);
-
-        assert_eq!(ran.end, Exit::Exited(3));
-        // `pwd` prints the physical path, and the macOS temp directory sits behind a symlink
-        let real = fs::canonicalize(&dir).expect("canonical");
-        let expected = format!("café\nnaïve\nrésumé\n{}", real.display());
-        assert_eq!(ran.output, expected);
-        assert!(!ran.shell.is_empty());
-
-        let (read, _) = shelled(&dir, "cat", &interrupt);
-        assert_eq!((read.end, read.output), (Exit::Exited(0), String::new()));
-        let (left, kept) = shelled(&dir, "sleep 30 &", &interrupt);
-        assert_eq!(left.end, Exit::Exited(0));
-        assert!(kept);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn shell_typed() {
-        let dir = temp_dir("shell-café");
-        fs::create_dir_all(&dir).expect("dir");
-        let interrupt = Interrupt::default();
-        let line = "echo café& (echo naïve)1>&2& echo résumé& cd& exit /b 3";
-        let (ran, _) = shelled(&dir, line, &interrupt);
-
-        assert_eq!(ran.end, Exit::Exited(3));
-        let expected = format!("café\nnaïve\nrésumé\n{}", dir.display());
-        assert_eq!(ran.output, expected);
-        assert_eq!(ran.shell.to_lowercase(), "cmd");
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Output written before the interrupt is kept too

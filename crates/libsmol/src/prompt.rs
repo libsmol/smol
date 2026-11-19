@@ -21,7 +21,7 @@ pub(crate) const TOOL_DOC: &str = "Runs Python code.";
 pub(crate) const ARGUMENT_DOC: &str = "The Python code to run.";
 
 /// Labels a message the user wrote while the agent worked, for the agent and the summarizer alike
-const UPDATE: &str = "Task update";
+pub(crate) const UPDATE: &str = "Task update";
 
 const RULES: &str = "- Never make up data or functions; check unfamiliar ones with `help()`.
 - Do the task instead of describing it.
@@ -52,7 +52,7 @@ pub(crate) const UNFINISHED: &str = "stopped before it answered";
 pub(crate) const STOPPED_BY_CODE: &str = "stopped by agent.stop()";
 /// The worker puts it in the docs of `agent()`, `agent.wait()` and `agent.stop()`
 pub(crate) const DONE: &str = "Agent done";
-const PROGRAM_DONE: &str = "Program done";
+pub(crate) const PROGRAM_DONE: &str = "Program done";
 
 pub(crate) fn no_agent(name: &str) -> String {
     format!("name: {name}: {NO_AGENT}")
@@ -478,7 +478,7 @@ pub(crate) const INTERRUPTED_BY_USER: &str = "interrupted by the user";
 const INTERRUPTED_BY_ASSIGNER: &str = "interrupted by the agent that assigned your task";
 pub(crate) const SKIPPED: &str = "not run: an earlier call failed";
 const REPLY_INTERRUPTED: &str = "The user interrupted you";
-const REPLY_STOPPED: &str = "The agent that assigned your task interrupted you";
+pub(crate) const REPLY_STOPPED: &str = "The agent that assigned your task interrupted you";
 
 /// A step whose calls the model sees reports this in their replies instead
 pub(crate) fn step_reason(step: &AgentStep) -> Option<&'static str> {
@@ -910,16 +910,8 @@ mod tests {
     use crate::agent::tests::{delegated_place, main_place};
     use crate::agent::{Brief, Place};
     use crate::config::Skill;
-    use crate::model::tests::png;
-    use crate::model::{Media, MediaKind};
-    use crate::prompt::{
-        call_error, done, media_tag, shell, step_error, system, transcript, unseen, HANDED_BACK,
-        OUTLASTING, SHOWN_IMAGES, TRUSTING,
-    };
-    use crate::steps::{
-        AgentStep, Call, CallError, CodeResult, DoneStep, Ending, Exit, MemoryStep, Program,
-        Returned, ShellStep, StepError,
-    };
+    use crate::model::MediaKind;
+    use crate::prompt::{system, HANDED_BACK, SHOWN_IMAGES, TRUSTING};
     use crate::tools::mcp::Server;
     use crate::tools::memories::Digest;
     use crate::worker::host::{Added, Calling};
@@ -928,7 +920,6 @@ mod tests {
     use serde_json::{Map, Value};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use worker::PYTHON_VERSION;
 
     fn global(id: i64, text: &str) -> Memory {
         Memory {
@@ -936,259 +927,6 @@ mod tests {
             text: text.to_owned(),
             project: false,
         }
-    }
-
-    #[test]
-    fn done_worded() {
-        let program = Program {
-            pid: 42,
-            command: "python3 brew.py --café".to_owned(),
-        };
-        let answered = Returned {
-            name: "naïve".to_owned(),
-            end: Ending::Answer("Spelled naïve 🐍".to_owned()),
-        };
-        let failed = Returned {
-            name: "café".to_owned(),
-            end: Ending::Error("model: http 503: busy".to_owned()),
-        };
-        let step = DoneStep {
-            agents: vec![answered, failed],
-            programs: vec![program],
-            output: "brewed 🐍\n".to_owned(),
-            idle: false,
-        };
-        let expected = "[Agent done]\n<answer agent=\"naïve\">\nSpelled naïve 🐍\n</answer>\n\
-                        <failed agent=\"café\">\nmodel: http 503: busy\n</failed>\n\n\
-                        [Program done]\npid 42: python3 brew.py --café\n<output>\nbrewed 🐍\n</output>";
-        assert_eq!(done(&step), expected);
-
-        let quiet = DoneStep {
-            agents: Vec::new(),
-            output: " \n".to_owned(),
-            ..step
-        };
-        assert_eq!(
-            done(&quiet),
-            "[Program done]\npid 42: python3 brew.py --café"
-        );
-    }
-
-    #[test]
-    fn system_sections() {
-        let instructions = vec!["Reply in French".to_owned(), "Indent with tabs".to_owned()];
-        let skills = vec![Skill {
-            name: "weekly".to_owned(),
-            description: "Write the weekly report".to_owned(),
-            path: PathBuf::from("/home/zoë/.smol/skills/weekly/SKILL.md"),
-        }];
-        let brief = Brief {
-            instructions,
-            skills,
-            ..Brief::default()
-        };
-        let cwd = Path::new("/home/zoë/work");
-
-        let function = |name: &str, header: &str, summary: &str| Function {
-            name: name.to_owned(),
-            header: header.to_owned(),
-            summary: summary.to_owned(),
-        };
-        let functions = [
-            function(
-                "ls",
-                "ls(path) -> list[str]",
-                "Sorted paths.\nThe café/ folder ends with /.",
-            ),
-            function("agent", "agent(name, task) -> None", "Sends task."),
-            function("agent.wait", "agent.wait(*names) -> dict", "The answers."),
-            function("help", "help(request) -> None", "Prints the docs."),
-        ];
-
-        let main = main_place();
-        let text = system(&functions, &[], &brief, cwd, None, &main, &|_| false);
-
-        let built_in = "## Built-in\n\n```python\n\
-                        ls(path) -> list[str]\n    # Sorted paths.\n    # The café/ folder ends with /.\n\n\
-                        agent(name, task) -> None\n    # Sends task.\n\n\
-                        agent.wait(*names) -> dict\n    # The answers.\n\n\
-                        help(request) -> None\n    # Prints the docs.\n```\n\n# Skills";
-        assert!(text.contains(built_in), "{text}");
-        let delegating = "the task stays open while any agent is at work.\n\n## When to use\n\n\
-                          - Reviewing your changes or conclusions: \
-                          a fresh context sees what yours no longer does.";
-        assert!(text.contains(delegating), "{text}");
-        let place = format!(
-            ") in `/home/zoë/work`.\n\
-             - Python: CPython {PYTHON_VERSION} in a venv kept for this folder; packages you install import right away.\n\
-             - Today"
-        );
-        assert!(text.contains(&place), "{text}");
-        let skill = "\n\n# Skills\n\n\
-             When a task matches a skill, read and follow its `SKILL.md`; paths in it are relative to its folder.\n\n\
-             - `weekly`: Write the weekly report (`/home/zoë/.smol/skills/weekly/SKILL.md`)\n\n# Sub-agents\n\n";
-        assert!(text.contains(skill), "{text}");
-        let files = "and save the correct one, if any.\n\n# Instructions\n\n\
-                     Follow these instructions:\n\n\
-                     <instructions>\nReply in French\n</instructions>\n\n\
-                     <instructions>\nIndent with tabs\n</instructions>\n\n# Environment\n\n";
-        assert!(text.contains(files), "{text}");
-        let rules = "may add to or change it.\n\n# Rules\n\n- Never make up data or functions;";
-        assert!(text.contains(rules), "{text}");
-        assert!(text.ends_with(" (UTC)."), "{text}");
-
-        let empty = Brief::default();
-        let delegated = delegated_place();
-        let plain = system(&[], &[], &empty, cwd, Some(&[]), &delegated, &|_| false);
-        assert!(!plain.contains("<instructions"), "{plain}");
-        assert!(!plain.contains("# Skills"), "{plain}");
-        assert!(!plain.contains("# Memories"), "{plain}");
-        assert!(!plain.contains("remember()"), "{plain}");
-        let sandbox =
-            "right away.\n- Sandbox: writing outside `/home/zoë/work`, the venv and `$TMPDIR` (used by `tempfile`), ";
-        assert!(plain.contains(sandbox), "{plain}");
-
-        let registry = [PathBuf::from("/home/zoë/.cargo/registry")];
-        let allowed = system(&[], &[], &empty, cwd, Some(&registry), &main, &|_| false);
-        let sandbox =
-            "writing outside `/home/zoë/work`, `/home/zoë/.cargo/registry`, the venv and `$TMPDIR` (used by `tempfile`), ";
-        assert!(allowed.contains(sandbox), "{allowed}");
-    }
-
-    #[test]
-    fn memories_shown() {
-        let cwd = Path::new("/home/zoë/work");
-        let main = main_place();
-        let remember = Function {
-            name: "remember".to_owned(),
-            header: "remember(text) -> int".to_owned(),
-            summary: "Saves text.".to_owned(),
-        };
-        let newest = vec![
-            global(7, "Writes résumés in French"),
-            global(3, "Prefers tabs\nover spaces"),
-        ];
-        let digest = Digest {
-            newest: newest.clone(),
-            global: 2,
-            here: 12,
-        };
-        let brief = Brief {
-            digest,
-            ..Brief::default()
-        };
-
-        let functions = [remember];
-        let text = system(&functions, &[], &brief, cwd, None, &main, &|_| false);
-        let section = format!(
-            "only what changed, without the four parts.\n\n# Memories\n\n{OUTLASTING}\n\n\
-             Global memories:\n\
-             - [7] Writes résumés in French\n\
-             - [3] Prefers tabs over spaces\n\n\
-             This project has 12 memories of its own, not listed here; \
-             before you start a task, `recall()` its key words.\n\n\
-             ## Rules\n\n- `remember()` what the user asks you to, the lasting preferences they state, "
-        );
-        assert!(text.contains(&section), "{text}");
-        let rules = "and save the correct one, if any.\n\n# Environment\n\n";
-        assert!(text.contains(rules), "{text}");
-
-        let digest = Digest {
-            newest,
-            global: 14,
-            here: 0,
-        };
-        let more = Brief {
-            digest,
-            ..Brief::default()
-        };
-        let text = system(&functions, &[], &more, cwd, None, &main, &|_| false);
-        let heading = format!(
-            "# Memories\n\n{OUTLASTING}\n\n\
-             Global memories, the newest 2 of 14 (`recall()` finds the rest):\n\
-             - [7] Writes résumés in French\n"
-        );
-        assert!(text.contains(&heading), "{text}");
-
-        let empty = Brief::default();
-        let bare = system(&functions, &[], &empty, cwd, None, &main, &|_| false);
-        let rules = format!(
-            "only what changed, without the four parts.\n\n# Memories\n\n{OUTLASTING}\n\n## Rules\n\n- `remember()`"
-        );
-        assert!(bare.contains(&rules), "{bare}");
-
-        let digest = Digest {
-            here: 1,
-            ..Digest::default()
-        };
-        let counted = Brief {
-            digest,
-            ..Brief::default()
-        };
-        let delegated = delegated_place();
-        let helper = system(&[], &[], &counted, cwd, None, &delegated, &|_| false);
-        let section =
-            "`help()` prints the rest.\n\n## Built-in\n\n```python\n\n```\n\n# Memories\n\n\
-                       This project has 1 memory of its own, not listed here; \
-                       before you start a task, `recall()` its key words.\n\n# Environment\n\n";
-        assert!(helper.contains(section), "{helper}");
-        assert!(!helper.contains("remember("), "{helper}");
-    }
-
-    /// Agents that agent() starts are told too, since their answers can reach the user
-    #[test]
-    fn images_shown() {
-        let cwd = Path::new("/home/zoë/work");
-        let main = main_place();
-        let empty = Brief::default();
-        let plain = system(&[], &[], &empty, cwd, None, &main, &|_| false);
-        assert!(!plain.contains("![alt]"), "{plain}");
-
-        let brief = Brief {
-            images_shown: true,
-            ..Brief::default()
-        };
-        let text = system(&[], &[], &brief, cwd, None, &main, &|_| false);
-        let shown = "in Markdown, and ends the task. \
-                     It goes to the user, and no hidden tests or graders check it.\n\
-                     - A message starting with `[Task update]` is from the user, belongs to the current task \
-                     and may add to or change it.\n\n\
-                     To show the user an image, such as a chart you saved, put `![alt](path)` on a line of its own.\n\n\
-                     # Rules";
-        assert!(text.contains(shown), "{text}");
-
-        let delegated = delegated_place();
-        let helper = system(&[], &[], &brief, cwd, None, &delegated, &|_| false);
-        let shown = "your answer and ends the task.\n\
-                     - Only your answer is returned to the agent that assigned this task, \
-                     so include everything the task asks for. No hidden tests or graders check it.\n\
-                     - Report what you find, and change files only when the task asks you to.\n\
-                     - A message starting with `[Task update]` is from the agent that assigned your task, \
-                     belongs to the current task and may add to or change it.\n\n\
-                     To show the user an image, such as a chart you saved, put `![alt](path)` on a line of its own.\n\n\
-                     # Rules";
-        assert!(helper.contains(shown), "{helper}");
-    }
-
-    #[test]
-    fn view_adapted() {
-        let view = Function {
-            name: "view".to_owned(),
-            header: "view(path) -> None".to_owned(),
-            summary: "Adds the café photo.".to_owned(),
-        };
-        let functions = [view];
-        let cwd = Path::new("/home/zoë/work");
-        let empty = Brief::default();
-        let delegated = delegated_place();
-
-        let images = |kind: MediaKind| kind == MediaKind::Image;
-        let shown = system(&functions, &[], &empty, cwd, None, &delegated, &images);
-        let stub = "\nview(path) -> None\n    # Shows you an image file by adding it to this call's result.\n```";
-        assert!(shown.contains(stub), "{shown}");
-
-        let hidden = system(&functions, &[], &empty, cwd, None, &delegated, &|_| false);
-        assert!(!hidden.contains("view(path)"), "{hidden}");
     }
 
     /// Checks the layout every combination of the optional parts renders to
@@ -1302,7 +1040,6 @@ mod tests {
             let text = system(&functions, servers, brief, cwd, writable, place, &takes);
 
             assert!(!text.contains("\n\n\n"), "{text}");
-            assert!(text.ends_with(" (UTC)."), "{text}");
             assert_eq!(text.matches("```").count() % 2, 0, "{text}");
             let lines: Vec<&str> = text.lines().collect();
             let mut seen = Vec::new();
@@ -1330,11 +1067,6 @@ mod tests {
             let registered = writable == Some(&registry[..]);
             assert_eq!(text.contains("\n# Memories\n"), remembered, "{text}");
             assert_eq!(text.contains("\n# Sub-agents\n"), main, "{text}");
-            let updated = match main {
-                true => "`[Task update]` is from the user,",
-                false => "`[Task update]` is from the agent that assigned your task,",
-            };
-            assert!(text.contains(updated), "{text}");
             assert_eq!(text.contains(HANDED_BACK), !main, "{text}");
             assert_eq!(text.contains(TRUSTING), main, "{text}");
             assert_eq!(
@@ -1344,141 +1076,7 @@ mod tests {
             );
             assert_eq!(text.contains("\nview(path)"), image || video, "{text}");
             assert_eq!(text.contains(SHOWN_IMAGES), brief.images_shown, "{text}");
-            let resumed = text.contains("even if you have already answered.");
-            assert_eq!(resumed, main && brief.background, "{text}");
-            let waits = text.contains("with the user's next message if you have already answered.");
-            assert_eq!(waits, main && !brief.background, "{text}");
-            assert_eq!(text.contains("\n- Sandbox: "), writable.is_some(), "{text}");
             assert_eq!(text.contains("/.cargo/registry`"), registered, "{text}");
         }
-    }
-
-    /// The model cannot tell from the record how far it got before the interrupt
-    #[test]
-    fn interrupt_explained() {
-        let stopped = |text: &str, calls: Vec<Call>| AgentStep {
-            text: text.to_owned(),
-            calls,
-            error: Some(StepError::Interrupted),
-            ..AgentStep::default()
-        };
-        let interrupted = "[The user interrupted you]";
-        assert_eq!(
-            step_error(&stopped("", Vec::new())).as_deref(),
-            Some(interrupted)
-        );
-        let prose = stopped("Roses are red", Vec::new());
-        assert_eq!(step_error(&prose).as_deref(), Some(interrupted));
-        let plain = "[interrupted by the user]";
-
-        let written = Call {
-            code: "open('half.txt', 'w')".to_owned(),
-            ..Call::default()
-        };
-        let ran = Call {
-            result: Some(CodeResult::default()),
-            error: Some(CallError::Interrupted),
-            ..written.clone()
-        };
-        let step = stopped("First, a note.", vec![ran.clone(), written.clone()]);
-        assert_eq!(call_error(&step, &ran).as_deref(), Some(plain));
-        let unrun = call_error(&step, &written);
-        let expected = "[not run: interrupted by the user]";
-        assert_eq!(unrun.as_deref(), Some(expected));
-
-        let failed = AgentStep {
-            error: None,
-            ..step
-        };
-        let skipped = call_error(&failed, &written);
-        let expected = "[not run: an earlier call failed]";
-        assert_eq!(skipped.as_deref(), Some(expected));
-
-        // Summaries see the bare reasons
-        let step = MemoryStep::Action(Box::new(stopped("", Vec::new())));
-        let text = transcript(&[&step], usize::MAX);
-        assert_eq!(text, "[Error]\nThe user interrupted you");
-        let step = MemoryStep::Action(Box::new(failed));
-        let text = transcript(&[&step], usize::MAX);
-        let expected = "[Agent]\nFirst, a note.\n\n\
-                        [Code]\nopen('half.txt', 'w')\n\n[Error]\ninterrupted by the user\n\n\
-                        [Code]\nopen('half.txt', 'w')\n\n[Error]\nnot run: an earlier call failed";
-        assert_eq!(text, expected);
-    }
-
-    #[test]
-    fn shell_described() {
-        let ran = |output: &str, end: Exit| ShellStep {
-            command: "grep order log.txt".to_owned(),
-            shell: "fish".to_owned(),
-            output: output.to_owned(),
-            end,
-        };
-        let head = "[The user ran this fish command]\n$ grep order log.txt\n";
-
-        let found = shell(&ran("order 1\norder 2\n", Exit::Exited(0)));
-        let expected = format!("{head}order 1\norder 2\n[exited with code 0]");
-        assert_eq!(found, expected);
-        let none = shell(&ran("", Exit::Exited(1)));
-        assert_eq!(none, format!("{head}[no output]\n[exited with code 1]"));
-        let killed = shell(&ran("", Exit::Signaled(9)));
-        assert_eq!(killed, format!("{head}[no output]\n[ended with signal 9]"));
-        #[cfg(windows)]
-        {
-            let crashed = shell(&ran("", Exit::Exited(0xC0000005_u32 as i32)));
-            assert_eq!(
-                crashed,
-                format!("{head}[no output]\n[exited with code 0xC0000005]")
-            );
-        }
-        let stopped = shell(&ran("", Exit::Interrupted));
-        let expected = format!("{head}[no output]\n[interrupted by the user]");
-        assert_eq!(stopped, expected);
-        let missing = shell(&ran("", Exit::Unstarted("fish not found".to_owned())));
-        assert_eq!(missing, format!("{head}[did not start: fish not found]"));
-
-        // Summaries see the command without the lead line or brackets
-        let step = MemoryStep::Shell(ran("", Exit::Exited(1)));
-        let text = transcript(&[&step], usize::MAX);
-        assert_eq!(text, "[Shell]\n$ grep order log.txt\nexited with code 1");
-        let step = MemoryStep::Shell(ran("order 1\n", Exit::Signaled(9)));
-        let text = transcript(&[&step], usize::MAX);
-        assert_eq!(
-            text,
-            "[Shell]\n$ grep order log.txt\norder 1\nended with signal 9"
-        );
-    }
-
-    #[test]
-    fn called_media() {
-        let called = Media {
-            from_call: true,
-            ..png("a.png")
-        };
-        let tag = media_tag("screen.grab", &called);
-        assert_eq!(tag, "<image from=\"screen.grab\"/>");
-        let note = unseen("screen.grab", &called);
-        let expected = "[image from screen.grab: not shown, the model takes no images]";
-        assert_eq!(note, expected);
-
-        let result = CodeResult {
-            printed: Some("Captured".to_owned()),
-            media: vec![("screen.grab".to_owned(), called)],
-            ..CodeResult::default()
-        };
-        let call = Call {
-            code: "screen.grab()".to_owned(),
-            result: Some(result),
-            ..Call::default()
-        };
-        let step = AgentStep {
-            calls: vec![call],
-            ..AgentStep::default()
-        };
-        let step = MemoryStep::Action(Box::new(step));
-        let transcript = transcript(&[&step], 100);
-        let observed =
-            "[Code]\nscreen.grab()\n\n[Observation]\nCaptured\n<image from=\"screen.grab\"/>";
-        assert_eq!(transcript, observed);
     }
 }

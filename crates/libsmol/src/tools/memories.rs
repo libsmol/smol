@@ -366,59 +366,17 @@ fn parts(text: &str) -> Vec<(bool, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use crate::prompt::{self, EMPTY_MEMORY, NESTED, NO_MEMORY};
+    use crate::prompt::NO_MEMORY;
     use crate::tests::temp_dir;
-    use crate::tools::memories::{matched, terms, Digest, Memories};
+    use crate::tools::memories::Memories;
     use crate::utils::block_on;
     use crate::worker::MemoryCall;
-    use reaper::tilde;
-    use reaper::wire::Memory;
-    use serde_json::json;
     use std::fs;
     use std::path::Path;
 
     fn opened(config: &Path, cwd: &str) -> Memories {
         fs::create_dir_all(config).expect("config");
         Memories::new(config, Path::new(cwd))
-    }
-
-    fn memory(id: i64, text: &str, project: bool) -> Memory {
-        Memory {
-            id,
-            text: text.to_owned(),
-            project,
-        }
-    }
-
-    fn words(text: &str) -> Vec<String> {
-        let cut = terms(text);
-        cut.split_whitespace().map(str::to_owned).collect()
-    }
-
-    #[test]
-    fn chinese_cut() {
-        let cut = words("中华人民共和国成立了");
-        for word in ["中华", "人民", "共和国", "中华人民共和国"] {
-            assert!(cut.contains(&word.to_owned()), "{cut:?}");
-        }
-        assert_eq!(words("用pnpm安装依赖"), ["用", "pnpm", "安装", "依赖"]);
-        assert_eq!(
-            terms("The café: nautilus_trader"),
-            "The café: nautilus_trader"
-        );
-    }
-
-    #[test]
-    fn query_quoted() {
-        assert_eq!(matched("安装 pnpm"), "\"安装\" OR \"pnpm\"");
-        assert_eq!(matched("中华人民共和国"), "\"中华人民共和国\"");
-        let syntax = "\"say\" OR \"\"\"hi\"\"\" OR \"AND\" OR \"NEAR(a\"";
-        assert_eq!(matched("say \"hi\" AND * NEAR(a"), syntax);
-        assert_eq!(matched("。！ ? "), "");
-        let controls = "\"café\" OR \"naïve\" OR \"résumé\"";
-        assert_eq!(matched("café\0naïve\u{1b}résumé"), controls);
-        let pieces = "(\"第\" AND \"4\" AND \"章\") OR (\"llama.cpp\" AND \"依赖\")";
-        assert_eq!(matched("第4章 llama.cpp依赖"), pieces);
     }
 
     #[test]
@@ -463,36 +421,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn newest_fallback() {
-        let dir = temp_dir("fallback");
-        let here = opened(&dir, "/home/zoë/café");
-        let saving = async {
-            let mut ids = Vec::new();
-            for index in 0..12 {
-                let text = match index {
-                    0 => "The résumé template lives in docs".to_owned(),
-                    _ => format!("Naïve note {index}"),
-                };
-                let id = here.remember(&text, true).await.expect("remember");
-                ids.push(id);
-            }
-            ids
-        };
-        let ids = block_on(saving);
-
-        let found = |query: &str| {
-            let recalling = here.recall(query);
-            let recalled = block_on(recalling).expect("recall");
-            recalled.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
-        };
-
-        let newest: Vec<i64> = ids.iter().rev().take(10).copied().collect();
-        assert_eq!(found("unknown words"), newest);
-        assert_eq!(found("résumé"), [ids[0]]);
-        fs::remove_dir_all(&dir).ok();
-    }
-
     /// Characters of a word jieba doesn't know don't match on their own
     #[test]
     fn words_whole() {
@@ -519,41 +447,6 @@ mod tests {
         assert_eq!(both.len(), 2, "{both:?}");
         assert!(both.contains(&ids[0]) && both.contains(&ids[2]), "{both:?}");
         fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn digest_counted() {
-        let dir = temp_dir("digest");
-        let here = opened(&dir, "/home/zoë/café");
-        let elsewhere = opened(&dir, "/home/zoë/naïve");
-        let saving = async {
-            let empty = here.digest().await.expect("digest");
-            let first = here.remember("Prefers résumé over CV", false).await;
-            let second = elsewhere.remember("Replies in French", false).await;
-            here.remember("Tests run with pytest", true).await.ok();
-            elsewhere.remember("Builds with make", true).await.ok();
-            let digest = here.digest().await.expect("digest");
-            (
-                empty,
-                first.expect("remember"),
-                second.expect("remember"),
-                digest,
-            )
-        };
-        let (empty, first, second, digest) = block_on(saving);
-        fs::remove_dir_all(&dir).ok();
-
-        assert_eq!(empty, Digest::default());
-        let newest = vec![
-            memory(second, "Replies in French", false),
-            memory(first, "Prefers résumé over CV", false),
-        ];
-        let expected = Digest {
-            newest,
-            global: 2,
-            here: 1,
-        };
-        assert_eq!(digest, expected);
     }
 
     #[test]
@@ -590,59 +483,6 @@ mod tests {
         assert_eq!(searched, []);
     }
 
-    #[test]
-    fn listed_scoped() {
-        let dir = temp_dir("listed");
-        let here = opened(&dir, "/home/zoë/café");
-        let there = opened(&dir, "/home/zoë/naïve");
-        let saving = async {
-            let shared = here.remember("Prefers résumé over CV", false).await;
-            let own = here.remember("Tests run with pytest", true).await;
-            there.remember("Builds with make", true).await.ok();
-            let newer = there.remember("Replies in French", false).await;
-            let listed = here.listed().await.expect("listed");
-            (
-                shared.expect("remember"),
-                own.expect("remember"),
-                newer.expect("remember"),
-                listed,
-            )
-        };
-        let (shared, own, newer, listed) = block_on(saving);
-        fs::remove_dir_all(&dir).ok();
-
-        let expected = [
-            memory(own, "Tests run with pytest", true),
-            memory(newer, "Replies in French", false),
-            memory(shared, "Prefers résumé over CV", false),
-        ];
-        assert_eq!(listed, expected);
-    }
-
-    #[test]
-    fn same_text_once() {
-        let dir = temp_dir("same-text");
-        let here = opened(&dir, "/home/zoë/café");
-        let there = opened(&dir, "/home/zoë/naïve");
-        let saving = async {
-            let text = "Prefers résumé over CV";
-            let first = here.remember(text, true).await.expect("remember");
-            let again = here.remember("  Prefers résumé over CV\n", true).await;
-            let global = here.remember(text, false).await.expect("remember");
-            let theirs = there.remember(text, true).await.expect("remember");
-            let found = here.recall("").await.expect("recall");
-            (first, again.expect("remember"), global, theirs, found)
-        };
-        let (first, again, global, theirs, found) = block_on(saving);
-        fs::remove_dir_all(&dir).ok();
-
-        assert_eq!(again, first);
-        assert_ne!(global, first);
-        assert_ne!(theirs, first);
-        assert_ne!(theirs, global);
-        assert_eq!(found.len(), 2, "{found:?}");
-    }
-
     /// An id the code still holds never names a memory saved later
     #[test]
     fn ids_never_reused() {
@@ -658,70 +498,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert!(second > first, "{first} {second}");
-    }
-
-    #[test]
-    fn read_only_recalls() {
-        let dir = temp_dir("read-only");
-        let here = opened(&dir, "/home/zoë/café");
-        let answering = async {
-            let remember = MemoryCall::Remember {
-                text: "Prefers naïve tests".to_owned(),
-                project: true,
-            };
-            let saved = here.answer(remember, true).await.expect("remember");
-            let forget = MemoryCall::Forget { id: 1 };
-            let refused = here.answer(forget, false).await;
-            let recall = MemoryCall::Recall {
-                query: String::new(),
-            };
-            let found = here.answer(recall, false).await;
-            (saved, refused, found)
-        };
-        let (saved, refused, found) = block_on(answering);
-        fs::remove_dir_all(&dir).ok();
-
-        assert_eq!(refused, Err(NESTED.to_owned()));
-        assert_eq!(found, Ok(json!([[saved, "Prefers naïve tests"]])));
-    }
-
-    #[test]
-    fn remember_checked() {
-        let dir = temp_dir("checked");
-        let here = opened(&dir, "/home/zoë/café");
-        let longest = "é".repeat(150);
-        let longer = "é".repeat(151);
-        let checking = async {
-            let blank = here.remember(" \n ", true).await;
-            let kept = here.remember(&longest, true).await;
-            let refused = here.remember(&longer, true).await;
-            (blank, kept, refused)
-        };
-        let (blank, kept, refused) = block_on(checking);
-        fs::remove_dir_all(&dir).ok();
-
-        assert_eq!(blank, Err(EMPTY_MEMORY.to_owned()));
-        assert!(kept.is_ok(), "{kept:?}");
-        assert_eq!(refused, Err(prompt::long_memory(151)));
-    }
-
-    #[test]
-    fn open_failure() {
-        let dir = temp_dir("unopened");
-        let db = dir.join("memory.db");
-        fs::create_dir_all(&db).expect("dir");
-        let here = opened(&dir, "/home/zoë/café");
-        let recall = MemoryCall::Recall {
-            query: "café".to_owned(),
-        };
-        let answering = here.answer(recall, true);
-        let failed = block_on(answering);
-        fs::remove_dir_all(&dir).ok();
-
-        let failed = failed.expect_err("opened");
-        let shown = tilde(&db);
-        let expected = format!("{shown}: unable to open database file");
-        assert!(failed.starts_with(&expected), "{failed}");
     }
 
     /// Sessions of several libsmol write the same database at once

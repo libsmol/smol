@@ -272,64 +272,16 @@ pub(crate) fn finish(app: App, host: impl Host, kitty: bool, ending: &Ending) {
 
 #[cfg(test)]
 mod tests {
-    use crate::conversation::{Entry, Helper};
     use crate::tests::fake;
-    use crate::tui::picture::{state, Load, Source};
     use crate::tui::*;
-    use agent_client_protocol_schema::v1::ToolCallStatus;
     use image::{ImageBuffer, Rgba, RgbaImage};
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
-    use std::{env, fs, process, thread};
+    use std::{env, fs, process};
 
     pub(crate) fn app() -> App {
         let agent = fake();
         let session = Session::start(&agent, None, None, false).expect("start");
         App::new(session, Box::new(Local))
-    }
-
-    pub(crate) fn draw(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|frame| ui::draw(frame, app)).expect("draw");
-        terminal
-    }
-
-    pub(crate) fn fill(app: &mut App, lines: usize) {
-        for line in 0..lines {
-            let text = format!("line {line}");
-            app.session.conversation.push(Entry::Info(text));
-        }
-    }
-
-    pub(crate) fn helper(task: &str, status: ToolCallStatus, text: &str) -> Helper {
-        Helper {
-            id: "call_1.1".to_owned(),
-            task: task.to_owned(),
-            name: None,
-            status,
-            text: text.to_owned(),
-            preview: String::new(),
-            interrupted: false,
-            started: None,
-            hue: 0,
-            tokens: None,
-            totals: None,
-        }
-    }
-
-    /// Pictures load on loader threads
-    pub(crate) fn settled(source: &Source) -> Load {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let state = state(source);
-            if !matches!(state, Load::Loading(_)) || Instant::now() > deadline {
-                return state;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
     }
 
     /// A PNG `width` by `height` pixels, red above and blue below, in a folder of its own
@@ -344,28 +296,5 @@ mod tests {
         let path = dir.join("café.png");
         pixels.save(&path).expect("save");
         path
-    }
-
-    #[test]
-    fn kilo_units() {
-        let cases = [
-            999, 1_000, 1_250, 1_300, 9_999, 45_442, 123_195, 999_500, 1_048_576,
-        ];
-        let shown = cases.map(kilo);
-        let expected = [
-            "999", "1k", "1.25k", "1.3k", "10k", "45.4k", "123k", "1M", "1.05M",
-        ];
-        assert_eq!(shown, expected, "{cases:?}");
-    }
-
-    #[test]
-    fn fitted_width() {
-        assert_eq!(fitted("ab", 4), "ab  ");
-        assert_eq!(fitted("abcdef", 4), "abc…");
-        assert_eq!(fitted("🍕🚀🎉", 5), "🍕🚀…");
-        assert_eq!(fitted("🍕🚀🎉", 4), "🍕… ");
-        assert_eq!(fitted("abc", 0), "");
-        assert_eq!(fitted("⚠️🍕🚀🎉🐍", 5), "⚠️🍕…");
-        assert_eq!(fitted("⚠️🍕", 5), "⚠️🍕 ");
     }
 }

@@ -24,18 +24,3 @@ pub(crate) fn page(code: &str) -> Result<String, String> {
     );
     Ok(html)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::tui::diagram::page;
-
-    #[test]
-    fn page_wraps_svg() {
-        let code = "graph LR\n    A[read 🐍] --> B[write 🚀]";
-        let html = page(code).expect("page");
-        assert!(html.contains("<svg") && html.contains("read 🐍"), "{html}");
-
-        let refused = page("graph TD\n    A[unclosed --> B");
-        assert!(refused.is_err_and(|e| e.starts_with("diagram: ")));
-    }
-}

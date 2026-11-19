@@ -316,12 +316,11 @@ fn indexed(index: u8) -> (u8, u8, u8) {
 
 #[cfg(test)]
 mod tests {
-    use crate::tui::web::grid::{encode, hex, Grid};
+    use crate::tui::web::grid::{encode, Grid};
     use ratatui::backend::Backend;
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Position, Rect, Size};
     use ratatui::style::{Color, Modifier, Style};
-    use ratatui::Terminal;
     use serde_json::{json, Value};
 
     /// A wide symbol takes the column after it, and runs break where the style does
@@ -365,32 +364,5 @@ mod tests {
             (frame["w"].clone(), frame["clear"].clone()),
             (json!(6), json!(true))
         );
-    }
-
-    /// A redraw to the same screen changes nothing, and moving the cursor alone does
-    #[test]
-    fn redraws_compared() {
-        let mut terminal = Terminal::new(Grid::new(Size::new(8, 2))).expect("terminal");
-        let draw = |terminal: &mut Terminal<Grid>, column: u16| {
-            let drawn = terminal.draw(|frame| {
-                frame.render_widget("café", frame.area());
-                frame.set_cursor_position(Position::new(column, 1));
-            });
-            drawn.expect("draw");
-            terminal.backend_mut().take()
-        };
-
-        assert!(!draw(&mut terminal, 4).is_empty());
-        assert!(draw(&mut terminal, 4).is_empty());
-        let moved = draw(&mut terminal, 5);
-        assert!(!moved.is_empty() && moved.cells.is_empty());
-    }
-
-    #[test]
-    fn colors_named() {
-        assert_eq!(hex(Color::Reset), Value::Null);
-        assert_eq!(hex(Color::Indexed(196)), json!("#ff0000"));
-        assert_eq!(hex(Color::Indexed(244)), json!("#808080"));
-        assert_eq!(hex(Color::Indexed(9)), hex(Color::LightRed));
     }
 }

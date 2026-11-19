@@ -60,9 +60,10 @@ A Rust workspace (edition 2021) whose code from the model runs in a pinned CPyth
 
 ## Tests
 
+- Write a test only where losing it could let a real bug ship unnoticed: a platform or runtime pitfall (those under Lessons learned), a disk or wire format, a rule of the agent loop, or the sandbox. Test behavior, not wording: never pin the text of prompts, errors, notices or the TUI, and compare text the model sees with what `prompt.rs` builds. The TUI is checked with tmux screenshots and prompts with real models, not with tests.
 - Tests always live in `#[cfg(test)] mod tests` inside the source file, never in a separate tests.rs. Shared helpers go in the parent module's `mod tests` as `pub(crate)`. Python helper scripts are the exception.
 - Test names have at most 3 words. Assert messages print only values (`"{logs}"`), never sentences, and `expect` texts are short ("evaluate", "error").
-- Test data is English. Bugs that use byte indices as character counts only show up with multibyte text, so data that goes through text handling includes accented words (café, naïve, résumé) and, where display width matters, emoji (🐍). The only Chinese in the repository is the full-width punctuation the code recognizes in model replies (such as '。' and '：') and the tests of that handling, and the text in the tests of how memories cut Chinese into words.
+- Test data is English. Bugs that use byte indices as character counts only show up with multibyte text, so data that goes through text handling includes accented words (café, naïve, résumé) and, where display width matters, emoji (🐍). The only Chinese in the repository is the full-width punctuation the code recognizes in model replies (such as '。' and '：'), and the text in the tests of how memories cut Chinese into words.
 - Tests start real workers: the worker and python are the test binary itself, which a constructor in `lib.rs` turns into either when started as one, so worker-side code is built with `cfg(test)` too, and one venv in `target/<profile>/.venv` serves them all. Programs tests start outside the sandbox, such as the fake MCP server, run on `interpreter()`, a link named `python3` to the test binary, so tests need no Python of the machine's.
 
 ## Text for the model (prompts, builtin docs, errors)

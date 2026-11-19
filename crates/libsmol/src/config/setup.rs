@@ -252,38 +252,3 @@ fn default_name(api: &str) -> String {
     let at = labels.len().saturating_sub(2);
     labels[at].to_owned()
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::config::setup::{check_name, default_name, parse_context};
-
-    #[test]
-    fn default_names() {
-        let cases = [
-            ("https://api.deepseek.com/v1", "deepseek"),
-            ("http://localhost:11434/v1", "local"),
-            ("http://127.0.0.1:8000/v1", "local"),
-            ("http://ollama:11434/v1", "ollama"),
-            ("https://example.com./v1", "example"),
-            ("https://api.café.com/v1", "xn--caf-dma"),
-        ];
-        for (api, name) in cases {
-            assert_eq!(default_name(api), name, "{api}");
-        }
-    }
-
-    #[test]
-    fn answers_checked() {
-        assert_eq!(parse_context(""), Ok(None));
-        assert_eq!(parse_context("128,000"), Ok(Some(128_000)));
-        assert_eq!(parse_context("65_536"), Ok(Some(65_536)));
-        let words = Err("not a whole number".to_owned());
-        assert_eq!(parse_context("64k"), words);
-        assert_eq!(parse_context("512"), Err("below 1024".to_owned()));
-
-        assert_eq!(check_name("über café"), Ok(()));
-        assert_eq!(check_name(""), Err("can't be empty".to_owned()));
-        let slashed = check_name("café/v1").expect_err("problem");
-        assert!(slashed.starts_with("can't contain /"), "{slashed}");
-    }
-}

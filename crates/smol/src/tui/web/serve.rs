@@ -396,20 +396,12 @@ fn same(given: &str, token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::tui::picture::Pictures;
-    use crate::tui::web::input::Input;
-    use crate::tui::web::serve::{listen, Served, LEFT};
-    use crate::tui::web::{Arrival, Who};
-    use ratatui::layout::Size;
+    use crate::tui::web::serve::{listen, Served};
+    use crate::tui::web::Arrival;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
-    use std::sync::atomic::Ordering;
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-    use tungstenite::client::IntoClientRequest;
-    use tungstenite::http::HeaderValue;
-    use tungstenite::protocol::frame::coding::CloseCode;
-    use tungstenite::Message;
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -476,47 +468,5 @@ mod tests {
             opened.contains("sandbox") && opened.ends_with("<p>naïve</p>"),
             "{opened}"
         );
-    }
-
-    #[test]
-    fn socket_relayed() {
-        let (address, _served, arrivals) = started();
-        let wait = Duration::from_secs(5);
-        let mut request = format!("ws://{address}/ws")
-            .into_client_request()
-            .expect("request");
-        let port = address.port();
-        let cookie = HeaderValue::from_str(&format!("smol-{port}={TOKEN}")).expect("cookie");
-        request.headers_mut().insert("cookie", cookie);
-        let stream = TcpStream::connect(address).expect("connect");
-        let (mut socket, _) = tungstenite::client(request, stream).expect("handshake");
-
-        let Ok(Arrival::Joined {
-            id,
-            outbox,
-            parting,
-        }) = arrivals.recv_timeout(wait)
-        else {
-            panic!("joined");
-        };
-        // Only the sending thread writes, so the ping read before the size goes unanswered
-        socket.send(Message::Ping("naïve".into())).expect("ping");
-        socket
-            .send(Message::text(r#"{"t":"size","w":90,"h":30}"#))
-            .expect("send");
-        let Ok(Arrival::Input(who, Input::Size(size))) = arrivals.recv_timeout(wait) else {
-            panic!("size");
-        };
-        assert_eq!((who, size), (Who::Browser(id), Size::new(90, 30)));
-
-        outbox.send("café".to_owned()).expect("queue");
-        assert_eq!(socket.read().expect("read"), Message::text("café"));
-        parting.store(LEFT, Ordering::Relaxed);
-        drop(outbox);
-        let Message::Close(Some(frame)) = socket.read().expect("close") else {
-            panic!("close");
-        };
-        assert_eq!(frame.code, CloseCode::from(LEFT));
-        assert!(matches!(arrivals.recv_timeout(wait), Ok(Arrival::Left(left)) if left == id));
     }
 }

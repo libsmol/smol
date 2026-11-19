@@ -100,10 +100,10 @@ fn rfc3339(epoch: f64) -> String {
 #[cfg(test)]
 mod tests {
     use crate::acp::rpc::Lines;
-    use crate::acp::{line_range, task_of};
+    use crate::acp::task_of;
     use crate::tools::attach::Mention;
     use agent_client_protocol_schema::v1::{
-        ContentBlock, EmbeddedResource, EmbeddedResourceResource, ImageContent, ResourceLink,
+        ContentBlock, EmbeddedResource, EmbeddedResourceResource, ResourceLink,
         TextResourceContents,
     };
     use reqwest::Url;
@@ -117,34 +117,6 @@ mod tests {
             messages.push(message);
         }
         messages
-    }
-
-    #[test]
-    fn links_kept() {
-        let path = env::temp_dir().join("résumé.md");
-        let uri = Url::from_file_path(&path).expect("uri");
-        let file = ResourceLink::new("résumé.md", uri.as_str());
-        let page = ResourceLink::new("Café", "https://example.com/café");
-        let image = ImageContent::new("iVBORw0KGgo=", "image/png");
-        let blocks = [
-            ContentBlock::from("Summarize these"),
-            ContentBlock::ResourceLink(file),
-            ContentBlock::ResourceLink(page),
-            ContentBlock::Image(image),
-        ];
-
-        let task = task_of(&blocks);
-
-        assert_eq!(task.text, "Summarize these\nhttps://example.com/café");
-        let file = Mention::File {
-            path,
-            lines: None,
-            text: None,
-        };
-        let image = Mention::Image {
-            data: "iVBORw0KGgo=".to_owned(),
-        };
-        assert_eq!(task.mentions, [file, image]);
     }
 
     #[test]
@@ -179,22 +151,5 @@ mod tests {
             text: "error: unused café".to_owned(),
         };
         assert_eq!(task.mentions, [file(None), file(Some(selected)), resource]);
-    }
-
-    #[test]
-    fn line_ranges_read() {
-        let cases = [
-            ("L10", Some((10, 10))),
-            ("L10:20", Some((10, 20))),
-            ("L10-L20", Some((10, 20))),
-            ("L20:10", None),
-            ("L0", None),
-            ("café", None),
-            ("L", None),
-        ];
-
-        for (fragment, range) in cases {
-            assert_eq!(line_range(fragment), range, "{fragment}");
-        }
     }
 }

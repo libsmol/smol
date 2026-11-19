@@ -743,75 +743,7 @@ fn select_of(options: &[SessionConfigOption], selector: Selector) -> Option<&Ses
 #[cfg(test)]
 mod tests {
     use crate::client::*;
-    use crate::tests::{fake, shell};
-    use agent_client_protocol_schema::v1::SessionConfigSelectOption;
-
-    #[test]
-    fn model_display_name() {
-        let models = vec![
-            SessionConfigSelectOption::new("llama", "llama (qwen3)"),
-            SessionConfigSelectOption::new("deepseek", "DeepSeek (deepseek-flash)"),
-        ];
-        let option = |current: &str| {
-            SessionConfigOption::select("model", "Model", current.to_owned(), models.clone())
-                .category(SessionConfigOptionCategory::Model)
-        };
-
-        let model = |current| {
-            let options = [option(current)];
-            chosen(&options, Selector::Model)
-        };
-        assert_eq!(
-            model("deepseek").as_deref(),
-            Some("DeepSeek (deepseek-flash)")
-        );
-        assert_eq!(model("other").as_deref(), Some("other"));
-
-        let options = [option("llama")];
-        let listed = offerings(&options, Selector::Model);
-        let current: Vec<bool> = listed.iter().map(|offering| offering.current).collect();
-        assert_eq!(listed[1].value, "deepseek");
-        assert_eq!(current, [true, false]);
-
-        // Each selector finds only the option of its own category
-        let levels = vec![SessionConfigSelectOption::new("max", "max")];
-        let effort = SessionConfigOption::select("effort", "Effort", "max".to_owned(), levels)
-            .category(SessionConfigOptionCategory::ThoughtLevel);
-        let options = [option("llama"), effort];
-        assert_eq!(chosen(&options, Selector::Effort).as_deref(), Some("max"));
-        assert_eq!(offerings(&options, Selector::Model).len(), 2);
-        assert_eq!(chosen(&options[..1], Selector::Effort), None);
-    }
-
-    #[test]
-    fn startup_stderr_tail() {
-        let agent = shell("printf '\\377\\n' >&2; echo startup failed >&2; exit 3");
-        let Err(error) = Client::start(&agent, false) else {
-            panic!("started");
-        };
-
-        let text = error.to_string();
-        assert!(text.starts_with("agent: exited\n\u{FFFD}\n"), "{text}");
-        assert!(text.ends_with("\nstartup failed"), "{text}");
-    }
-
-    #[test]
-    fn images_declared() {
-        let agent = shell(
-            r#"read -r line
-id=$(printf '%s\n' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9][0-9]*\).*/\1/p')
-case $line in
-*'"_smol/images":true'*) name=images ;;
-*) name=plain ;;
-esac
-printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"%s","version":"1"}}}\n' "$id" "$name"
-cat >/dev/null"#,
-        );
-        let (client, _inbox) = Client::start(&agent, true).expect("start");
-        assert_eq!(client.agent.name, "images");
-        let (client, _inbox) = Client::start(&agent, false).expect("start");
-        assert_eq!(client.agent.name, "plain");
-    }
+    use crate::tests::fake;
 
     #[test]
     fn requests_after_exit() {

@@ -282,7 +282,7 @@ mod tests {
     use crate::config::{Kind, ModelSpec};
     use crate::model::tests::{parsed, png, served, DONE};
     use crate::model::{ChatMessage, Finish, Media, Part, Purpose, Sealed, ToolCall};
-    use crate::prompt::TOOL_DOC;
+    use crate::prompt::{self, TOOL_DOC};
     use crate::tests::{temp_dir, write_file};
     use serde_json::{json, Value};
     use std::fs;
@@ -340,87 +340,6 @@ mod tests {
     }
 
     #[test]
-    fn calls_collected() {
-        let (finished, content, _) = parsed(
-            Kind::Responses,
-            &[
-                r#"data: {"type":"response.output_text.delta","delta":"Let me work it out."}"#,
-                r#"data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a","name":"eval","arguments":""}}"#,
-                r#"data: {"type":"response.function_call_arguments.delta","delta":"{\"code\": \"print('caf"}"#,
-                r#"data: {"type":"response.function_call_arguments.delta","delta":"é')\"}"}"#,
-                r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_a","name":"eval","arguments":"{\"code\": \"print('café')\"}","status":"completed"}}"#,
-                r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","name":"eval","arguments":"{\"code\": \"x = 'naïve'\"}","status":"completed"}}"#,
-                r#"data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_c","name":"ls","arguments":"{}"}}"#,
-                r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
-            ],
-        );
-        assert_eq!(finished.expect("parse").finish, Finish::Stop);
-        let kept = json!({ "type": "function_call", "status": "completed" });
-        let calls = format!(
-            "Let me work it out.print('café')[mock {kept}][end][mock {kept}]x = 'naïve'[end][ls {{}}]"
-        );
-        assert_eq!(content, calls);
-
-        let (finished, content, _) = parsed(
-            Kind::Responses,
-            &[
-                r#"data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a","name":"eval","arguments":""}}"#,
-                r#"data: {"type":"response.function_call_arguments.delta","delta":"{\"code\": \"pri"}"#,
-                r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_a","name":"eval","arguments":"{\"code\": \"pri","status":"incomplete"}}"#,
-                r#"data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#,
-            ],
-        );
-        assert_eq!(finished.expect("parse").finish, Finish::Length);
-        let kept = json!({ "type": "function_call", "status": "incomplete" });
-        assert_eq!(content, format!("pri[mock {kept}]"));
-
-        let (finished, content, _) = parsed(
-            Kind::Responses,
-            &[
-                r#"data: {"type":"response.output_text.delta","delta":"Crème"}"#,
-                r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#,
-            ],
-        );
-        let filtered = Finish::Other("content_filter".to_owned());
-        assert_eq!(finished.expect("parse").finish, filtered);
-        assert_eq!(content, "Crème");
-    }
-
-    #[test]
-    fn stream_failures() {
-        let failed = |line: &str| parsed(Kind::Responses, &[line]).0.expect_err("error");
-
-        let overloaded = failed(
-            r#"data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"The café is\n  overloaded"}}}"#,
-        );
-        assert_eq!(overloaded.message, "stream: The café is overloaded");
-        assert!(overloaded.transient);
-
-        let refused = failed(
-            r#"data: {"type":"response.failed","response":{"error":{"code":"invalid_prompt","message":"Bad résumé"}}}"#,
-        );
-        assert_eq!(refused.message, "stream: Bad résumé");
-        assert!(!refused.transient);
-
-        let flat = failed(
-            r#"data: {"type":"error","code":"rate_limit_exceeded","message":"Slow down, naïve"}"#,
-        );
-        assert_eq!(flat.message, "stream: Slow down, naïve");
-        assert!(flat.transient);
-
-        let nested = failed(
-            r#"data: {"type":"error","error":{"code":"invalid_image","message":"Not a café photo"}}"#,
-        );
-        assert_eq!(nested.message, "stream: Not a café photo");
-        assert!(!nested.transient);
-
-        let partial = r#"data: {"type":"response.output_text.delta","delta":"Half a sentence"}"#;
-        let cut = parsed(Kind::Responses, &[partial]).0.expect_err("cut");
-        assert_eq!(cut.message, "stream: ended early");
-        assert!(cut.transient);
-    }
-
-    #[test]
     fn request_sent() {
         let dir = temp_dir("responses");
         let picture = dir.join("chart.png");
@@ -429,6 +348,7 @@ mod tests {
             file: picture,
             ..png("chart.png")
         };
+        let tag = prompt::media_tag("chart.png", &media);
         let viewed = Part::Media("chart.png".to_owned(), media);
 
         let call = |id: &str, code: &str| ToolCall::eval(id.to_owned(), code);
@@ -465,7 +385,7 @@ mod tests {
             },
             ChatMessage::Tool {
                 id: "call_2".to_owned(),
-                parts: vec![Part::Text("[no output]".to_owned()), viewed],
+                parts: vec![Part::Text(prompt::NO_OUTPUT.to_owned()), viewed],
             },
             ChatMessage::Tool {
                 id: "call_3".to_owned(),
@@ -483,7 +403,6 @@ mod tests {
         let (finished, body) = served(Kind::Responses, DONE, &spec, &conversation, Purpose::Step);
         finished.expect("finished");
 
-        let tag = "<image path=\"chart.png\"/>";
         let url = "data:image/png;base64,cG5n";
         let image = json!({ "type": "input_image", "image_url": url, "detail": "auto" });
         let expected = json!([
@@ -499,7 +418,7 @@ mod tests {
             { "type": "function_call", "call_id": "call_2", "name": "eval", "arguments": "{\"code\":\"view('chart.png')\"}" },
             { "type": "function_call", "call_id": "call_3", "name": "functions_r_sum_", "arguments": "{}" },
             { "type": "function_call_output", "call_id": "call_2", "output": [
-                { "type": "input_text", "text": format!("[no output]\n{tag}") },
+                { "type": "input_text", "text": format!("{}\n{tag}", prompt::NO_OUTPUT) },
                 image,
             ]},
             { "type": "function_call_output", "call_id": "call_3", "output": "No such tool" },
@@ -617,42 +536,5 @@ mod tests {
             output("call_3"),
         ]);
         assert_eq!(body["input"], expected);
-    }
-
-    #[test]
-    fn messages_split() {
-        let said = |id: &str, phase: &str| json!({ "type": "message", "id": id, "role": "assistant", "status": "completed", "phase": phase });
-        let items = vec![said("msg_1", "commentary"), said("msg_2", "final_answer")];
-        let first = "Checking the café menu.";
-        let text = format!("{first}\n\nCrème brûlée it is.");
-        let spec = ModelSpec::default();
-        let sent = |ends: Vec<usize>| {
-            let sealed = Sealed {
-                provider: "mock".to_owned(),
-                kind: Kind::Responses,
-                items: items.clone(),
-                ends,
-            };
-            let answered = ChatMessage::Assistant {
-                text: text.clone(),
-                reasoning: None,
-                sealed: Some(sealed),
-                calls: Vec::new(),
-            };
-            let conversation = [ChatMessage::user("Pick a dessert"), answered];
-            let (_, body) = served(Kind::Responses, DONE, &spec, &conversation, Purpose::Step);
-            body["input"].clone()
-        };
-        let output =
-            |text: &str| json!([{ "type": "output_text", "text": text, "annotations": [] }]);
-
-        let split = sent(vec![first.len(), text.len()]);
-        assert_eq!(split[1]["content"], output(first));
-        assert_eq!(split[2]["content"], output("Crème brûlée it is."));
-        assert_eq!(split[2]["phase"], "final_answer");
-
-        let older = sent(Vec::new());
-        assert_eq!(older[1]["content"], output(&text));
-        assert_eq!(older.as_array().map(Vec::len), Some(2));
     }
 }

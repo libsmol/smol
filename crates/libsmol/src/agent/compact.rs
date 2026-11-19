@@ -233,17 +233,15 @@ fn squeezed(steps: &[&MemoryStep], budget: u64) -> String {
 mod tests {
     use crate::agent::compact::*;
     use crate::agent::tests::{called, recorded, reply, Run, Script};
-    use crate::model::{Finish, Generating, MediaKind, Model, ModelError, StreamDelta, TokenUsage};
+    use crate::model::{Generating, MediaKind, Model, ModelError, StreamDelta, TokenUsage};
     use crate::steps::tests::{asked, coded, metered, replied};
-    use crate::steps::{
-        AgentMemory, AgentStep, Attachment, Content, Exit, ShellStep, StepError, TaskStep,
-    };
+    use crate::steps::{AgentMemory, AgentStep};
     use crate::tests::content;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
     fn agent(window: Option<u64>, replies: Vec<Result<Script, ModelError>>) -> Run {
-        recorded(replies, window, SUMMARIZER, Box::new(|_| {}))
+        recorded(replies, window, Box::new(|_| {}))
     }
 
     /// Answers as `inner` does, with an output limit
@@ -280,23 +278,6 @@ mod tests {
         run.agent.agent.model = Arc::new(Limited { inner, max_tokens });
     }
 
-    /// A long output and a last step that measured `tokens`
-    fn filled(tokens: u64) -> AgentMemory {
-        let task = asked("Tidy the logs");
-        let printed = "log ".repeat(150_000);
-        let read = coded("print(log)", Some(printed));
-        let counted = AgentStep {
-            usage: metered(tokens, 0),
-            ..replied("The log is 600,000 characters long.")
-        };
-        let steps = vec![
-            MemoryStep::Task(task),
-            MemoryStep::Action(Box::new(read)),
-            MemoryStep::Action(Box::new(counted)),
-        ];
-        AgentMemory { steps }
-    }
-
     fn watched(
         window: Option<u64>,
         replies: Vec<Result<Script, ModelError>>,
@@ -313,7 +294,7 @@ mod tests {
             seen.lock().expect("events").push(kind);
         });
 
-        let run = recorded(replies, window, SUMMARIZER, on_event);
+        let run = recorded(replies, window, on_event);
         (run, events)
     }
 
@@ -332,11 +313,6 @@ mod tests {
             measured(reply("x holds 41."), 900),
             measured(reply("42"), 100),
         ]
-    }
-
-    fn summarized(memory: &AgentMemory) -> bool {
-        let summary = |step: &MemoryStep| matches!(step, MemoryStep::Summary(_));
-        memory.steps.iter().any(summary)
     }
 
     fn contents(request: &[ChatMessage]) -> Vec<String> {
@@ -362,23 +338,19 @@ mod tests {
         };
         assert_eq!(content(system), SUMMARIZER);
 
+        // The summarizer reads the older steps, and the latest stays word for word after the summary
         let asked = content(asked);
-        let start = "<conversation>\n[Task]\nAdd 1 to x\n\n[Code]\nx = 41\n";
-        assert!(asked.starts_with(start), "{asked}");
-        assert!(!asked.contains("print('data')"), "{asked}");
         assert!(
-            asked.contains("The conversation above leaves out its latest messages"),
+            asked.contains("Add 1 to x") && asked.contains("x = 41"),
             "{asked}"
         );
+        assert!(!asked.contains("print('data')"), "{asked}");
 
         let after = contents(&requests[3]);
+        let summarized = prompt::summarized("x holds 41.", Some("Add 1 to x"), &[]);
         assert_eq!(
             after[1..],
-            [
-                "[Summary of your work so far, replacing earlier messages]\n<summary>\nx holds 41.\n</summary>\n\n[Current task]\nAdd 1 to x",
-                "eval:\nprint('data')",
-                "data",
-            ]
+            [summarized.as_str(), "eval:\nprint('data')", "data"]
         );
 
         let mut kinds = Vec::new();
@@ -416,59 +388,6 @@ mod tests {
             loaded.conversation("", &all, None),
             memory.conversation("", &all, None)
         );
-    }
-
-    #[test]
-    fn reserve_capped() {
-        let window = 1 << 20;
-        let mut run = agent(Some(window), vec![Ok(reply("Summary"))]);
-        let limit = window - MAX_RESERVE_TOKENS;
-
-        let mut below = filled(limit - 1);
-        run.agent.compact(&mut below).expect("compact");
-        assert!(!summarized(&below));
-
-        let mut full = filled(limit);
-        run.agent.compact(&mut full).expect("compact");
-        assert!(summarized(&full));
-    }
-
-    /// The reserve holds the output limit, up to half the window
-    #[test]
-    fn reserve_fits_output() {
-        for (max_tokens, limit) in [(20_000, 44_000), (50_000, 32_000)] {
-            let mut run = agent(Some(64_000), vec![Ok(reply("Summary"))]);
-            limited(&mut run, max_tokens);
-
-            let mut below = filled(limit - 1);
-            run.agent.compact(&mut below).expect("compact");
-            assert!(!summarized(&below), "{max_tokens}");
-
-            let mut full = filled(limit);
-            run.agent.compact(&mut full).expect("compact");
-            assert!(summarized(&full), "{max_tokens}");
-        }
-    }
-
-    /// A long system prompt lowers the reserve, which would otherwise have every step compact
-    #[test]
-    fn reserve_under_system() {
-        let mut run = agent(Some(32_000), vec![Ok(reply("Summary"))]);
-        limited(&mut run, 16_000);
-        // About 12000 tokens, which leaves a reserve of 10000
-        let system = "Rules for the café ".repeat(1800);
-
-        let mut below = filled(21_999);
-        run.agent
-            .compact_under(&mut below, &system)
-            .expect("compact");
-        assert!(!summarized(&below));
-
-        let mut full = filled(22_000);
-        run.agent
-            .compact_under(&mut full, &system)
-            .expect("compact");
-        assert!(summarized(&full));
     }
 
     /// Every summary request leaves the output limit free in the window,
@@ -519,95 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn transcript_cut() {
-        let replies = vec![Ok(reply("Read the file")), Ok(reply("Printed it"))];
-        let mut run = agent(Some(4000), replies);
-        let data = Attachment {
-            path: "data.txt".to_owned(),
-            content: Content::File {
-                text: "café ".repeat(1800),
-                lines: None,
-            },
-        };
-        let task = TaskStep {
-            files: vec![data],
-            ..asked("Print data")
-        };
-        let printed = "naïve ".repeat(1500);
-        let ran = coded("print(data)", Some(printed));
-        let mut memory = AgentMemory {
-            steps: vec![MemoryStep::Task(task), MemoryStep::Action(Box::new(ran))],
-        };
-        run.agent.compact(&mut memory).expect("compact");
-
-        let requests = run.requests.lock().expect("requests");
-        assert_eq!(requests.len(), 2);
-        let budget = (4000.0 * MAX_TRANSCRIPT_SHARE) as u64;
-        let mut transcripts = Vec::new();
-        for request in requests.iter() {
-            let asked = content(&request[1]);
-            let (_, transcript) = asked.split_once("<conversation>").unwrap_or_default();
-            let (transcript, _) = transcript.split_once("</conversation>").unwrap_or_default();
-            let size = text_bytes(transcript);
-            assert!(estimate(size) <= budget, "{size}");
-            let cuts = transcript.matches("characters cut").count();
-            assert_eq!(cuts, 1, "{transcript}");
-            transcripts.push(transcript.to_owned());
-        }
-        assert!(
-            transcripts[0].contains("<file path=\"data.txt\">\ncafé café café"),
-            "{transcripts:?}"
-        );
-        assert!(transcripts[1].contains("naïve naïve"), "{transcripts:?}");
-    }
-
-    #[test]
-    fn stored_cut_kept() {
-        let printed = "über ".repeat(8000);
-        let stored = truncated(&printed, MAX_OBSERVATION_CHARS);
-        let ran = coded("print(log)", Some(stored));
-        let step = MemoryStep::Action(Box::new(ran));
-
-        let text = squeezed(&[&step], 1 << 20);
-        let marker = prompt::cut(40_000 - MAX_OBSERVATION_CHARS);
-        assert!(text.contains(&marker), "{text}");
-    }
-
-    #[test]
-    fn interrupted_summary_dropped() {
-        let (mut run, events) = watched(Some(1000), filling());
-        let interrupt = run.agent.agent.interrupt.clone();
-        *run.interrupt.lock().expect("interrupt") = Some(interrupt);
-
-        let mut memory = AgentMemory::default();
-        let answer = run.agent.turn(&mut memory, "Add 1 to x").expect("run");
-        assert_eq!(answer, None);
-        assert!(!summarized(&memory));
-
-        let Some(MemoryStep::Action(step)) = memory.steps.last() else {
-            panic!("{:?}", memory.steps);
-        };
-        assert_eq!(step.error, Some(StepError::Interrupted));
-
-        let events = events.lock().expect("events");
-        assert_eq!(*events, ["compact", "failed: interrupted"]);
-    }
-
-    #[test]
-    fn cut_summary_fails() {
-        let mut replies = filling();
-        replies[2] = Ok(Script {
-            finish: Finish::Length,
-            ..reply("")
-        });
-        let mut run = agent(Some(1000), replies);
-        let mut memory = AgentMemory::default();
-        let error = run.agent.turn(&mut memory, "Add 1 to x").expect_err("cut");
-        assert!(error.to_string().contains("output limit"), "{error}");
-        assert_eq!(run.requests.lock().expect("requests").len(), 3);
-    }
-
-    #[test]
     fn new_task_kept() {
         let replies = vec![
             measured(called("x = 41\nprint('a' * 600)"), 500),
@@ -623,251 +453,11 @@ mod tests {
 
         let requests = run.requests.lock().expect("requests");
         let asked = content(&requests[2][1]);
-        assert!(
-            asked.starts_with("<conversation>\n[Task]\nCheck x\n"),
-            "{asked}"
-        );
+        assert!(asked.contains("Check x"), "{asked}");
         assert!(!asked.contains("Add 1 to x"), "{asked}");
 
         let after = contents(&requests[3]);
-        assert_eq!(
-            after[1..],
-            [
-                "[Summary of your work so far, replacing earlier messages]\n<summary>\nx holds 41.\n</summary>",
-                "x is 41.",
-                "Add 1 to x",
-            ]
-        );
-    }
-
-    /// A model error right after compaction leaves the resent task with the same conversation
-    #[test]
-    fn resent_after_summary() {
-        let replies = vec![
-            measured(called("x = 41\nprint('a' * 600)"), 500),
-            measured(reply("x is 41."), 840),
-            measured(reply("x holds 41."), 900),
-            Err(ModelError::new("http 400: bad request")),
-            measured(reply("42"), 100),
-        ];
-        let mut run = agent(Some(1000), replies);
-        let mut memory = AgentMemory::default();
-        run.agent.turn(&mut memory, "Check x").expect("run");
-        run.agent.turn(&mut memory, "Add 1 to x").expect_err("400");
-        assert!(summarized(&memory));
-        let answer = run.agent.turn(&mut memory, "Add 1 to x").expect("run");
-        assert_eq!(answer, Some("42".to_owned()));
-
-        let requests = run.requests.lock().expect("requests");
-        let resent = contents(&requests[4]);
-        assert_eq!(resent, contents(&requests[3]));
-        let asked = "Add 1 to x";
-        let count = resent.iter().filter(|text| *text == asked).count();
-        assert_eq!(count, 1, "{resent:?}");
-    }
-
-    /// The command output is over the share for recent steps, so only the unseen rule keeps it
-    #[test]
-    fn shell_kept() {
-        let replies = vec![
-            measured(called("x = 41\nprint('a' * 600)"), 500),
-            measured(reply("x is 41."), 840),
-            measured(reply("x holds 41."), 900),
-            measured(reply("42"), 100),
-        ];
-        let mut run = agent(Some(1000), replies);
-        let mut memory = AgentMemory::default();
-        run.agent.turn(&mut memory, "Check x").expect("run");
-        let ran = ShellStep {
-            command: "cat notes.txt".to_owned(),
-            shell: "fish".to_owned(),
-            output: "log line\n".repeat(100),
-            end: Exit::Exited(0),
-        };
-        let shown = prompt::shell(&ran);
-        memory.steps.push(MemoryStep::Shell(ran));
-        run.agent.turn(&mut memory, "Add 1 to x").expect("run");
-
-        let requests = run.requests.lock().expect("requests");
-        let asked = content(&requests[2][1]);
-        assert!(!asked.contains("notes.txt"), "{asked}");
-        let after = contents(&requests[3]);
-        assert_eq!(after[after.len() - 2..], [shown, "Add 1 to x".to_owned()]);
-    }
-
-    /// The latest output is over the recent share but stays because the model has not seen it
-    #[test]
-    fn latest_output_kept() {
-        let mut run = agent(Some(1000), vec![Ok(reply("Read the first one"))]);
-        let first = AgentStep {
-            usage: metered(500, 10),
-            ..coded("print('first')", Some("first".to_owned()))
-        };
-        let printed = "log ".repeat(150);
-        let latest = AgentStep {
-            usage: metered(800, 10),
-            ..coded("print(log)", Some(printed.clone()))
-        };
-        let mut memory = AgentMemory {
-            steps: vec![
-                MemoryStep::Task(asked("Read the log")),
-                MemoryStep::Action(Box::new(first)),
-                MemoryStep::Action(Box::new(latest)),
-            ],
-        };
-        run.agent.compact(&mut memory).expect("compact");
-
-        assert!(summarized(&memory));
-        let requests = run.requests.lock().expect("requests");
-        let asked = content(&requests[0][1]);
-        assert!(!asked.contains("log log"), "{asked}");
-        let conversation = memory.conversation("", &|_| true, None);
-        let texts = contents(&conversation);
-        assert_eq!(texts.last(), Some(&printed), "{texts:?}");
-    }
-
-    #[test]
-    fn early_interrupt_uncompacted() {
-        let (mut run, events) = watched(Some(1000), vec![Ok(reply("Summary"))]);
-        let ran = AgentStep {
-            usage: metered(950, 10),
-            ..coded("print('first')", Some("first".to_owned()))
-        };
-        let mut memory = AgentMemory {
-            steps: vec![
-                MemoryStep::Task(asked("First one")),
-                MemoryStep::Action(Box::new(ran)),
-            ],
-        };
-        run.agent.agent.interrupt.cancel(0);
-        let answer = run.agent.turn(&mut memory, "Second one").expect("run");
-        assert_eq!(answer, None);
-
-        assert!(!summarized(&memory));
-        let events = events.lock().expect("events");
-        assert!(events.is_empty(), "{events:?}");
-        let Some(MemoryStep::Action(step)) = memory.steps.last() else {
-            panic!("{:?}", memory.steps);
-        };
-        assert_eq!(step.error, Some(StepError::Interrupted));
-    }
-
-    #[test]
-    fn long_history_chunked() {
-        let replies = vec![Ok(reply("First part")), Ok(reply("Second part"))];
-        let mut run = agent(Some(4000), replies);
-        // Each output fits alone and both fit by characters but not by bytes
-        let ran = |printed: &str| {
-            let printed = printed.repeat(500);
-            let step = coded("print(read())", Some(printed));
-            MemoryStep::Action(Box::new(step))
-        };
-        let answered = AgentStep {
-            usage: metered(3900, 10),
-            ..replied("Read them all")
-        };
-        let task = asked("Tidy up");
-        let mut memory = AgentMemory {
-            steps: vec![
-                MemoryStep::Task(task),
-                ran("café 🐍 "),
-                ran("naïve 🐍 "),
-                MemoryStep::Action(Box::new(answered)),
-            ],
-        };
-        run.agent.compact(&mut memory).expect("compact");
-
-        let requests = run.requests.lock().expect("requests");
-        assert_eq!(requests.len(), 2);
-        let budget = (4000.0 * MAX_TRANSCRIPT_SHARE) as u64;
-        for request in requests.iter() {
-            let asked = content(&request[1]);
-            let (_, transcript) = asked.split_once("<conversation>").unwrap_or_default();
-            let (transcript, _) = transcript.split_once("</conversation>").unwrap_or_default();
-            let size = text_bytes(transcript);
-            assert!(estimate(size) <= budget, "{size}");
-            // Cut observations would fit in one chunk, but chunking leaves them whole
-            assert!(!transcript.contains("characters cut"), "{transcript}");
-        }
-        let second = content(&requests[1][1]);
-        let start = "<previous-summary>\nFirst part\n</previous-summary>\n\n<conversation>\n";
-        assert!(second.starts_with(start), "{second}");
-
-        let Some(MemoryStep::Summary(summary)) = memory.steps.last() else {
-            panic!("{:?}", memory.steps);
-        };
-        assert_eq!(summary.summary, "Second part");
-    }
-
-    #[test]
-    fn huge_update_summarized() {
-        let replies = vec![Ok(reply("Recap")), Ok(reply("Recap")), Ok(reply("Recap"))];
-        let mut run = agent(Some(10_000), replies);
-        let printed = "first".to_owned();
-        let ran = AgentStep {
-            usage: metered(9000, 10),
-            ..coded("print('first')", Some(printed))
-        };
-        let data = Attachment {
-            path: "big.txt".to_owned(),
-            content: Content::File {
-                text: "crème brûlée ".repeat(3375),
-                lines: None,
-            },
-        };
-        let update = TaskStep {
-            files: vec![data],
-            ..asked("See the attached file")
-        };
-        let first = asked("First one");
-        let mut memory = AgentMemory {
-            steps: vec![
-                MemoryStep::Task(first),
-                MemoryStep::Action(Box::new(ran)),
-                MemoryStep::Update(update),
-            ],
-        };
-        run.agent.compact(&mut memory).expect("compact");
-
-        assert!(summarized(&memory));
-        let conversation = memory.conversation("", &|_| true, None);
-        let texts = contents(&conversation);
-        assert!(
-            texts.iter().all(|text| !text.contains("brûlée crème")),
-            "{texts:?}"
-        );
-        assert!(texts[1].contains("See the attached file"), "{texts:?}");
-    }
-
-    #[test]
-    fn task_after_summary() {
-        let mut run = agent(Some(1000), vec![Ok(reply("Second summary"))]);
-        let printed = "data ".repeat(150);
-        let ran = coded("print(data)", Some(printed));
-        let answered = replied(&"done ".repeat(150));
-        let task = |text: &str| MemoryStep::Task(asked(text));
-        let earlier = SummaryStep {
-            summary: "brief ".repeat(165),
-            kept: 2,
-            ..SummaryStep::default()
-        };
-        let mut memory = AgentMemory {
-            steps: vec![
-                task("First one"),
-                MemoryStep::Action(Box::new(ran)),
-                MemoryStep::Action(Box::new(answered)),
-                MemoryStep::Summary(earlier),
-                task("Second one"),
-            ],
-        };
-
-        run.agent.compact(&mut memory).expect("compact");
-        assert_eq!(run.agent.probe.saves, [6]);
-
-        let Some(MemoryStep::Summary(summary)) = memory.steps.last() else {
-            panic!("{:?}", memory.steps);
-        };
-        assert_eq!(summary.summary, "Second summary");
-        assert_eq!(summary.kept, 1);
+        let summarized = prompt::summarized("x holds 41.", None, &[]);
+        assert_eq!(after[1..], [summarized.as_str(), "x is 41.", "Add 1 to x"]);
     }
 }

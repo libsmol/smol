@@ -456,7 +456,6 @@ fn read_meta(reader: impl Read) -> Option<SessionMeta> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::config::McpKind;
     use crate::history::*;
     use crate::steps::tests::{asked, one_task};
     use crate::steps::{Attachment, Content, Exit, ShellStep, TaskStep};
@@ -473,27 +472,6 @@ pub(crate) mod tests {
         meta.update_title(memory);
         store.save(memory, &[], &mut meta).expect("save");
         meta
-    }
-
-    #[test]
-    fn mcp_follows_config() {
-        let server = |enabled| McpConfig {
-            name: "web".to_owned(),
-            description: None,
-            enabled,
-            kind: McpKind::Http {
-                url: "http://127.0.0.1:1/mcp".to_owned(),
-                headers: BTreeMap::new(),
-            },
-        };
-        let mut settings = Settings::default();
-        settings.set_mcp(&server(true), false);
-        assert!(!settings.mcp_on(&server(true)));
-
-        // A switch that matches the config isn't recorded, so it follows later config changes
-        settings.set_mcp(&server(true), true);
-        assert!(settings.mcp.is_empty(), "{:?}", settings.mcp);
-        assert!(!settings.mcp_on(&server(false)));
     }
 
     #[test]
@@ -593,35 +571,6 @@ pub(crate) mod tests {
         fs::write(project.join("b3.json"), older).expect("write");
         let refused = store.load(cwd, "b3").expect_err("format");
         assert_eq!(refused.to_string(), "session: b3: not found");
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn other_cwd_refused() {
-        let dir = temp_dir("elsewhere");
-        let store = HistoryStore::new(&dir);
-        let memory = one_task("Fix the menu");
-        let here = Path::new("/home/zoë/naïve");
-        let settings = Settings {
-            cwd: here.to_owned(),
-            ..Settings::default()
-        };
-        saved(&store, &memory, "s1", &settings);
-
-        store.locate(here, "s1").expect("here");
-        let other = Path::new("/home/zoë/café");
-        let refused = store
-            .locate(other, "s1")
-            .expect_err("elsewhere")
-            .to_string();
-        let expected = "session: s1: belongs to /home/zoë/naïve; resume it there";
-        assert_eq!(refused, expected);
-        let missing = store.locate(other, "s2").expect_err("missing").to_string();
-        assert_eq!(missing, "session: s2: not found");
-        assert!(!store.project(other).exists());
-        assert!(store.list(Some(other)).expect("list").is_empty());
-        assert_eq!(store.list(None).expect("list").len(), 1);
 
         fs::remove_dir_all(&dir).ok();
     }

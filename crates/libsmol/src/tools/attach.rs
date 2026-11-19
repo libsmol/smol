@@ -435,57 +435,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn media(attached: Attachment) -> Option<Media> {
-        match attached.content {
-            Content::Media { media } => Some(media),
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn mentions_attached() {
-        let dir = temp_dir("mentions");
-        let copies = dir.join("copies");
-        let path = dir.join("menu.txt");
-        write_file(&path, "café\ncrème\r\nbrûlée\npiñata\n".as_bytes());
-        let mention = |lines, text: Option<&str>| {
-            let file = Mention::File {
-                path: path.clone(),
-                lines: Some(lines),
-                text: text.map(str::to_owned),
-            };
-            attach(&file, &dir, &copies)
-        };
-
-        let middle = mention((2, 3), None);
-        let picked = Content::File {
-            text: "crème\nbrûlée".to_owned(),
-            lines: Some((2, 3)),
-        };
-        assert_eq!(middle.content, picked);
-        assert_eq!(text(&mention((4, 9), None)), "piñata");
-
-        let edited = mention((1, 1), Some("café au lait"));
-        let sent = Content::File {
-            text: "café au lait".to_owned(),
-            lines: Some((1, 1)),
-        };
-        assert_eq!((edited.path.as_str(), edited.content), ("menu.txt", sent));
-
-        let uri = "zed:///agent/diagnostics?include_warnings=true";
-        let diagnostics = Mention::Resource {
-            uri: uri.to_owned(),
-            text: "error: unused café".to_owned(),
-        };
-        let resource = attach(&diagnostics, &dir, &copies);
-        let sent = Content::Resource {
-            text: "error: unused café".to_owned(),
-        };
-        assert_eq!((resource.path.as_str(), resource.content), (uri, sent));
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
     #[test]
     fn attaches() {
         let dir = temp_dir("attach");
@@ -510,13 +459,14 @@ pub(crate) mod tests {
         };
         assert_eq!((src.path.as_str(), src.content), ("src/", listed));
         assert_eq!(shown("").0, "./");
-        let undecoded = "[not attached: 4 bytes, not UTF-8; decode it in code]";
+        let undecoded = prompt::unattached(&prompt::undecoded(4));
         assert_eq!(shown("latin1.txt").1, undecoded);
 
         let (_, cut) = shown("long.txt");
-        assert!(cut.contains("\n[10 characters cut]\n"), "{cut}");
+        let marker = format!("\n{}\n", prompt::cut(10));
+        assert!(cut.contains(&marker), "{cut}");
         let (_, huge) = shown("huge.txt");
-        let refused = "[not attached: 1200000 bytes, too large; read the parts you need in code]";
+        let refused = prompt::unattached(&prompt::too_large(1_200_000));
         assert_eq!(huge, refused);
 
         let gone = dir.join("gone.txt");
@@ -524,10 +474,11 @@ pub(crate) mod tests {
         let path = slashed(&gone);
         assert_eq!(outside.path, path);
         // Windows words the reason in the system language
-        let missing = "[not attached: ";
-        assert!(text(&outside).starts_with(missing), "{outside:?}");
         #[cfg(unix)]
-        assert_eq!(text(&outside), "[not attached: no such file or directory]");
+        assert_eq!(
+            text(&outside),
+            prompt::unattached("no such file or directory")
+        );
 
         let trailing = format!("{}/src/", dir.display());
         let trailing = PathBuf::from(trailing);
@@ -542,138 +493,9 @@ pub(crate) mod tests {
             // SAFETY: The path is a NUL-terminated C string
             let made = unsafe { libc::mkfifo(named.as_ptr(), 0o600) };
             assert_eq!(made, 0);
-            assert_eq!(shown("pipe").1, "[not attached: not a regular file]");
+            assert_eq!(shown("pipe").1, prompt::unattached("not a regular file"));
         }
 
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn media_copied() {
-        let dir = temp_dir("media");
-        let copies = dir.join("copies");
-        let png = [b"\x89PNG\r\n\x1a\n".as_slice(), "pixels".as_bytes()].concat();
-        write_file(&dir.join("screenshot.PNG"), &png);
-        write_file(&dir.join("clip.mp4"), b"\0\0\0\x18ftypisom");
-        let jpeg = [b"\xff\xd8\xff".as_slice(), &[0; 62]].concat();
-        write_file(&dir.join("large.jpg"), &jpeg);
-        write_file(&dir.join("renamed.jpg"), &png);
-        write_file(&dir.join("fake.png"), "not an image".as_bytes());
-
-        let image = attach_path(&dir.join("screenshot.PNG"), &dir, &copies);
-        assert_eq!(image.path, "screenshot.PNG");
-        let copy = media(image).expect("image");
-        assert_eq!(
-            (copy.kind, copy.mime.as_str()),
-            (MediaKind::Image, "image/png")
-        );
-        assert_eq!(copy.file.components().count(), 1, "{copy:?}");
-        assert_eq!(copy.file.extension(), Some("png".as_ref()));
-        let copied = fs::read(copies.join(&copy.file)).expect("copy");
-        assert_eq!(copied, png);
-
-        let renamed = attach_path(&dir.join("renamed.jpg"), &dir, &copies);
-        let copy = media(renamed).expect("renamed");
-        assert_eq!(copy.mime, "image/png");
-        assert_eq!(copy.file.extension(), Some("png".as_ref()));
-        let fake = attach_path(&dir.join("fake.png"), &dir, &copies);
-        assert_eq!(text(&fake), "not an image");
-
-        let video = attach_path(&dir.join("clip.mp4"), &dir, &copies);
-        let copy = media(video).expect("video");
-        assert_eq!(
-            (copy.kind, copy.mime.as_str()),
-            (MediaKind::Video, "video/mp4")
-        );
-
-        let large = attach_path(&dir.join("large.jpg"), &dir, &copies);
-        let refused = "65 bytes, over the 64-byte image limit";
-        assert_eq!(text(&large), format!("[not attached: {refused}]"));
-
-        assert!(returned(&copies, b"BM").is_none());
-        assert!(returned(&copies, b"\0\0\0\x1cftypavif").is_none());
-        let media = returned(&copies, &png).expect("known").expect("copied");
-        assert!(media.from_call);
-        let mut big = png.clone();
-        big.resize(65, 0);
-        let refused_big = returned(&copies, &big);
-        assert_eq!(refused_big, Some(Err(refused.to_owned())));
-
-        // A file in the way keeps the copies directory from being created
-        let blocked = dir.join("screenshot.PNG");
-        let failed = returned(&blocked, &png).expect("known");
-        let failed = failed.expect_err("blocked");
-        assert!(failed.starts_with("not copied: "), "{failed}");
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn images_pasted() {
-        let dir = temp_dir("pasted");
-        let copies = dir.join("copies");
-        let png = [b"\x89PNG\r\n\x1a\n".as_slice(), "pixels".as_bytes()].concat();
-        let pasted = |data: &[u8]| {
-            let data = STANDARD.encode(data);
-            attach(&Mention::Image { data }, &dir, &copies)
-        };
-
-        let image = pasted(&png);
-        let path = image.path.clone();
-        let copied = media(image).expect("image");
-        assert_eq!(copied.mime, "image/png");
-        let copy = copies.join(&copied.file);
-        assert_eq!(path, shown_path(&copy, &dir));
-        assert_eq!(fs::read(&copy).expect("copy"), png);
-
-        let video = pasted(b"\0\0\0\x18ftypisom");
-        let refused = "[not attached: not a PNG, JPEG, GIF or WebP image]";
-        assert_eq!(
-            (video.path.as_str(), text(&video)),
-            ("pasted image", refused)
-        );
-        let mut big = png.clone();
-        big.resize(65, 0);
-        let refused = "[not attached: 65 bytes, over the 64-byte image limit]";
-        assert_eq!(text(&pasted(&big)), refused);
-        let garbled = Mention::Image {
-            data: "café".to_owned(),
-        };
-        let garbled = attach(&garbled, &dir, &copies);
-        assert_eq!(text(&garbled), "[not attached: not base64]");
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The limit is the one of what the content is, not of what its extension names
-    #[test]
-    fn limits_by_content() {
-        let dir = temp_dir("limits");
-        let copies = dir.join("copies");
-        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-        png.resize(100, b'p');
-        let mut mp4 = b"\0\0\0\x18ftypisom".to_vec();
-        mp4.resize(100, b'v');
-        write_file(&dir.join("café.mov"), &png);
-        write_file(&dir.join("naïve.png"), &mp4);
-
-        let image = attach_path(&dir.join("café.mov"), &dir, &copies);
-        let refused = "100 bytes, over the 64-byte image limit";
-        let unattached = Content::File {
-            text: format!("[not attached: {refused}]"),
-            lines: None,
-        };
-        assert_eq!(image.content, unattached);
-        let video = attach_path(&dir.join("naïve.png"), &dir, &copies);
-        let kind = media(video).map(|media| media.kind);
-        assert_eq!(kind, Some(MediaKind::Video));
-
-        let viewed_image = viewed(&dir.join("café.mov"), &copies).expect_err("image");
-        let shown = slashed(&dir.join("café.mov"));
-        let expected = format!("view: {shown}: {refused}");
-        assert_eq!(viewed_image.to_string(), expected);
-        let viewed_video = viewed(&dir.join("naïve.png"), &copies).expect("video");
-        assert_eq!(viewed_video.kind, MediaKind::Video);
         fs::remove_dir_all(&dir).ok();
     }
 

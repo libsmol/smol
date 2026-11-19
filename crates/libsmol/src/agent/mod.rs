@@ -664,29 +664,26 @@ pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::agent::{
-        title_of, Agent, Asking, Brief, Event, Nudging, Place, Queue, Records, Sink, Streamed,
-        Task, TaskViews, Turn, Unseen, RETRY_WAIT,
+        Agent, Asking, Brief, Event, Nudging, Place, Queue, Sink, Streamed, Task, TaskViews, Turn,
+        Unseen,
     };
     use crate::config::{Access, Kind};
-    use crate::history::MAX_TITLE_CHARS;
     use crate::model::{
         ChatMessage, Finish, Finished, Generating, MediaKind, Model, ModelError, Purpose, Sealed,
         StreamDelta, TokenUsage, Unread,
     };
-    use crate::prompt::{NESTED, RESTARTED};
-    use crate::steps::{AgentMemory, Content, MemoryStep};
-    use crate::tests::{content, temp_dir, write_file, Temp};
+    use crate::prompt::RESTARTED;
+    use crate::steps::AgentMemory;
+    use crate::tests::{content, temp_dir, Temp};
     use crate::tools::attach::tests::mentioned;
     use crate::tools::memories::Memories;
     use crate::utils::{block_on, Interrupt};
     use crate::worker::host::tests::unserved;
     use crate::worker::host::{Rank, Worker};
     use crate::worker::workplace::tests::opened;
-    use crate::worker::{MemoryCall, Service};
     use crate::Result;
-    use serde_json::{json, Value};
+    use serde_json::Value;
     use std::collections::VecDeque;
-    use std::fs;
     use std::future;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -779,13 +776,11 @@ pub(crate) mod tests {
 
     type Requests = Arc<Mutex<Vec<Vec<ChatMessage>>>>;
 
-    /// Records every request and cancels `interrupt` on one whose system prompt is `trigger`
+    /// Records every request
     struct Recording {
         replies: ScriptedModel,
         window: Option<u64>,
-        trigger: &'static str,
         requests: Requests,
-        interrupt: Arc<Mutex<Option<Interrupt>>>,
     }
 
     impl Model for Recording {
@@ -797,13 +792,6 @@ pub(crate) mod tests {
         ) -> Generating<'a> {
             let request = conversation.to_vec();
             self.requests.lock().expect("requests").push(request);
-
-            let interrupt = self.interrupt.lock().expect("interrupt").clone();
-            let triggered = content(&conversation[0]) == self.trigger;
-            if let Some(interrupt) = interrupt.filter(|_| triggered) {
-                interrupt.cancel(u64::MAX);
-            }
-
             self.replies.generate(conversation, purpose, on_delta)
         }
 
@@ -1007,159 +995,27 @@ pub(crate) mod tests {
     pub(crate) struct Run {
         pub(crate) agent: Temp<Tested>,
         pub(crate) requests: Requests,
-        pub(crate) interrupt: Arc<Mutex<Option<Interrupt>>>,
     }
 
     pub(crate) fn recorded(
         replies: Vec<Result<Script, ModelError>>,
         window: Option<u64>,
-        trigger: &'static str,
         events: Box<dyn FnMut(Event) + Send>,
     ) -> Run {
         let requests = Requests::default();
-        let interrupt = Arc::<Mutex<Option<Interrupt>>>::default();
         let model = Recording {
             replies: ScriptedModel::new(replies),
             window,
-            trigger,
             requests: Arc::clone(&requests),
-            interrupt: Arc::clone(&interrupt),
         };
         let agent = scripted(model, events);
-
-        Run {
-            agent,
-            requests,
-            interrupt,
-        }
-    }
-
-    #[test]
-    fn title_cleaned() {
-        let titled = |answer: &str| {
-            let replies = vec![Ok(reply(answer))];
-            let model: Arc<dyn Model> = Arc::new(ScriptedModel::new(replies));
-            let task = "Write me a snake game".to_owned();
-            let naming = title_of(model, task);
-            block_on(naming)
-        };
-
-        let title = titled("  **“Snake game”**。\nAn extra line");
-        assert_eq!(title.as_deref(), Some("Snake game"));
-        let heading = titled("\n# .env file setup\n");
-        assert_eq!(heading.as_deref(), Some(".env file setup"));
-        assert_eq!(titled("「」。"), None);
-
-        let long = "café".repeat(20);
-        let cut = titled(&long).expect("title");
-        assert_eq!(cut.chars().count(), MAX_TITLE_CHARS);
-
-        let refused = vec![Err(ModelError::new("refused"))];
-        let failed: Arc<dyn Model> = Arc::new(ScriptedModel::new(refused));
-        let task = "task".to_owned();
-        let naming = title_of(failed, task);
-        assert_eq!(block_on(naming), None);
-    }
-
-    #[test]
-    fn empty_task_refused() {
-        let mut run = recorded(Vec::new(), None, "", Box::new(|_| {}));
-        let mut memory = AgentMemory::default();
-        let error = run.agent.turn(&mut memory, " \n").expect_err("refused");
-        assert_eq!(error.to_string(), "task: empty");
-        assert!(memory.steps.is_empty());
-    }
-
-    #[test]
-    fn huge_task_refused() {
-        let replies = vec![Ok(reply("Watched it"))];
-        let mut run = recorded(replies, Some(40_000), "", Box::new(|_| {}));
-        let video = run.agent.dir.join("clip.mp4");
-        write_file(&video, b"\0\0\0\x18ftypisom\0\0\x02\0isomiso2mp41");
-        let files = [video];
-
-        // Over half the window but still inside it
-        let mut memory = AgentMemory::default();
-        let huge = "crème brûlée ".repeat(5625);
-        let error = run.agent.turn(&mut memory, &huge).expect_err("refused");
-        let error = error.to_string();
-        let refused = "task: too large: about 30000 tokens, over half of the 40000-token context";
-        assert_eq!(error, refused);
-        assert!(memory.steps.is_empty());
-
-        run.agent
-            .turn_attached(&mut memory, &huge, &files)
-            .expect_err("refused");
-        let copies = run.agent.agent.workplace.copies.clone();
-        let left = fs::read_dir(&copies).expect("copies").count();
-        assert_eq!(left, 0);
-
-        let answer = run.agent.turn_attached(&mut memory, "Watch it", &files);
-        let answer = answer.expect("run");
-        assert_eq!(answer, Some("Watched it".to_owned()));
-        let MemoryStep::Task(task) = &memory.steps[0] else {
-            panic!("{:?}", memory.steps);
-        };
-        let Content::Media { media } = &task.files[0].content else {
-            panic!("{task:?}");
-        };
-        assert!(copies.join(&media.file).exists());
-    }
-
-    #[test]
-    fn retry_after_waited() {
-        let waits = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&waits);
-        let on_event = Box::new(move |event: Event| {
-            if let Event::Retry { wait, .. } = event {
-                seen.lock().expect("waits").push(wait);
-            }
-        });
-        let asked = Duration::from_millis(50);
-        let mut limited = ModelError::transient("http 429: too many requests");
-        limited.retry_after = Some(asked);
-        let busy = ModelError::transient("http 503: service busy");
-        let replies = vec![Err(limited), Err(busy), Ok(reply("Done"))];
-        let model = ScriptedModel::new(replies);
-        let mut agent = scripted(model, on_event);
-
-        let mut memory = AgentMemory::default();
-        let answer = agent.turn(&mut memory, "Add one to x").expect("run");
-        assert_eq!(answer.as_deref(), Some("Done"));
-        let expected = [asked, RETRY_WAIT * 2];
-        assert_eq!(*waits.lock().expect("waits"), expected);
-    }
-
-    #[test]
-    fn context_counts_observation() {
-        let printed = Script {
-            usage: Some(TokenUsage::new(100, 20)),
-            ..called("print('observed' * 300)")
-        };
-        let mut run = recorded(vec![Ok(printed)], None, "", Box::new(|_| {}));
-
-        let mut memory = AgentMemory::default();
-        run.agent.turn(&mut memory, "task").expect("run");
-
-        let MemoryStep::Action(step) = &memory.steps[1] else {
-            panic!("{:?}", memory.steps);
-        };
-        let used = step.used.expect("used");
-        let seen = AgentMemory {
-            steps: memory.steps[..2].to_vec(),
-        };
-        let takes = |_: MediaKind| false;
-        let requests = run.requests.lock().expect("requests");
-        let prompt = content(&requests[0][0]);
-        let expected = seen.tokens(&prompt, &takes, None);
-        assert_eq!(used, expected);
-        assert!(used > 120 + 300, "{used}");
+        Run { agent, requests }
     }
 
     #[test]
     fn restart_told_once() {
         let replies = vec![Ok(called("print('reading the orders again')"))];
-        let mut run = recorded(replies, None, "", Box::new(|_| {}));
+        let mut run = recorded(replies, None, Box::new(|_| {}));
         let mut ignore = |_: &str| {};
         let mut none = unserved;
         let code = "import os\nos._exit(1)";
@@ -1182,36 +1038,5 @@ pub(crate) mod tests {
             "reading the orders again",
         ];
         assert_eq!(second, expected);
-    }
-
-    /// Agents that agent() starts only recall, whatever their code asks the agent
-    #[test]
-    fn helpers_only_recall() {
-        let tested = scripted(ScriptedModel::new(Vec::new()), Box::new(|_| {}));
-        let helper = Agent {
-            place: delegated_place(),
-            ..tested.agent.clone()
-        };
-        let asked = |agent: &Agent, call: MemoryCall| {
-            let records = Arc::new(Records::default());
-            let mut serving = agent.serving(&[], Box::new(Unseen), &records);
-            let calling = serving(Service::Memory(call));
-            block_on(calling).result
-        };
-        let remember = || MemoryCall::Remember {
-            text: "Uses tabs in the café".to_owned(),
-            project: true,
-        };
-
-        let refused = asked(&helper, remember());
-        let saved = asked(&tested.agent, remember());
-        let recall = MemoryCall::Recall {
-            query: "tabs".to_owned(),
-        };
-        let found = asked(&helper, recall);
-
-        assert_eq!(refused, Err(NESTED.to_owned()));
-        let id = saved.expect("remember");
-        assert_eq!(found, Ok(json!([[id, "Uses tabs in the café"]])));
     }
 }

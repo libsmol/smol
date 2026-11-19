@@ -251,14 +251,7 @@ mod tests {
     use crate::tests::{temp_dir, write_file};
     use crate::tools::files::*;
     #[cfg(unix)]
-    use std::ffi::CString;
-    #[cfg(unix)]
-    use std::os::unix::ffi::OsStrExt;
-    #[cfg(unix)]
     use std::os::unix::fs::symlink;
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::Duration;
 
     fn listed(root: &Path, recursive: bool) -> Vec<OsString> {
         let going = AtomicBool::new(false);
@@ -288,124 +281,6 @@ mod tests {
 
         let build = dir.join("build");
         assert_eq!(listed(&build, true), ["out.o"]);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Once set, the walk stops at once and file reads see end of file
-    #[test]
-    fn stop_honored() {
-        let dir = temp_dir("stop");
-        write_file(&dir.join("deep/one.txt"), "one\n".as_bytes());
-        // Reads see end of file anyway, but a walk that goes on hangs opening this FIFO
-        #[cfg(unix)]
-        {
-            let pipe = dir.join("deep/.gitignore");
-            let named = CString::new(pipe.as_os_str().as_bytes()).expect("path");
-            // SAFETY: The path is a NUL-terminated C string
-            let made = unsafe { libc::mkfifo(named.as_ptr(), 0o600) };
-            assert_eq!(made, 0);
-        }
-
-        let stopped = AtomicBool::new(true);
-        assert!(ls(&dir, true, &stopped).expect("ls").is_empty());
-
-        let (sender, receiver) = mpsc::channel();
-        let root = dir.clone();
-        thread::spawn(move || {
-            let stopped = AtomicBool::new(true);
-            let found = grep("one", &root, None, 0, &stopped);
-            let empty = found.is_ok_and(|rows| rows.is_empty());
-            sender.send(empty).ok();
-        });
-        let limit = Duration::from_secs(5);
-        assert_eq!(receiver.recv_timeout(limit), Ok(true));
-
-        let mut reader = Stopping {
-            inner: "one two".as_bytes(),
-            stop: &stopped,
-        };
-        let mut buffer = [0; 16];
-        assert_eq!(reader.read(&mut buffer).expect("read"), 0);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn grep_walks() {
-        let dir = temp_dir("grep");
-        let write = |path: &str, data: &[u8]| write_file(&dir.join(path), data);
-        write(".gitignore", "build/\ngenerated.rs\n".as_bytes());
-        write("deep/code.rs", b"fn main() {}\nconst A: u8 = 1;\n");
-        write("deep/generated.rs", b"fn main() {}\n");
-        write("build/gen.rs", b"const B: u8 = 2;\n");
-        write("blob.bin", b"const\0binary");
-        // The NUL comes after the first chunk read in
-        let late = [b"const Z: u8 = 0;\n".repeat(20_000), b"\0".to_vec()].concat();
-        write("deep/late.log", &late);
-        write("deep/crlf.txt", "déjà vu \r\nthe end:\r\n".as_bytes());
-
-        let going = AtomicBool::new(false);
-        let found = |pattern: &str, root: &Path, glob: Option<&str>| {
-            let rows = grep(pattern, root, glob, 0, &going).expect("grep");
-            let mut shown = Vec::new();
-            for (name, number, line, _) in rows {
-                let path = Path::new(&name);
-                let relative = path.strip_prefix(&dir).unwrap_or(path);
-                let relative = slashed(relative);
-                shown.push(format!("{relative}:{number}:{line}"));
-            }
-            shown
-        };
-
-        let code = dir.join("deep/code.rs");
-        let crlf = dir.join("deep/crlf.txt");
-        let constant = ["deep/code.rs:2:const A: u8 = 1;"];
-        assert_eq!(found("const [A-Z]", &dir, None), constant);
-        assert!(found("snake|const", &dir, Some("*.txt")).is_empty());
-        let main = ["deep/code.rs:1:fn main() {}"];
-        assert_eq!(found("(?i)FN MAIN", &dir, Some("*.rs")), main);
-        assert_eq!(found("main", &code, Some("*.txt")), main);
-        assert_eq!(found(":$", &crlf, None), ["deep/crlf.txt:2:the end:"]);
-        assert_eq!(found(r"\s+$", &crlf, None), ["deep/crlf.txt:1:déjà vu "]);
-
-        // Points at the parenthesis as written, not the one grep-regex adds
-        let unclosed = grep("café(", &dir, None, 0, &going).expect_err("invalid");
-        let message = unclosed.to_string();
-        let expected =
-            "grep: pattern: regex parse error:\n    café(\n        ^\nerror: unclosed group";
-        assert!(message.starts_with(expected), "{message}");
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn context_rows() {
-        let dir = temp_dir("context");
-        let menu = dir.join("menu.txt");
-        let lines = "café\r\ncrème\r\nbrûlée\r\nnaïve\r\ncafé au lait\r\nrésumé\r\npiñata\r\n";
-        write_file(&menu, lines.as_bytes());
-
-        let going = AtomicBool::new(false);
-        let shown = |pattern: &str, context: usize| {
-            let rows = grep(pattern, &menu, None, context, &going).expect("grep");
-            let mut shown = Vec::new();
-            for (_, number, line, matched) in rows {
-                let mark = if matched { ':' } else { '-' };
-                shown.push(format!("{number}{mark}{line}"));
-            }
-            shown
-        };
-
-        let around = ["1:café", "2-crème", "4-naïve", "5:café au lait", "6-résumé"];
-        assert_eq!(shown("café", 1), around);
-        let joined = [
-            "1:café",
-            "2:crème",
-            "3-brûlée",
-            "4-naïve",
-            "5:café au lait",
-            "6-résumé",
-        ];
-        assert_eq!(shown("café|crème", 1), joined);
-        assert_eq!(shown("piñata", 0), ["7:piñata"]);
         fs::remove_dir_all(&dir).ok();
     }
 

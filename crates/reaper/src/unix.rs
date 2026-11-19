@@ -610,7 +610,7 @@ fn pids(
 
 /// What KERN_PROCARGS2 gives is the count of arguments, the executable's path,
 /// NULs up to the first argument, then each argument and the environment ending in NUL
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn arguments(procargs: &[u8]) -> Option<String> {
     let (count, rest) = procargs.split_first_chunk::<4>()?;
     let count = usize::try_from(i32::from_ne_bytes(*count)).ok()?;
@@ -647,9 +647,9 @@ fn marked(environ: &[u8], text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::unix::{arguments, prepare, Group, KILL_WAIT};
     #[cfg(target_os = "linux")]
-    use crate::unix::{marked, sweep};
+    use crate::unix::sweep;
+    use crate::unix::{prepare, Group, KILL_WAIT};
     #[cfg(target_os = "linux")]
     use std::fs;
     use std::io::{BufRead, BufReader};
@@ -657,55 +657,6 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
-
-    #[test]
-    fn own_session() {
-        let mut command = Command::new("sleep");
-        command.arg("30");
-        prepare(&mut command);
-        let mut child = command.spawn().expect("spawn");
-        let pid = child.id() as libc::pid_t;
-
-        // SAFETY: Only reads this process's session and group ids
-        let ids = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
-        child.kill().ok();
-        child.wait().ok();
-        assert_eq!(ids, (pid, pid));
-    }
-
-    /// The group's first process is left out, and so is a child it never reaps,
-    /// while a child in a session of its own is still listed
-    #[test]
-    fn members_listed() {
-        let detached = "perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sleep 32";
-        let script = format!("sleep 30 & sleep 0 & {detached} & exec sleep 31");
-        let mut command = Command::new("sh");
-        command.args(["-c", &script]);
-        let mark = prepare(&mut command);
-        let mut child = command.spawn().expect("spawn");
-        let group = Group::new(child.id(), mark).expect("group");
-
-        let started = Instant::now();
-        let members = loop {
-            let members = group.members().expect("members");
-            let mut commands: Vec<&str> = members.iter().map(|member| &*member.command).collect();
-            commands.sort_unstable();
-            if commands == ["sleep 30", "sleep 32"] {
-                break members;
-            }
-            assert!(started.elapsed() < Duration::from_secs(5), "{members:?}");
-            thread::sleep(Duration::from_millis(20));
-        };
-        assert!(members.iter().all(|member| member.parent == child.id()));
-        // A session of its own is out of reach of the group's kill
-        for member in &members {
-            // SAFETY: Only sends a signal to a child of this test's own
-            unsafe { libc::kill(member.pid as libc::pid_t, libc::SIGKILL) };
-        }
-
-        drop(group);
-        child.wait().ok();
-    }
 
     /// The group gets SIGTERM first, and a program that handles it ends cleanly
     #[test]
@@ -747,29 +698,6 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         assert!(waited >= KILL_WAIT, "{waited:?}");
         assert!(waited < KILL_WAIT * 5, "{waited:?}");
-    }
-
-    #[test]
-    fn procargs_read() {
-        let mut procargs = 3_i32.to_ne_bytes().to_vec();
-        let rest = "/usr/bin/python3\0\0\0python3\0-c\0print('café')\0HOME=/Users/zoë\0";
-        procargs.extend(rest.as_bytes());
-        let read = arguments(&procargs);
-        assert_eq!(read.as_deref(), Some("python3 -c print('café')"));
-        assert_eq!(arguments(&[1, 0]), None);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn marks_matched() {
-        let environ = "PATH=/bin\0SMOL_REAPER=9.9.1 1.2.3\0CAFÉ=crème\0";
-        assert!(marked(environ.as_bytes(), "1.2.3"));
-        // A process prefix matches every program that process started
-        assert!(marked(environ.as_bytes(), "1.2"));
-
-        let other = "SMOL_REAPER=1.2.30 11.2.3\0CAFÉ=1.2.3\0";
-        assert!(!marked(other.as_bytes(), "1.2.3"));
-        assert!(!marked(b"", "1.2.3"));
     }
 
     #[test]

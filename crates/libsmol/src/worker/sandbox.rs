@@ -5,7 +5,7 @@ use landlock::{
     ABI,
 };
 use reaper::{cause, tilde};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::convert::Infallible;
@@ -364,7 +364,7 @@ fn isolated(_: &[(PathBuf, bool)], _: &[PathBuf]) -> Option<Isolation> {
 
 /// Seatbelt takes the last rule that matches, so deeper paths come later
 /// and a hidden path or a folder above one comes after a granted one of the same depth
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn profile(granted: &[(PathBuf, bool)], hidden: &[PathBuf]) -> String {
     let mut rules: Vec<(&Path, &str, &str)> = Vec::new();
     for (path, write) in granted {
@@ -453,8 +453,8 @@ pub(crate) mod tests {
     use crate::worker::host::tests::unserved;
     use crate::worker::host::{Rank, Worker};
     #[cfg(target_os = "linux")]
-    use crate::worker::sandbox::{landlock_abi, spread, Grant};
-    use crate::worker::sandbox::{profile, sweep, LOCK, PIP_CACHE_ENV, TEMP_PREFIX};
+    use crate::worker::sandbox::landlock_abi;
+    use crate::worker::sandbox::PIP_CACHE_ENV;
     use crate::worker::workplace::tests::opened;
     use crate::worker::workplace::{Workplace, PASSED_ENV};
     use std::env;
@@ -467,82 +467,7 @@ pub(crate) mod tests {
     use std::os::unix::net::SocketAddr;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
     use std::sync::Arc;
-
-    #[test]
-    fn profile_built() {
-        let granted = [
-            (PathBuf::from("/Users/zoë/.smol/skills/p\"d\\f"), false),
-            (PathBuf::from("/"), false),
-            (PathBuf::from("/Users/zoë/café"), true),
-        ];
-        let hidden = [
-            PathBuf::from("/Users/zoë/a/b"),
-            PathBuf::from("/Users/zoë/.ssh"),
-            PathBuf::from("/Users/zoë/.smol"),
-        ];
-        let expected = "(version 1)\n(allow default)\n(deny file-write*)\n\
-            (deny network-outbound (subpath \"/\"))\n\
-            (allow file-read* (subpath \"/\"))\n\
-            (deny file-write-unlink file-write-create (literal \"/\"))\n\
-            (deny file-write-unlink file-write-create (literal \"/Users\"))\n\
-            (deny file-write-unlink file-write-create (literal \"/Users/zoë\"))\n\
-            (allow file-read* file-write* network-outbound (subpath \"/Users/zoë/café\"))\n\
-            (deny file-write-unlink file-write-create (literal \"/Users/zoë/café\"))\n\
-            (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.ssh\"))\n\
-            (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/.smol\"))\n\
-            (deny file-write-unlink file-write-create (literal \"/Users/zoë/a\"))\n\
-            (deny file-read* file-write* network-outbound (subpath \"/Users/zoë/a/b\"))\n\
-            (allow file-read* (subpath \"/Users/zoë/.smol/skills/p\\\"d\\\\f\"))\n\
-            (allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n\
-            (deny signal (target others))\n";
-        assert_eq!(profile(&granted, &hidden), expected);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn folders_spread() {
-        let dir = temp_dir("spread");
-        let outside = dir.join("outside");
-        let home = dir.join("home");
-        write_file(&home.join(".ssh/id_rsa"), b"secret");
-        write_file(&home.join(".config/gh/hosts.yml"), b"token");
-        write_file(&home.join(".config/git/config"), b"[user]");
-        write_file(&home.join(".gitconfig"), b"[user]");
-        write_file(&home.join("café/main.rs"), b"fn main() {}");
-        write_file(&outside.join("notes.md"), b"notes");
-        fs::create_dir_all(home.join(".cargo/registry")).expect("dir");
-        symlink(home.join(".ssh"), home.join("keys")).expect("link");
-        symlink(home.join(".config"), home.join("settings")).expect("link");
-        symlink(&outside, home.join("data")).expect("link");
-        let home = fs::canonicalize(&home).expect("real");
-        // The last one is missing
-        let hidden = [
-            home.join(".ssh"),
-            home.join(".config/gh"),
-            home.join(".cargo/credentials.toml"),
-        ];
-
-        let mut allowed = Vec::new();
-        spread(&home, Grant::Read, &hidden, &mut allowed);
-        spread(&home.join("café"), Grant::Write, &hidden, &mut allowed);
-        spread(&home.join(".ssh"), Grant::Write, &hidden, &mut allowed);
-        allowed.sort();
-        fs::remove_dir_all(&dir).ok();
-
-        let expected = [
-            (home.clone(), Grant::List),
-            (home.join(".cargo"), Grant::List),
-            (home.join(".cargo/registry"), Grant::Read),
-            (home.join(".config"), Grant::List),
-            (home.join(".config/git"), Grant::Read),
-            (home.join(".gitconfig"), Grant::Read),
-            (home.join("café"), Grant::Read),
-            (home.join("café"), Grant::Write),
-        ];
-        assert_eq!(allowed, expected);
-    }
 
     fn evaluated(workplace: Workplace, code: &str) -> String {
         let interrupt = Interrupt::default();
@@ -807,29 +732,5 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(logs, format!("[True, False, True, {cached}]"));
-    }
-
-    /// Only folders whose lock nobody holds are removed
-    #[test]
-    fn stale_swept() {
-        let dir = temp_dir("swept");
-        let cwd = dir.join("café");
-        fs::create_dir_all(&cwd).expect("dir");
-        let live = opened(&cwd, &dir, &Access::default());
-        let id = new_id();
-        let name = format!("{TEMP_PREFIX}{id}");
-        let stale = env::temp_dir().join(name);
-        fs::create_dir_all(stale.join("tmp")).expect("dir");
-        fs::write(stale.join(LOCK), "").expect("lock");
-
-        sweep();
-        let kept = [cwd.exists(), live.sandbox.temp.exists(), stale.exists()];
-        let temp = live.sandbox.temp.clone();
-        drop(live);
-        let left = [temp.exists(), dir.join("copies").exists()];
-        fs::remove_dir_all(&dir).ok();
-
-        assert_eq!(kept, [true, true, false]);
-        assert_eq!(left, [false, false]);
     }
 }

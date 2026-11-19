@@ -557,11 +557,10 @@ fn unauthorized(top: &(dyn error::Error + 'static)) -> bool {
 pub(crate) mod tests {
     use crate::config::{McpConfig, McpKind};
     use crate::tests::{interpreter, temp_dir};
-    use crate::tools::mcp::{connect, said_lines, Down, Link, Server};
+    use crate::tools::mcp::{connect, Down, Link, Server};
     use crate::utils::block_on;
     use serde_json::{json, Map};
     use std::collections::BTreeMap;
-    use std::fs;
     use std::io::{BufRead, BufReader};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
@@ -608,17 +607,6 @@ pub(crate) mod tests {
             enabled: true,
             kind,
         }
-    }
-
-    fn connect_error(server: &McpConfig) -> String {
-        let cwd = Path::new(CWD);
-        let copies = temp_dir("copies");
-
-        let connecting = connect(server, cwd, copies);
-        let Err(Down::Failed(failed)) = block_on(connecting) else {
-            panic!("not failed");
-        };
-        failed
     }
 
     /// The fake server over HTTP, answering `refused` with 401, until the child is dropped
@@ -671,21 +659,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn structured_sent() {
-        let server = fake();
-        let called = |tool: &str| {
-            let label = format!("fake.{tool}");
-            let calling = (server.call)(tool.to_owned(), Map::new(), label);
-            block_on(calling).result
-        };
-
-        let stats = json!({"text": "3 cafés counted", "structured": {"count": 3}});
-        assert_eq!(called("stats"), Ok(stats));
-        let bare = json!({"text": "{\"count\":3}", "structured": {"count": 3}});
-        assert_eq!(called("bare"), Ok(bare));
-    }
-
-    #[test]
     fn cancel_sent() {
         let server = fake();
 
@@ -712,111 +685,6 @@ pub(crate) mod tests {
         let counting = (server.call)("cancelled".to_owned(), Map::new(), label);
         let counted = block_on(counting).result.expect("call");
         assert_eq!(counted, json!({"text": "1"}));
-    }
-
-    #[test]
-    fn stderr_shown() {
-        let script = "import sys\nsys.stderr.buffer.write('missing environment variable API_TOKEN\\n'.encode())\nsys.exit(1)";
-        let args = vec!["-c".to_owned(), script.to_owned()];
-        let exited = stdio("broken", args);
-        let expected =
-            "connect: connection closed during the handshake\nmissing environment variable API_TOKEN";
-        assert_eq!(connect_error(&exited), expected);
-
-        // A server that never replies still gets its stderr shown
-        let script = "import sys, time\nsys.stderr.buffer.write('waiting for authorization in the browser…\\n'.encode())\nsys.stderr.flush()\ntime.sleep(60)";
-        let args = vec!["-c".to_owned(), script.to_owned()];
-        let silent = stdio("broken", args);
-        let expected = "connect: timed out after 5s\nwaiting for authorization in the browser…";
-        assert_eq!(connect_error(&silent), expected);
-
-        // Progress redrawn on one line for longer than the kept tail
-        let script = "import sys\n\
-            progress = '\\r'.join(f'{i}% café' for i in range(50000))\n\
-            sys.stderr.buffer.write(progress.encode())\n\
-            sys.stderr.buffer.write('\\n\\x1b[31mmissing API_TOKEN\\x1b[0m\\n'.encode())\n\
-            sys.exit(1)";
-        let args = vec!["-c".to_owned(), script.to_owned()];
-        let drawn = stdio("broken", args);
-        let expected =
-            "connect: connection closed during the handshake\n49999% café\nmissing API_TOKEN";
-        assert_eq!(connect_error(&drawn), expected);
-
-        // A line the kept tail starts inside, here in the middle of a character
-        let script = "import sys\n\
-            sys.stderr.buffer.write(('é' * 10000 + '\\nmissing API_TOKEN\\n').encode())\n\
-            sys.exit(1)";
-        let args = vec!["-c".to_owned(), script.to_owned()];
-        let long = stdio("broken", args);
-        let expected = "connect: connection closed during the handshake\nmissing API_TOKEN";
-        assert_eq!(connect_error(&long), expected);
-    }
-
-    #[test]
-    fn stderr_cleaned() {
-        let long = "é".repeat(400);
-        let said = format!(
-            "zeroth\nfirst\n\x1b[33mwarning\x1b[0m: café\r\n10%\r55%\r100%\n\n{long}\nlast naïve line"
-        );
-        let cut = "é".repeat(300);
-        let expected = format!("first\nwarning: café\n100%\n{cut}…\nlast naïve line");
-        assert_eq!(said_lines(said.as_bytes()), expected);
-    }
-
-    #[test]
-    fn image_kept() {
-        let copies = temp_dir("mcp-image");
-        let (server, _link) = started(copies.clone());
-        let label = "fake.mixed".to_owned();
-        let calling = (server.call)("mixed".to_owned(), Map::new(), label);
-        let called = block_on(calling);
-
-        let [(label, _)] = &called.media[..] else {
-            panic!("{:?}", called.media);
-        };
-        assert_eq!(label, "fake.mixed");
-
-        let expected = "Intro\nembedded content\n[resource link: file:///big.bin]";
-        let result = called.result.expect("call");
-        assert_eq!(result, json!({"text": expected}));
-
-        let entries = fs::read_dir(&copies).expect("copies");
-        let names: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-        let [copy] = &names[..] else {
-            panic!("{names:?}");
-        };
-        assert_eq!(copy.extension(), Some("png".as_ref()));
-        assert_eq!(fs::read(copy).expect("copy"), b"\x89PNG\r\n\x1a\nhello");
-        fs::remove_dir_all(&copies).ok();
-    }
-
-    /// A server that exits after connecting still yields its last stderr lines
-    #[test]
-    fn exit_noticed() {
-        let code = "import atexit, runpy, sys\n\
-            def said():\n    sys.stderr.buffer.write('written at exit\\n'.encode())\n    sys.stderr.buffer.flush()\n\
-            atexit.register(said)\n\
-            runpy.run_path(sys.argv[1], run_name='__main__')";
-        let args = vec!["-c".to_owned(), code.to_owned(), SCRIPT.to_owned()];
-        let server = stdio("fake", args);
-        let cwd = Path::new(CWD);
-        let copies = temp_dir("copies");
-
-        let running = async {
-            let (server, link) = connect(&server, cwd, copies).await.expect("connect");
-            let label = "fake.exit".to_owned();
-            let calling = (server.call)("exit".to_owned(), Map::new(), label);
-            let failed = calling.await.result.expect_err("exited");
-            let ending = link.ended();
-            let ended = time::timeout(Duration::from_secs(5), ending).await;
-            let down = ended.map(|(_, down)| down);
-            (failed, down)
-        };
-        let (failed, down) = block_on(running);
-
-        assert_eq!(failed, "server disconnected");
-        let said = Down::Failed("server disconnected\nwritten at exit".to_owned());
-        assert_eq!(down.ok(), Some(said));
     }
 
     #[test]
@@ -854,35 +722,5 @@ pub(crate) mod tests {
         assert_eq!(failed, [refused, refused]);
         let call = Down::Unauthorized(refused.to_owned());
         assert_eq!(down.ok(), Some(call));
-    }
-
-    #[test]
-    fn connect_failure() {
-        let kind = McpKind::Http {
-            url: "http://127.0.0.1:1/mcp".to_owned(),
-            headers: BTreeMap::new(),
-        };
-        let server = McpConfig {
-            name: "down".to_owned(),
-            description: None,
-            enabled: true,
-            kind,
-        };
-
-        // Windows words the reason in the system language
-        let failed = connect_error(&server);
-        let expected = "connect: cannot connect to 127.0.0.1:1: ";
-        assert!(failed.starts_with(expected), "{failed}");
-        #[cfg(unix)]
-        assert!(failed.ends_with(": connection refused"), "{failed}");
-
-        let kind = McpKind::Stdio {
-            command: PathBuf::from("/no/such/program"),
-            args: Vec::new(),
-            env: BTreeMap::new(),
-        };
-        let missing = McpConfig { kind, ..server };
-        let failed = connect_error(&missing);
-        assert!(failed.starts_with("start: /no/such/program: "), "{failed}");
     }
 }
