@@ -2103,6 +2103,7 @@ name = "libsmol-reaper"
 version = "0.11.0"
 dependencies = [
  "libc",
+ "serde",
  "windows-sys 0.61.2",
 ]
 

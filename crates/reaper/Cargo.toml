@@ -9,6 +9,9 @@ publish = false
 keywords = ["process", "process-group", "job-object", "watchdog"]
 categories = ["os"]
 
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

@@ -1,6 +1,7 @@
 use crate::chat::Session;
+use crate::conversation::Tokens;
 use crate::tui::app::App;
-use crate::tui::desktop::Local;
+use crate::tui::desktop::{Desktop, Local};
 use crate::tui::screen::Screen;
 use anyhow::Result;
 use ratatui::style::{Modifier, Style};
@@ -9,6 +10,8 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::{flag, low_level};
 use std::env;
+use std::ffi::OsString;
+use std::fmt;
 use std::io::stdout;
 #[cfg(unix)]
 use std::sync::atomic::AtomicUsize;
@@ -22,6 +25,7 @@ mod app;
 mod clipboard;
 mod desktop;
 mod diagram;
+mod draft;
 mod highlight;
 mod markdown;
 mod picture;
@@ -97,10 +101,12 @@ pub(crate) fn widened(text: &str) -> String {
     text.replace('\t', "    ")
 }
 
-pub(crate) fn in_out(input: u64, output: u64) -> String {
-    let input = kilo(input);
-    let output = kilo(output);
-    format!("⇡{input} ⇣{output}")
+impl fmt::Display for Tokens {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let input = kilo(self.input);
+        let output = kilo(self.output);
+        write!(f, "⇡{input} ⇣{output}")
+    }
 }
 
 pub(crate) fn kilo(n: u64) -> String {
@@ -211,19 +217,13 @@ pub(crate) fn drive(app: &mut App, host: &mut impl Host, ending: &Ending) -> Res
 }
 
 pub(crate) fn run(
-    command: &[String],
+    command: &[OsString],
     model: Option<String>,
     resume: Option<&str>,
     task: Option<String>,
 ) -> Result<()> {
     let kitty = picture::kitty_here();
-    picture::set_kitty(kitty);
-    let session = Session::start(command, model, resume, kitty)?;
-    let mut app = App::new(session, Box::new(Local));
-
-    if resume.is_some() {
-        app.show_session();
-    }
+    let mut app = start(command, model, resume, kitty, Box::new(Local))?;
     if let Some(task) = task.filter(|task| !task.is_empty()) {
         app.submit_text(&task);
     }
@@ -231,19 +231,38 @@ pub(crate) fn run(
     let ending = Ending::catch();
     let mut screen = Screen::enter()?;
     drive(&mut app, &mut screen, &ending)?;
-
-    // The terminal keeps the images it was sent after smol exits unless they are deleted,
-    // as placeholders don't count as placements on screen
-    picture::clear();
-    picture::send(&mut stdout(), &[]).ok();
-    drop(screen);
-    leave(app, &ending);
+    finish(app, screen, kitty, &ending);
     Ok(())
+}
+
+/// Opens the session and the app that shows it, with pictures drawn as Kitty images when `kitty`
+pub(crate) fn start(
+    command: &[OsString],
+    model: Option<String>,
+    resume: Option<&str>,
+    kitty: bool,
+    desktop: Box<dyn Desktop>,
+) -> Result<App> {
+    picture::set_kitty(kitty);
+    let session = Session::start(command, model, resume, kitty)?;
+    let mut app = App::new(session, desktop);
+    if resume.is_some() {
+        app.show_session();
+    }
+    Ok(app)
 }
 
 /// Says goodbye once the host gave the terminal back, then lets libsmol save before a caught
 /// signal ends smol
-pub(crate) fn leave(app: App, ending: &Ending) {
+pub(crate) fn finish(app: App, host: impl Host, kitty: bool, ending: &Ending) {
+    // The terminal keeps the images it was sent after smol exits unless they are deleted,
+    // as placeholders don't count as placements on screen
+    picture::clear();
+    if kitty {
+        picture::send(&mut stdout(), &[]).ok();
+    }
+    drop(host);
+
     if let Some(line) = app.session.parting() {
         println!("{line}");
     }

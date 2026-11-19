@@ -1,9 +1,9 @@
 use crate::acp::rpc::{Notice, SessionPeer};
-use crate::agent::{Event, Failure, HelperView, Helpers, Status, Unseen};
+use crate::agent::{Event, Failure, Status, TaskView, TaskViews, Unseen};
 use crate::prompt::{SKIPPED, TOOL};
 use crate::steps::{
-    estimate, spent, text_bytes, AgentMemory, AgentStep, Call, CallError, DoneStep, Ending, Exit,
-    Helper, MemoryStep, Program, ShellStep, StepError, SummaryStep, TaskStep, Usage,
+    estimate, spent, text_bytes, AgentMemory, AgentRecord, AgentStep, Call, CallError, DoneStep,
+    Ending, Exit, MemoryStep, Program, ShellStep, StepError, SummaryStep, TaskStep, Usage,
 };
 use agent_client_protocol_schema::v1::{
     ContentBlock, ContentChunk, MessageId, Meta, ResourceLink, SessionUpdate, ToolCall,
@@ -11,11 +11,10 @@ use agent_client_protocol_schema::v1::{
 };
 use reaper::one_line;
 use reaper::wire::{
-    AGENT, BACKGROUND, DECODE_DURATION, DURATION, ERROR, ESTIMATED_OUTPUT, INPUT_TOKENS,
-    INTERRUPTED, NAME, OUTPUT_TOKENS, PARENT, SHELL, STEPS, TASK, UPDATE, WAITING,
+    Measured, AGENT, BACKGROUND, ERROR, NAME, PARENT, SHELL, TASK, UPDATE, WAITING,
 };
 use reqwest::Url;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::mem;
 use std::path::{self, Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -82,7 +81,8 @@ impl Translator {
         }
     }
 
-    pub(crate) fn replay(&mut self, memory: &AgentMemory) {
+    /// `agents` are the session's, whose tasks the calls that sent them show
+    pub(crate) fn replay(&mut self, memory: &AgentMemory, agents: &[AgentRecord]) {
         for step in &memory.steps {
             match step {
                 MemoryStep::Task(task) => self.task(task, false),
@@ -112,11 +112,19 @@ impl Translator {
                         }
 
                         let result = call.result.as_ref();
-                        let helpers = result.map(|result| result.agents.as_slice());
-                        let views = self.helpers(index);
-                        for (offset, helper) in helpers.unwrap_or_default().iter().enumerate() {
-                            let mut view = views.open(offset + 1, helper);
-                            view.close(helper);
+                        let sent = result.map(|result| result.agents.as_slice());
+                        let views = self.tasks(index);
+                        for (offset, sent) in sent.unwrap_or_default().iter().enumerate() {
+                            let found = agents.iter().find(|agent| agent.name == sent.name);
+                            let Some(agent) = found else {
+                                continue;
+                            };
+                            let Some(task) = agent.tasks.get(sent.number) else {
+                                continue;
+                            };
+                            let mut view = views.open(offset + 1, &agent.name, &task.task);
+                            let steps = agent.steps(sent.number);
+                            view.close(&task.end, steps);
                         }
                         if call.result.is_some() || call.error.is_some() {
                             self.ran(index, call);
@@ -256,12 +264,13 @@ impl Translator {
         let fields = ToolCallUpdateFields::new().status(status).content(content);
         let mut update = ToolCallUpdate::new(id, fields);
         if failed {
-            let error = (ERROR.to_owned(), json!(shell.end.to_string()));
-            let mut meta = Meta::from_iter([error]);
-            // The client recognizes interrupts by this key, which matches the one on usage updates
-            if shell.end == Exit::Interrupted {
-                meta.insert(INTERRUPTED.to_owned(), true.into());
-            }
+            // The client recognizes interrupts as it does on usage updates
+            let measured = Measured {
+                interrupted: shell.end == Exit::Interrupted,
+                ..Measured::default()
+            };
+            let mut meta = meta_of(&measured);
+            meta.insert(ERROR.to_owned(), json!(shell.end.to_string()));
             update = update.meta(meta);
         }
         self.peer.update(SessionUpdate::ToolCallUpdate(update));
@@ -269,7 +278,7 @@ impl Translator {
 
     /// Shows a client that declared `BACKGROUND` the programs that ended while no turn ran
     pub(crate) fn ended(&mut self, done: &DoneStep) {
-        if !self.peer.background() {
+        if !self.peer.declared().background {
             return;
         }
 
@@ -320,8 +329,11 @@ impl Translator {
                 0 => 0,
                 used => used + output,
             };
-            let estimated = (ESTIMATED_OUTPUT.to_owned(), json!(output));
-            let meta = Meta::from_iter([estimated]);
+            let measured = Measured {
+                estimated_output: Some(output),
+                ..Measured::default()
+            };
+            let meta = meta_of(&measured);
             let update = UsageUpdate::new(used, self.window).meta(meta);
             self.peer.update(SessionUpdate::UsageUpdate(update));
         }
@@ -392,12 +404,12 @@ impl Translator {
     }
 
     /// A call that was never opened shows none of the agents it starts
-    pub(crate) fn helpers(&self, index: usize) -> Box<dyn Helpers> {
+    pub(crate) fn tasks(&self, index: usize) -> Box<dyn TaskViews> {
         let Some(opened) = self.opened(index) else {
             return Box::new(Unseen);
         };
 
-        Box::new(HelperCalls {
+        Box::new(TaskCalls {
             peer: self.peer.clone(),
             parent: opened.id.clone(),
             cwd: self.cwd.clone(),
@@ -545,38 +557,44 @@ impl Translator {
             self.used = used;
         }
 
-        let mut meta = usage_meta(usage);
         // Replay has no stop reason for the turn, so interrupts can only go on the step
-        if interrupted {
-            meta.insert(INTERRUPTED.to_owned(), true.into());
-        }
-
+        let measured = Measured {
+            interrupted,
+            ..measured(usage)
+        };
+        let meta = meta_of(&measured);
         let update = UsageUpdate::new(self.used, self.window).meta(meta);
         self.peer.update(SessionUpdate::UsageUpdate(update));
     }
 }
 
-/// The keys that steps and agents report their usage with
-fn usage_meta(usage: &Usage) -> Meta {
-    let mut meta = Meta::new();
-    meta.insert(DURATION.to_owned(), usage.duration.into());
-    if let Some(tokens) = usage.tokens {
-        meta.insert(INPUT_TOKENS.to_owned(), tokens.input_tokens.into());
-        meta.insert(OUTPUT_TOKENS.to_owned(), tokens.output_tokens.into());
+/// What steps and agents report of their usage
+fn measured(usage: &Usage) -> Measured {
+    let tokens = usage.tokens;
+    Measured {
+        duration: Some(usage.duration),
+        decode_duration: usage.decode_duration,
+        input_tokens: tokens.map(|tokens| tokens.input_tokens),
+        output_tokens: tokens.map(|tokens| tokens.output_tokens),
+        ..Measured::default()
     }
-    if let Some(decode) = usage.decode_duration {
-        meta.insert(DECODE_DURATION.to_owned(), decode.into());
-    }
-    meta
 }
 
-struct HelperCalls {
+fn meta_of(measured: &Measured) -> Meta {
+    let value = serde_json::to_value(measured).expect("serialize");
+    match value {
+        Value::Object(meta) => meta,
+        _ => Meta::new(),
+    }
+}
+
+struct TaskCalls {
     peer: SessionPeer,
     parent: String,
     cwd: PathBuf,
 }
 
-struct HelperCall {
+struct TaskCall {
     peer: SessionPeer,
     id: String,
     started: bool,
@@ -584,11 +602,11 @@ struct HelperCall {
     closed: bool,
 }
 
-impl Helpers for HelperCalls {
-    fn open(&self, number: usize, helper: &Helper) -> Box<dyn HelperView> {
+impl TaskViews for TaskCalls {
+    fn open(&self, number: usize, name: &str, task: &str) -> Box<dyn TaskView> {
         let id = format!("{}.{number}", self.parent);
-        let title = agent_title(&helper.task, &self.cwd);
-        let asked = json!({ TASK: helper.task, NAME: helper.name });
+        let title = agent_title(task, &self.cwd);
+        let asked = json!({ TASK: task, NAME: name });
         let marked = (AGENT.to_owned(), json!(true));
         let parent = (PARENT.to_owned(), json!(self.parent));
         let meta = Meta::from_iter([marked, parent]);
@@ -599,7 +617,7 @@ impl Helpers for HelperCalls {
             .meta(meta);
         self.peer.update(SessionUpdate::ToolCall(opened));
 
-        let view = HelperCall {
+        let view = TaskCall {
             peer: self.peer.clone(),
             id,
             started: false,
@@ -617,7 +635,7 @@ impl Helpers for HelperCalls {
     }
 }
 
-impl HelperCall {
+impl TaskCall {
     fn send(&self, fields: ToolCallUpdateFields, meta: Meta) {
         let update = ToolCallUpdate::new(self.id.clone(), fields).meta(meta);
         self.peer.update(SessionUpdate::ToolCallUpdate(update));
@@ -625,19 +643,20 @@ impl HelperCall {
 
     /// Replay closes it right after opening it, and an aborted one ends as its saved record does,
     /// so every way it ends sends the same last update
-    fn finish(&mut self, end: &Ending, memory: &AgentMemory) {
+    fn finish(&mut self, end: &Ending, steps: &[MemoryStep]) {
         let (status, text) = match end.outcome() {
             Ok(text) => (ToolCallStatus::Completed, text),
             Err(text) => (ToolCallStatus::Failed, text),
         };
 
-        let (usage, steps) = spent(&memory.steps);
-        let mut meta = usage_meta(&usage);
-        meta.insert(STEPS.to_owned(), steps.into());
-        // The client recognizes interrupts by this key, which matches the one on usage updates
-        if matches!(end, Ending::Interrupted {} | Ending::Stopped {}) {
-            meta.insert(INTERRUPTED.to_owned(), true.into());
-        }
+        let (usage, steps) = spent(steps);
+        // The client recognizes interrupts as it does on usage updates
+        let measured = Measured {
+            steps: Some(steps as u64),
+            interrupted: matches!(end, Ending::Interrupted {} | Ending::Stopped {}),
+            ..measured(&usage)
+        };
+        let meta = meta_of(&measured);
 
         let content = vec![ToolCallContent::from(text)];
         let fields = ToolCallUpdateFields::new().status(status).content(content);
@@ -646,7 +665,7 @@ impl HelperCall {
     }
 }
 
-impl HelperView for HelperCall {
+impl TaskView for TaskCall {
     fn shown(&mut self, status: &Status) {
         let mut content = vec![ToolCallContent::from(status.doing.clone())];
         if !status.preview.is_empty() {
@@ -658,24 +677,26 @@ impl HelperView for HelperCall {
         }
         self.started = true;
 
-        let mut meta = usage_meta(&status.usage);
-        meta.insert(STEPS.to_owned(), status.steps.into());
+        let measured = Measured {
+            steps: Some(status.steps as u64),
+            ..measured(&status.usage)
+        };
+        let meta = meta_of(&measured);
         self.send(fields, meta);
     }
 
-    fn close(&mut self, helper: &Helper) {
-        self.finish(&helper.end, &helper.memory);
+    fn close(&mut self, end: &Ending, steps: &[MemoryStep]) {
+        self.finish(end, steps);
     }
 }
 
-impl Drop for HelperCall {
+impl Drop for TaskCall {
     fn drop(&mut self) {
         if self.closed {
             return;
         }
 
-        let empty = AgentMemory::default();
-        self.finish(&Ending::Unfinished {}, &empty);
+        self.finish(&Ending::Unfinished {}, &[]);
     }
 }
 
@@ -727,7 +748,7 @@ mod tests {
     use crate::model::tests::png;
     use crate::model::Finish;
     use crate::steps::tests::{asked, coded, metered, replied};
-    use crate::steps::{CodeResult, Helper};
+    use crate::steps::{AgentTask, CodeResult, Sent};
     use serde_json::Value;
     use std::env;
     use std::path::MAIN_SEPARATOR;
@@ -754,7 +775,7 @@ mod tests {
             steps: vec![MemoryStep::Restarted],
         };
         let (mut replaying, mut sent) = translator(0);
-        replaying.replay(&memory);
+        replaying.replay(&memory, &[]);
         let replayed = drained(&mut sent);
         assert_eq!(told, replayed);
 
@@ -802,7 +823,7 @@ mod tests {
 
     fn replayed(memory: &AgentMemory) -> Vec<Value> {
         let (mut translator, mut sent) = translator(1000);
-        translator.replay(memory);
+        translator.replay(memory, &[]);
 
         let messages = drained(&mut sent);
         let updates = messages.iter().map(|message| &message["params"]["update"]);
@@ -913,7 +934,7 @@ mod tests {
         assert_eq!(thoughts, expected);
 
         let (mut replaying, mut sent) = translator(1000);
-        replaying.replay(&memory);
+        replaying.replay(&memory, &[]);
         let replayed = drained(&mut sent);
         assert_eq!(shown(&replayed)[1..], shown(&live));
         assert!(replayed.len() < live.len(), "{replayed:?}");
@@ -948,7 +969,7 @@ mod tests {
             steps: vec![MemoryStep::Action(Box::new(step))],
         };
         let (mut replaying, mut sent) = translator(1000);
-        replaying.replay(&memory);
+        replaying.replay(&memory, &[]);
         let again = drained(&mut sent);
         assert_eq!(shown(&again), shown(&told));
 
@@ -990,7 +1011,7 @@ mod tests {
             steps: vec![MemoryStep::Action(Box::new(step))],
         };
         let (mut replaying, mut sent) = translator(1000);
-        replaying.replay(&memory);
+        replaying.replay(&memory, &[]);
         let again = drained(&mut sent);
         assert_eq!(shown(&again), shown(&told));
 
@@ -1223,7 +1244,7 @@ mod tests {
             steps: vec![MemoryStep::Action(Box::new(replayed))],
         };
         translator.progress.since = Some(earlier);
-        translator.replay(&memory);
+        translator.replay(&memory, &[]);
         let ended = usages();
         assert_eq!(ended.len(), 1, "{ended:?}");
         assert_eq!(ended[0]["_meta"]["estimatedOutput"], Value::Null);
@@ -1322,12 +1343,12 @@ mod tests {
 
         let (lines, mut sent) = mpsc::unbounded_channel();
         let peer = Peer::new(Out::Lines(lines));
-        peer.set_background(true);
+        peer.declare(&json!({ "_smol/background": true }));
         let peer = SessionPeer::new(peer, "session-1");
         let cwd = env::temp_dir();
         let copies = cwd.join("copies");
         let mut translator = Translator::new(peer, Some(1000), cwd, copies);
-        translator.replay(&memory);
+        translator.replay(&memory, &[]);
 
         let messages = drained(&mut sent);
         let [ended] = &messages[..] else {
@@ -1379,7 +1400,7 @@ mod tests {
 
     /// Each task the code sends an agent is a tool call of its own, the same live and on replay
     #[test]
-    fn helpers_shown() {
+    fn tasks_shown() {
         let (mut live, mut sent) = translator(1000);
         live.translate(Event::Code(
             0,
@@ -1390,25 +1411,20 @@ mod tests {
             ..Call::default()
         };
         live.translate(Event::Run(0, &running));
-        let started = live.helpers(0);
+        let started = live.tasks(0);
         let counted = AgentStep {
             usage: metered(100, 20),
             ..replied("3 cafés")
         };
+        let task = "Count the cafés\nin menu.txt";
         let memory = AgentMemory {
             steps: vec![
-                MemoryStep::Task(asked("Count the cafés\nin menu.txt")),
+                MemoryStep::Task(asked(task)),
                 MemoryStep::Action(Box::new(counted)),
             ],
         };
-        let helper = Helper {
-            task: "Count the cafés\nin menu.txt".to_owned(),
-            name: Some("cafés".to_owned()),
-            end: Ending::Answer("3 cafés".to_owned()),
-            memory,
-            resendable: true,
-        };
-        let mut call = started.open(1, &helper);
+        let end = Ending::Answer("3 cafés".to_owned());
+        let mut call = started.open(1, "cafés", task);
         let status = |doing: &str, preview: &str| Status {
             doing: doing.to_owned(),
             preview: preview.to_owned(),
@@ -1420,10 +1436,14 @@ mod tests {
             ..status("running print(len(cafés))", "print(len(cafés))")
         };
         call.shown(&spent);
-        call.close(&helper);
+        call.close(&end, &memory.steps);
+        let named = Sent {
+            name: "cafés".to_owned(),
+            number: 0,
+        };
         let result = CodeResult {
             printed: Some("3 cafés".to_owned()),
-            agents: vec![helper],
+            agents: vec![named],
             ..CodeResult::default()
         };
         let ran = Call {
@@ -1438,11 +1458,21 @@ mod tests {
         live.translate(Event::StepEnd(&step));
         let told = drained(&mut sent);
 
-        let memory = AgentMemory {
+        let session = AgentMemory {
             steps: vec![MemoryStep::Action(Box::new(step))],
         };
+        let tasked = AgentTask {
+            task: task.to_owned(),
+            start: 0,
+            end,
+        };
+        let agent = AgentRecord {
+            name: "cafés".to_owned(),
+            memory,
+            tasks: vec![tasked],
+        };
         let (mut replaying, mut sent) = translator(1000);
-        replaying.replay(&memory);
+        replaying.replay(&session, &[agent]);
         let again = drained(&mut sent);
         assert_eq!(shown(&again), shown(&told));
 
@@ -1481,30 +1511,18 @@ mod tests {
         assert_eq!(closed["_meta"], meta);
 
         // An interrupted agent is marked like an interrupted command
-        let stopped = Helper {
-            task: "Count the cafés".to_owned(),
-            name: Some("counter".to_owned()),
-            end: Ending::Interrupted {},
-            memory: AgentMemory::default(),
-            resendable: true,
-        };
         let (mut stopping, mut sent) = translator(1000);
         let code = streamed("agent('counter', 'Count the cafés')\n");
         stopping.translate(Event::Code(0, code));
-        let started = stopping.helpers(0);
-        let mut call = started.open(1, &stopped);
-        call.close(&stopped);
+        let started = stopping.tasks(0);
+        let mut call = started.open(1, "counter", "Count the cafés");
+        call.close(&Ending::Interrupted {}, &[]);
 
         // One aborted before it closes still ends, and so does one replayed while running
-        let running = Helper {
-            task: "Spell naïve".to_owned(),
-            end: Ending::Running {},
-            ..stopped.clone()
-        };
-        let dropped = started.open(2, &running);
+        let dropped = started.open(2, "counter", "Spell naïve");
         drop(dropped);
-        let mut replayed = started.open(3, &running);
-        replayed.close(&running);
+        let mut replayed = started.open(3, "counter", "Spell naïve");
+        replayed.close(&Ending::Running {}, &[]);
 
         // The code's call says which agents it waits for, until it stops waiting
         started.waiting(&["counter".to_owned()]);

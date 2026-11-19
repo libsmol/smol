@@ -1,5 +1,5 @@
 use crate::client::{
-    chosen, offerings, Asked, Client, Incoming, McpState, McpStatus, Memory, Offering, Program,
+    chosen, current, mcp_line, offerings, Asked, Client, Event, Incoming, Offering, Program,
     Refusal, Selector,
 };
 use crate::conversation::{Conversation, Entry, Outcome};
@@ -11,9 +11,10 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use image::ImageFormat;
-use reaper::wire::MCP_PREFIX;
+use reaper::wire::{McpState, McpStatus, Memory, MCP_PREFIX};
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::path::{is_separator, Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
@@ -85,13 +86,14 @@ pub(crate) struct Session {
     dropped: Vec<String>,
     /// Set only once the agent reports a save time,
     /// since the first message may be refused or cancelled before it goes out
-    saved: bool,
-    unsaved: bool,
+    stored: bool,
+    /// The last save failed
+    save_failed: bool,
 }
 
 impl Session {
     pub(crate) fn start(
-        command: &[String],
+        command: &[OsString],
         model: Option<String>,
         resume: Option<&str>,
         images_shown: bool,
@@ -126,8 +128,8 @@ impl Session {
             images: BTreeMap::new(),
             switched_on: Vec::new(),
             dropped: Vec::new(),
-            saved: resume.is_some(),
-            unsaved: false,
+            stored: resume.is_some(),
+            save_failed: false,
         })
     }
 
@@ -151,9 +153,7 @@ impl Session {
         if resume.is_none() {
             // The effort goes second, as switching models resets it
             for selector in [Selector::Model, Selector::Effort] {
-                let offered = self.offerings(selector);
-                let current = offered.into_iter().find(|offering| offering.current);
-                let Some(current) = current else {
+                let Some(current) = current(&self.options, selector) else {
                     continue;
                 };
 
@@ -166,16 +166,33 @@ impl Session {
             }
         }
 
-        self.id = opened.id;
-        self.options = options;
-        self.title.clear();
-        self.mcp.clear();
-        self.programs.clear();
-        self.conversation = Conversation::default();
-        self.switched_on.clear();
-        self.dropped.clear();
-        self.saved = resume.is_some();
-        self.unsaved = false;
+        // Every field is named, so one added later can't be left over from the session before
+        let Self {
+            client: _,
+            inbox: _,
+            id,
+            title,
+            options: offered,
+            mcp,
+            programs,
+            conversation,
+            run: _,
+            images: _,
+            switched_on,
+            dropped,
+            stored,
+            save_failed,
+        } = self;
+        *id = opened.id;
+        *offered = options;
+        title.clear();
+        mcp.clear();
+        programs.clear();
+        *conversation = Conversation::default();
+        switched_on.clear();
+        dropped.clear();
+        *stored = resume.is_some();
+        *save_failed = false;
 
         Ok(())
     }
@@ -243,7 +260,7 @@ impl Session {
     /// Called before the client drops, so an exited agent ended on its own
     pub(crate) fn parting(&self) -> Option<String> {
         let id = &self.id;
-        let line = match (self.saved, self.unsaved, self.client.exited()) {
+        let line = match (self.stored, self.save_failed, self.client.exited()) {
             (true, _, true) => format!("session {id}: the agent exited; `smol --resume {id}` restores the last saved state"),
             (true, false, false) => format!("session {id}: saved; resume with `smol --resume {id}`"),
             (true, true, false) => format!("session {id}: the last save failed; `smol --resume {id}` restores the last saved state"),
@@ -343,15 +360,32 @@ impl Session {
     }
 
     fn receive(&mut self, message: Incoming) -> Output {
-        match message {
-            Incoming::Update(session, update) if session == self.id => {
+        let event = match message {
+            Incoming::Session(session, event) if session == self.id => event,
+            // A session left behind may still send a few
+            Incoming::Session(..) => return Output::Shown,
+
+            Incoming::Exited(text) => {
+                self.conversation.push(Entry::Failure(text));
+                return Output::Shown;
+            }
+
+            Incoming::Done(stop) => {
+                self.run = None;
+                let outcome = self.conversation.done(stop);
+                return Output::Done(outcome);
+            }
+        };
+
+        match event {
+            Event::Update(update) => {
                 if let SessionUpdate::SessionInfoUpdate(info) = &*update {
                     if let MaybeUndefined::Value(title) = &info.title {
                         self.title = title.clone();
                     }
                     if let MaybeUndefined::Value(_) = &info.updated_at {
-                        self.saved = true;
-                        self.unsaved = false;
+                        self.stored = true;
+                        self.save_failed = false;
                     }
                     return Output::Shown;
                 }
@@ -363,17 +397,17 @@ impl Session {
                 Output::Shown
             }
 
-            Incoming::Notice(session, notice) if session == self.id => {
-                self.unsaved |= notice.unsaved;
+            Event::Notice(notice) => {
+                self.save_failed |= notice.unsaved;
                 self.conversation.notice(&notice);
                 Output::Shown
             }
 
-            Incoming::Queued(session, asked) if session == self.id => Output::Queued(asked),
+            Event::Queued(asked) => Output::Queued(asked),
 
-            Incoming::Background(session) if session == self.id => Output::Background,
+            Event::Background => Output::Background,
 
-            Incoming::Programs(session, programs) if session == self.id => {
+            Event::Programs(programs) => {
                 let mut listed = Vec::new();
                 for mut program in programs {
                     let known = self.programs.iter().find(|known| known.pid == program.pid);
@@ -386,7 +420,7 @@ impl Session {
                 Output::Shown
             }
 
-            Incoming::Mcp(session, servers) if session == self.id => {
+            Event::Mcp(servers) => {
                 for server in &servers {
                     let old = self.mcp.iter().find(|old| old.name == server.name);
                     let old = old.map(|old| &old.state);
@@ -404,7 +438,7 @@ impl Session {
                         self.dropped.push(name.clone());
                     }
 
-                    let text = server.to_string();
+                    let text = mcp_line(server);
                     let entry = match &server.state {
                         McpState::Connected { .. } if switched_on => Entry::Info(text),
                         McpState::Failed { .. } if switched_on || dropped => Entry::Failure(text),
@@ -423,24 +457,39 @@ impl Session {
                 self.mcp = servers;
                 Output::Servers
             }
-
-            Incoming::Exited(text) => {
-                self.conversation.push(Entry::Failure(text));
-                Output::Shown
-            }
-
-            Incoming::Done(stop) => {
-                self.run = None;
-                let outcome = self.conversation.done(stop);
-                Output::Done(outcome)
-            }
-
-            _ => Output::Shown,
         }
     }
 }
 
-pub(crate) fn opens_mention(before: &str) -> bool {
+/// How a picked path goes in the input, open after a folder for the path to go on
+pub(crate) fn mention(path: &str) -> String {
+    let quoted = path.contains(char::is_whitespace);
+    match (quoted, path.ends_with('/')) {
+        (false, false) => format!("@{path} "),
+        (false, true) => format!("@{path}"),
+        (true, false) => format!("@\"{path}\" "),
+        (true, true) => format!("@\"{path}"),
+    }
+}
+
+/// Returns the character count including the @, and the path typed so far
+pub(crate) fn typing_mention(before: &str) -> Option<(usize, &str)> {
+    let mut ats = before.rmatch_indices('@').map(|(at, _)| at);
+    let at = ats.find(|&at| opens_mention(&before[..at]))?;
+
+    let rest = &before[at + 1..];
+    let path = match rest.strip_prefix('"') {
+        Some(quoted) if quoted.contains('"') => return None,
+        Some(quoted) => quoted,
+        None if rest.contains(char::is_whitespace) => return None,
+        None => rest,
+    };
+
+    let count = before[at..].chars().count();
+    Some((count, path))
+}
+
+fn opens_mention(before: &str) -> bool {
     let previous = before.chars().next_back();
     let named =
         |c: char| c.is_ascii_alphanumeric() || is_separator(c) || matches!(c, '.' | '-' | '_');
@@ -554,10 +603,11 @@ fn mentions(text: &str, exists: impl Fn(&str) -> bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use crate::chat::*;
-    use crate::client::Notice;
+    use crate::client::Event;
     use crate::tests::{fake, shell};
     use agent_client_protocol_schema::v1::SessionInfoUpdate;
     use image::RgbaImage;
+    use reaper::wire::Notice;
     use std::cell::Cell;
     use std::io::Cursor;
     use std::thread;
@@ -568,13 +618,13 @@ mod tests {
             name: "web".to_owned(),
             state,
         };
-        Incoming::Mcp(session.to_owned(), vec![server])
+        Incoming::Session(session.to_owned(), Event::Mcp(vec![server]))
     }
 
     fn info(session: &str, info: SessionInfoUpdate) -> Incoming {
         let update = SessionUpdate::SessionInfoUpdate(info);
         let update = Box::new(update);
-        Incoming::Update(session.to_owned(), update)
+        Incoming::Session(session.to_owned(), Event::Update(update))
     }
 
     /// The infos, warnings and failures that receiving `message` added
@@ -600,7 +650,7 @@ mod tests {
         let mut session = Session::start(&agent, None, None, false).expect("start");
 
         let switched = session.set_mcp(true, "web").expect("switch");
-        assert_eq!(switched.to_string(), "mcp: web: connecting");
+        assert_eq!(mcp_line(&switched), "mcp: web: connecting");
 
         let stale = status("s1", McpState::Off);
         assert!(shown(&mut session, stale).is_empty());
@@ -633,7 +683,7 @@ mod tests {
         assert_eq!(failed, ["✗ mcp: web: failed: refused again"]);
 
         let switched = session.set_mcp(false, "web").expect("switch");
-        assert_eq!(switched.to_string(), "mcp: web: off");
+        assert_eq!(mcp_line(&switched), "mcp: web: off");
         assert_eq!(session.mcp[0].state, McpState::Off);
     }
 
@@ -681,19 +731,19 @@ mod tests {
         let titled = info("s1", titled);
         session.receive(titled);
         assert_eq!(session.title, "Snake game");
-        assert!(!session.saved);
+        assert!(!session.stored);
 
         let stamped = SessionInfoUpdate::new().updated_at("2026-10-12T00:00:00Z".to_owned());
         let stamped = info("s1", stamped);
         session.receive(stamped);
-        assert!(session.saved);
+        assert!(session.stored);
 
         session.open(None).expect("open");
         assert_eq!((session.id.as_str(), session.mcp.len()), ("s2", 0));
         assert_eq!(session.title, "");
-        assert!(!session.saved);
+        assert!(!session.stored);
         session.open(Some("s1")).expect("resume");
-        assert!(session.saved);
+        assert!(session.stored);
 
         let connected = status("s1", McpState::Connected { tools: 1 });
         assert!(shown(&mut session, connected).is_empty());
@@ -718,7 +768,7 @@ mod tests {
                     since,
                 });
             }
-            Incoming::Programs("s1".to_owned(), programs)
+            Incoming::Session("s1".to_owned(), Event::Programs(programs))
         };
 
         session.receive(listed(&[42]));
@@ -742,7 +792,7 @@ mod tests {
             step: false,
             unsaved: true,
         };
-        let notice = Incoming::Notice("s1".to_owned(), failed());
+        let notice = Incoming::Session("s1".to_owned(), Event::Notice(failed()));
         session.receive(notice);
         assert_eq!(session.parting().as_deref(), Some("session s1: not saved"));
 
@@ -752,7 +802,7 @@ mod tests {
         let saved = "session s1: saved; resume with `smol --resume s1`";
         assert_eq!(session.parting().as_deref(), Some(saved));
 
-        let notice = Incoming::Notice("s1".to_owned(), failed());
+        let notice = Incoming::Session("s1".to_owned(), Event::Notice(failed()));
         session.receive(notice);
         let unsaved =
             "session s1: the last save failed; `smol --resume s1` restores the last saved state";

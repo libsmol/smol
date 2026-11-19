@@ -1,4 +1,5 @@
-use crate::tui::app::{pasted, Alert, App};
+use crate::tui::app::{Alert, App, ALTGR};
+use crate::tui::draft::MAX_UNFOLDED_CHARS;
 use crate::tui::theme::{self, BG, FG};
 use crate::tui::{multiplexed, picture, ui, Host};
 use anyhow::Result;
@@ -6,8 +7,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{SetCursorStyle, Show};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::style::Print;
@@ -46,7 +48,7 @@ pub(crate) struct Screen {
     truecolor: bool,
     notifier: Notifier,
     /// Taken to be true until the terminal reports losing focus
-    pub(crate) focused: bool,
+    focused: bool,
     /// When events were last read
     listened: Instant,
 }
@@ -128,7 +130,7 @@ impl Host for Screen {
         }
 
         // Images drawn last frame go out now, and their placeholders show them once they arrive
-        picture::send(&mut stdout(), &app.shown)?;
+        picture::send(&mut stdout(), &app.pictures)?;
         if !app.take_dirty() {
             return Ok(());
         }
@@ -261,10 +263,49 @@ fn restore() {
     terminal::disable_raw_mode().ok();
 }
 
+/// Windows sends a paste as one batch of key presses with newlines as Enter,
+/// and with `stalled` the batch may be keys typed during a freeze
+fn pasted(events: &[Event], stalled: bool) -> Option<String> {
+    let mut text = String::new();
+    for event in events {
+        let key = match event {
+            Event::Key(key) => key,
+            // The mouse moved during the paste
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => continue,
+            _ => return None,
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+
+        let modifiers = key.modifiers.difference(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Char(c) if modifiers.is_empty() || modifiers == ALTGR => text.push(c),
+            KeyCode::Enter if key.modifiers.is_empty() => text.push('\n'),
+            KeyCode::Tab if key.modifiers.is_empty() => text.push('\t'),
+            _ => return None,
+        }
+    }
+
+    // A long line is a paste too, since typing it in key by key diffs the input each time
+    let count = text.chars().count();
+    let burst = count > 1;
+    let long = count > MAX_UNFOLDED_CHARS;
+    let typed = stalled && text.ends_with('\n') && text.matches('\n').count() == 1;
+    match burst && (text.contains('\n') || long) && !typed {
+        true => Some(text),
+        false => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::tui::app::Alert;
-    use crate::tui::screen::{alerted, caught, notifier, Notifier, CAUGHT};
+    use crate::tui::draft::MAX_UNFOLDED_CHARS;
+    use crate::tui::screen::{alerted, caught, notifier, pasted, Notifier, CAUGHT};
+    use ratatui::crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+    };
 
     #[test]
     fn alerts_escaped() {
@@ -314,5 +355,50 @@ mod tests {
         assert_eq!(failed, None);
         assert!(!CAUGHT.get());
         assert_eq!(caught(|| 1 + 1), Some(2));
+    }
+
+    #[test]
+    fn key_burst_pasted() {
+        let pressed = |code| Event::Key(KeyEvent::from(code));
+        let first = pressed(KeyCode::Char('é'));
+        let enter = pressed(KeyCode::Enter);
+        let second = pressed(KeyCode::Char('ñ'));
+        let shifted = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
+        let moved = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        let burst = [
+            first.clone(),
+            enter.clone(),
+            moved,
+            Event::Key(shifted),
+            second.clone(),
+        ];
+        assert_eq!(pasted(&burst, false).as_deref(), Some("é\nAñ"));
+        assert_eq!(pasted(&burst, true).as_deref(), Some("é\nAñ"));
+
+        // A line typed during a freeze, then Enter
+        let line = [first.clone(), second.clone(), enter.clone()];
+        assert_eq!(pasted(&line, true), None);
+        assert_eq!(pasted(&line, false).as_deref(), Some("éñ\n"));
+
+        // One long line too, which then folds
+        let long = vec![first.clone(); MAX_UNFOLDED_CHARS + 1];
+        let text = "é".repeat(MAX_UNFOLDED_CHARS + 1);
+        assert_eq!(pasted(&long, true), Some(text));
+        assert_eq!(pasted(&long[1..], false), None);
+
+        let up = pressed(KeyCode::Up);
+        let typed = [
+            vec![enter.clone()],
+            vec![first.clone(), second],
+            vec![first, up, enter],
+        ];
+        for events in typed {
+            assert_eq!(pasted(&events, false), None, "{events:?}");
+        }
     }
 }

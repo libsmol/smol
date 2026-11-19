@@ -1,8 +1,8 @@
-use crate::tui::picture::Picture;
+use crate::tui::picture::Pictures;
 use crate::tui::web::input::decode;
 use crate::tui::web::{Arrival, Who};
 use httparse::{Request, Status, EMPTY_HEADER};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::str;
@@ -48,10 +48,9 @@ const PAGE_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'sel
 /// Diagrams and pictures the user opens run no script
 const OPENED_POLICY: &str = "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'";
 
-/// What the server hands out besides the page, which the TUI's thread puts here
+/// The files the user opened, which the TUI's thread puts here for the server to hand out
 #[derive(Default)]
 pub(crate) struct Served {
-    pub(crate) images: HashMap<u32, Arc<Picture>>,
     opened: VecDeque<(u64, Arc<[u8]>, &'static str)>,
     last: u64,
 }
@@ -72,6 +71,7 @@ struct Server {
     token: String,
     cookie: String,
     served: Arc<Mutex<Served>>,
+    pictures: Pictures,
     arrivals: Sender<Arrival>,
     next_id: AtomicU64,
 }
@@ -85,6 +85,7 @@ pub(crate) fn listen(
     address: SocketAddr,
     token: String,
     served: Arc<Mutex<Served>>,
+    pictures: Pictures,
     arrivals: Sender<Arrival>,
 ) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(address)?;
@@ -94,6 +95,7 @@ pub(crate) fn listen(
         token,
         cookie,
         served,
+        pictures,
         arrivals,
         next_id: AtomicU64::new(1),
     });
@@ -251,9 +253,8 @@ impl Server {
                     path.strip_prefix("/image/").and_then(|id| id.parse().ok());
                 let number: Option<u64> = path.strip_prefix("/open/").and_then(|n| n.parse().ok());
 
-                // Taken out under the lock, which the TUI's thread needs for every frame
+                let picture = image.and_then(|id| self.pictures.image(id));
                 let served = self.served.lock().expect("served");
-                let picture = image.and_then(|id| served.images.get(&id).cloned());
                 let opened = served.opened.iter().find(|(n, ..)| Some(*n) == number);
                 let opened = opened.cloned();
                 drop(served);
@@ -288,11 +289,12 @@ impl Server {
             return;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        if self
-            .arrivals
-            .send(Arrival::Joined(id, outbox, parting))
-            .is_err()
-        {
+        let joined = Arrival::Joined {
+            id,
+            outbox,
+            parting,
+        };
+        if self.arrivals.send(joined).is_err() {
             return;
         }
 
@@ -393,9 +395,11 @@ fn same(given: &str, token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::tui::picture::Pictures;
     use crate::tui::web::input::Input;
     use crate::tui::web::serve::{listen, Served, LEFT};
     use crate::tui::web::{Arrival, Who};
+    use ratatui::layout::Size;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
     use std::sync::atomic::Ordering;
@@ -413,7 +417,14 @@ mod tests {
         let served = Arc::default();
         let (arrive, arrivals) = mpsc::channel();
         let address = "127.0.0.1:0".parse().expect("address");
-        let bound = listen(address, TOKEN.to_owned(), Arc::clone(&served), arrive);
+        let pictures = Pictures::here();
+        let bound = listen(
+            address,
+            TOKEN.to_owned(),
+            Arc::clone(&served),
+            pictures,
+            arrive,
+        );
         (bound.expect("listen"), served, arrivals)
     }
 
@@ -480,7 +491,12 @@ mod tests {
         let stream = TcpStream::connect(address).expect("connect");
         let (mut socket, _) = tungstenite::client(request, stream).expect("handshake");
 
-        let Ok(Arrival::Joined(id, outbox, parting)) = arrivals.recv_timeout(wait) else {
+        let Ok(Arrival::Joined {
+            id,
+            outbox,
+            parting,
+        }) = arrivals.recv_timeout(wait)
+        else {
             panic!("joined");
         };
         // Only the sending thread writes, so the ping read before the size goes unanswered
@@ -488,10 +504,10 @@ mod tests {
         socket
             .send(Message::text(r#"{"t":"size","w":90,"h":30}"#))
             .expect("send");
-        let Ok(Arrival::Input(who, Input::Size(90, 30))) = arrivals.recv_timeout(wait) else {
+        let Ok(Arrival::Input(who, Input::Size(size))) = arrivals.recv_timeout(wait) else {
             panic!("size");
         };
-        assert_eq!(who, Who::Browser(id));
+        assert_eq!((who, size), (Who::Browser(id), Size::new(90, 30)));
 
         outbox.send("café".to_owned()).expect("queue");
         assert_eq!(socket.read().expect("read"), Message::text("café"));

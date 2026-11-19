@@ -1,5 +1,5 @@
-use crate::config::McpConfig;
-use crate::steps::{AgentMemory, MemoryStep};
+use crate::config::{AgentConfig, McpConfig, Models};
+use crate::steps::{AgentMemory, AgentRecord, MemoryStep};
 use crate::utils::{folded, new_id};
 use crate::{Error, Result};
 use reaper::{cause, tilde};
@@ -23,7 +23,7 @@ const MAX_NAME_CHARS: usize = 16;
 pub(crate) const VENV: &str = ".venv";
 /// Bump it whenever the saved session format changes,
 /// as sessions in any other format are neither listed nor opened
-const FORMAT: u32 = 8;
+const FORMAT: u32 = 9;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SessionMeta {
@@ -40,7 +40,7 @@ pub(crate) struct SessionMeta {
 }
 
 impl SessionMeta {
-    /// The title and the rest are filled in on save
+    /// The title comes with `update_title`
     pub(crate) fn new(id: String, settings: Settings) -> Self {
         let now = now();
         Self {
@@ -52,6 +52,41 @@ impl SessionMeta {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// The title the model chose, or else the start of the first task, or of the first command
+    /// before it
+    pub(crate) fn update_title(&mut self, memory: &AgentMemory) {
+        let mut tasked = None;
+        let mut typed = None;
+        for step in &memory.steps {
+            match step {
+                MemoryStep::Task(task) => {
+                    let words: Vec<&str> = task.text.split_whitespace().collect();
+                    let mut text = words.join(" ");
+                    if text.is_empty() {
+                        if let Some(file) = task.files.first() {
+                            text = file.path.clone();
+                        }
+                    }
+                    tasked = Some(text).filter(|text| !text.is_empty());
+                    break;
+                }
+                MemoryStep::Shell(ran) if typed.is_none() => {
+                    let words: Vec<&str> = ran.command.split_whitespace().collect();
+                    let command = words.join(" ");
+                    typed = Some(format!("! {command}"));
+                }
+                _ => {}
+            }
+        }
+
+        let chosen = &self.model_title;
+        self.title = match (chosen.is_empty(), tasked.or(typed)) {
+            (false, _) => chosen.clone(),
+            (true, Some(text)) => text.chars().take(MAX_TITLE_CHARS).collect(),
+            (true, None) => "(empty)".to_owned(),
+        };
     }
 }
 
@@ -80,13 +115,84 @@ impl Settings {
             false => self.mcp.insert(name, on),
         };
     }
+
+    /// A chosen effort belongs to its model, so choosing another model drops it
+    pub(crate) fn choose_model(&mut self, model: String) {
+        if model != self.model {
+            self.effort = None;
+        }
+        self.model = model;
+    }
+
+    /// The chosen effort, or the model's own in model.toml without one
+    pub(crate) fn current_effort<'a>(&'a self, models: &'a Models) -> Option<&'a str> {
+        let own = models.effort(&self.model);
+        self.effort.as_deref().or(own)
+    }
+
+    /// These settings for a session opening in `cwd`, with a notice for each model or effort that
+    /// no longer holds
+    pub(crate) fn resumed(
+        &self,
+        cwd: &Path,
+        models: &Models,
+        agent: &AgentConfig,
+    ) -> (Settings, Vec<String>) {
+        let mut notices = Vec::new();
+        let mut settings = Settings {
+            cwd: cwd.to_owned(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            mcp: BTreeMap::new(),
+        };
+
+        let names = models.names();
+        if !names.contains(&self.model) {
+            let first = names.first().cloned().unwrap_or_default();
+            if !self.model.is_empty() {
+                let gone = &self.model;
+                let notice = format!("model: {gone}: not in model.toml, using {first}");
+                notices.push(notice);
+            }
+            settings.choose_model(first);
+        }
+
+        if let Some(chosen) = &settings.effort {
+            let model = &settings.model;
+            if let Err(error) = models.check_effort(model, chosen) {
+                let notice = match models.effort(model) {
+                    Some(own) => format!("{error}, using {own}"),
+                    None => error.to_string(),
+                };
+                notices.push(notice);
+                settings.effort = None;
+            }
+        }
+
+        for server in &agent.servers {
+            if let Some(on) = self.mcp.get(&server.name) {
+                settings.set_mcp(server, *on);
+            }
+        }
+        // A skipped entry keeps its saved switch, which the next save would otherwise drop
+        for entry in &agent.skipped {
+            if let Some(on) = self.mcp.get(&entry.name) {
+                settings.mcp.insert(entry.name.clone(), *on);
+            }
+        }
+
+        (settings, notices)
+    }
 }
 
-#[derive(Serialize, Deserialize)]
-struct Record<M = SessionMeta, A = AgentMemory> {
+/// What a session's file holds
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Record<M = SessionMeta, A = AgentMemory, G = Vec<AgentRecord>> {
     /// Must come first because `read_meta` only reads the start
-    meta: M,
-    memory: A,
+    pub(crate) meta: M,
+    pub(crate) memory: A,
+    /// The agents that `agent()` started
+    pub(crate) agents: G,
 }
 
 pub(crate) struct HistoryStore {
@@ -118,46 +224,20 @@ impl HistoryStore {
         Self { dir }
     }
 
-    /// Even when saving fails, `meta` already carries the new title and time
-    pub(crate) fn save(&self, memory: &AgentMemory, meta: &mut SessionMeta) -> Result<()> {
-        let project = self.project(&meta.settings.cwd);
-        let path = session_file(&project, &meta.id)?;
-
-        let mut tasked = None;
-        let mut typed = None;
-        for step in &memory.steps {
-            match step {
-                MemoryStep::Task(task) => {
-                    let words: Vec<&str> = task.text.split_whitespace().collect();
-                    let mut text = words.join(" ");
-                    if text.is_empty() {
-                        if let Some(file) = task.files.first() {
-                            text = file.path.clone();
-                        }
-                    }
-                    tasked = Some(text).filter(|text| !text.is_empty());
-                    break;
-                }
-                MemoryStep::Shell(ran) if typed.is_none() => {
-                    let words: Vec<&str> = ran.command.split_whitespace().collect();
-                    let command = words.join(" ");
-                    typed = Some(format!("! {command}"));
-                }
-                _ => {}
-            }
-        }
-
-        let chosen = &meta.model_title;
-        meta.title = match (chosen.is_empty(), tasked.or(typed)) {
-            (false, _) => chosen.clone(),
-            (true, Some(text)) => text.chars().take(MAX_TITLE_CHARS).collect(),
-            (true, None) => "(empty)".to_owned(),
-        };
+    /// Even when saving fails, `meta` already carries the new time
+    pub(crate) fn save(
+        &self,
+        memory: &AgentMemory,
+        agents: &[AgentRecord],
+        meta: &mut SessionMeta,
+    ) -> Result<()> {
+        let path = self.file(&meta.settings.cwd, &meta.id)?;
         meta.updated_at = now();
 
         let record = Record {
             meta: &*meta,
             memory,
+            agents,
         };
         let json = serde_json::to_string(&record).map_err(|e| failed(&path, &e))?;
 
@@ -165,6 +245,7 @@ impl HistoryStore {
         let unique = new_id();
         let extension = format!("json.{unique}.tmp");
         let tmp = path.with_extension(extension);
+        let project = self.project(&meta.settings.cwd);
         fs::create_dir_all(&project).map_err(|e| failed(&path, &e))?;
         // On a full disk every step saves again, so broken temp files would pile up unless removed
         let written = fs::write(&tmp, json).and_then(|()| fs::rename(&tmp, &path));
@@ -179,8 +260,8 @@ impl HistoryStore {
     /// Fails if another process has the session open,
     /// but if locking itself fails it goes unlocked and saving reports the problem
     pub(crate) fn lock(&self, cwd: &Path, id: &str) -> Result<Option<Lock>> {
+        let path = self.file(cwd, id)?.with_extension("lock");
         let project = self.project(cwd);
-        let path = session_file(&project, id)?.with_extension("lock");
         fs::create_dir_all(&project).ok();
 
         // The file we lock may be one the previous holder just deleted
@@ -222,8 +303,7 @@ impl HistoryStore {
     /// Fails unless the session is saved for the working directory,
     /// naming the directory when it is saved for another
     pub(crate) fn locate(&self, cwd: &Path, id: &str) -> Result<()> {
-        let project = self.project(cwd);
-        let path = session_file(&project, id)?;
+        let path = self.file(cwd, id)?;
         if path.exists() {
             return Ok(());
         }
@@ -241,9 +321,8 @@ impl HistoryStore {
         Err(Error::SessionNotFound(id.to_owned()))
     }
 
-    pub(crate) fn load(&self, cwd: &Path, id: &str) -> Result<(SessionMeta, AgentMemory)> {
-        let project = self.project(cwd);
-        let path = session_file(&project, id)?;
+    pub(crate) fn load(&self, cwd: &Path, id: &str) -> Result<Record> {
+        let path = self.file(cwd, id)?;
         let missing = || Error::SessionNotFound(id.to_owned());
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -255,8 +334,8 @@ impl HistoryStore {
             return Err(missing());
         }
 
-        let record: Record = serde_json::from_str(&text).map_err(|e| failed(&path, &e))?;
-        Ok((record.meta, record.memory))
+        let record = serde_json::from_str(&text).map_err(|e| failed(&path, &e))?;
+        Ok(record)
     }
 
     pub(crate) fn list(&self, cwd: Option<&Path>) -> Result<Vec<SessionMeta>> {
@@ -291,9 +370,13 @@ impl HistoryStore {
     /// The copies directory sits next to the saved session,
     /// and `list` only reads .json so it never counts as a session
     pub(crate) fn copies(&self, cwd: &Path, id: &str) -> Result<PathBuf> {
-        let project = self.project(cwd);
-        let path = session_file(&project, id)?;
+        let path = self.file(cwd, id)?;
         Ok(path.with_extension(""))
+    }
+
+    fn file(&self, cwd: &Path, id: &str) -> Result<PathBuf> {
+        let project = self.project(cwd);
+        session_file(&project, id)
     }
 
     /// The folder of the working directory's sessions and venv,
@@ -376,7 +459,7 @@ pub(crate) mod tests {
     use crate::config::McpKind;
     use crate::history::*;
     use crate::steps::tests::{asked, one_task};
-    use crate::steps::{Attachment, Exit, ShellStep, TaskStep};
+    use crate::steps::{Attachment, Content, Exit, ShellStep, TaskStep};
     use crate::tests::temp_dir;
 
     /// Saves it as a new session
@@ -387,7 +470,8 @@ pub(crate) mod tests {
         settings: &Settings,
     ) -> SessionMeta {
         let mut meta = SessionMeta::new(id.to_owned(), settings.clone());
-        store.save(memory, &mut meta).expect("save");
+        meta.update_title(memory);
+        store.save(memory, &[], &mut meta).expect("save");
         meta
     }
 
@@ -426,7 +510,7 @@ pub(crate) mod tests {
         };
 
         saved(&store, &memory, "a1", &settings);
-        let (meta, _) = store.load(cwd, "a1").expect("load");
+        let meta = store.load(cwd, "a1").expect("load").meta;
         assert_eq!(meta.title, "A task");
         assert_eq!(meta.settings.model, "tiny");
         assert_eq!(meta.settings.effort.as_deref(), Some("high"));
@@ -439,15 +523,23 @@ pub(crate) mod tests {
         let leftover = names.filter(|entry| entry.path().to_string_lossy().ends_with(".tmp"));
         assert_eq!(leftover.count(), 0);
 
-        // The chosen title is saved under `name` among the settings, as 0.7.0 saved it
+        // The chosen title is saved under `name` among the settings, as 0.7.0 saved it,
+        // and the agents beside the conversation
         let mut named = SessionMeta::new("a1".to_owned(), settings.clone());
         named.model_title = "Clean up the date helpers".to_owned();
-        store.save(&memory, &mut named).expect("save");
+        let agent = AgentRecord {
+            name: "cafés".to_owned(),
+            ..AgentRecord::default()
+        };
+        let agents = [agent];
+        named.update_title(&memory);
+        store.save(&memory, &agents, &mut named).expect("save");
         let raw = fs::read_to_string(project.join("a1.json")).expect("read");
         let kept = r#""mcp":{"fake":false},"name":"Clean up the date helpers","created_at""#;
         assert!(raw.contains(kept), "{raw}");
-        let (meta, _) = store.load(cwd, "a1").expect("load");
-        assert_eq!(meta.model_title, "Clean up the date helpers");
+        let record = store.load(cwd, "a1").expect("load");
+        assert_eq!(record.meta.model_title, "Clean up the date helpers");
+        assert_eq!(record.agents, agents);
         let listed = store.list(Some(cwd)).expect("list");
         let titles: Vec<&str> = listed.iter().map(|meta| meta.title.as_str()).collect();
         assert!(titles.contains(&"Clean up the date helpers"), "{titles:?}");
@@ -455,7 +547,10 @@ pub(crate) mod tests {
         let lines = asked("First line\n\n  second line\t");
         let attached = Attachment {
             path: "screenshot.png".to_owned(),
-            ..Attachment::default()
+            content: Content::File {
+                text: String::new(),
+                lines: None,
+            },
         };
         let files = TaskStep {
             text: " \n".to_owned(),

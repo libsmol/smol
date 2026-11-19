@@ -1,5 +1,6 @@
+use crate::prompt;
 use crate::steps::{Exit, ShellStep, MAX_OBSERVATION_CHARS};
-use crate::utils::{seamed, Interrupt};
+use crate::utils::{truncated, Interrupt};
 #[cfg(windows)]
 use encoding_rs::Encoding;
 use reaper::{cause, terminal_view, Group, Mark, Member};
@@ -26,19 +27,27 @@ use tokio::time::{self, Instant};
 #[cfg(windows)]
 use windows_sys::Win32::Globalization::GetACP;
 
-/// Must hold `MAX_OBSERVATION_CHARS` characters at up to 4 bytes each
-const KEPT_BYTES: usize = 256 * 1024;
+/// Kept at each end of a clip, which must hold `MAX_OBSERVATION_CHARS` characters at up to 4 bytes
+/// each
+const MAX_HALF_BYTES: usize = 256 * 1024;
 const CHUNK_BYTES: usize = 64 * 1024;
 /// Gives up when a program left in the background keeps the pipe open
-pub(crate) const DRAIN_WAIT: Duration = Duration::from_secs(2);
+const DRAIN_WAIT: Duration = Duration::from_secs(2);
+/// A program that is going away gets this long to exit and say how
+const EXIT_WAIT: Duration = Duration::from_secs(2);
 pub(crate) const SHOWN_EVERY: Duration = Duration::from_millis(100);
 
 /// Dropping it kills the whole group
 pub(crate) struct Process {
     group: Arc<Group>,
-    /// The outer `Option` says whether the child was reaped
-    /// and the inner one is `None` when reaping failed
-    ended: watch::Receiver<Option<Option<Exit>>>,
+    ended: watch::Receiver<Reaped>,
+}
+
+/// How the child ended once reaped, unknown when reaping failed
+#[derive(Clone)]
+enum Reaped {
+    Running,
+    Ended(Option<Exit>),
 }
 
 /// What a program wrote, read from its pipe as it comes so the program never waits on a full pipe,
@@ -75,7 +84,7 @@ impl Process {
             }
         };
 
-        let (reaped, ended) = watch::channel(None);
+        let (reaped, ended) = watch::channel(Reaped::Running);
         // A dropped `Process` couldn't kill the group if the reaping task held a strong reference
         let held = Arc::downgrade(&group);
         let waiting = async move {
@@ -87,7 +96,7 @@ impl Process {
                 }
             }
             let end = status.ok().map(end_of);
-            reaped.send(Some(end)).ok();
+            reaped.send(Reaped::Ended(end)).ok();
         };
         task::spawn(waiting);
 
@@ -108,7 +117,7 @@ impl Process {
         let process = Self::new(child, mark)?;
 
         let parts = Parts {
-            open: Clip::new(KEPT_BYTES),
+            open: Clip::new(MAX_HALF_BYTES),
             closed: None,
             finished: false,
         };
@@ -137,7 +146,7 @@ impl Process {
                 while let Some(at) = held.windows(end.len()).position(|window| window == end) {
                     parts.open.push(&held[..at]);
                     held.drain(..at + end.len());
-                    let before = mem::replace(&mut parts.open, Clip::new(KEPT_BYTES));
+                    let before = mem::replace(&mut parts.open, Clip::new(MAX_HALF_BYTES));
                     parts.closed = Some(before);
                     shared.changed.notify_one();
                 }
@@ -161,12 +170,27 @@ impl Process {
     }
 
     pub(crate) async fn wait(&mut self) -> Option<Exit> {
-        let ended = self.ended.wait_for(Option::is_some).await;
-        ended.ok().and_then(|end| end.clone()).flatten()
+        let reaped = |reaped: &Reaped| matches!(reaped, Reaped::Ended(_));
+        let ended = self.ended.wait_for(reaped).await;
+        match ended.as_deref() {
+            Ok(Reaped::Ended(end)) => end.clone(),
+            _ => None,
+        }
     }
 
     pub(crate) fn reaped(&self) -> bool {
-        self.ended.borrow().is_some()
+        matches!(*self.ended.borrow(), Reaped::Ended(_))
+    }
+
+    /// How it ended, once it does or after `EXIT_WAIT`, and all it wrote that `output` still
+    /// holds, read after the group is killed
+    pub(crate) async fn remains(&mut self, output: &Output) -> (Option<Exit>, Clip) {
+        let exiting = self.wait();
+        let end = time::timeout(EXIT_WAIT, exiting).await.ok().flatten();
+        // Programs it left, like the helpers multiprocessing starts, would keep the pipe open
+        self.kill();
+        let said = output.rest().await;
+        (end, said)
     }
 
     pub(crate) fn kill(&self) {
@@ -219,7 +243,7 @@ impl Output {
     /// Everything since the last end marker
     pub(crate) fn take(&self) -> Clip {
         let mut parts = self.shared.lock();
-        mem::replace(&mut parts.open, Clip::new(KEPT_BYTES))
+        mem::replace(&mut parts.open, Clip::new(MAX_HALF_BYTES))
     }
 
     /// A part not yet taken followed by everything since the last end marker,
@@ -238,7 +262,7 @@ impl Output {
 
         let (closed, open) = {
             let mut parts = self.shared.lock();
-            let open = mem::replace(&mut parts.open, Clip::new(KEPT_BYTES));
+            let open = mem::replace(&mut parts.open, Clip::new(MAX_HALF_BYTES));
             (parts.closed.take(), open)
         };
         match closed {
@@ -312,41 +336,51 @@ impl Clip {
         joined
     }
 
-    /// The kept text as the program wrote it, and the number of characters dropped from the middle
-    fn text(&self) -> (String, usize) {
+    /// The kept text as the program wrote it
+    fn text(&self) -> String {
         let mut bytes = self.head.clone();
         bytes.extend(&self.tail);
-        let text = decoded(&bytes);
-        (text, self.cut)
+        decoded(&bytes)
     }
 
-    /// The kept text without terminal sequences and redrawn frames, and where its tail starts,
-    /// with head and tail cleaned apart once the middle is dropped as a sequence may span the seam
-    pub(crate) fn cleaned(&self) -> (String, usize) {
+    /// The kept text without terminal sequences, redrawn frames and the line breaks it ends with,
+    /// kept to `max` characters and marked once where text is missing
+    pub(crate) fn shown(&self, max: usize) -> String {
         if self.cut == 0 {
-            let (text, _) = self.text();
+            let text = self.text();
             let text = terminal_view(&text);
-            let seam = text.len();
-            return (text, seam);
+            let text = text.trim_end_matches('\n');
+            return truncated(text, max);
         }
 
+        // Head and tail are cleaned apart, as a sequence may span the seam
         let head = decoded(&self.head);
         let head = terminal_view(&head);
         let tail: Vec<u8> = self.tail.iter().copied().collect();
         let tail = decoded(&tail);
         let tail = terminal_view(&tail);
         let seam = head.len();
-        (head + &tail, seam)
-    }
+        let text = head + &tail;
+        let text = text.trim_end_matches('\n');
 
-    pub(crate) fn cut(&self) -> usize {
-        self.cut
-    }
+        // Each side keeps up to half, and a side shorter than that leaves the rest to the other
+        let (head, tail) = text.split_at(seam.min(text.len()));
+        let heads = head.chars().count();
+        let tails = tail.chars().count();
+        let max = max.min(heads + tails);
+        let half = max / 2;
+        let tail_kept = match heads < max - half {
+            true => tails.min(max - heads),
+            false => tails.min(half),
+        };
+        let head_kept = heads.min(max - tail_kept);
 
-    pub(crate) fn shown(&self, max: usize) -> String {
-        let (text, seam) = self.cleaned();
-        let (head, tail) = text.split_at(seam);
-        seamed(head, tail, self.cut, max)
+        let head: String = head.chars().take(head_kept).collect();
+        let tail: String = tail.chars().skip(tails - tail_kept).collect();
+        let dropped = heads - head_kept + self.cut + tails - tail_kept;
+        let marker = prompt::cut(dropped);
+
+        format!("{head}\n{marker}\n{tail}")
     }
 
     /// Returns text only when more output arrived since the last call
@@ -524,9 +558,9 @@ mod tests {
         let mut clip = Clip::new(20);
         clip.push(written.as_bytes());
 
-        let expected = "head line one, two!\n\n[436 characters cut]\nlast\n";
+        let expected = "head line one, two!\n\n[436 characters cut]\nlast";
         assert_eq!(clip.shown(1000), expected);
-        assert_eq!(clip.shown(10), "head \n[451 characters cut]\nlast\n");
+        assert_eq!(clip.shown(10), "head l\n[450 characters cut]\nlast");
     }
 
     /// A character split across two chunks is completed by the next one
@@ -547,7 +581,7 @@ mod tests {
         // The head limit of 3 bytes falls inside ï
         let mut clip = Clip::new(3);
         clip.push("naïve café".as_bytes());
-        assert_eq!(clip.text(), ("naïfé".to_owned(), 5));
+        assert_eq!((clip.text(), clip.cut), ("naïfé".to_owned(), 5));
     }
 
     /// A part not yet taken comes with what followed it, such as a crash after the startup marker
@@ -564,7 +598,7 @@ mod tests {
             output.rest().await
         };
         let said = block_on(reading);
-        assert_eq!(said.shown(1000), "started café\ncrashed naïve\n");
+        assert_eq!(said.shown(1000), "started café\ncrashed naïve");
 
         let mut first = Clip::new(4);
         first.push("café crème".as_bytes());
@@ -594,7 +628,7 @@ mod tests {
         assert_eq!(ran.end, Exit::Exited(3));
         // `pwd` prints the physical path, and the macOS temp directory sits behind a symlink
         let real = fs::canonicalize(&dir).expect("canonical");
-        let expected = format!("café\nnaïve\nrésumé\n{}\n", real.display());
+        let expected = format!("café\nnaïve\nrésumé\n{}", real.display());
         assert_eq!(ran.output, expected);
         assert!(!ran.shell.is_empty());
 

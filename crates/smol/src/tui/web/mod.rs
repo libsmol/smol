@@ -1,14 +1,14 @@
-use crate::chat::Session;
 use crate::conversation::Entry;
 use crate::tui::app::App;
 use crate::tui::clipboard::{self, UNREACHABLE};
-use crate::tui::desktop::{Desktop, Local};
+use crate::tui::desktop::{opened, Desktop, Local, Opened};
+use crate::tui::picture::{self, Pictures};
 use crate::tui::render::Target;
 use crate::tui::screen::{self, Screen};
 use crate::tui::web::grid::{encode, Changes, Grid};
 use crate::tui::web::input::Input;
 use crate::tui::web::serve::{Served, LEFT};
-use crate::tui::{diagram, drive, leave, picture, theme, ui, Ending, Host, POLL_EVERY};
+use crate::tui::{drive, finish, start, theme, ui, Ending, Host, POLL_EVERY};
 use anyhow::{bail, Context, Result};
 use ratatui::backend::{Backend, ClearType};
 use ratatui::buffer::{self, CellWidth};
@@ -17,9 +17,10 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{self, BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::layout::{Position, Rect, Size};
 use ratatui::Terminal;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::io::{self, stdout};
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -37,7 +38,6 @@ mod serve;
 const FIRST_SIZE: Size = Size::new(80, 24);
 /// How long the browsers get to hear that smol web ended
 const PARTING_WAIT: Duration = Duration::from_millis(500);
-const MAX_IMAGES: usize = 64;
 /// Each guess at a token takes a request, which nothing limits
 const MIN_TOKEN_CHARS: usize = 16;
 
@@ -50,16 +50,26 @@ pub(crate) enum Who {
 }
 
 pub(crate) enum Arrival {
-    /// With the browser's outbox, and the closing code its socket sends once the outbox goes
-    Joined(u64, SyncSender<String>, Arc<AtomicU16>),
+    Joined {
+        id: u64,
+        outbox: SyncSender<String>,
+        /// The closing code its socket sends once the outbox goes
+        parting: Arc<AtomicU16>,
+    },
     Left(u64),
     Input(Who, Input),
 }
 
-struct Browser {
+/// A screen the user looks at the TUI on
+struct Device {
+    /// Unknown for a browser until its page says it
     size: Option<Size>,
-    /// Whether the user looks at its page, as the page last said
+    /// Whether the user looks at it, as it last said
     focused: bool,
+}
+
+struct Browser {
+    device: Device,
     outbox: SyncSender<String>,
     parting: Arc<AtomicU16>,
     /// Missed frames, so the next one it gets is the whole screen
@@ -69,7 +79,7 @@ struct Browser {
 /// The terminal `smol web` runs in, which shows the shared screen cut to its own size
 struct Mirror {
     screen: Screen,
-    size: Size,
+    device: Device,
     /// The picture store's Kitty images are for browsers, which this terminal may not draw
     kitty: bool,
     /// Drawn whole on the next show, as at the start and after its own size changed
@@ -92,17 +102,22 @@ struct Web {
     latest: Option<Who>,
     asker: Rc<Cell<Who>>,
     told: Rc<RefCell<Vec<(u64, String)>>>,
-    served: Arc<Mutex<Served>>,
     arrivals: Receiver<Arrival>,
     /// The whole screen as a frame for browsers that fell behind, until the next draw
-    whole: Option<(String, Vec<u32>)>,
+    whole: Option<String>,
+}
+
+impl Relay {
+    fn tell(&self, id: u64, message: Value) {
+        self.told.borrow_mut().push((id, message.to_string()));
+    }
 }
 
 impl Desktop for Relay {
     fn selecting(&mut self, text: &str) {
         if let Who::Browser(id) = self.asker.get() {
             let message = json!({ "t": "selection", "text": text });
-            self.told.borrow_mut().push((id, message.to_string()));
+            self.tell(id, message);
         }
     }
 
@@ -111,7 +126,7 @@ impl Desktop for Relay {
             return Local.copy(text);
         };
         let message = json!({ "t": "copy", "text": text });
-        self.told.borrow_mut().push((id, message.to_string()));
+        self.tell(id, message);
     }
 
     fn open(&mut self, target: &Target) -> Result<(), String> {
@@ -119,23 +134,16 @@ impl Desktop for Relay {
             return Local.open(target);
         };
 
-        let url = match target {
-            Target::Url(url) => url.clone(),
-            Target::Diagram(code) => {
-                let html = diagram::page(code)?;
+        let url = match opened(target)? {
+            Opened::Url(url) => url,
+            Opened::File { mime, bytes, .. } => {
                 let mut served = self.served.lock().expect("served");
-                let number = served.open(html.into_bytes(), "text/html; charset=utf-8");
-                format!("open/{number}")
-            }
-            Target::Picture(source) => {
-                let (bytes, format) = picture::original(source)?;
-                let mut served = self.served.lock().expect("served");
-                let number = served.open(bytes, format.to_mime_type());
+                let number = served.open(bytes, mime);
                 format!("open/{number}")
             }
         };
         let message = json!({ "t": "open", "url": url });
-        self.told.borrow_mut().push((id, message.to_string()));
+        self.tell(id, message);
         Ok(())
     }
 
@@ -164,8 +172,8 @@ impl Host for Web {
 
     fn show(&mut self, app: &mut App) -> Result<()> {
         let mirror = self.mirror.as_ref();
-        let browsed = self.browsers.values().any(|browser| browser.focused);
-        let looked = browsed || mirror.is_some_and(|mirror| mirror.screen.focused);
+        let browsed = self.browsers.values().any(|browser| browser.device.focused);
+        let looked = browsed || mirror.is_some_and(|mirror| mirror.device.focused);
         let alert = app.alert.take();
         if let Some(alert) = alert.filter(|_| !looked) {
             if let Some(mirror) = mirror {
@@ -179,7 +187,7 @@ impl Host for Web {
         }
 
         if mirror.is_some_and(|mirror| mirror.kitty) {
-            picture::send(&mut stdout(), &app.shown)?;
+            picture::send(&mut stdout(), &app.pictures)?;
         }
 
         // A busy app draws on every turn of the loop, mostly the same screen again
@@ -213,32 +221,10 @@ impl Host for Web {
             self.whole = Some(encoded(&grid.whole()));
         }
 
-        let mut served = self.served.lock().expect("served");
-        for (_, ids) in diff.iter().chain(&self.whole) {
-            for &id in ids {
-                if served.images.contains_key(&id) {
-                    continue;
-                }
-                if let Some(picture) = picture::image(id) {
-                    served.images.insert(id, picture);
-                }
-            }
-        }
-        // Browsers keep the images they fetched, and may still fetch any on the screen
-        if served.images.len() > MAX_IMAGES {
-            let cells = grid.screen().content.iter();
-            let shown: Vec<u32> = cells
-                .filter_map(picture::tile)
-                .map(|tile| tile.image)
-                .collect();
-            served.images.retain(|id, _| shown.contains(id));
-        }
-        drop(served);
-
         for browser in self.browsers.values_mut() {
             let frame = match (browser.behind, &self.whole, &diff) {
-                (true, Some((frame, _)), _) => frame,
-                (false, _, Some((frame, _))) => frame,
+                (true, Some(frame), _) => frame,
+                (false, _, Some(frame)) => frame,
                 _ => continue,
             };
             let sent = browser.outbox.try_send(frame.clone());
@@ -258,10 +244,17 @@ impl Host for Web {
 
         for arrival in arrivals {
             match arrival {
-                Arrival::Joined(id, outbox, parting) => {
-                    let browser = Browser {
+                Arrival::Joined {
+                    id,
+                    outbox,
+                    parting,
+                } => {
+                    let device = Device {
                         size: None,
                         focused: false,
+                    };
+                    let browser = Browser {
+                        device,
                         outbox,
                         parting,
                         behind: true,
@@ -274,39 +267,24 @@ impl Host for Web {
                 }
                 // A browser let go after it quit may still have input on the way
                 Arrival::Input(Who::Browser(id), _) if !self.browsers.contains_key(&id) => {}
-                Arrival::Input(who, Input::Size(width, height)) => {
-                    let size = Size::new(width, height);
-                    match who {
-                        Who::Here => {
-                            if let Some(mirror) = &mut self.mirror {
-                                mirror.size = size;
-                                mirror.stale = true;
-                            }
-                        }
-                        Who::Browser(id) => {
-                            if let Some(browser) = self.browsers.get_mut(&id) {
-                                browser.size = Some(size);
-                            }
-                        }
+                Arrival::Input(who, Input::Size(size)) => {
+                    if let Some(device) = self.device(who) {
+                        device.size = Some(size);
+                    }
+                    if let (Who::Here, Some(mirror)) = (who, &mut self.mirror) {
+                        mirror.stale = true;
                     }
                     self.latest = Some(who);
                     self.fit(app);
                 }
-                Arrival::Input(who, Input::Focus(focused)) => match who {
-                    Who::Here => {
-                        if let Some(mirror) = &mut self.mirror {
-                            mirror.screen.focused = focused;
-                        }
+                Arrival::Input(who, Input::Focus(focused)) => {
+                    if let Some(device) = self.device(who) {
+                        device.focused = focused;
                     }
-                    Who::Browser(id) => {
-                        if let Some(browser) = self.browsers.get_mut(&id) {
-                            browser.focused = focused;
-                        }
-                    }
-                },
+                }
                 Arrival::Input(who, Input::Image(data)) => {
                     self.asker.set(who);
-                    app.paste_image(move |_| Ok(data));
+                    app.paste_image(Some(data));
                     self.latest = Some(who);
                     self.fit(app);
                 }
@@ -342,6 +320,16 @@ impl Host for Web {
 }
 
 impl Web {
+    fn device(&mut self, who: Who) -> Option<&mut Device> {
+        match who {
+            Who::Here => self.mirror.as_mut().map(|mirror| &mut mirror.device),
+            Who::Browser(id) => {
+                let browser = self.browsers.get_mut(&id);
+                browser.map(|browser| &mut browser.device)
+            }
+        }
+    }
+
     /// Closes a browser that quit, which then hears it left
     fn let_go(&mut self, app: &mut App, id: u64) {
         if let Some(browser) = self.browsers.remove(&id) {
@@ -352,11 +340,10 @@ impl Web {
 
     /// Makes the screen the size of the device that acted last
     fn fit(&mut self, app: &mut App) {
-        let size = match self.latest {
-            Some(Who::Here) => self.mirror.as_ref().map(|mirror| mirror.size),
-            Some(Who::Browser(id)) => self.browsers.get(&id).and_then(|browser| browser.size),
-            None => None,
+        let Some(latest) = self.latest else {
+            return;
         };
+        let size = self.device(latest).and_then(|device| device.size);
         let Some(size) = size else {
             return;
         };
@@ -388,14 +375,15 @@ impl Mirror {
             backend.clear_region(ClearType::All)?;
         }
 
-        let area = Rect::from((Position::ORIGIN, self.size));
+        let size = self.device.size.unwrap_or(FIRST_SIZE);
+        let area = Rect::from((Position::ORIGIN, size));
         let mut cells = Vec::new();
         for &at in changes.cells.iter().filter(|at| area.contains(**at)) {
             let mut cell = grid.screen()[at].clone();
             // The terminal would wrap a wide symbol cut by its edge
             let end = at.x.saturating_add(cell.symbol().cell_width());
             let cut = end > area.right();
-            if cut || (!self.kitty && picture::tile(&cell).is_some()) {
+            if cut || (!self.kitty && picture::is_tile(&cell)) {
                 let bg = cell.bg;
                 cell = buffer::Cell::EMPTY;
                 cell.bg = bg;
@@ -439,7 +427,7 @@ pub(crate) fn fixed_token(token: &str) -> Result<String, String> {
 }
 
 pub(crate) fn run(
-    command: &[String],
+    command: &[OsString],
     model: Option<String>,
     resume: Option<&str>,
     address: SocketAddr,
@@ -458,13 +446,25 @@ pub(crate) fn run(
     // A taken address fails before the agent starts
     let served = Arc::default();
     let (arrive, arrivals) = mpsc::channel();
-    let bound = serve::listen(address, token.clone(), Arc::clone(&served), arrive.clone());
+    let pictures = Pictures::here();
+    let bound = serve::listen(
+        address,
+        token.clone(),
+        Arc::clone(&served),
+        pictures,
+        arrive.clone(),
+    );
     let bound = bound.with_context(|| format!("web: {address}"))?;
 
-    let kitty = picture::kitty_here();
+    let asker = Rc::new(Cell::new(Who::Here));
+    let told = Rc::default();
+    let relay = Relay {
+        asker: Rc::clone(&asker),
+        told: Rc::clone(&told),
+        served,
+    };
     // Browsers draw every picture from its Kitty placeholders, whatever this terminal does
-    picture::set_kitty(true);
-    let session = Session::start(command, model, resume, true)?;
+    let mut app = start(command, model, resume, true, Box::new(relay))?;
 
     let host = match bound.ip() {
         ip if ip.is_unspecified() => "localhost".to_owned(),
@@ -477,17 +477,6 @@ pub(crate) fn run(
         eprintln!("smol web: the token goes over plain HTTP, so reach this address only through TLS or a private network");
     }
 
-    let asker = Rc::new(Cell::new(Who::Here));
-    let told = Rc::default();
-    let relay = Relay {
-        asker: Rc::clone(&asker),
-        told: Rc::clone(&told),
-        served: Arc::clone(&served),
-    };
-    let mut app = App::new(session, Box::new(relay));
-    if resume.is_some() {
-        app.show_session();
-    }
     let shown = format!("web: {url}");
     app.session.conversation.push(Entry::Info(shown));
 
@@ -514,7 +503,8 @@ pub(crate) fn run(
                     for event in events {
                         match event {
                             Event::Resize(width, height) => {
-                                sized = Some(Input::Size(width, height))
+                                let size = Size::new(width, height);
+                                sized = Some(Input::Size(size));
                             }
                             Event::FocusGained => focused = Some(Input::Focus(true)),
                             Event::FocusLost => focused = Some(Input::Focus(false)),
@@ -533,10 +523,15 @@ pub(crate) fn run(
                 }
             });
 
+            // A terminal that keeps quiet about focus is taken to be looked at
+            let device = Device {
+                size: Some(Size::new(columns, rows)),
+                focused: true,
+            };
             Some(Mirror {
                 screen,
-                size: Size::new(columns, rows),
-                kitty,
+                device,
+                kitty: picture::kitty_here(),
                 stale: true,
                 stop,
             })
@@ -545,7 +540,8 @@ pub(crate) fn run(
     };
     drop(arrive);
 
-    let size = mirror.as_ref().map_or(FIRST_SIZE, |mirror| mirror.size);
+    let size = mirror.as_ref().and_then(|mirror| mirror.device.size);
+    let size = size.unwrap_or(FIRST_SIZE);
     let grid = Grid::new(size);
     let terminal = Terminal::new(grid)?;
     let latest = mirror.as_ref().map(|_| Who::Here);
@@ -556,7 +552,6 @@ pub(crate) fn run(
         latest,
         asker,
         told,
-        served,
         arrivals,
         whole: None,
     };
@@ -576,13 +571,8 @@ pub(crate) fn run(
         }
     }
 
-    // A Kitty terminal keeps the images it was sent after smol exits unless they are deleted
-    picture::clear();
-    if web.mirror.as_ref().is_some_and(|mirror| mirror.kitty) {
-        picture::send(&mut stdout(), &[]).ok();
-    }
-    drop(web);
-    leave(app, &ending);
+    let kitty = web.mirror.as_ref().is_some_and(|mirror| mirror.kitty);
+    finish(app, web, kitty, &ending);
     Ok(())
 }
 
@@ -601,6 +591,7 @@ mod tests {
     use ratatui::crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
+    use ratatui::layout::Size;
     use ratatui::Terminal;
     use serde_json::Value;
     use std::cell::Cell;
@@ -608,7 +599,7 @@ mod tests {
     use std::fs;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU16, Ordering};
-    use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+    use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -622,7 +613,7 @@ mod tests {
         let relay = Relay {
             asker: Rc::clone(&asker),
             told: Rc::clone(&told),
-            served: Arc::clone(&served),
+            served,
         };
         let app = App::new(session, Box::new(relay));
 
@@ -635,11 +626,23 @@ mod tests {
             latest: None,
             asker,
             told,
-            served,
             arrivals,
             whole: None,
         };
         (app, web, arrive)
+    }
+
+    fn joined(id: u64, outbox: SyncSender<String>, parting: Arc<AtomicU16>) -> Arrival {
+        Arrival::Joined {
+            id,
+            outbox,
+            parting,
+        }
+    }
+
+    fn sized(who: Who, width: u16, height: u16) -> Arrival {
+        let size = Size::new(width, height);
+        Arrival::Input(who, Input::Size(size))
     }
 
     fn step(app: &mut App, web: &mut Web) {
@@ -691,22 +694,20 @@ mod tests {
         let one = Who::Browser(1);
         let two = Who::Browser(2);
 
-        let joined = Arrival::Joined(1, first, Arc::clone(&parting));
-        arrive.send(joined).expect("join");
         arrive
-            .send(Arrival::Input(one, Input::Size(60, 20)))
-            .expect("size");
+            .send(joined(1, first, Arc::clone(&parting)))
+            .expect("join");
+        arrive.send(sized(one, 60, 20)).expect("size");
         step(&mut app, &mut web);
         let (size, screen) = seen(&to_first);
         assert_eq!(size, (60, 20));
         assert!(screen.contains("Ask anything"), "{screen}");
 
         // The one who joins later gets the whole screen, now at its size, and so does the first
-        let joined = Arrival::Joined(2, second, Arc::default());
-        arrive.send(joined).expect("join");
         arrive
-            .send(Arrival::Input(two, Input::Size(90, 30)))
-            .expect("size");
+            .send(joined(2, second, Arc::default()))
+            .expect("join");
+        arrive.send(sized(two, 90, 30)).expect("size");
         step(&mut app, &mut web);
         assert_eq!(seen(&to_second).0, (90, 30));
         assert_eq!(seen(&to_first).0, (90, 30));
@@ -722,8 +723,7 @@ mod tests {
         let control = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
         let quit = Input::Events(vec![control('c'), control('d')]);
         arrive.send(Arrival::Input(one, quit)).expect("quit");
-        let sized = Input::Size(90, 30);
-        arrive.send(Arrival::Input(two, sized)).expect("size");
+        arrive.send(sized(two, 90, 30)).expect("size");
         step(&mut app, &mut web);
         assert!(!app.quit);
         assert_eq!(parting.load(Ordering::Relaxed), LEFT);
@@ -737,15 +737,16 @@ mod tests {
     fn image_arrived() {
         let (mut app, mut web, arrive) = hosted();
         let (outbox, _sent) = mpsc::sync_channel(64);
-        let joined = Arrival::Joined(1, outbox, Arc::default());
-        arrive.send(joined).expect("join");
+        arrive
+            .send(joined(1, outbox, Arc::default()))
+            .expect("join");
         let path = written("browser", 2, 2);
         let png = fs::read(&path).expect("png");
         fs::remove_dir_all(path.parent().expect("dir")).ok();
         let pasted = Arrival::Input(Who::Browser(1), Input::Image(png));
         arrive.send(pasted).expect("image");
         step(&mut app, &mut web);
-        assert_eq!(app.input.lines(), ["[image #1]"]);
+        assert_eq!(app.draft.text(), "[image #1]");
 
         let alt_v = Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
         let pressed = Arrival::Input(Who::Browser(1), Input::Events(vec![alt_v]));
@@ -761,10 +762,10 @@ mod tests {
     fn selection_sent() {
         let (mut app, mut web, arrive) = hosted();
         let (outbox, sent) = mpsc::sync_channel(64);
-        let joined = Arrival::Joined(1, outbox, Arc::default());
-        arrive.send(joined).expect("join");
-        let sized = Arrival::Input(Who::Browser(1), Input::Size(60, 20));
-        arrive.send(sized).expect("size");
+        arrive
+            .send(joined(1, outbox, Arc::default()))
+            .expect("join");
+        arrive.send(sized(Who::Browser(1), 60, 20)).expect("size");
         fill(&mut app, 40);
         step(&mut app, &mut web);
 
@@ -811,8 +812,9 @@ mod tests {
     fn alert_unless_looked() {
         let (mut app, mut web, arrive) = hosted();
         let (outbox, sent) = mpsc::sync_channel(64);
-        let joined = Arrival::Joined(1, outbox, Arc::default());
-        arrive.send(joined).expect("join");
+        arrive
+            .send(joined(1, outbox, Arc::default()))
+            .expect("join");
         let alerts = |sent: &Receiver<String>| {
             let mut alerts = Vec::new();
             for text in sent.try_iter() {

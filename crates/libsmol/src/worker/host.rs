@@ -1,13 +1,13 @@
 use crate::model::Media;
 use crate::prompt::{self, ADDING_SERVER, LEFT_BEHIND, NO_SERVER};
-use crate::spawn::{Clip, Output, Process, DRAIN_WAIT, SHOWN_EVERY};
+use crate::spawn::{Clip, Output, Process, SHOWN_EVERY};
 use crate::steps::{CallError, DoneStep, Program, MAX_OBSERVATION_CHARS};
 use crate::tools::mcp::Server;
-use crate::utils::{new_id, one_lined, Interrupt, Reply};
+use crate::utils::{cut_inline, new_id, Interrupt, Reply};
 use crate::worker::workplace::Workplace;
 use crate::worker::{
-    end_marker, greeting, Delegation, FromWorker, Function, HostCall, HostNote, Message, Service,
-    ToWorker, WorkerCall, WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, WORKER_ARG,
+    control, end_marker, greeted, greeting, FromWorker, Function, HostCall, HostNote, Message,
+    Service, ToWorker, WorkerCall, WorkerNote, CONTROL_ENV, COPIES_ENV, MAIN_ENV, WORKER_ARG,
 };
 use crate::{Error, Result};
 use reaper::{cause, Member};
@@ -63,17 +63,12 @@ impl From<Reply> for Called {
     }
 }
 
-#[derive(Debug, Default)]
 pub(crate) struct Evaluated {
-    pub(crate) logs: String,
-    /// Characters dropped from the middle of `logs`
-    pub(crate) cut: usize,
-    /// Where the part of `logs` after the dropped middle starts
-    pub(crate) seam: usize,
+    pub(crate) printed: Clip,
     pub(crate) error: Option<CallError>,
     pub(crate) media: Vec<(String, Media)>,
-    /// The code actually run after stray tags were stripped
-    pub(crate) code: Option<String>,
+    /// The code actually run, when stray tags had to be stripped
+    pub(crate) repaired: Option<String>,
 }
 
 #[derive(Clone)]
@@ -81,7 +76,16 @@ pub(crate) struct Added {
     /// The name used in code
     pub(crate) name: String,
     pub(crate) server: Server,
-    pub(crate) headers: Vec<String>,
+    /// Each function's signature as the system prompt lists it
+    pub(crate) stubs: Vec<String>,
+}
+
+/// The session's own worker, which offers `agent()`, `remember()` and `forget()`,
+/// or one of an agent that `agent()` started
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Rank {
+    Main,
+    Delegated,
 }
 
 /// Callers keep track of the installed MCP servers and pass them in on every call
@@ -91,7 +95,7 @@ pub(crate) struct Worker {
     /// Shared with the workers of agents the code starts
     workplace: Arc<Workplace>,
     interrupt: Interrupt,
-    delegation: Delegation,
+    rank: Rank,
     functions: Vec<Function>,
     restarted: bool,
 }
@@ -108,10 +112,22 @@ struct Live {
     /// Every call not yet answered, which a thread the code started may still wait for
     running: HashMap<u64, AbortHandle>,
     media: Vec<(String, Media)>,
-    /// Programs that calls left running and their descendants, as last seen
+    followed: Followed,
+}
+
+/// The programs that calls left running and their descendants, as last seen
+#[derive(Default)]
+struct Followed {
     left: Vec<Member>,
     /// The worker's own processes, such as its console host on Windows
     own: Vec<Member>,
+}
+
+/// An interrupt sent to the running code, which is sent again at `resend` until it stops or
+/// `give_up` passes
+struct Stopping {
+    resend: Instant,
+    give_up: Instant,
 }
 
 enum Event {
@@ -133,18 +149,22 @@ enum Outcome {
 #[derive(Deserialize)]
 struct Ran {
     error: Option<String>,
-    code: Option<String>,
+    repaired: Option<String>,
 }
 
-/// Fields match the dict returned by `_server`
+/// Matches the dict returned by `_server`
 #[derive(Deserialize)]
-struct Installed {
-    name: String,
-    /// Another server that already holds this name
-    server: Option<String>,
-    /// Missing when the name is taken
-    #[serde(default)]
-    headers: Vec<String>,
+#[serde(untagged)]
+enum Installed {
+    /// `holder` is the configured name of another server that holds the name
+    Taken {
+        name: String,
+        holder: String,
+    },
+    Added {
+        name: String,
+        stubs: Vec<String>,
+    },
 }
 
 impl Worker {
@@ -153,13 +173,13 @@ impl Worker {
         interrupt: &Interrupt,
         workplace: Arc<Workplace>,
         servers: &[&Added],
-        delegation: Delegation,
+        rank: Rank,
         restarted: bool,
     ) -> Result<Self> {
         let mut worker = Self {
             workplace,
             interrupt: interrupt.clone(),
-            delegation,
+            rank,
             functions: Vec::new(),
             restarted,
             live: None,
@@ -218,14 +238,15 @@ impl Worker {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(failed)?;
         let address = listener.local_addr().map_err(failed)?;
         let token = new_id();
-        let control = format!("{address}/{token}");
+        let address = address.to_string();
+        let control = control(&address, &token);
 
         command
             .env(CONTROL_ENV, control)
             .env(COPIES_ENV, copies)
             .stdin(Stdio::null());
-        if self.delegation == Delegation::On {
-            command.env(AGENTS_ENV, "on");
+        if self.rank == Rank::Main {
+            command.env(MAIN_ENV, "on");
         }
         let marker = end_marker(&token);
         let (mut process, output) = Process::start(command, Some(marker)).map_err(failed)?;
@@ -248,9 +269,9 @@ impl Worker {
         let (lines, mut writer) = match accepted {
             Some(Ok((lines, writer, Some(said)))) if said == expected => (lines, writer),
             // An update replaced the executable while the session ran, which `/proc/self/exe` avoids on Linux
-            Some(Ok((_, _, Some(said)))) if said.starts_with(&token) => {
-                let version = said.split_once(' ').map(|(_, version)| version);
-                let reason = prompt::replaced(version.unwrap_or_default());
+            Some(Ok((_, _, Some(said)))) if greeted(&said, &token).is_some() => {
+                let version = greeted(&said, &token).unwrap_or_default();
+                let reason = prompt::replaced(version);
                 return Err(prompt::unstarted(&reason));
             }
             _ => {
@@ -277,8 +298,7 @@ impl Worker {
             calls: JoinSet::new(),
             running: HashMap::new(),
             media: Vec::new(),
-            left: Vec::new(),
-            own: Vec::new(),
+            followed: Followed::default(),
         };
 
         // Startup output runs up to the end marker and doesn't belong to the first snippet
@@ -308,7 +328,7 @@ impl Worker {
         };
 
         let own = live.process.members().await;
-        live.own = own.unwrap_or_default();
+        live.followed.own = own.unwrap_or_default();
 
         for added in servers {
             live.install(&added.server, Some(&added.name)).await?;
@@ -326,17 +346,17 @@ impl Worker {
         let live = self.live.as_mut().expect("connected");
         let installed = live.install(&server, None).await.map_err(Error::Python)?;
 
-        let name = installed.name;
-        if let Some(other) = installed.server {
-            let message = format!("{name}: name already used by server {other}");
-            return Err(Error::Mcp(message));
+        match installed {
+            Installed::Added { name, stubs } => Ok(Added {
+                name,
+                server,
+                stubs,
+            }),
+            Installed::Taken { name, holder } => {
+                let message = format!("{name}: name already used by server {holder}");
+                Err(Error::Mcp(message))
+            }
         }
-
-        Ok(Added {
-            name,
-            server,
-            headers: installed.headers,
-        })
     }
 
     /// Doesn't restart a lost worker just for this
@@ -365,10 +385,7 @@ impl Worker {
 
         // A worker lost while the model wrote the code never ran it
         if let Some(live) = self.live.as_mut().filter(|live| live.process.reaped()) {
-            let end = live.process.wait().await;
-            // Programs it left would keep the pipe open
-            live.process.kill();
-            let said = live.output.rest().await;
+            let (end, said) = live.process.remains(&live.output).await;
             let said = said.shown(MAX_OBSERVATION_CHARS / 2);
             self.reap();
             let reason = prompt::lost(end.as_ref(), said.trim());
@@ -391,36 +408,45 @@ impl Worker {
         };
         let id = live.send(run);
 
-        let mut stopping = None;
-        let mut cancel_at = Instant::now();
+        let mut stopping: Option<Stopping> = None;
         let mut show_at = Instant::now() + SHOWN_EVERY;
-        let mut ran = None;
+        // The reply, and when to stop waiting for the output still on the way
+        let mut replied: Option<(Result<Ran, String>, Instant)> = None;
         let mut ended: Option<Clip> = None;
-        let mut draining = None;
         let outcome = loop {
-            let stop_at = stopping.unwrap_or_else(Instant::now);
-            let drain_at = draining.unwrap_or_else(Instant::now);
+            let now = Instant::now();
+            let resend_at = stopping.as_ref().map_or(now, |stopping| stopping.resend);
+            let give_up_at = stopping.as_ref().map_or(now, |stopping| stopping.give_up);
+            let drained_at = replied.as_ref().map_or(now, |(_, at)| *at);
             let event = select! {
                 biased;
                 event = live.next() => event,
                 () = interrupt.wait(), if stopping.is_none() => {
                     live.note(HostNote::Cancel { id });
-                    stopping = Some(Instant::now() + STOP_WAIT);
-                    cancel_at = Instant::now() + CANCEL_EVERY;
+                    let now = Instant::now();
+                    let started = Stopping {
+                        resend: now + CANCEL_EVERY,
+                        give_up: now + STOP_WAIT,
+                    };
+                    stopping = Some(started);
                     continue;
                 }
-                () = time::sleep_until(cancel_at), if stopping.is_some() => {
+                () = time::sleep_until(resend_at), if stopping.is_some() => {
                     live.note(HostNote::Cancel { id });
-                    cancel_at += CANCEL_EVERY;
+                    if let Some(stopping) = &mut stopping {
+                        stopping.resend += CANCEL_EVERY;
+                    }
                     continue;
                 }
                 // Once the reply is in, the code has stopped and only its output is still on the way
-                () = time::sleep_until(stop_at), if stopping.is_some() && ran.is_none() => {
+                () = time::sleep_until(give_up_at), if stopping.is_some() && replied.is_none() => {
                     break Outcome::Stuck;
                 }
-                () = time::sleep_until(drain_at), if draining.is_some() => {
-                    let ran = ran.take().expect("replied");
-                    break Outcome::Replied(ran);
+                () = time::sleep_until(drained_at), if replied.is_some() => {
+                    match replied.take() {
+                        Some((ran, _)) => break Outcome::Replied(ran),
+                        None => continue,
+                    }
                 }
                 () = time::sleep_until(show_at) => {
                     show_at = Instant::now() + SHOWN_EVERY;
@@ -438,21 +464,20 @@ impl Worker {
 
             let (number, call) = match event {
                 Event::Answer(number, reply) if number == id => {
-                    let replied = match reply {
+                    let ran = match reply {
                         Ok(finished) => serde_json::from_value(finished).map_err(|e| e.to_string()),
                         Err(reason) => Err(reason),
                     };
                     if ended.is_some() {
-                        break Outcome::Replied(replied);
+                        break Outcome::Replied(ran);
                     }
-                    ran = Some(replied);
-                    draining = Some(Instant::now() + OUTPUT_WAIT);
+                    replied = Some((ran, Instant::now() + OUTPUT_WAIT));
                     continue;
                 }
                 Event::End(part) => {
                     ended = Some(part);
-                    match ran.take() {
-                        Some(replied) => break Outcome::Replied(replied),
+                    match replied.take() {
+                        Some((ran, _)) => break Outcome::Replied(ran),
                         None => continue,
                     }
                 }
@@ -501,42 +526,35 @@ impl Worker {
         }
         while live.calls.join_next().await.is_some() {}
 
-        let end = match outcome {
+        let (end, rest) = match outcome {
             Outcome::Gone => {
-                let exiting = live.process.wait();
-                let reaped = time::timeout(DRAIN_WAIT, exiting).await;
-                // Programs it left, like the helpers multiprocessing starts, would keep the pipe open
-                live.process.kill();
-                reaped.ok().flatten()
+                let (end, rest) = live.process.remains(&live.output).await;
+                (end, Some(rest))
             }
-            _ => None,
+            _ => (None, None),
         };
-        let said = match (ended, &outcome) {
+        let printed = match (ended, rest) {
             (Some(part), _) => part,
-            (None, Outcome::Gone) => live.output.rest().await,
-            (None, _) => live.output.take(),
+            (None, Some(rest)) => rest,
+            (None, None) => live.output.take(),
         };
-
-        let (logs, seam) = said.cleaned();
-        let cut = said.cut();
-        let media = mem::take(&mut live.media);
         let mut output = Evaluated {
-            logs,
-            cut,
-            seam,
-            media,
-            ..Evaluated::default()
+            printed,
+            error: None,
+            media: mem::take(&mut live.media),
+            repaired: None,
         };
 
         let failure = match outcome {
             Outcome::Replied(Ok(ran)) => {
                 // Ones that ended since `ended` last looked stay until it reports them
                 let members = live.members().await.unwrap_or_default();
+                let left = &mut live.followed.left;
                 for member in members {
-                    match live.left.iter_mut().find(|left| left.same(&member)) {
+                    match left.iter_mut().find(|known| known.same(&member)) {
                         // One in the middle of exec shows its name alone until it is seen again
-                        Some(left) => *left = member,
-                        None => live.left.push(member),
+                        Some(known) => *known = member,
+                        None => left.push(member),
                     }
                 }
 
@@ -545,7 +563,7 @@ impl Worker {
                     false => CallError::Execution(error),
                 };
                 output.error = ran.error.map(judged);
-                output.code = ran.code;
+                output.repaired = ran.repaired;
                 return Ok(output);
             }
             Outcome::Replied(Err(reason)) => Some(reason),
@@ -566,24 +584,25 @@ impl Worker {
     /// The programs that calls left running and that ended since, with the output printed since
     /// the last call, or None while they all run. Dropping the future loses nothing
     pub(crate) async fn ended(&mut self) -> Option<DoneStep> {
-        let live = self.live.as_mut().filter(|live| !live.left.is_empty())?;
+        let live = self
+            .live
+            .as_mut()
+            .filter(|live| !live.followed.left.is_empty())?;
         let members = live.members().await?;
-
         let mut programs = Vec::new();
-        for top in tops(&live.left) {
+        for top in live.followed.tops() {
             let alive = members.iter().any(|member| member.same(top));
             if !alive {
-                let ended = program(top);
-                programs.push(ended);
+                programs.push(program(top));
             }
         }
-        live.left = members;
+        live.followed.left = members;
         if programs.is_empty() {
             return None;
         }
 
         let said = live.output.take();
-        let output = said.shown(MAX_OBSERVATION_CHARS);
+        let output = said.shown(usize::MAX);
         info!("programs: ended [count={}]", programs.len());
         Some(DoneStep {
             programs,
@@ -598,7 +617,7 @@ impl Worker {
             return Vec::new();
         };
 
-        let tops = tops(&live.left);
+        let tops = live.followed.tops();
         tops.into_iter().map(program).collect()
     }
 
@@ -608,7 +627,7 @@ impl Worker {
         let Some(live) = &self.live else {
             return future::pending().await;
         };
-        let tops = tops(&live.left);
+        let tops = live.followed.tops();
         if tops.is_empty() {
             return future::pending().await;
         }
@@ -626,11 +645,28 @@ impl Worker {
     }
 }
 
+impl Followed {
+    /// The followed processes whose parent isn't followed too, each a program of its own,
+    /// as one whose parent is belongs to that program until it outlives it
+    fn tops(&self) -> Vec<&Member> {
+        let mut tops = Vec::new();
+        for member in &self.left {
+            let parented = self.left.iter().any(|other| other.pid == member.parent);
+            let helper = member.command.contains(MULTIPROCESSING);
+            if !parented && !helper {
+                tops.push(member);
+            }
+        }
+        tops
+    }
+}
+
 impl Live {
     /// Leaves out the worker's own processes, and is None when they can't be listed
     async fn members(&self) -> Option<Vec<Member>> {
         let mut members = self.process.members().await?;
-        members.retain(|member| !self.own.iter().any(|own| own.same(member)));
+        let own = &self.followed.own;
+        members.retain(|member| !own.iter().any(|own| own.same(member)));
         Some(members)
     }
 
@@ -731,32 +767,16 @@ impl Live {
     }
 }
 
-/// The followed processes whose parent isn't followed too, each a program of its own,
-/// as one whose parent is belongs to that program until it outlives it
-fn tops(followed: &[Member]) -> Vec<&Member> {
-    let mut tops = Vec::new();
-    for member in followed {
-        let parented = followed.iter().any(|other| other.pid == member.parent);
-        let helper = member.command.contains(MULTIPROCESSING);
-        if !parented && !helper {
-            tops.push(member);
-        }
-    }
-    tops
-}
-
 fn program(member: &Member) -> Program {
-    let command = one_lined(&member.command, MAX_COMMAND_CHARS);
+    let command = cut_inline(&member.command, MAX_COMMAND_CHARS);
     Program {
         pid: member.pid,
         command,
     }
 }
 
-async fn start_error(process: Process, output: Output) -> String {
-    // Kill it first or the pipe stays open and the output never ends
-    drop(process);
-    let said = output.rest().await;
+async fn start_error(mut process: Process, output: Output) -> String {
+    let (_, said) = process.remains(&output).await;
     let said = said.shown(MAX_OBSERVATION_CHARS / 2);
     prompt::unstarted(said.trim())
 }
@@ -766,6 +786,7 @@ pub(crate) mod tests {
     use crate::agent::tests::main_place;
     use crate::agent::{serve, Brief, Delegating, MAX_PARALLEL_AGENTS};
     use crate::config::Access;
+    use crate::model::Media;
     use crate::prompt::{self, system};
     use crate::steps::CallError;
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
@@ -773,9 +794,9 @@ pub(crate) mod tests {
     use crate::tools::mcp::Server;
     use crate::tools::memories::Memories;
     use crate::utils::{block_on, new_id, Interrupt};
-    use crate::worker::host::{tops, Added, Called, Calling, Evaluated, Worker, STOP_WAIT};
+    use crate::worker::host::{Added, Called, Calling, Followed, Rank, Worker, STOP_WAIT};
     use crate::worker::workplace::tests::opened;
-    use crate::worker::{AgentCall, Asked, Delegation, Service};
+    use crate::worker::{AgentCall, Asked, Service};
     use reaper::Member;
     use serde_json::{json, Map, Value};
     use std::env;
@@ -819,8 +840,16 @@ pub(crate) mod tests {
         }
     }
 
+    /// A call's result with its output cleaned as the model is shown it, but uncut
+    struct Shown {
+        printed: String,
+        error: Option<CallError>,
+        media: Vec<(String, Media)>,
+        repaired: Option<String>,
+    }
+
     impl Tried {
-        fn eval(&mut self, code: &str) -> Evaluated {
+        fn eval(&mut self, code: &str) -> Shown {
             let mut ignore = |_: &str| {};
             let servers: Vec<&Added> = self.servers.iter().collect();
             let delegate = &mut *self.delegate;
@@ -830,7 +859,13 @@ pub(crate) mod tests {
             let evaluating = self
                 .worker
                 .evaluate(code, &servers, &mut ignore, &mut serving);
-            block_on(evaluating).expect("evaluate")
+            let output = block_on(evaluating).expect("evaluate");
+            Shown {
+                printed: output.printed.shown(usize::MAX),
+                error: output.error,
+                media: output.media,
+                repaired: output.repaired,
+            }
         }
 
         /// Replaces a server with the same name and returns its name in code
@@ -856,11 +891,11 @@ pub(crate) mod tests {
         }
     }
 
-    fn build(interrupt: Interrupt, cwd: PathBuf, delegation: Delegation) -> Temp<Tried> {
+    fn build(interrupt: Interrupt, cwd: PathBuf, rank: Rank) -> Temp<Tried> {
         let dir = temp_dir("session");
         let workplace = opened(&cwd, &dir, &Access::default());
         let restarted = false;
-        let building = Worker::new(&interrupt, Arc::new(workplace), &[], delegation, restarted);
+        let building = Worker::new(&interrupt, Arc::new(workplace), &[], rank, restarted);
         let worker = block_on(building).expect("worker");
 
         let no_agents = |call: AgentCall| -> Calling { panic!("{call:?}") };
@@ -870,7 +905,7 @@ pub(crate) mod tests {
             delegate: Box::new(no_agents),
             memories: Memories::new(&dir, &cwd),
             // Agents that agent() starts only recall
-            writable: delegation != Delegation::Off,
+            writable: rank == Rank::Main,
         };
         Temp { value, dir }
     }
@@ -883,18 +918,18 @@ pub(crate) mod tests {
     fn workspace(name: &str) -> (Temp<Tried>, PathBuf) {
         let dir = temp_dir(name);
         fs::create_dir_all(&dir).expect("dir");
-        let worker = build(Interrupt::default(), dir.clone(), Delegation::On);
+        let worker = build(Interrupt::default(), dir.clone(), Rank::Main);
         (worker, dir)
     }
 
-    fn run(code: &str) -> Evaluated {
+    fn run(code: &str) -> Shown {
         fresh().eval(code)
     }
 
     fn interruptible() -> (Temp<Tried>, Interrupt) {
         let interrupt = Interrupt::default();
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let worker = build(interrupt.clone(), cwd, Delegation::On);
+        let worker = build(interrupt.clone(), cwd, Rank::Main);
         (worker, interrupt)
     }
 
@@ -918,7 +953,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn error(output: Evaluated) -> String {
+    fn error(output: Shown) -> String {
         let error = output.error.expect("error");
         error.to_string()
     }
@@ -931,12 +966,12 @@ pub(crate) mod tests {
             try:\n    while True:\n        pass\nexcept Exception:\n    print('caught')\n";
         let output = worker.eval(code);
 
-        assert_eq!(output.logs, "");
+        assert_eq!(output.printed, "");
         assert_eq!(output.error, Some(CallError::Interrupted));
 
         interrupt.begin(1);
         let output = worker.eval("[noted, 1 + 1]");
-        assert_eq!(output.logs, "['café', 2]\n");
+        assert_eq!(output.printed, "['café', 2]");
         assert!(!worker.take_restarted());
     }
 
@@ -947,13 +982,13 @@ pub(crate) mod tests {
         assert!(!worker.take_restarted());
 
         let exited = worker.eval("import os\nprint('leaving')\nos._exit(3)");
-        assert_eq!(exited.logs, "leaving\n");
+        assert_eq!(exited.printed, "leaving");
         let message = error(exited);
         assert_eq!(message, "Python exited with code 3");
         assert!(worker.take_restarted());
         assert!(!worker.take_restarted());
         let output = worker.eval("'x' in globals()");
-        assert_eq!(output.logs, "False\n");
+        assert_eq!(output.printed, "False");
 
         // Running code doesn't take the flag
         let crashed = worker.eval("import os\nos.abort()");
@@ -964,7 +999,7 @@ pub(crate) mod tests {
         #[cfg(windows)]
         assert!(crashed.starts_with("Python exited with code "), "{crashed}");
         let output = worker.eval("1 + 1");
-        assert_eq!(output.logs, "2\n");
+        assert_eq!(output.printed, "2");
         assert!(worker.take_restarted());
     }
 
@@ -981,7 +1016,7 @@ pub(crate) mod tests {
 
         interrupt.begin(1);
         let output = worker.eval("print('ran')");
-        assert_eq!(output.logs, "ran\n");
+        assert_eq!(output.printed, "ran");
     }
 
     /// A worker that exits between steps is also replaced before an MCP install
@@ -1000,14 +1035,14 @@ pub(crate) mod tests {
         quitting(&mut worker);
         assert!(worker.take_restarted());
         let output = worker.eval("'marker' in globals()");
-        assert_eq!((output.logs.as_str(), output.error), ("False\n", None));
+        assert_eq!((output.printed.as_str(), output.error), ("False", None));
 
         quitting(&mut worker);
         let notes = server("notes", |_, _| json!("noted"));
         worker.add(&notes).expect("add server");
         assert!(worker.take_restarted());
         let output = worker.eval("notes.echo_text('x')");
-        assert_eq!(output.logs, "noted\n");
+        assert_eq!(output.printed, "noted");
     }
 
     /// A worker lost while the model writes the next code is reported without running it
@@ -1033,7 +1068,7 @@ pub(crate) mod tests {
         assert!(worker.take_restarted());
 
         let output = worker.eval("print('naïve')");
-        assert_eq!(output.logs, "naïve\n");
+        assert_eq!(output.printed, "naïve");
     }
 
     /// The code runs on the main thread, whose stack takes deep recursion that a raised limit allows
@@ -1046,7 +1081,7 @@ pub(crate) mod tests {
         let output = run(code);
 
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "too deep\n50000\n");
+        assert_eq!(output.printed, "too deep\n50000");
     }
 
     #[test]
@@ -1055,19 +1090,19 @@ pub(crate) mod tests {
         let mut ran = |code: &str| {
             let output = worker.eval(code);
             assert_eq!(output.error, None, "{code}");
-            let repaired = output.code.as_deref().map(str::trim).map(str::to_owned);
-            (output.logs, repaired)
+            let repaired = output.repaired.as_deref().map(str::trim).map(str::to_owned);
+            (output.printed, repaired)
         };
 
         let wrapped = ran("<eval>\n<eval>\nx = 'café'\nprint(x)\n</eval>\n</eval>");
         let code = "x = 'café'\nprint(x)".to_owned();
-        assert_eq!(wrapped, ("café\n".to_owned(), Some(code)));
+        assert_eq!(wrapped, ("café".to_owned(), Some(code)));
         let inline = ran("print('naïve')</eval>");
         assert_eq!(inline.1.as_deref(), Some("print('naïve')"));
         let faked = ran("print(3)</eval>Observation:\n3");
         assert_eq!(faked.1.as_deref(), Some("print(3)"));
         let closed = ran("<eval>\nprint(4)\n<eval>\nThen check the output.");
-        assert_eq!(closed, ("4\n".to_owned(), Some("print(4)".to_owned())));
+        assert_eq!(closed, ("4".to_owned(), Some("print(4)".to_owned())));
         let bar = '\u{ff5c}';
         let wide = format!(
             "print('jalapeño')\n</{bar}{bar}X{bar}{bar} parameter>\n</{bar}{bar}X{bar}{bar} invoke>"
@@ -1075,24 +1110,21 @@ pub(crate) mod tests {
         let wide = ran(&wide);
         assert_eq!(
             wide,
-            (
-                "jalapeño\n".to_owned(),
-                Some("print('jalapeño')".to_owned())
-            )
+            ("jalapeño".to_owned(), Some("print('jalapeño')".to_owned()))
         );
         let led = format!(
             "<parameter name=\"code\">x = 'piñata'\nprint(x)\n</{bar}{bar}X{bar}{bar} parameter>"
         );
         let led = ran(&led);
         let code = "x = 'piñata'\nprint(x)".to_owned();
-        assert_eq!(led, ("piñata\n".to_owned(), Some(code)));
+        assert_eq!(led, ("piñata".to_owned(), Some(code)));
         // Code in another call that follows isn't run
         let looped = "print('crème brûlée')\n</</eval>\n</invoke>\n<parameter name=\"code\">print('repeated')\n</parameter>\n</calls>";
         let looped = ran(looped);
         assert_eq!(
             looped,
             (
-                "crème brûlée\n".to_owned(),
+                "crème brûlée".to_owned(),
                 Some("print('crème brûlée')".to_owned())
             )
         );
@@ -1100,18 +1132,18 @@ pub(crate) mod tests {
         // Tags inside strings are left alone
         let quoted = ran("s = '''\n</eval>\n'''\nprint(len(s), '<eval>')\n</eval>");
         let code = "s = '''\n</eval>\n'''\nprint(len(s), '<eval>')".to_owned();
-        assert_eq!(quoted, ("9 <eval>\n".to_owned(), Some(code)));
+        assert_eq!(quoted, ("9 <eval>".to_owned(), Some(code)));
         let page = ran("résumé = '''\n</div>\n'''\nprint(len(résumé))\n</invoke>");
         let code = "résumé = '''\n</div>\n'''\nprint(len(résumé))".to_owned();
-        assert_eq!(page, ("8\n".to_owned(), Some(code)));
+        assert_eq!(page, ("8".to_owned(), Some(code)));
         let block = ran("façade = '''\n<div>\n'''\nprint(len(façade))\n</eval>");
         let code = "façade = '''\n<div>\n'''\nprint(len(façade))".to_owned();
-        assert_eq!(block, ("7\n".to_owned(), Some(code)));
+        assert_eq!(block, ("7".to_owned(), Some(code)));
         let valid = ran("html = '<eval>café</eval>'\nprint(html)");
-        assert_eq!(valid, ("<eval>café</eval>\n".to_owned(), None));
+        assert_eq!(valid, ("<eval>café</eval>".to_owned(), None));
 
         let broken = worker.eval("print(1\n</eval>");
-        assert_eq!(broken.code, None);
+        assert_eq!(broken.repaired, None);
         let error = error(broken);
         assert!(error.starts_with("syntax error"), "{error}");
     }
@@ -1127,14 +1159,14 @@ pub(crate) mod tests {
         assert_eq!(output.error, None);
 
         // Source is attached only after the step finishes
-        let logs = worker.eval("help(count)\nhelp(Node)\nhelp(nested)").logs;
+        let logs = worker.eval("help(count)\nhelp(Node)\nhelp(nested)").printed;
         let counted = "@logged\ndef count(rows, *, unique=False) -> int:\n    # count the rows\n    return len(rows)\n";
         assert!(logs.contains(counted), "{logs}");
         assert!(
             logs.contains("class Node(dict):\n    level = 1\n"),
             "{logs}"
         );
-        assert!(logs.ends_with("def nested(x):\n    return x\n"), "{logs}");
+        assert!(logs.ends_with("def nested(x):\n    return x"), "{logs}");
 
         // A `def` that never ran isn't attached to the old function,
         // and neither is one rebound to another value later
@@ -1143,12 +1175,9 @@ pub(crate) mod tests {
         assert!(message.starts_with("ZeroDivisionError"), "{message}");
         let swapped = worker.eval("def nested(x):\n    return 2 * x\nnested = Node");
         assert_eq!(swapped.error, None);
-        let logs = worker.eval("help(count)\nhelp(nested)").logs;
+        let logs = worker.eval("help(count)\nhelp(nested)").printed;
         assert!(logs.contains(counted), "{logs}");
-        assert!(
-            logs.ends_with("class Node(dict):\n    level = 1\n"),
-            "{logs}"
-        );
+        assert!(logs.ends_with("class Node(dict):\n    level = 1"), "{logs}");
     }
 
     /// A worker stuck after an interrupt and one that exits on its own are both replaced
@@ -1162,17 +1191,17 @@ pub(crate) mod tests {
         let (mut worker, interrupt) = interruptible();
 
         let mut turn = 0;
-        for (code, said) in [(stuck, "stuck\n"), (exiting, "")] {
+        for (code, said) in [(stuck, "stuck"), (exiting, "")] {
             worker.eval("x = 1");
             cancel_soon(&interrupt, turn);
             let stopped = worker.eval(code);
-            assert_eq!(stopped.logs, said, "{code}");
+            assert_eq!(stopped.printed, said, "{code}");
             assert_eq!(stopped.error, Some(CallError::Interrupted), "{code}");
 
             turn += 1;
             interrupt.begin(turn);
             let output = worker.eval("'x' in globals()");
-            assert_eq!(output.logs, "False\n", "{code}");
+            assert_eq!(output.printed, "False", "{code}");
             assert!(worker.take_restarted(), "{code}");
         }
     }
@@ -1189,14 +1218,14 @@ pub(crate) mod tests {
 
         interrupt.begin(1);
         let kept = worker.eval("x");
-        assert_eq!(kept.logs, "kept\n");
+        assert_eq!(kept.printed, "kept");
     }
 
     #[test]
     fn error_location() {
         let mut worker = fresh();
         let output = worker.eval("print('before')\nx = 1\n1 / 0");
-        assert_eq!(output.logs, "before\n");
+        assert_eq!(output.printed, "before");
 
         let message = error(output);
         assert!(message.starts_with("ZeroDivisionError"), "{message}");
@@ -1230,7 +1259,7 @@ pub(crate) mod tests {
             try:\n    lookup({})\nexcept KeyError:\n    traceback.print_exc()";
         let output = worker.eval(code);
         assert_eq!(output.error, None);
-        let logs = output.logs;
+        let logs = output.printed;
         assert!(logs.starts_with(&format!("{defined}\n")), "{logs}");
         let framed = "File \"<smolcode-1>\", line 2, in lookup\n    value = row['café']\n";
         assert!(logs.contains(framed), "{logs}");
@@ -1326,9 +1355,10 @@ pub(crate) mod tests {
         let evaluating = worker.evaluate(code, &[], &mut shown, &mut none);
         let output = block_on(evaluating).expect("evaluate");
 
-        assert_eq!(output.logs, "first line\nsecond line\n");
+        let printed = output.printed.shown(usize::MAX);
+        assert_eq!(printed, "first line\nsecond line");
         let first = seen.first().map(String::as_str);
-        assert_eq!(first, Some("first line\n"), "{seen:?}");
+        assert_eq!(first, Some("first line"), "{seen:?}");
     }
 
     #[test]
@@ -1337,12 +1367,12 @@ pub(crate) mod tests {
         worker.eval("x = {'café': [1, 2]}");
 
         let output = worker.eval("x");
-        assert_eq!(output.logs, "{'café': [1, 2]}\n");
+        assert_eq!(output.printed, "{'café': [1, 2]}");
 
         let every =
             "x = 1\nx\nprint('printed')\n'text'\nNone\nfor i in range(3):\n    i\n[x, 'naïve']";
         let output = worker.eval(every);
-        assert_eq!(output.logs, "1\nprinted\ntext\n[1, 'naïve']\n");
+        assert_eq!(output.printed, "1\nprinted\ntext\n[1, 'naïve']");
     }
 
     #[test]
@@ -1458,7 +1488,7 @@ pub(crate) mod tests {
                     if stat.S_ISSOCK(mode):\n            os.write(fd, (note + '\\n').encode())\n            return\n\
             for name in ['/etc/hostname', '../café.png', 'naïve.png']:\n    forge(name)";
         let output = run(code);
-        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.error, None, "{}", output.printed);
 
         let labels: Vec<&str> = output.media.iter().map(|(label, _)| &**label).collect();
         assert_eq!(labels, ["naïve.png"]);
@@ -1473,7 +1503,7 @@ pub(crate) mod tests {
         let module = dir.join("smol_local.py");
         fs::write(&module, "value = 42\n").expect("write");
 
-        let mut worker = build(Interrupt::default(), dir.clone(), Delegation::On);
+        let mut worker = build(Interrupt::default(), dir.clone(), Rank::Main);
         let code = "import argparse, os, pathlib, runpy, shutil, smol_local, sys\n\
              print(smol_local.value)\n\
              _ = pathlib.Path('script.py').write_text('import sys\\nprint(sys.argv[0])')\n\
@@ -1487,7 +1517,7 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "42\nscript.py\nTrue True\nZoë\n");
+        assert_eq!(output.printed, "42\nscript.py\nTrue True\nZoë");
     }
 
     /// A file in the working directory named like a module the bootstrap imports
@@ -1497,12 +1527,12 @@ pub(crate) mod tests {
         fs::create_dir_all(&dir).expect("create dir");
         fs::write(dir.join("token.py"), "raise SystemExit('café')\n").expect("write");
 
-        let mut worker = build(Interrupt::default(), dir.clone(), Delegation::On);
+        let mut worker = build(Interrupt::default(), dir.clone(), Rank::Main);
         let output = worker.eval("1 + 1");
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "2\n");
+        assert_eq!(output.printed, "2");
     }
 
     /// What pip puts in the venv imports in the same session
@@ -1521,7 +1551,7 @@ pub(crate) mod tests {
         let output = worker.eval(&code);
 
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "naïve\n");
+        assert_eq!(output.printed, "naïve");
     }
 
     /// Like what `pip install -e` leaves, a .pth file in the venv imports in the same session
@@ -1547,7 +1577,7 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "naïve\n");
+        assert_eq!(output.printed, "naïve");
     }
 
     /// Python that multiprocessing starts gets the worker's flags and must still run site as the venv
@@ -1562,7 +1592,7 @@ pub(crate) mod tests {
         let output = worker.eval(code);
 
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "True\n");
+        assert_eq!(output.printed, "True");
     }
 
     /// The python the code starts adds PYTHONPATH, unless -E or -I leave out the environment
@@ -1580,8 +1610,8 @@ pub(crate) mod tests {
         let output = worker.eval(code);
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(output.error, None, "{}", output.logs);
-        assert_eq!(output.logs, "0 42\n1 \n1 \n");
+        assert_eq!(output.error, None, "{}", output.printed);
+        assert_eq!(output.printed, "0 42\n1 \n1 ");
     }
 
     /// A venv the code makes, inside the session's or inside that one, gets its own python,
@@ -1601,8 +1631,8 @@ pub(crate) mod tests {
         let output = worker.eval(code);
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(output.error, None, "{}", output.logs);
-        assert_eq!(output.logs, "False True True\n0 True\n");
+        assert_eq!(output.error, None, "{}", output.printed);
+        assert_eq!(output.printed, "False True True\n0 True");
     }
 
     /// A venv the code makes gets a python.exe that relays to the interpreter, pip and activation scripts
@@ -1620,12 +1650,12 @@ pub(crate) mod tests {
         let output = worker.eval(code);
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.error, None, "{}", output.printed);
         // venv warns first when the path has short names, as the CI runner's TEMP does
         assert!(
-            output.logs.ends_with("True True True\n0 True\n"),
+            output.printed.ends_with("True True True\n0 True"),
             "{}",
-            output.logs
+            output.printed
         );
     }
 
@@ -1650,8 +1680,8 @@ pub(crate) mod tests {
         );
         let output = worker.eval(&code);
 
-        assert_eq!(output.error, None, "{}", output.logs);
-        assert_eq!(output.logs, "True True 0 False False\n");
+        assert_eq!(output.error, None, "{}", output.printed);
+        assert_eq!(output.printed, "True True 0 False False");
     }
 
     /// A pool fails at once instead of waiting on a process that can't import the code
@@ -1670,7 +1700,7 @@ pub(crate) mod tests {
 
         let output = worker.eval("import pickle\npickle.loads(pickle.dumps(square))(3)");
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "9\n");
+        assert_eq!(output.printed, "9");
     }
 
     #[test]
@@ -1681,8 +1711,8 @@ pub(crate) mod tests {
              [recall('fridays') == [(a, 'Deploys the café site on Fridays')], len(recall()), forget(a), recall('fridays') == [(b, 'Prefers naïve tests')]]";
         let output = worker.eval(code);
 
-        assert_eq!(output.error, None, "{}", output.logs);
-        assert_eq!(output.logs, "[True, 2, None, True]\n");
+        assert_eq!(output.error, None, "{}", output.printed);
+        assert_eq!(output.printed, "[True, 2, None, True]");
     }
 
     #[test]
@@ -1698,8 +1728,8 @@ pub(crate) mod tests {
                         'ValueError: forget: no such memory', \
                         'TypeError: forget: id must be int, not str', 'TypeError: remember: text must be str, not int', \
                         'ValueError: forget: no such memory', \
-                        \"ValueError: remember: a str holds a lone surrogate, which isn't valid Unicode\"]\n";
-        assert_eq!(output.logs, expected);
+                        \"ValueError: remember: a str holds a lone surrogate, which isn't valid Unicode\"]";
+        assert_eq!(output.printed, expected);
     }
 
     /// Agents that agent() started only recall, even when their code asks the agent directly
@@ -1707,7 +1737,7 @@ pub(crate) mod tests {
     fn memories_nested() {
         let dir = temp_dir("nested");
         fs::create_dir_all(&dir).expect("dir");
-        let mut worker = build(Interrupt::default(), dir.clone(), Delegation::Off);
+        let mut worker = build(Interrupt::default(), dir.clone(), Rank::Delegated);
         let names: Vec<String> = worker.functions().iter().map(|f| f.name.clone()).collect();
         let code = "ask = recall.__globals__['_ask']\n\
              try:\n    ask('remember', {'text': 'Uses tabs', 'project': True})\n\
@@ -1720,8 +1750,8 @@ pub(crate) mod tests {
         assert!(!names.contains(&"remember".to_owned()), "{names:?}");
         assert!(!names.contains(&"forget".to_owned()), "{names:?}");
         assert_eq!(
-            output.logs,
-            "not available to agents started by agent()\n[]\n"
+            output.printed,
+            "not available to agents started by agent()\n[]"
         );
     }
 
@@ -1846,11 +1876,11 @@ pub(crate) mod tests {
     fn closed_stdout_reopened() {
         let mut worker = fresh();
         let output = worker.eval("import sys\nprint('written')\nsys.stdout.close()");
-        assert_eq!(output.logs, "written\n");
+        assert_eq!(output.printed, "written");
 
         let output = worker.eval("print('next')\nprint('original', file=sys.__stdout__)\n1 + 1");
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "next\noriginal\n2\n");
+        assert_eq!(output.printed, "next\noriginal\n2");
     }
 
     /// Dropping a stream made on fd 1 closes the fd, which a file opened next would take
@@ -1861,7 +1891,7 @@ pub(crate) mod tests {
              sys.stdout = io.TextIOWrapper(open(sys.stdout.fileno(), 'wb', 0), write_through=True)\n\
              print('café')";
         let output = worker.eval(code);
-        assert_eq!(output.logs, "café\n");
+        assert_eq!(output.printed, "café");
 
         let code = "import subprocess\n\
              notes = open('notes.txt', 'w')\n\
@@ -1873,7 +1903,7 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "naïve\nrésumé\n");
+        assert_eq!(output.printed, "naïve\nrésumé");
         assert_eq!(notes, "");
     }
 
@@ -1884,10 +1914,10 @@ pub(crate) mod tests {
         let code = "import sys\nsys.stdout.flush()\n\
              _ = sys.stdout.buffer.write(b'\\x02smol\\x03end\\n')\nprint('café')";
         let output = worker.eval(code);
-        assert_eq!(output.logs, "\u{2}smol\u{3}end\ncafé\n");
+        assert_eq!(output.printed, "\u{2}smol\u{3}end\ncafé");
 
         let next = worker.eval("print('naïve')");
-        assert_eq!(next.logs, "naïve\n");
+        assert_eq!(next.printed, "naïve");
     }
 
     #[test]
@@ -1897,7 +1927,7 @@ pub(crate) mod tests {
 
         assert_eq!(output.error, None);
         for expected in ["raw\n", "café-naïve!résumé\n", "UserWarning: careful"] {
-            let logs = &output.logs;
+            let logs = &output.printed;
             assert!(logs.contains(expected), "{logs}");
         }
     }
@@ -1914,7 +1944,7 @@ pub(crate) mod tests {
 
         let output = run(&code);
 
-        assert_eq!(output.logs, "[]\n");
+        assert_eq!(output.printed, "[]");
     }
 
     /// Only a stop in place replies and keeps variables set by the interrupted snippet
@@ -1943,7 +1973,7 @@ pub(crate) mod tests {
             turn += 1;
             interrupt.begin(turn);
             let kept = worker.eval("stopped_at");
-            assert_eq!(kept.logs, format!("{index}\n"), "{code}");
+            assert_eq!(kept.printed, index.to_string(), "{code}");
             turn += 1;
         }
     }
@@ -1954,7 +1984,7 @@ pub(crate) mod tests {
 
         let caught = "import errno\ntry:\n    ls('/nope/café')\nexcept FileNotFoundError as e:\n    print(e.errno == errno.ENOENT, e.filename)";
         let output = worker.eval(caught);
-        assert_eq!(output.logs, "True /nope/café\n");
+        assert_eq!(output.printed, "True /nope/café");
 
         let output = worker.eval("ls('/nope/café')");
         let message = error(output);
@@ -1981,11 +2011,11 @@ pub(crate) mod tests {
         let not_callable = "TypeError: 'str' object is not callable";
         assert!(hidden.starts_with(not_callable), "{hidden}");
 
-        let help = run("help('grep')").logs;
+        let help = run("help('grep')").printed;
         assert!(help.starts_with("grep(pattern: str"), "{help}");
 
         let back = run("del grep, notes\n[callable(grep), notes.echo_text('x')]");
-        assert_eq!(back.logs, "[True, 'echo']\n");
+        assert_eq!(back.printed, "[True, 'echo']");
         assert_eq!(back.error, None);
     }
 
@@ -2000,8 +2030,8 @@ pub(crate) mod tests {
 
         let code = "import time\n[callable(fetch), callable(print), print_mcp.echo_text('x'), time_mcp.echo_text('y')]";
         let kept = worker.eval(code);
-        assert_eq!(kept.logs, "[True, True, 'echo', 'echo']\n");
-        let listed = worker.eval("help(time_mcp)").logs;
+        assert_eq!(kept.printed, "[True, True, 'echo', 'echo']");
+        let listed = worker.eval("help(time_mcp)").printed;
         let titled = "MCP server time_mcp (configured as time)";
         assert!(listed.starts_with(titled), "{listed}");
     }
@@ -2017,7 +2047,7 @@ pub(crate) mod tests {
         let servers: Vec<&Added> = worker.servers.iter().collect();
         let workplace = Arc::clone(&worker.workplace);
         let interrupt = Interrupt::default();
-        let starting = Worker::new(&interrupt, workplace, &servers, Delegation::Off, false);
+        let starting = Worker::new(&interrupt, workplace, &servers, Rank::Delegated, false);
         let mut helper = block_on(starting).expect("worker");
         let mut ignore = |_: &str| {};
         let mut none = unserved;
@@ -2025,8 +2055,9 @@ pub(crate) mod tests {
         let evaluating = helper.evaluate(code, &servers, &mut ignore, &mut none);
         let output = block_on(evaluating).expect("evaluate");
 
-        assert_eq!(output.error, None, "{}", output.logs);
-        assert_eq!(output.logs, "café\n");
+        let printed = output.printed.shown(usize::MAX);
+        assert_eq!(output.error, None, "{printed}");
+        assert_eq!(printed, "café");
     }
 
     #[test]
@@ -2039,12 +2070,12 @@ pub(crate) mod tests {
         let refused = worker.add(&second).expect_err("clash");
         assert_eq!(refused, "a_b: name already used by server a-b");
         let kept = worker.eval("a_b.echo_text('x')");
-        assert_eq!(kept.logs, "first\n");
+        assert_eq!(kept.printed, "first");
 
         let again = server("a-b", |_, _| json!("again"));
         worker.add(&again).expect("replace");
         let replaced = worker.eval("a_b.echo_text('x')");
-        assert_eq!(replaced.logs, "again\n");
+        assert_eq!(replaced.printed, "again");
     }
 
     #[test]
@@ -2061,7 +2092,7 @@ pub(crate) mod tests {
         // Sent straight to the worker, as `remove` skips names it never added
         worker.remove_server("print");
         let kept = worker.eval("callable(print)");
-        assert_eq!(kept.logs, "True\n");
+        assert_eq!(kept.printed, "True");
 
         // A lost worker isn't restarted just for this
         worker.add(&notes).expect("add server");
@@ -2084,9 +2115,9 @@ pub(crate) mod tests {
         assert_eq!(named, "my_forms");
 
         let echoed = worker.eval("my_forms.echo_text(the_text='déjà vu')");
-        assert_eq!(echoed.logs, "['echo-text', {'the-text': 'déjà vu'}]\n");
+        assert_eq!(echoed.printed, "['echo-text', {'the-text': 'déjà vu'}]");
         let unset = worker.eval("my_forms.echo_text(None)");
-        assert_eq!(unset.logs, "['echo-text', {}]\n");
+        assert_eq!(unset.printed, "['echo-text', {}]");
 
         let output = worker.eval("my_forms.echo_text(the_text=object())");
         let message = error(output);
@@ -2109,13 +2140,13 @@ pub(crate) mod tests {
         worker.add(&server).expect("add server");
 
         let called = worker.eval("[fake.add(a=2, b=3), fake.echo_text(the_text='café')]");
-        assert_eq!(called.logs, "['5', 'café']\n");
+        assert_eq!(called.printed, "['5', 'café']");
         assert_eq!(called.error, None);
 
         // A dict only for a tool whose output schema says so, as its signature does
         let structured = worker.eval("[fake.stats(), fake.counts(), fake.bare()]");
-        let expected = "[{'count': 3}, '3 cafés counted', '{\"count\":3}']\n";
-        assert_eq!(structured.logs, expected);
+        let expected = "[{'count': 3}, '3 cafés counted', '{\"count\":3}']";
+        assert_eq!(structured.printed, expected);
 
         let failed = worker.eval("fake.fail()");
         let failed = error(failed);
@@ -2147,9 +2178,8 @@ pub(crate) mod tests {
         assert_eq!(output.error, None);
 
         let output = worker.eval("caller.join(5)\n[caller.is_alive(), replies]");
-        let expected =
-            "[False, ['slow.echo_text: stopped when the code that was running ended']]\n";
-        assert_eq!(output.logs, expected);
+        let expected = "[False, ['slow.echo_text: stopped when the code that was running ended']]";
+        assert_eq!(output.printed, expected);
     }
 
     /// A thread the code started gets a reply to a call made while a server is being added,
@@ -2177,7 +2207,7 @@ pub(crate) mod tests {
         let code = "stop = True\npoller.join(5)\n\
              [poller.is_alive(), 'notes.echo_text: not run while an MCP server was being added' in replies]";
         let output = worker.eval(code);
-        assert_eq!(output.logs, "naïve poller started\n[False, True]\n");
+        assert_eq!(output.printed, "naïve poller started\n[False, True]");
     }
 
     /// A thread printing between snippets never blocks, and its output heads the next snippet
@@ -2188,14 +2218,15 @@ pub(crate) mod tests {
              def chatter():\n    global done\n    for i in range(3000):\n        print(f'{i:04} café ' + 'x' * 190)\n    done = True\n\
              threading.Timer(1, chatter).start()";
         let output = worker.eval(code);
-        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.error, None, "{}", output.printed);
         let waiting = async { time::sleep(Duration::from_secs(3)).await };
         block_on(waiting);
 
         let output = worker.eval("done");
-        assert!(output.logs.starts_with("0000 café "), "{}", output.logs);
-        assert!(output.logs.ends_with("True\n"), "{}", output.logs);
-        assert!(output.cut > 0, "{}", output.cut);
+        let printed = &output.printed;
+        assert!(printed.starts_with("0000 café "), "{printed}");
+        assert!(printed.ends_with("True"), "{printed}");
+        assert!(printed.contains(" characters cut]\n"), "{printed}");
     }
 
     #[test]
@@ -2267,11 +2298,11 @@ pub(crate) mod tests {
             print(answers['cafés'], type(answers['fail']).__name__, answers['fail'], 'slow' in answers)\n\
             print(agent.stop('slow'))";
         let output = worker.eval(code);
-        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.error, None, "{}", output.printed);
         let printed = "slow: running for 1s, step 1: thinking\n\
             done: cafés RuntimeError agent.wait: model: http 503: busy False\n\
-            None\n";
-        assert_eq!(output.logs, printed);
+            None";
+        assert_eq!(output.printed, printed);
         let tasks = ["cafés: Count the cafés", "naïve: Spell naïve"];
         assert_eq!(*sent.lock().expect("sent"), tasks);
 
@@ -2317,7 +2348,7 @@ pub(crate) mod tests {
             "agent.stop(name: str) -> None",
         ];
         assert_eq!(headers, listed);
-        let helped = worker.eval("help(agent)").logs;
+        let helped = worker.eval("help(agent)").printed;
         let summaries = "\n\nagent.wait(*names: str, timeout: float | None = None) -> dict[str, str | RuntimeError]\n    \
                          The answers of the named agents, or of all not yet taken, once they end or after timeout seconds.\n    \
                          Returns early when the user sends a message, and prints what each one still at work is doing.\n\n\
@@ -2330,9 +2361,9 @@ pub(crate) mod tests {
     fn docs_shared() {
         let output = run("help(agent)\nhelp(agent.stop)");
         let limit = format!("Up to {MAX_PARALLEL_AGENTS} agents work at a time");
-        assert!(output.logs.contains(&limit), "{}", output.logs);
+        assert!(output.printed.contains(&limit), "{}", output.printed);
         let done = format!("no \"[{}]\" message", prompt::DONE);
-        assert!(output.logs.contains(&done), "{}", output.logs);
+        assert!(output.printed.contains(&done), "{}", output.printed);
     }
 
     struct Dropped(Arc<AtomicBool>);
@@ -2356,8 +2387,8 @@ pub(crate) mod tests {
             time.sleep(0.5)\n\
             print(program.pid)";
         let output = worker.eval(code);
-        assert_eq!(output.error, None, "{}", output.logs);
-        let pid: u32 = output.logs.trim().parse().expect("pid");
+        assert_eq!(output.error, None, "{}", output.printed);
+        let pid: u32 = output.printed.parse().expect("pid");
         assert_eq!(block_on(worker.ended()), None);
 
         // The inner program may end a moment before the one it belongs to
@@ -2399,7 +2430,11 @@ pub(crate) mod tests {
             member(13, 1, "python3 brew.py --café"),
             member(14, 13, "sleep 30"),
         ];
-        let pids: Vec<u32> = tops(&followed).iter().map(|top| top.pid).collect();
+        let followed = Followed {
+            left: followed.to_vec(),
+            own: Vec::new(),
+        };
+        let pids: Vec<u32> = followed.tops().iter().map(|top| top.pid).collect();
         assert_eq!(pids, [13]);
     }
 
@@ -2425,7 +2460,7 @@ pub(crate) mod tests {
             time.sleep(0.5)";
         let output = worker.eval(code);
 
-        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.error, None, "{}", output.printed);
         assert!(dropped.load(Ordering::SeqCst));
     }
 
@@ -2461,7 +2496,7 @@ pub(crate) mod tests {
         // Only a stop in place keeps it
         interrupt.begin(1);
         let kept = worker.eval("called");
-        assert_eq!(kept.logs, "1\n");
+        assert_eq!(kept.printed, "1");
     }
 
     #[test]
@@ -2479,17 +2514,17 @@ pub(crate) mod tests {
 
         let output = worker.eval("help(fake)\nhelp('fake.wait')");
         assert_eq!(output.error, None);
-        let logs = output.logs;
+        let logs = output.printed;
         assert!(logs.starts_with("MCP server fake\n"), "{logs}");
         let wait = "\nfake.wait(seconds: float = None) -> str\nSleeps, then answers";
         assert!(logs.contains(wait), "{logs}");
 
-        let logs = worker.eval("help(news)").logs;
+        let logs = worker.eval("help(news)").printed;
         let shown = logs.chars().count();
         assert!(shown < 8192, "{shown}");
         assert!(logs.contains("news.tool39("), "{logs}");
         assert!(logs.contains("née…\n"), "{logs}");
-        let full = worker.eval("help('news.tool39')").logs;
+        let full = worker.eval("help('news.tool39')").printed;
         let about = "née".repeat(100);
         assert!(full.contains(&about), "{full}");
     }
@@ -2538,8 +2573,8 @@ pub(crate) mod tests {
         let code = "print(café.get_user(crème='brûlée', jalapeños=2))\nprint(café.get_user_2())";
         let called = worker.eval(code);
         assert_eq!(
-            called.logs,
-            "get-user {\"crème\":\"brûlée\",\"jalapeños\":2}\nget_user {}\n"
+            called.printed,
+            "get-user {\"crème\":\"brûlée\",\"jalapeños\":2}\nget_user {}"
         );
 
         // The agent receives the name as written in code
@@ -2553,7 +2588,7 @@ pub(crate) mod tests {
         let name = worker.add(&notes).expect("add server");
         assert_eq!(name, "déjà_vu");
         let called = worker.eval("déjà_vu.echo_text(the_text='hi')");
-        assert_eq!(called.logs, "déjà_vu.echo_text\n");
+        assert_eq!(called.printed, "déjà_vu.echo_text");
     }
 
     #[test]
@@ -2587,17 +2622,17 @@ pub(crate) mod tests {
         worker.add(&news).expect("add server");
 
         let output = worker.eval("help('news.find')");
-        let header = output.logs.lines().next();
+        let header = output.printed.lines().next();
         let countries = "'c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9', 'c10', 'c11'";
         let expected = format!("news.find(query: str, limit: int, topic: Literal['general'] = None, range: Literal['day', 'week'] | None = None, since: str | None = None, tags: list[str] = None, kind: Literal['a', 'b'] = None, chain: Any | None = None, country: Literal[{countries}] = None) -> str");
         assert_eq!(header, Some(expected.as_str()));
 
         let called = worker.eval("news.find('weather', 3)");
-        assert_eq!(called.logs, "{'query': 'weather', 'limit': 3}\n");
+        assert_eq!(called.printed, "{'query': 'weather', 'limit': 3}");
 
         // A call missing a required argument isn't sent
         let missing = worker.eval("news.find('weather')");
-        assert_eq!(missing.logs, "");
+        assert_eq!(missing.printed, "");
         let message = error(missing);
         let first = message.lines().next();
         let refused = format!("TypeError: {expected}: missing a required argument: 'limit'");
@@ -2615,7 +2650,7 @@ pub(crate) mod tests {
             let code = format!("help({request})");
             let output = worker.eval(&code);
             assert_eq!(output.error, None);
-            output.logs
+            output.printed
         };
 
         let edit = help("edit");
@@ -2639,9 +2674,9 @@ pub(crate) mod tests {
         assert!(json.contains("dumps"), "{json}");
 
         let long = help("long");
-        assert_eq!(long, format!("long()\n{defined}\n"));
+        assert_eq!(long, format!("long()\n{defined}"));
 
-        assert_eq!(help("'nope.nothing'"), "help: nope.nothing: not found\n");
+        assert_eq!(help("'nope.nothing'"), "help: nope.nothing: not found");
     }
 
     #[test]
@@ -2662,8 +2697,8 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(output.error, None);
-        let expected = "2\n11\n['café\\nsecond\\n', '0001', ['a', 'b'], 'via pathlib', 'x refuses', 'not found']\n";
-        assert_eq!(output.logs, expected);
+        let expected = "2\n11\n['café\\nsecond\\n', '0001', ['a', 'b'], 'via pathlib', 'x refuses', 'not found']";
+        assert_eq!(output.printed, expected);
     }
 
     #[test]
@@ -2673,11 +2708,11 @@ pub(crate) mod tests {
         assert_eq!(output.error, None);
 
         let written = fs::read_to_string(dir.join("log.txt")).expect("read");
-        let closed = worker.eval("log.closed").logs;
+        let closed = worker.eval("log.closed").printed;
         fs::remove_dir_all(&dir).ok();
 
         assert_eq!(written, "still open");
-        assert_eq!(closed, "False\n");
+        assert_eq!(closed, "False");
     }
 
     /// A pipe is flushed after each snippet, and one a thread is stuck writing to doesn't hold the snippet up
@@ -2694,10 +2729,10 @@ pub(crate) mod tests {
              threading.Thread(target=stuck.write, args=(b'x' * 1_000_000,), daemon=True).start()\n\
              time.sleep(0.3)";
         let output = worker.eval(code);
-        assert_eq!(output.error, None, "{}", output.logs);
+        assert_eq!(output.error, None, "{}", output.printed);
 
         let output = worker.eval("os.read(reader, 100).decode()");
-        assert_eq!(output.logs, "café\n");
+        assert_eq!(output.printed, "café");
 
         // Each flush ends once its pipe drains
         let code = "drained = 0\n\
@@ -2707,7 +2742,7 @@ pub(crate) mod tests {
              while any(flusher.is_alive() for flusher in flushers) and time.monotonic() < deadline:\n    time.sleep(0.01)\n\
              [len(flushers), any(flusher.is_alive() for flusher in flushers)]";
         let output = worker.eval(code);
-        assert_eq!(output.logs, "[2, False]\n");
+        assert_eq!(output.printed, "[2, False]");
     }
 
     /// A function the code defined is looked up before a builtin of the same name
@@ -2718,9 +2753,9 @@ pub(crate) mod tests {
         let output = worker.eval(code);
 
         assert!(
-            output.logs.contains("Reads the naïve cache."),
+            output.printed.contains("Reads the naïve cache."),
             "{}",
-            output.logs
+            output.printed
         );
     }
 
@@ -2740,20 +2775,20 @@ pub(crate) mod tests {
         let cut = format!(
             "{wide}\n[1808 characters cut; print(..., limit=None) skips this cut]\n{wide}\n"
         );
-        let logs = &output.logs;
+        let logs = &output.printed;
         assert!(logs.starts_with(&cut), "{logs}");
 
         let whole = format!("\n{}\n", "y".repeat(10000));
         assert!(logs.contains(&whole));
 
-        let short = "zzzzz\n[90 characters cut; print(..., limit=None) skips this cut]\nzzzzz\n";
+        let short = "zzzzz\n[90 characters cut; print(..., limit=None) skips this cut]\nzzzzz";
         assert!(logs.ends_with(short));
         // Text files end lines with \r\n on Windows
         assert_eq!(written.trim_end(), "w".repeat(10000));
 
         let captured = "import contextlib, io\nbuf = io.StringIO()\nwith contextlib.redirect_stdout(buf):\n    print('c' * 10000)\nlen(buf.getvalue())";
         let captured = run(captured);
-        assert_eq!(captured.logs, "10001\n");
+        assert_eq!(captured.printed, "10001");
     }
 
     #[test]
@@ -2772,7 +2807,7 @@ pub(crate) mod tests {
         let menu = "const crème\nbrûlée\nflan\nmatcha\nconst piñata\n";
         write_file(&dir.join("menu.txt"), menu.as_bytes());
 
-        let mut run = |code: &str| worker.eval(code).logs;
+        let mut run = |code: &str| worker.eval(code).printed;
         let found = run("grep('const')");
         let around = run("found = grep('const', context=1)\nfound");
         let sliced = run("found[3:]");
@@ -2784,22 +2819,22 @@ pub(crate) mod tests {
 
         let expected = "4 matches in 2 files\n\n\
             deep/café.rs\n2:const CAFÉ: u8 = 1;\n3:const NAÏVE: u8 = 2;\n\n\
-            menu.txt\n1:const crème\n5:const piñata\n";
+            menu.txt\n1:const crème\n5:const piñata";
         assert_eq!(found, expected);
         let expected = "4 matches in 2 files\n\n\
             deep/café.rs\n1-fn main() {}\n2:const CAFÉ: u8 = 1;\n3:const NAÏVE: u8 = 2;\n\n\
-            menu.txt\n1:const crème\n2-brûlée\n--\n4-matcha\n5:const piñata\n";
+            menu.txt\n1:const crème\n2-brûlée\n--\n4-matcha\n5:const piñata";
         assert_eq!(around, expected);
         assert_eq!(
             sliced,
-            "1 match in 1 file\n\nmenu.txt\n4-matcha\n5:const piñata\n"
+            "1 match in 1 file\n\nmenu.txt\n4-matcha\n5:const piñata"
         );
-        let expected = "([('deep/café.rs', 2, 'const CAFÉ: u8 = 1;')], <class 'list'>)\n";
+        let expected = "([('deep/café.rs', 2, 'const CAFÉ: u8 = 1;')], <class 'list'>)";
         assert_eq!(kept, expected);
-        assert_eq!(none, "0 matches in 0 files\n");
-        let expected = "[('deep/café.rs', 2, 'const CAFÉ: u8 = 1;'), 'café']\n";
+        assert_eq!(none, "0 matches in 0 files");
+        let expected = "[('deep/café.rs', 2, 'const CAFÉ: u8 = 1;'), 'café']";
         assert_eq!(mixed, expected);
-        assert_eq!(added, "[('menu.txt', 5, 'const piñata'), 'café']\n");
+        assert_eq!(added, "[('menu.txt', 5, 'const piñata'), 'café']");
     }
 
     /// A search interrupted halfway stops in place without waiting for the worker to be killed
@@ -2821,7 +2856,7 @@ pub(crate) mod tests {
         }
         write_file(&dir.join("random.txt"), text.as_bytes());
         let interrupt = Interrupt::default();
-        let mut worker = build(interrupt.clone(), dir.clone(), Delegation::On);
+        let mut worker = build(interrupt.clone(), dir.clone(), Rank::Main);
 
         worker.eval("noted = 1");
         cancel_soon(&interrupt, 0);
@@ -2833,7 +2868,7 @@ pub(crate) mod tests {
         interrupt.begin(1);
         let kept = worker.eval("noted");
         fs::remove_dir_all(&dir).ok();
-        assert_eq!(kept.logs, "1\n");
+        assert_eq!(kept.printed, "1");
         assert!(!worker.take_restarted());
     }
 
@@ -2859,7 +2894,7 @@ pub(crate) mod tests {
         let file = error(file);
         let folder = worker.eval("grep('secret', 'closed')");
         let folder = error(folder);
-        let skipped = worker.eval("grep('secret')").logs;
+        let skipped = worker.eval("grep('secret')").printed;
         let open = Permissions::from_mode(0o700);
         fs::set_permissions(&closed, open).expect("chmod");
         fs::remove_dir_all(&dir).ok();
@@ -2873,7 +2908,7 @@ pub(crate) mod tests {
             folder.lines().next(),
             Some(format!("{denied}: 'closed'").as_str())
         );
-        assert_eq!(skipped, "0 matches in 0 files\n");
+        assert_eq!(skipped, "0 matches in 0 files");
     }
 
     #[test]
@@ -2916,6 +2951,6 @@ pub(crate) mod tests {
         let output = run(code);
 
         assert_eq!(output.error, None);
-        assert_eq!(output.logs, "café\nbefore\ndirect\nafter\n");
+        assert_eq!(output.printed, "café\nbefore\ndirect\nafter");
     }
 }

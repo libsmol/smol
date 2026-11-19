@@ -9,6 +9,9 @@ but their files stay in `~/.smol/projects` untouched.
 
 ## Unreleased
 
+Sessions are saved in format 9, so sessions from 0.11.0 and earlier are no longer
+listed.
+
 - Agents have names and keep their conversations. `agent(name, task)` sends a
   task and returns at once: a new name starts an agent, one at work gets the
   task as a `[Task update]` after its current call, and one that answered
@@ -20,21 +23,30 @@ but their files stay in `~/.smol/projects` untouched.
   interrupts one, which is told so. Answers the code didn't take come in the
   `[Agent done]` message, and agents of a resumed session take tasks again.
   `Agent`, `Agent.get()`, lists of tasks and `name=` are gone.
-- The system prompt describes an agent as a worker that reads, searches,
-  reviews and judges in a context of its own while the model makes the
-  changes, suggests one for reviewing the model's changes or conclusions, for
-  many independent items that each need judgment and for reading whose details
-  the model won't need again, tells the model to do everything else itself and
-  never to redo an agent's work, and asks for each new task with its goal,
-  context, limits and the answer it needs. An agent is told to report what it
-  finds and to change files only when its task asks it to.
+- The system prompt describes an agent as a fresh copy of the model that has
+  its environment but not its Python session or this conversation, so it
+  knows only what its task tells it, and that reads, searches, reviews and
+  judges while the model makes the changes. It suggests one for reviewing the
+  model's changes or conclusions, for many independent items that each need
+  judgment and for reading whose details the model won't need again, and tells
+  the model to do everything else itself. A rule tells the model to take an
+  agent's answer as a result it obtained and to check only what contradicts
+  something it has seen: in tests grok redid an agent's work in 1 run of 15,
+  where it did in 8 of 30. Each new task states its goal, context, limits and
+  the answer it needs, and a follow-up only what changed, which shortened
+  follow-ups from about 430 characters to 110. An agent is told to report what
+  it finds and to change files only when its task asks it to.
 - smol lists the agents in the sidebar between the MCP servers and the
   programs, each with its state and tokens, tags a task with its agent's name,
   gives an agent's later tasks its color, and counts as awaited only the agents
   the code waits for.
 - Roles are gone: `roles.toml` is no longer read and `agent()` takes no
   `role`, so agents run on the session's model and their tasks say what they
-  should do. Sessions with agents that had roles still open.
+  should do.
+- The session file keeps each agent's whole conversation beside the session's,
+  with its tasks, and the call that sent a task names only its agent and
+  number. A task that is aborted or at work when libsmol exits leaves the
+  agent's conversation as it was before the task.
 - For ACP clients: the `rawInput` of `_smol/agent` calls always has `name`
   and no longer `role`, and the call running the code carries
   `_smol/waiting`, the names of the agents it waits for, empty once it stops
@@ -70,6 +82,11 @@ but their files stay in `~/.smol/projects` untouched.
   `reasoning_details` of OpenRouter and the thought signatures that Gemini 3
   puts in `extra_content`, whose calls failed from the second step on. Calls
   that carry such fields go back under the ids the provider gave them.
+- `fetch()` reads an error page in the charset its headers or its own `<meta>`
+  declare, as it does a page that loads, where it read every error page as
+  UTF-8.
+- `libsmol` given an argument that isn't valid Unicode prints its usage, where
+  it panicked, and smol starts a `libsmol` whose path isn't valid Unicode.
 
 ## 0.11.0 - 2026-11-16
 

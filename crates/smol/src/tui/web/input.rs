@@ -3,13 +3,14 @@ use base64::Engine;
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::layout::Size;
 use serde::Deserialize;
 
 /// Columns or rows past any real screen, which a device can't make the shared one take
 const MAX_SIDE: u16 = 1000;
 
 pub(crate) enum Input {
-    Size(u16, u16),
+    Size(Size),
     /// Whether the user looks at the device
     Focus(bool),
     Events(Vec<Event>),
@@ -94,7 +95,8 @@ pub(crate) fn decode(text: &str) -> Option<Input> {
     let events = match message {
         Message::Size { w, h } => {
             let sized = (1..=MAX_SIDE).contains(&w) && (1..=MAX_SIDE).contains(&h);
-            return sized.then_some(Input::Size(w, h));
+            let size = Size::new(w, h);
+            return sized.then_some(Input::Size(size));
         }
 
         Message::Focus { on } => return Some(Input::Focus(on)),

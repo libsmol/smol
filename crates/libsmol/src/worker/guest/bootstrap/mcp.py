@@ -98,16 +98,16 @@ def _server(source, name, description, tools):
             name += "_mcp"
     taken = builtins.get(name)
     if isinstance(taken, _Server) and taken._source != source:
-        return {"name": name, "server": taken._source}
+        return {"name": name, "holder": taken._source}
 
     functions = {}
     entries = []
-    headers = []
+    stubs = []
     for spec in tools:
-        function, entry, header = _tool(name, spec, functions)
+        function, entry, stub = _tool(name, spec, functions)
         functions[function.__name__] = function
         entries.append(entry)
-        headers.append(header)
+        stubs.append(stub)
 
     titled = name if name == source else f"{name} (configured as {source})"
     about = description.strip()
@@ -115,7 +115,7 @@ def _server(source, name, description, tools):
     entries = "\n".join(entries)
     listing = f"MCP server {titled}{about}\n\nFunctions (help({name}.<function>) prints one in full):\n\n{entries}"
     builtins[name] = _Server(name, source, listing, functions)
-    return {"name": name, "headers": headers}
+    return {"name": name, "stubs": stubs}
 
 def _unserver(name):
     builtins = vars(_builtins)
@@ -161,7 +161,7 @@ def _tool(server, spec, used):
     called = f"{server}.{name}"
     header = f"{called}({typed}) -> {returns}"
     # The system prompt names optional parameters only, and help() gives their types
-    brief = f"{called}({named}) -> {returns}"
+    stub = f"{called}({named}) -> {returns}"
 
     described = spec.get("description") or ""
     doc = described
@@ -208,4 +208,4 @@ def _tool(server, spec, used):
     if len(first) > _MAX_SUMMARY_CHARS:
         first = first[: _MAX_SUMMARY_CHARS - 1] + "…"
     entry = f"{header}\n    {first}" if first else header
-    return function, entry, brief
+    return function, entry, stub

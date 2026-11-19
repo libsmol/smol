@@ -11,7 +11,8 @@ use agent_client_protocol_schema::v1::{
 use agent_client_protocol_schema::ProtocolVersion;
 use anyhow::{anyhow, bail, Result};
 use reaper::wire::{
-    BACKGROUND, ENQUEUED, FORGET, IMAGES, MCP, MEMORIES, NOTICE, PROGRAMS, QUEUED, SHELL,
+    McpState, McpStatus, Memories, Memory, Notice, BACKGROUND, ENQUEUED, FORGET, IMAGES, MCP,
+    MEMORIES, NOTICE, PROGRAMS, QUEUED, SHELL,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -19,15 +20,16 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::error;
+use std::ffi::OsString;
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -41,23 +43,30 @@ const MAX_STDERR_LINES: usize = 20;
 const STDERR_WAIT: Duration = Duration::from_millis(200);
 /// The agent needs time to finish saving the cancelled turn
 const EXIT_WAIT: Duration = Duration::from_secs(5);
+const EXIT_EVERY: Duration = Duration::from_millis(50);
 
 const INVALID_PARAMS: i64 = -32602;
 const METHOD_NOT_FOUND: i64 = -32601;
 const AUTH_REQUIRED: i64 = -32000;
 
 pub(crate) enum Incoming {
-    Update(String, Box<SessionUpdate>),
-    Notice(String, Notice),
-    Mcp(String, Vec<McpStatus>),
-    Queued(String, Asked),
-    /// Programs the code left running ended while no turn ran
-    Background(String),
-    /// The programs the code left running that still run
-    Programs(String, Vec<Program>),
+    /// For the session with this id
+    Session(String, Event),
     /// Sent only when no request is waiting for a reply
     Exited(String),
     Done(Result<StopReason>),
+}
+
+/// What the agent tells of one session
+pub(crate) enum Event {
+    Update(Box<SessionUpdate>),
+    Notice(Notice),
+    Mcp(Vec<McpStatus>),
+    Queued(Asked),
+    /// Programs the code left running ended while no turn ran
+    Background,
+    /// The programs the code left running that still run
+    Programs(Vec<Program>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,51 +78,22 @@ pub(crate) struct Program {
     pub(crate) since: Instant,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Notice {
-    pub(crate) text: String,
-    pub(crate) retry_in: Option<f64>,
-    /// A step that has not produced any text yet still counts as the current step
-    pub(crate) step: bool,
-    pub(crate) unsaved: bool,
+/// The line that tells the user of a server's state
+pub(crate) fn mcp_line(status: &McpStatus) -> String {
+    let state = mcp_state(&status.state);
+    format!("mcp: {}: {state}", status.name)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct McpStatus {
-    pub(crate) name: String,
-    #[serde(flatten)]
-    pub(crate) state: McpState,
-}
-
-impl fmt::Display for McpStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "mcp: {}: {}", self.name, self.state)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "state", rename_all = "lowercase")]
-pub(crate) enum McpState {
-    Off,
-    Connecting,
-    Connected { tools: usize },
-    Failed { error: String },
-    Unauthorized { error: String },
-}
-
-impl fmt::Display for McpState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            McpState::Off => f.write_str("off"),
-            McpState::Connecting => f.write_str("connecting"),
-            McpState::Connected { tools } => {
-                let tools = tool_count(*tools);
-                write!(f, "connected, {tools}")
-            }
-            McpState::Failed { error } => write!(f, "failed: {error}"),
-            McpState::Unauthorized { error } => write!(f, "unauthorized: {error}"),
+pub(crate) fn mcp_state(state: &McpState) -> String {
+    match state {
+        McpState::Off => "off".to_owned(),
+        McpState::Connecting => "connecting".to_owned(),
+        McpState::Connected { tools } => {
+            let tools = tool_count(*tools);
+            format!("connected, {tools}")
         }
+        McpState::Failed { error } => format!("failed: {error}"),
+        McpState::Unauthorized { error } => format!("unauthorized: {error}"),
     }
 }
 
@@ -139,19 +119,6 @@ impl fmt::Display for Refusal {
 }
 
 impl error::Error for Refusal {}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Memory {
-    pub(crate) id: i64,
-    pub(crate) text: String,
-    /// Kept for the working directory rather than for every directory
-    pub(crate) project: bool,
-}
-
-#[derive(Deserialize)]
-struct Memories {
-    memories: Vec<Memory>,
-}
 
 /// The select options smol shows and switches, each found by its ACP category
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,10 +151,9 @@ struct Connection {
     /// Taking it closes the pipe, and the agent exits when it reads the end
     stdin: Mutex<Option<ChildStdin>>,
     next_id: AtomicU64,
-    pending: Mutex<HashMap<u64, Reply>>,
+    /// None once the agent exited
+    pending: Mutex<Option<HashMap<u64, Reply>>>,
     tail: Mutex<VecDeque<String>>,
-    /// Changed only while holding the `pending` lock
-    exited: AtomicBool,
 }
 
 impl Connection {
@@ -224,13 +190,13 @@ impl Connection {
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut pending = self.pending.lock().expect("pending lock");
-        if self.exited.load(Ordering::Relaxed) {
+        let Some(waiting) = pending.as_mut() else {
             drop(pending);
             let text = self.exit_text();
             let error = anyhow!("{text}");
             return reply(Err(error));
-        }
-        pending.insert(id, reply);
+        };
+        waiting.insert(id, reply);
         drop(pending);
 
         self.post(id, method, params);
@@ -307,7 +273,7 @@ pub(crate) struct Client {
     connection: Arc<Connection>,
     child: Child,
     events: Sender<Incoming>,
-    command: Vec<String>,
+    command: Vec<OsString>,
     /// The agent's terminal auth method, which smol runs in its own terminal
     auth: Option<AuthMethodTerminal>,
     pub(crate) cwd: PathBuf,
@@ -318,7 +284,7 @@ pub(crate) struct Client {
 impl Client {
     /// `command` must not be empty
     pub(crate) fn start(
-        command: &[String],
+        command: &[OsString],
         images_shown: bool,
     ) -> Result<(Self, Receiver<Incoming>)> {
         let cwd = match env::current_dir() {
@@ -348,11 +314,7 @@ impl Client {
         let spawned = process.spawn();
         let mut child = match spawned {
             Ok(child) => child,
-            Err(e) => {
-                let command = command.join(" ");
-                let reason = reaper::cause(&e);
-                bail!("agent: {command}: {reason}");
-            }
+            Err(e) => return Err(unstarted(command, &e)),
         };
 
         let stdout = child.stdout.take().expect("stdout is piped");
@@ -361,9 +323,8 @@ impl Client {
         let connection = Arc::new(Connection {
             stdin: Mutex::new(stdin),
             next_id: AtomicU64::new(0),
-            pending: Mutex::default(),
+            pending: Mutex::new(Some(HashMap::new())),
             tail: Mutex::default(),
-            exited: AtomicBool::new(false),
         });
         let (events, inbox) = mpsc::channel();
 
@@ -402,12 +363,14 @@ impl Client {
                 let params = &message["params"];
                 let session = params["sessionId"].as_str().unwrap_or_default().to_owned();
 
-                let incoming = match (message.get("id"), method) {
+                let event = match (message.get("id"), method) {
                     (Some(id), None) => {
                         let Some(id) = id.as_u64() else {
                             continue;
                         };
-                        let reply = reader.pending.lock().expect("pending lock").remove(&id);
+                        let mut pending = reader.pending.lock().expect("pending lock");
+                        let reply = pending.as_mut().and_then(|waiting| waiting.remove(&id));
+                        drop(pending);
                         let Some(reply) = reply else {
                             continue;
                         };
@@ -434,7 +397,7 @@ impl Client {
                             connection: Arc::clone(&reader),
                             id: Some(id.clone()),
                         };
-                        Incoming::Queued(session, asked)
+                        Event::Queued(asked)
                     }
 
                     (Some(id), Some(method)) => {
@@ -449,31 +412,31 @@ impl Client {
                         let Ok(notification) = SessionNotification::deserialize(params) else {
                             continue;
                         };
-                        let update = Box::new(notification.update);
-                        Incoming::Update(session, update)
+                        Event::Update(Box::new(notification.update))
                     }
 
                     (None, Some(NOTICE)) => match Notice::deserialize(params) {
-                        Ok(notice) => Incoming::Notice(session, notice),
+                        Ok(notice) => Event::Notice(notice),
                         Err(_) => continue,
                     },
 
                     (None, Some(MCP)) => match Vec::<McpStatus>::deserialize(&params["servers"]) {
-                        Ok(servers) => Incoming::Mcp(session, servers),
+                        Ok(servers) => Event::Mcp(servers),
                         Err(_) => continue,
                     },
 
-                    (None, Some(BACKGROUND)) => Incoming::Background(session),
+                    (None, Some(BACKGROUND)) => Event::Background,
 
                     (None, Some(PROGRAMS)) => {
                         match Vec::<Program>::deserialize(&params["programs"]) {
-                            Ok(programs) => Incoming::Programs(session, programs),
+                            Ok(programs) => Event::Programs(programs),
                             Err(_) => continue,
                         }
                     }
 
                     _ => continue,
                 };
+                let incoming = Incoming::Session(session, event);
                 sender.send(incoming).ok();
             }
 
@@ -481,10 +444,8 @@ impl Client {
             stderr_closed.recv_timeout(STDERR_WAIT).ok();
             let text = reader.exit_text();
 
-            let mut pending = reader.pending.lock().expect("pending lock");
-            reader.exited.store(true, Ordering::Relaxed);
-            let replies: Vec<Reply> = pending.drain().map(|(_, reply)| reply).collect();
-            drop(pending);
+            let pending = reader.pending.lock().expect("pending lock").take();
+            let replies: Vec<Reply> = pending.unwrap_or_default().into_values().collect();
 
             let idle = replies.is_empty();
             for reply in replies {
@@ -550,11 +511,7 @@ impl Client {
 
         let status = match process.status() {
             Ok(status) => status,
-            Err(e) => {
-                let command = self.command.join(" ");
-                let reason = reaper::cause(&e);
-                bail!("agent: {command}: {reason}");
-            }
+            Err(e) => return Err(unstarted(&self.command, &e)),
         };
         Ok(status.success())
     }
@@ -684,7 +641,8 @@ impl Client {
     }
 
     pub(crate) fn exited(&self) -> bool {
-        self.connection.exited.load(Ordering::Relaxed)
+        let pending = self.connection.pending.lock().expect("pending lock");
+        pending.is_none()
     }
 
     pub(crate) fn cancel(&self, session: &str) {
@@ -710,24 +668,34 @@ impl Drop for Client {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return;
             }
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(EXIT_EVERY);
         }
         self.child.kill().ok();
         self.child.wait().ok();
     }
 }
 
+fn unstarted(command: &[OsString], error: &io::Error) -> anyhow::Error {
+    let parts: Vec<_> = command.iter().map(|part| part.to_string_lossy()).collect();
+    let command = parts.join(" ");
+    let reason = reaper::cause(error);
+    anyhow!("agent: {command}: {reason}")
+}
+
 /// The name of the current choice
 pub(crate) fn chosen(options: &[SessionConfigOption], selector: Selector) -> Option<String> {
     let select = select_of(options, selector)?;
-    let offered = offerings(options, selector);
-    let current = offered.into_iter().find(|offering| offering.current);
-
-    let name = match current {
+    let name = match current(options, selector) {
         Some(offering) => offering.name,
         None => select.current_value.0.to_string(),
     };
     Some(name)
+}
+
+/// The current choice, when it is among those offered
+pub(crate) fn current(options: &[SessionConfigOption], selector: Selector) -> Option<Offering> {
+    let offered = offerings(options, selector);
+    offered.into_iter().find(|offering| offering.current)
 }
 
 pub(crate) fn offerings(options: &[SessionConfigOption], selector: Selector) -> Vec<Offering> {
@@ -871,7 +839,7 @@ cat >/dev/null"#,
 
         let states: Vec<String> = servers
             .iter()
-            .map(|server| server.state.to_string())
+            .map(|server| mcp_state(&server.state))
             .collect();
         let expected = [
             "off",
@@ -880,6 +848,6 @@ cat >/dev/null"#,
             "unauthorized: authorization required",
         ];
         assert_eq!(states, expected);
-        assert_eq!(servers[1].to_string(), "mcp: web: connected, 3 tools");
+        assert_eq!(mcp_line(&servers[1]), "mcp: web: connected, 3 tools");
     }
 }

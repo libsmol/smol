@@ -1,25 +1,25 @@
-use crate::client::{tool_count, McpState, McpStatus};
+use crate::client::tool_count;
 use crate::conversation::Stats;
 use crate::tui::app::App;
 use crate::tui::picture;
 use crate::tui::render::{signal, wrap_ranges, Target};
 use crate::tui::{
-    clipped, fitted, in_out, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG,
-    YELLOW,
+    clipped, fitted, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG, YELLOW,
 };
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Padding, Paragraph, Wrap};
 use ratatui::Frame;
-use ratatui_textarea::{CursorMove, TextArea, WrapMode};
+use ratatui_textarea::TextArea;
+use reaper::wire::{McpState, McpStatus};
 use reaper::{one_line, tilde};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SIDEBAR_WIDTH: u16 = 32;
-const MIN_WIDE_SCREEN: u16 = 100;
+const MIN_WIDE_COLUMNS: u16 = 100;
 const MAX_INPUT_ROWS: usize = 10;
 const MAX_CHOICE_ROWS: usize = 10;
 const SCROLL_EVERY: Duration = Duration::from_millis(60);
@@ -31,29 +31,13 @@ const GREEN: Style = Style::new().fg(theme::GREEN);
 const QUEUED: &str = " · queued";
 const LOGO: [&str; 2] = ["▄▀▀ ▄▀▄▀▄ ▄▀▄ █ ", "▄▄▀ █ █ █ ▀▄▀ █▄"];
 
-pub(crate) fn input_box(text: &str) -> TextArea<'static> {
-    let lines = text.split('\n').map(str::to_owned).collect();
-    let mut input = TextArea::new(lines);
-    input.move_cursor(CursorMove::Bottom);
-    input.move_cursor(CursorMove::End);
-
-    input.set_wrap_mode(WrapMode::Glyph);
-    input.set_placeholder_style(DIM);
-    input.set_cursor_line_style(Style::new());
-    // Input methods place their candidate window at the hardware cursor,
-    // so the textarea cursor is not drawn
-    input.set_cursor_style(Style::new());
-
-    input
-}
-
 pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let base = Style::new().bg(theme::BG).fg(theme::FG);
     let ground = Block::new().style(base);
     frame.render_widget(ground, area);
 
-    let input_height = input_rows(&app.input, area.width) + 2;
+    let input_height = input_rows(&app.draft.area, area.width) + 2;
     let heights = [
         Constraint::Fill(1),
         Constraint::Length(input_height),
@@ -61,7 +45,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     ];
     let [body, input, status] = Layout::vertical(heights).areas(area);
 
-    let narrow = area.width < MIN_WIDE_SCREEN;
+    let narrow = area.width < MIN_WIDE_COLUMNS;
     let columns = [Constraint::Fill(1), Constraint::Length(SIDEBAR_WIDTH)];
     let [beside, sidebar] = Layout::horizontal(columns).areas(body);
     let conversation = if narrow { body } else { beside };
@@ -76,8 +60,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
 
     if narrow {
         let stats = talk.stats();
-        let tokens = in_out(stats.input, stats.output);
-        let mut usage = format!(" {tokens}");
+        let mut usage = format!(" {}", stats.tokens);
         if stats.context.is_some() && stats.window.is_some() {
             let mark = approx(stats);
             let share = match stats.ratio() {
@@ -92,9 +75,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         if working > 0 {
             agents.push(format!("{working} working"));
         }
-        if stats.agent_input + stats.agent_output > 0 {
-            let tokens = in_out(stats.agent_input, stats.agent_output);
-            agents.push(tokens);
+        if !stats.agent_tokens.is_zero() {
+            agents.push(stats.agent_tokens.to_string());
         }
         if !agents.is_empty() {
             let agents = agents.join(" · ");
@@ -144,7 +126,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let steps = vec![Span::styled("steps ", DIM), Span::raw(steps)];
         let counts = spread(turns, steps, width);
 
-        let tokens = in_out(stats.input, stats.output);
+        let tokens = stats.tokens.to_string();
         let tokens = labeled("tokens", tokens, width);
 
         let ratio = stats.ratio();
@@ -182,10 +164,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         ];
 
         // The progress line already counts the agents at work, and both don't fit here
-        let helped = stats.agent_input + stats.agent_output > 0;
+        let helped = !stats.agent_tokens.is_zero();
         let working = talk.helping();
         let agents = match (helped, working) {
-            (true, _) => Some(in_out(stats.agent_input, stats.agent_output)),
+            (true, _) => Some(stats.agent_tokens.to_string()),
             (false, 0) => None,
             (false, working) => Some(format!("{working} working")),
         };
@@ -232,10 +214,9 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             let latest = agent.latest;
             let (symbol, tint) = signal(latest);
             let name = latest.name.as_deref().unwrap_or("agent");
-            let (input, output) = agent.tokens;
-            let spent = match input + output {
-                0 => String::new(),
-                _ => in_out(input, output),
+            let spent = match agent.tokens.is_zero() {
+                true => String::new(),
+                false => agent.tokens.to_string(),
             };
             let room = width.saturating_sub(2 + 1 + spent.width());
             let name = clipped(name, room);
@@ -369,23 +350,20 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         progress.push(Line::from(line));
     }
 
-    let old_top = app.view_top();
+    let old_top = app.viewport.top();
     // Expanding, collapsing or resizing relays out everything,
     // and a scrolled-back view must stay on the same content
     let anchor = app.transcript.anchor(old_top, inner.width, app.expanded);
-    let anchor = anchor.filter(|_| app.scrolled_back > 0);
-    let scrolled = app.scrolled_back != app.drawn_back;
+    let anchor = anchor.filter(|_| app.viewport.back > 0);
     let rows = app.transcript.rows(talk, inner.width, app.expanded);
 
-    app.scrollbar = Rect::default();
-    app.shown.clear();
+    app.pictures.clear();
     // The welcome logo moves, and so do the spinners of pictures loading
     app.animating = rows.is_empty() || picture::loading();
     if rows.is_empty() {
-        // Clicks and selections number rows from `bottom`,
+        // Clicks and selections number rows from the bottom,
         // so an empty conversation must not keep the previous one's
-        app.bottom = 0;
-        app.scrolled_back = 0;
+        app.viewport.settle(0, 0, None);
 
         let mut welcome = Vec::new();
         for row in LOGO {
@@ -439,23 +417,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
 
         let height = usize::from(inner.height);
         let total = rows.len() + progress.len() + queued.len();
-        let bottom = total.saturating_sub(height);
-        match anchor {
-            Some(anchor) => {
-                let top = rows.row_at(anchor);
-                app.scrolled_back = bottom.saturating_sub(top);
-            }
-            // While scrolled back, content growing or shrinking must not shift what is being read
-            None if app.scrolled_back > 0 => {
-                let moved = app.scrolled_back.saturating_add(bottom);
-                app.scrolled_back = moved.saturating_sub(app.bottom);
-            }
-            None => {}
-        }
-
-        app.scrolled_back = app.scrolled_back.min(bottom);
-        app.bottom = bottom;
-        let top = bottom - app.scrolled_back;
+        let anchored = anchor.map(|anchor| rows.row_at(anchor));
+        let (top, scrolled) = app.viewport.settle(total, height, anchored);
 
         let lines = rows
             .iter()
@@ -465,8 +428,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let visible = lines.skip(top).take(height);
         let visible: Vec<Line> = visible.cloned().collect();
 
-        if app.scrolled_back > 0 {
-            let more = format!(" ↓ {} more lines · esc to follow ", app.scrolled_back);
+        if app.viewport.back > 0 {
+            let more = format!(" ↓ {} more lines · esc to follow ", app.viewport.back);
             let more = Line::styled(more, DIM).right_aligned();
             block = block.title_bottom(more);
         }
@@ -505,18 +468,14 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             let Target::Picture(source) = target else {
                 continue;
             };
-            if app.shown.last() != Some(source) {
-                app.shown.push(source.clone());
+            if app.pictures.last() != Some(source) {
+                app.pictures.push(source.clone());
             }
         }
 
-        // Without a track the thumb would land on the corner
         let track = conversation.inner(Margin::new(0, 1));
-        if bottom > 0 && !track.is_empty() {
-            let column = track.right().saturating_sub(1);
-            app.scrollbar = Rect::new(column, track.top(), 1, track.height);
-            let row = track.top() + thumb(top, bottom, track.height);
-            let cell = &mut frame.buffer_mut()[(column, row)];
+        if let Some(thumb) = app.viewport.place_bar(track) {
+            let cell = &mut frame.buffer_mut()[thumb];
             cell.set_symbol("█").set_style(ACCENT);
         }
 
@@ -529,38 +488,37 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         app.transcript.view(top..top + height, scrolled);
     }
 
-    app.drawn_back = app.scrolled_back;
-
-    let placeholder = match app.shell {
+    let draft = &mut app.draft;
+    let placeholder = match draft.shell {
         true => "Run a shell command · backspace goes back",
         false => "Ask anything",
     };
-    app.input.set_placeholder_text(placeholder);
+    draft.area.set_placeholder_text(placeholder);
     // Same color as the ! before the command in the conversation
-    let border = match app.shell {
+    let border = match draft.shell {
         true => PINK,
         false => ACCENT,
     };
     let input_block = panel().border_style(border);
-    app.input.set_block(input_block);
-    frame.render_widget(&app.input, input);
-    app.input_area = input;
+    draft.area.set_block(input_block);
+    frame.render_widget(&draft.area, input);
 
     let inner = panel().inner(input);
-    let cursor = app.input.screen_cursor();
+    let cursor = draft.area.screen_cursor();
     let row = cursor.row as u16;
-    app.input_top = match app.input.is_empty() {
+    draft.top = match draft.area.is_empty() {
         true => 0,
-        false => scroll_top(app.input_top, row, inner.height),
+        false => scroll_top(draft.top, row, inner.height),
     };
 
     let last_row = inner.height.saturating_sub(1);
     let last_col = inner.width.saturating_sub(1);
-    let row = row.saturating_sub(app.input_top);
+    let row = row.saturating_sub(draft.top);
     let row = row.min(last_row);
     let col = (cursor.col as u16).min(last_col);
     let position = Position::new(inner.x + col, inner.y + row);
     frame.set_cursor_position(position);
+    app.input_area = input;
 
     let highlighted = app.highlighted();
     app.choices_area = Rect::default();
@@ -672,7 +630,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             format!("{enter} · {queued}esc interrupt · {expand}")
         } else if app.session.run.is_some() {
             format!("{enter} · {queued}{expand}")
-        } else if app.draft().is_empty() {
+        } else if app.draft.whole().is_empty() {
             format!("ctrl+d quit · {expand} · : commands")
         } else {
             // VS Code takes ctrl+j, Windows Terminal takes alt+enter and macOS sends it as enter
@@ -715,12 +673,6 @@ fn keys(text: &str) -> Vec<Span<'static>> {
     }
     spans.push(Span::raw(" "));
     spans
-}
-
-pub(crate) fn thumb(top: usize, bottom: usize, length: u16) -> u16 {
-    let last = usize::from(length.saturating_sub(1));
-    let row = (top * last + bottom / 2).checked_div(bottom).unwrap_or(0);
-    row.min(last) as u16
 }
 
 /// Keeps only the left side when the right one does not fit
@@ -918,6 +870,7 @@ fn scroll_top(top: u16, row: u16, height: u16) -> u16 {
 mod tests {
     use crate::client::{Program, Selector};
     use crate::tests::started;
+    use crate::tui::draft::input_box;
     use crate::tui::tests::{app, draw, fill};
     use crate::tui::ui::*;
     use agent_client_protocol_schema::v1::{
@@ -926,6 +879,7 @@ mod tests {
     };
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget;
+    use ratatui_textarea::CursorMove;
     use serde_json::{json, Value};
 
     fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
@@ -963,15 +917,6 @@ mod tests {
         assert_eq!(widths(&unknown), [0, 10]);
         let red = gauge(Some(0.95), 10);
         assert_eq!(red.spans[0].style.fg, Some(theme::RED));
-    }
-
-    #[test]
-    fn thumb_rows() {
-        assert_eq!(thumb(0, 100, 10), 0);
-        assert_eq!(thumb(50, 100, 10), 5);
-        assert_eq!(thumb(100, 100, 10), 9);
-        assert_eq!(thumb(0, 0, 10), 0);
-        assert_eq!(thumb(3, 7, 1), 0);
     }
 
     #[test]
@@ -1247,7 +1192,7 @@ mod tests {
     #[test]
     fn newline_hint_shown() {
         let mut app = app();
-        app.input = input_box("café");
+        app.draft.replace("café");
         let rows = screen(&mut app, 80, 12);
 
         let newline = match cfg!(target_os = "linux") {
@@ -1281,7 +1226,7 @@ mod tests {
         );
         assert_eq!(following.matches('█').count(), 1, "{following}");
 
-        app.scrolled_back = usize::MAX;
+        app.viewport.back = usize::MAX;
         let top = bar(&mut app);
         assert!(top.starts_with('█') && top.ends_with('│'), "{top}");
     }
@@ -1291,14 +1236,14 @@ mod tests {
         let mut app = app();
         fill(&mut app, 40);
         draw(&mut app, 60, 20);
-        app.scrolled_back += 5;
+        app.viewport.scroll_up(5);
         draw(&mut app, 60, 20);
-        let top = app.view_top();
+        let top = app.viewport.top();
 
         fill(&mut app, 10);
         draw(&mut app, 60, 20);
-        assert_eq!(app.view_top(), top);
-        assert!(app.scrolled_back > 5, "{}", app.scrolled_back);
+        assert_eq!(app.viewport.top(), top);
+        assert!(app.viewport.back > 5, "{}", app.viewport.back);
     }
 
     #[test]
@@ -1404,7 +1349,7 @@ mod tests {
         );
 
         let stats = app.session.conversation.stats();
-        assert_eq!((stats.input, stats.output, stats.steps), (0, 0, 0));
+        assert_eq!((stats.tokens.is_zero(), stats.steps), (true, 0));
         assert_eq!(app.session.conversation.helping(), 2);
         let rows = screen(&mut app, 120, 30);
         let wide = rows.join("\n");

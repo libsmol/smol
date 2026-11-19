@@ -3,7 +3,7 @@ use crate::config::McpConfig;
 use crate::history::Settings;
 use crate::tools::mcp::{connect, Down, Server};
 use crate::worker::host::{Added, Worker};
-use serde_json::json;
+use reaper::wire::{self, McpStatus};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -45,6 +45,18 @@ enum McpState {
         added: Added,
     },
     Down(Down),
+}
+
+impl McpState {
+    /// The connect attempt it waits on or connected with, as each counts only for the latest
+    fn attempt(&self) -> Option<u64> {
+        match self {
+            McpState::Connecting { attempt, .. } | McpState::Connected { attempt, .. } => {
+                Some(*attempt)
+            }
+            McpState::Off | McpState::Down(_) => None,
+        }
+    }
 }
 
 pub(crate) enum McpEvent {
@@ -136,10 +148,7 @@ impl McpPool {
         match event {
             McpEvent::Attempted { attempt, result } => {
                 // A server toggled in the meantime is disconnected by dropping the result
-                let current = |server: &Mcp| match server.state {
-                    McpState::Connecting { attempt: now, .. } => now == attempt,
-                    _ => false,
-                };
+                let current = |server: &Mcp| server.state.attempt() == Some(attempt);
                 let Some(index) = self.servers.iter().position(current) else {
                     return;
                 };
@@ -187,10 +196,7 @@ impl McpPool {
             }
 
             McpEvent::Ended { attempt, at, down } => {
-                let current = |server: &Mcp| match server.state {
-                    McpState::Connected { attempt: now, .. } => now == attempt,
-                    _ => false,
-                };
+                let current = |server: &Mcp| server.state.attempt() == Some(attempt);
                 let Some(index) = self.servers.iter().position(current) else {
                     return;
                 };
@@ -218,25 +224,30 @@ impl McpPool {
     pub(crate) fn report(&self) {
         let mut listed = Vec::new();
         for server in &self.servers {
-            let name = &server.config.name;
-            let entry = match &server.state {
-                McpState::Off => json!({ "name": name, "state": "off" }),
-                McpState::Connecting { .. } => json!({ "name": name, "state": "connecting" }),
+            let state = match &server.state {
+                McpState::Off => wire::McpState::Off,
+                McpState::Connecting { .. } => wire::McpState::Connecting,
                 McpState::Connected { added, .. } => {
                     let tools = added.server.tools.len();
-                    json!({ "name": name, "state": "connected", "tools": tools })
+                    wire::McpState::Connected { tools }
                 }
                 McpState::Down(Down::Failed(error)) => {
-                    json!({ "name": name, "state": "failed", "error": error })
+                    let error = error.clone();
+                    wire::McpState::Failed { error }
                 }
                 McpState::Down(Down::Unauthorized(error)) => {
-                    json!({ "name": name, "state": "unauthorized", "error": error })
+                    let error = error.clone();
+                    wire::McpState::Unauthorized { error }
                 }
             };
-            listed.push(entry);
+            let status = McpStatus {
+                name: server.config.name.clone(),
+                state,
+            };
+            listed.push(status);
         }
 
-        self.peer.servers(listed);
+        self.peer.servers(&listed);
     }
 
     fn attempt(&mut self, index: usize, dropped: Option<String>) {

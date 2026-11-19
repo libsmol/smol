@@ -497,14 +497,30 @@ pub(crate) fn tile(cell: &Cell) -> Option<Tile> {
     })
 }
 
-/// The picture a Kitty image id was given to, once loaded
-pub(crate) fn image(id: u32) -> Option<Arc<Picture>> {
-    let shared = STORE.with(Arc::clone);
-    let store = shared.lock().expect("pictures");
-    let (source, _) = store.images.iter().find(|(_, (image, _))| *image == id)?;
-    match store.states.get(source) {
-        Some((Load::Ready(picture), _)) => Some(Arc::clone(picture)),
-        _ => None,
+/// Whether `placeholders` drew the cell, which `tile` reads back
+pub(crate) fn is_tile(cell: &Cell) -> bool {
+    cell.symbol().starts_with(PLACEHOLDER)
+}
+
+/// The UI thread's pictures, for the threads that serve them to browsers
+#[derive(Clone)]
+pub(crate) struct Pictures(Arc<Mutex<Store>>);
+
+impl Pictures {
+    /// Those of the calling thread, which must be the UI thread
+    pub(crate) fn here() -> Self {
+        let shared = STORE.with(Arc::clone);
+        Self(shared)
+    }
+
+    /// The picture a Kitty image id was given to, once loaded
+    pub(crate) fn image(&self, id: u32) -> Option<Arc<Picture>> {
+        let store = self.0.lock().expect("pictures");
+        let (source, _) = store.images.iter().find(|(_, (image, _))| *image == id)?;
+        match store.states.get(source) {
+            Some((Load::Ready(picture), _)) => Some(Arc::clone(picture)),
+            _ => None,
+        }
     }
 }
 

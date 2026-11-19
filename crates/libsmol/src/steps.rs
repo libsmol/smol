@@ -121,27 +121,34 @@ pub(crate) struct CodeResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) media: Vec<(String, Media)>,
     /// The tasks the code sent to agents with `agent()`, shown on replay and never sent to the model
-    /// of the session, while their steps make up the conversations of their agents
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) agents: Vec<Helper>,
+    pub(crate) agents: Vec<Sent>,
 }
 
-/// A task that `agent()` sent to an agent
+/// A task that the code sent with `agent()`, as the call that sent it records it
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Helper {
+pub(crate) struct Sent {
+    pub(crate) name: String,
+    /// Its place among the tasks of its agent
+    pub(crate) number: usize,
+}
+
+/// An agent that `agent()` started, with its whole conversation and the tasks it was sent
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AgentRecord {
+    pub(crate) name: String,
+    pub(crate) memory: AgentMemory,
+    pub(crate) tasks: Vec<AgentTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AgentTask {
     pub(crate) task: String,
-    /// Missing from tasks saved before agents were named
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) name: Option<String>,
+    /// Where its steps start in the agent's conversation, which run to the next task's start
+    pub(crate) start: usize,
     /// Saved beside the others as one key named after how it ended
     #[serde(flatten)]
     pub(crate) end: Ending,
-    /// The steps the task added to the agent's conversation
-    pub(crate) memory: AgentMemory,
-    /// Its steps keep what sending them again needs, which tasks saved before agents kept
-    /// their conversations dropped
-    #[serde(default, skip_serializing_if = "Not::not")]
-    pub(crate) resendable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,7 +166,18 @@ pub(crate) enum Ending {
     Running {},
 }
 
-impl Helper {
+impl AgentRecord {
+    /// The steps of its task numbered `number`
+    pub(crate) fn steps(&self, number: usize) -> &[MemoryStep] {
+        let steps = &self.memory.steps;
+        let start = self.tasks[number].start;
+        let next = self.tasks.get(number + 1);
+        let end = next.map_or(steps.len(), |next| next.start);
+        &steps[start.min(end)..end]
+    }
+}
+
+impl AgentTask {
     pub(crate) fn running(&self) -> bool {
         self.end == (Ending::Running {})
     }
@@ -208,20 +226,35 @@ pub(crate) struct TaskStep {
     pub(crate) files: Vec<Attachment>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Attachment {
-    /// Directories end in /, and a resource is named by its URI
+    /// As shown to the model, with directories ending in /, and a resource's URI
     pub(crate) path: String,
-    /// The first and last line of the file that `content` holds, counted from 1
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) lines: Option<(u32, u32)>,
-    pub(crate) content: String,
-    /// When set, `content` is empty
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) media: Option<Media>,
+    #[serde(flatten)]
+    pub(crate) content: Content,
+}
+
+/// Text is already cut, and is why the content couldn't be read when that failed
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum Content {
+    File {
+        text: String,
+        /// The first and last line of the file that `text` holds, counted from 1
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<(u32, u32)>,
+    },
+    /// The names in it
+    Directory {
+        text: String,
+    },
     /// Text the client sent for something that is not a local file
-    #[serde(default, skip_serializing_if = "Not::not")]
-    pub(crate) resource: bool,
+    Resource {
+        text: String,
+    },
+    Media {
+        media: Media,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -250,16 +283,11 @@ pub(crate) struct DoneStep {
 
 /// An agent whose task ended before the code took its answer
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum Returned {
-    Ended {
-        name: String,
-        /// Saved beside the name as one key named after how it ended
-        #[serde(flatten)]
-        end: Ending,
-    },
-    /// Saved before answers came along
-    Named(String),
+pub(crate) struct Returned {
+    pub(crate) name: String,
+    /// Saved beside the name as one key named after how it ended
+    #[serde(flatten)]
+    pub(crate) end: Ending,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -328,15 +356,20 @@ pub(crate) enum MemoryStep {
 }
 
 impl MemoryStep {
-    /// [`AgentMemory::conversation`] places the summary, and calls are numbered on from `calls`
-    pub(crate) fn messages(&self, calls: &mut usize) -> Vec<ChatMessage> {
+    /// [`AgentMemory::conversation`] places the summary, calls are numbered on from `calls`,
+    /// and media the model doesn't take, as `takes` tells, is a note
+    pub(crate) fn messages(
+        &self,
+        calls: &mut usize,
+        takes: &dyn Fn(MediaKind) -> bool,
+    ) -> Vec<ChatMessage> {
         let step = match self {
             MemoryStep::Task(task) => {
-                let parts = prompt::task(task);
+                let parts = prompt::task(task, takes);
                 return vec![ChatMessage::User(parts)];
             }
             MemoryStep::Update(update) => {
-                let parts = prompt::update(update);
+                let parts = prompt::update(update, takes);
                 return vec![ChatMessage::User(parts)];
             }
             MemoryStep::Shell(shell) => {
@@ -393,7 +426,7 @@ impl MemoryStep {
             let mut parts = Vec::new();
             if let Some(result) = &call.result {
                 let printed = result.printed.as_deref();
-                let shown = prompt::result(printed, &result.media);
+                let shown = prompt::result(printed, &result.media, takes);
                 parts.extend(shown);
             }
             if let Some(text) = prompt::call_error(step, call) {
@@ -519,17 +552,16 @@ impl AgentMemory {
         // Numbered in order of appearance, so new steps never renumber earlier ones
         let mut calls = 0;
         for step in visible.steps {
-            let added = step.messages(&mut calls);
+            let added = step.messages(&mut calls, takes);
             messages.extend(added);
         }
 
-        // Media the model doesn't take is never sent and doesn't count
         let mut attached = Vec::new();
         for message in &mut messages {
             if let ChatMessage::User(parts) | ChatMessage::Tool { parts, .. } = message {
-                let taken =
-                    |part: &&mut Part| matches!(part, Part::Media(_, media) if takes(media.kind));
-                let media = parts.iter_mut().filter(taken);
+                let media = parts
+                    .iter_mut()
+                    .filter(|part| matches!(part, Part::Media(..)));
                 attached.extend(media);
             }
         }
@@ -582,19 +614,19 @@ impl AgentMemory {
 
             let mut added = 0;
             for step in unmeasured {
-                let messages = step.messages(&mut 0);
-                added += bytes(&messages, takes);
+                let messages = step.messages(&mut 0, takes);
+                added += bytes(&messages);
             }
 
             // The measurement omits this step's results and errors, which may hold viewed images
-            let mut after = step.messages(&mut 0);
+            let mut after = step.messages(&mut 0, takes);
             after.retain(|message| !matches!(message, ChatMessage::Assistant { .. }));
-            let after = bytes(&after, takes);
+            let after = bytes(&after);
             return measured + estimate(added + after);
         }
 
         let conversation = self.conversation(system, takes, window);
-        let sent = bytes(&conversation, takes);
+        let sent = bytes(&conversation);
         estimate(sent)
     }
 
@@ -626,8 +658,8 @@ pub(crate) struct Visible<'a> {
 }
 
 /// Reasoning goes back as `reasoning_content` or sealed items, counted by its text,
-/// and media the model takes converts to bytes from a fixed token count
-pub(crate) fn bytes(messages: &[ChatMessage], takes: &dyn Fn(MediaKind) -> bool) -> usize {
+/// and media converts to bytes from a fixed token count
+pub(crate) fn bytes(messages: &[ChatMessage]) -> usize {
     let mut bytes = 0;
     for message in messages {
         let parts = match message {
@@ -661,11 +693,6 @@ pub(crate) fn bytes(messages: &[ChatMessage], takes: &dyn Fn(MediaKind) -> bool)
                 Part::Media(label, media) => (label, media),
             };
 
-            if !takes(media.kind) {
-                let note = prompt::unseen(label, media);
-                bytes += text_bytes(&note);
-                continue;
-            }
             let tokens = match media.kind {
                 MediaKind::Image => IMAGE_TOKENS,
                 MediaKind::Video => VIDEO_TOKENS,
@@ -929,7 +956,11 @@ pub(crate) mod tests {
             ..coded("print('half", None)
         };
         let cut = MemoryStep::Action(Box::new(cut));
-        let sent: Vec<String> = cut.messages(&mut 0).iter().map(content).collect();
+        let sent: Vec<String> = cut
+            .messages(&mut 0, &|_| true)
+            .iter()
+            .map(content)
+            .collect();
         let reason =
             "Your last reply was too long and was discarded, so nothing ran: write less per reply";
         assert_eq!(sent, [format!("[{reason}]")]);
@@ -941,34 +972,48 @@ pub(crate) mod tests {
             ..coded("print('café')", Some("café".to_owned()))
         };
         let stopped = MemoryStep::Action(Box::new(stopped));
-        let sent: Vec<String> = stopped.messages(&mut 0).iter().map(content).collect();
+        let sent: Vec<String> = stopped
+            .messages(&mut 0, &|_| true)
+            .iter()
+            .map(content)
+            .collect();
         assert_eq!(sent, ["eval:\nprint('café')", "café"]);
         let transcript = prompt::transcript(&[&stopped], usize::MAX);
         assert_eq!(transcript, "[Code]\nprint('café')\n\n[Observation]\ncafé");
     }
 
-    /// The agents a call started keep the saved format, with their answer or error beside the task,
-    /// and records saved with a role still load
+    /// An agent keeps the saved format, with each task's end beside it, and the steps of a task
+    /// run to where the next one starts, while a call names the tasks it sent
     #[test]
     fn agents_saved() {
-        let saved = r#"{"printed": "3 cafés", "agents": [
-            {"task": "Count the cafés", "answer": "3 cafés", "memory": {"steps": []}},
-            {"task": "Spell naïve", "role": "speller", "error": "model: http 503: busy", "memory": {"steps": []}},
-            {"task": "Read the résumé", "interrupted": {}, "memory": {"steps": []}}
+        let saved = r#"{"name": "cafés", "memory": {"steps": [
+            {"type": "task", "text": "Count the cafés"},
+            {"type": "restarted"},
+            {"type": "task", "text": "Spell naïve"}
+        ]}, "tasks": [
+            {"task": "Count the cafés", "start": 0, "answer": "3 cafés"},
+            {"task": "Spell naïve", "start": 2, "error": "model: http 503: busy"},
+            {"task": "Read the résumé", "start": 3, "interrupted": {}}
         ]}"#;
-        let result: CodeResult = serde_json::from_str(saved).expect("deserialize");
-        let ends: Vec<&Ending> = result.agents.iter().map(|helper| &helper.end).collect();
+        let record: AgentRecord = serde_json::from_str(saved).expect("deserialize");
+        let ends: Vec<&Ending> = record.tasks.iter().map(|task| &task.end).collect();
         let answered = Ending::Answer("3 cafés".to_owned());
         let failed = Ending::Error("model: http 503: busy".to_owned());
         assert_eq!(ends, [&answered, &failed, &Ending::Interrupted {}]);
+        let counts: Vec<usize> = (0..3).map(|number| record.steps(number).len()).collect();
+        assert_eq!(counts, [2, 1, 0]);
 
-        let again = serde_json::to_value(&result).expect("serialize");
-        let mut saved: serde_json::Value = serde_json::from_str(saved).expect("parse");
-        saved["agents"][1]
-            .as_object_mut()
-            .expect("record")
-            .remove("role");
+        let again = serde_json::to_value(&record).expect("serialize");
+        let saved: serde_json::Value = serde_json::from_str(saved).expect("parse");
         assert_eq!(again, saved);
+
+        let called = r#"{"agents": [{"name": "cafés", "number": 2}]}"#;
+        let result: CodeResult = serde_json::from_str(called).expect("deserialize");
+        let sent = Sent {
+            name: "cafés".to_owned(),
+            number: 2,
+        };
+        assert_eq!(result.agents, [sent]);
     }
 
     #[test]
@@ -995,7 +1040,7 @@ pub(crate) mod tests {
 
         let mut calls = 0;
         let action = MemoryStep::Action(Box::new(step));
-        let messages = action.messages(&mut calls);
+        let messages = action.messages(&mut calls, &|_| true);
         let ChatMessage::Assistant {
             text: seen,
             sealed: sent,
@@ -1046,7 +1091,7 @@ pub(crate) mod tests {
         };
         memory.steps.push(MemoryStep::Summary(summarized));
         let conversation = memory.conversation("", &|_| true, None);
-        let sent = bytes(&conversation, &|_| true);
+        let sent = bytes(&conversation);
         assert_eq!(tokens(&memory), estimate(sent));
     }
 
@@ -1062,29 +1107,26 @@ pub(crate) mod tests {
 
     #[test]
     fn attached_files() {
-        let file = |path: &str, content: &str| Attachment {
+        let attached = |path: &str, content| Attachment {
             path: path.to_owned(),
-            content: content.to_owned(),
-            ..Attachment::default()
+            content,
         };
-        let picked = Attachment {
-            lines: Some((10, 12)),
-            ..file("src/lib.rs", "fn café() {}\n")
+        let file = |path: &str, text: &str, lines| {
+            let text = text.to_owned();
+            attached(path, Content::File { text, lines })
         };
-        let one = Attachment {
-            lines: Some((3, 3)),
-            ..file("notes.md", "naïve")
+        let docs = Content::Directory {
+            text: "a.md".to_owned(),
         };
-        let diagnostics = Attachment {
-            resource: true,
-            ..file("zed:///agent/diagnostics", "error: unused café")
+        let diagnostics = Content::Resource {
+            text: "error: unused café".to_owned(),
         };
         let files = vec![
-            file("src/main.rs", "fn main() {}\n"),
-            file("docs/", "a.md"),
-            picked,
-            one,
-            diagnostics,
+            file("src/main.rs", "fn main() {}\n", None),
+            attached("docs/", docs.clone()),
+            file("src/lib.rs", "fn café() {}\n", Some((10, 12))),
+            file("notes.md", "naïve", Some((3, 3))),
+            attached("zed:///agent/diagnostics", diagnostics),
         ];
         let task = TaskStep {
             files,
@@ -1097,17 +1139,17 @@ pub(crate) mod tests {
             <file path=\"src/lib.rs\" lines=\"10-12\">\nfn café() {}\n</file>\n\
             <file path=\"notes.md\" lines=\"3\">\nnaïve\n</file>\n\
             <resource uri=\"zed:///agent/diagnostics\">\nerror: unused café\n</resource>";
-        assert_eq!(content(&asked.messages(&mut 0)[0]), text);
+        assert_eq!(content(&asked.messages(&mut 0, &|_| true)[0]), text);
         let transcript = prompt::transcript(&[&asked], usize::MAX);
         assert_eq!(transcript, format!("[Task]\n{text}"));
 
         let linked = TaskStep {
             text: String::new(),
-            files: vec![file("docs/", "a.md")],
+            files: vec![attached("docs/", docs)],
         };
         let linked = MemoryStep::Task(linked);
         let only = "<directory path=\"docs/\">\na.md\n</directory>";
-        assert_eq!(content(&linked.messages(&mut 0)[0]), only);
+        assert_eq!(content(&linked.messages(&mut 0, &|_| true)[0]), only);
 
         let ran = AgentStep {
             usage: metered(100, 20),
@@ -1124,13 +1166,16 @@ pub(crate) mod tests {
         let media = png("/history/s1/a.png");
         let image = Attachment {
             path: "screenshot.png".to_owned(),
-            media: Some(media.clone()),
-            ..Attachment::default()
+            content: Content::Media {
+                media: media.clone(),
+            },
         };
         let notes = Attachment {
             path: "notes.txt".to_owned(),
-            content: "Crème brûlée\n".to_owned(),
-            ..Attachment::default()
+            content: Content::File {
+                text: "Crème brûlée\n".to_owned(),
+                lines: None,
+            },
         };
         let update = TaskStep {
             files: vec![image, notes],
@@ -1138,7 +1183,7 @@ pub(crate) mod tests {
         };
 
         let asked = MemoryStep::Update(update);
-        let messages = asked.messages(&mut 0);
+        let messages = asked.messages(&mut 0, &|_| true);
         let head = "[Task update]\nLook at this one";
         let file = "<file path=\"notes.txt\">\nCrème brûlée\n</file>";
         let parts = vec![
@@ -1150,13 +1195,17 @@ pub(crate) mod tests {
 
         let tag = prompt::media_tag("screenshot.png", &media);
         let text = format!("{head}\n{tag}\n{file}");
-        let sent = bytes(&messages, &|_| true);
+        let sent = bytes(&messages);
         let estimated = estimate(sent);
         let expected = estimate(text.len()) + IMAGE_TOKENS as u64;
         assert_eq!(estimated, expected);
         let note = prompt::unseen("screenshot.png", &media);
-        let unseen = bytes(&messages, &|_| false);
-        assert_eq!(unseen, head.len() + note.len() + file.len() + 2);
+        let unseen = asked.messages(&mut 0, &|_| false);
+        let ChatMessage::User(parts) = &unseen[0] else {
+            panic!("{unseen:?}");
+        };
+        assert_eq!(parts[1], Part::Text(note.clone()));
+        assert_eq!(bytes(&unseen), head.len() + note.len() + file.len() + 2);
 
         let transcript = prompt::transcript(&[&asked], usize::MAX);
         let entry = format!("[Task update]\nLook at this one\n{tag}\n{file}");
@@ -1213,9 +1262,17 @@ pub(crate) mod tests {
         assert_eq!(more[..fewer.len()], fewer[..]);
         assert_eq!(counted(&viewing(24, &all)), (8, 16));
 
-        // Media the model doesn't take don't count toward a batch
+        // Media the model doesn't take become notes, which don't count toward a batch
         let videos = |kind| kind == MediaKind::Video;
-        assert_eq!(counted(&viewing(16, &videos)), (16, 0));
+        let unseen = viewing(16, &videos);
+        assert_eq!(counted(&unseen), (0, 0));
+        let last = prompt::unseen("menu 15.png", &png("café.png"));
+        assert!(
+            unseen
+                .iter()
+                .any(|message| content(message).contains(&last)),
+            "{unseen:?}"
+        );
     }
 
     #[test]
@@ -1240,7 +1297,7 @@ pub(crate) mod tests {
         };
 
         let quiet = MemoryStep::Action(Box::new(step(None)));
-        let messages = quiet.messages(&mut 0);
+        let messages = quiet.messages(&mut 0, &|_| true);
         assert_eq!(messages[1], answer(vec![viewed.clone()]));
 
         // Measured usage leaves out the later results, so their images must be estimated too
@@ -1252,6 +1309,9 @@ pub(crate) mod tests {
         let printed = step(Some("Printed"));
         let printed = MemoryStep::Action(Box::new(printed));
         let text = Part::Text("Printed".to_owned());
-        assert_eq!(printed.messages(&mut 0)[1], answer(vec![text, viewed]));
+        assert_eq!(
+            printed.messages(&mut 0, &|_| true)[1],
+            answer(vec![text, viewed])
+        );
     }
 }

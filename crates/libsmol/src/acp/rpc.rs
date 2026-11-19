@@ -4,12 +4,11 @@ use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     Error as RpcError, ErrorCode, SessionNotification, SessionUpdate, CLIENT_METHOD_NAMES,
 };
-use reaper::wire::{BACKGROUND, MCP, NOTICE, PROGRAMS, QUEUED};
+use reaper::wire::{self, McpStatus, BACKGROUND, IMAGES, MCP, NOTICE, PROGRAMS, QUEUED};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 #[cfg(test)]
@@ -31,16 +30,19 @@ pub(crate) enum Notice {
     Unsaved,
 }
 
+/// The `_smol/` capabilities the client declared
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Declared {
+    pub(crate) queued: bool,
+    pub(crate) images: bool,
+    pub(crate) background: bool,
+}
+
 /// Writes only whole lines
 pub(crate) struct Peer {
     out: Out,
     pending: Waiting,
-    /// The client declared `_smol/queued`
-    queued: AtomicBool,
-    /// The client declared `_smol/images`
-    images: AtomicBool,
-    /// The client declared `_smol/background`
-    background: AtomicBool,
+    declared: Mutex<Declared>,
 }
 
 impl Peer {
@@ -48,9 +50,7 @@ impl Peer {
         Arc::new(Self {
             out,
             pending: Waiting::default(),
-            queued: AtomicBool::new(false),
-            images: AtomicBool::new(false),
-            background: AtomicBool::new(false),
+            declared: Mutex::default(),
         })
     }
 
@@ -105,24 +105,19 @@ impl Peer {
         self.pending.answer(id, reply);
     }
 
-    pub(crate) fn set_queued(&self, queued: bool) {
-        self.queued.store(queued, Ordering::Relaxed);
+    /// Takes what the `_meta` of the client's capabilities declares
+    pub(crate) fn declare(&self, meta: &Value) {
+        let on = |name: &str| meta[name].as_bool() == Some(true);
+        let declared = Declared {
+            queued: on(QUEUED),
+            images: on(IMAGES),
+            background: on(BACKGROUND),
+        };
+        *self.declared.lock().expect("declared") = declared;
     }
 
-    pub(crate) fn set_images(&self, images: bool) {
-        self.images.store(images, Ordering::Relaxed);
-    }
-
-    pub(crate) fn images(&self) -> bool {
-        self.images.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn set_background(&self, background: bool) {
-        self.background.store(background, Ordering::Relaxed);
-    }
-
-    pub(crate) fn background(&self) -> bool {
-        self.background.load(Ordering::Relaxed)
+    pub(crate) fn declared(&self) -> Declared {
+        *self.declared.lock().expect("declared")
     }
 }
 
@@ -152,19 +147,18 @@ impl SessionPeer {
             Notice::Session => (None, false, false),
             Notice::Unsaved => (None, false, true),
         };
-        let retry_in = retry_in.map(|wait| wait.as_secs_f64());
-
-        let params = json!({
-            "sessionId": &*self.id,
-            "text": text,
-            "retryIn": retry_in,
-            "step": step,
-            "unsaved": unsaved,
-        });
+        let notice = wire::Notice {
+            text: text.to_owned(),
+            retry_in: retry_in.map(|wait| wait.as_secs_f64()),
+            step,
+            unsaved,
+        };
+        let mut params = json!(notice);
+        params["sessionId"] = json!(&*self.id);
         self.peer.notify(NOTICE, params);
     }
 
-    pub(crate) fn servers(&self, servers: Vec<Value>) {
+    pub(crate) fn servers(&self, servers: &[McpStatus]) {
         let status = json!({ "sessionId": &*self.id, "servers": servers });
         self.peer.notify(MCP, status);
     }
@@ -174,15 +168,14 @@ impl SessionPeer {
         self.peer.notify(PROGRAMS, params);
     }
 
-    /// The client declared `BACKGROUND`
-    pub(crate) fn background(&self) -> bool {
-        self.peer.background()
+    pub(crate) fn declared(&self) -> Declared {
+        self.peer.declared()
     }
 
     /// Tells a client that declared `BACKGROUND` that programs the code left running ended
     /// while no turn ran, for it to hand them the next turn
     pub(crate) fn background_ended(&self) {
-        if self.background() {
+        if self.declared().background {
             let params = json!({ "sessionId": &*self.id });
             self.peer.notify(BACKGROUND, params);
         }
@@ -190,7 +183,7 @@ impl SessionPeer {
 
     /// None unless the client declared `QUEUED` and answered
     pub(crate) async fn queued(&self) -> Option<Value> {
-        if !self.peer.queued.load(Ordering::Relaxed) {
+        if !self.declared().queued {
             return None;
         }
 

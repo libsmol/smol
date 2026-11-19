@@ -1,6 +1,6 @@
 use crate::model::{
-    error_text, merged, tool_parameters, Call, ChatMessage, Finish, ModelError, OpenAIModel,
-    Purpose, Stream, StreamDelta, TokenUsage,
+    error_text, grouped, merged, tool_parameters, Call, ChatMessage, Finish, ModelError,
+    OpenAIModel, Purpose, Stream, StreamDelta, TokenUsage,
 };
 use crate::prompt::{self, TOOL};
 use serde_json::{json, Map, Value};
@@ -13,10 +13,7 @@ pub(crate) fn body(
     purpose: Purpose,
 ) -> Map<String, Value> {
     let mut input = Vec::new();
-    let together = |a: &ChatMessage, b: &ChatMessage| {
-        matches!((a, b), (ChatMessage::User(_), ChatMessage::User(_)))
-    };
-    for group in conversation.chunk_by(together) {
+    for group in grouped(conversation) {
         match &group[0] {
             ChatMessage::System(text) => {
                 let message = json!({ "role": "system", "content": text });
@@ -109,17 +106,18 @@ pub(crate) fn body(
         reasoning.insert("effort".into(), json!(effort));
     }
     // Only steps show the reasoning
-    if let Some(summary) = model.summary.as_ref().filter(|_| purpose == Purpose::Step) {
+    let summary = model.spec.summary.as_ref();
+    if let Some(summary) = summary.filter(|_| purpose == Purpose::Step) {
         reasoning.insert("summary".into(), json!(summary));
     }
 
     let mut body = Map::new();
-    body.insert("model".into(), json!(model.id));
+    body.insert("model".into(), json!(model.spec.id));
     if !reasoning.is_empty() {
         body.insert("reasoning".into(), Value::Object(reasoning));
     }
     body.insert("input".into(), Value::Array(input));
-    if let Some(max_tokens) = model.max_tokens {
+    if let Some(max_tokens) = model.spec.max_tokens {
         body.insert("max_output_tokens".into(), json!(max_tokens));
     }
     body.insert("stream".into(), json!(true));
@@ -168,34 +166,30 @@ impl Stream {
                     fields.remove(*field);
                 }
             }
-
-            let sealed = StreamDelta::Sealed {
-                provider: &self.provider,
-                kind: self.kind,
-                item: &kept,
-            };
-            on_delta(sealed);
+            self.seal_item(kept, on_delta);
         }
 
+        let paragraphs = &mut self.paragraphs;
         match kind {
             // Each message, reasoning item and summary part gets a paragraph of its own
-            "response.output_item.added" if item["type"] == "message" => self.opened = true,
+            "response.output_item.added" if item["type"] == "message" => paragraphs.opened = true,
             "response.output_text.delta" | "response.refusal.delta" if !delta.is_empty() => {
-                if mem::take(&mut self.opened) && self.said {
-                    on_delta(StreamDelta::Content("\n\n"));
+                let parted = mem::take(&mut paragraphs.opened) && paragraphs.said;
+                paragraphs.said = true;
+                if parted {
+                    self.say("\n\n", on_delta);
                 }
-                self.said = true;
-                on_delta(StreamDelta::Content(delta));
+                self.say(delta, on_delta);
             }
-            "response.reasoning_summary_part.added" => self.parted = true,
-            "response.output_item.added" if item["type"] == "reasoning" => self.parted = true,
+            "response.reasoning_summary_part.added" => paragraphs.parted = true,
+            "response.output_item.added" if item["type"] == "reasoning" => paragraphs.parted = true,
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta"
                 if !delta.is_empty() =>
             {
-                if mem::take(&mut self.parted) && self.reasoned {
+                if mem::take(&mut paragraphs.parted) && paragraphs.reasoned {
                     on_delta(StreamDelta::Reasoning("\n\n"));
                 }
-                self.reasoned = true;
+                paragraphs.reasoned = true;
                 on_delta(StreamDelta::Reasoning(delta));
             }
             "response.output_item.added" | "response.output_item.done"

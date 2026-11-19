@@ -1,5 +1,6 @@
 use crate::prompt;
 use reaper::cause;
+use reqwest::header::{HeaderMap, CONTENT_TYPE};
 use reqwest::{Client, ClientBuilder};
 use serde_json::Value;
 use std::collections::hash_map::RandomState;
@@ -51,22 +52,22 @@ static DRIVER: LazyLock<()> = LazyLock::new(|| {
     started.recv().ok();
 });
 
-pub fn block_on<F: Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     #[cfg(test)]
     LazyLock::force(&DRIVER);
     RUNTIME.block_on(future)
 }
 
-pub type Reply = Result<Value, String>;
+pub(crate) type Reply = Result<Value, String>;
 
 #[derive(Default)]
-pub struct Waiting {
+pub(crate) struct Waiting {
     next: AtomicU64,
     waiters: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
 }
 
 impl Waiting {
-    pub fn ask(&self) -> (u64, oneshot::Receiver<Reply>) {
+    pub(crate) fn ask(&self) -> (u64, oneshot::Receiver<Reply>) {
         let (sender, receiver) = oneshot::channel();
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let mut waiters = self.waiters.lock().expect("waiting lock");
@@ -74,12 +75,12 @@ impl Waiting {
         (id, receiver)
     }
 
-    pub fn take(&self, id: u64) -> Option<oneshot::Sender<Reply>> {
+    pub(crate) fn take(&self, id: u64) -> Option<oneshot::Sender<Reply>> {
         let mut waiters = self.waiters.lock().expect("waiting lock");
         waiters.remove(&id)
     }
 
-    pub fn answer(&self, id: u64, reply: Reply) {
+    pub(crate) fn answer(&self, id: u64, reply: Reply) {
         if let Some(sender) = self.take(id) {
             sender.send(reply).ok();
         }
@@ -133,7 +134,7 @@ pub(crate) fn truncated(text: &str, max: usize) -> String {
 }
 
 /// Like `truncated`, for text that must stay on one line
-pub(crate) fn one_lined(text: &str, max: usize) -> String {
+pub(crate) fn cut_inline(text: &str, max: usize) -> String {
     middle_cut(text, max, " ")
 }
 
@@ -150,33 +151,6 @@ fn middle_cut(text: &str, max: usize, apart: &str) -> String {
     let marker = prompt::cut(count - max);
 
     format!("{head}{apart}{marker}{apart}{tail}")
-}
-
-/// `head` and `tail` with `cut` characters already dropped between them, kept to `max` characters
-/// and marked once where text is missing
-pub(crate) fn seamed(head: &str, tail: &str, cut: usize, max: usize) -> String {
-    if cut == 0 {
-        let text = format!("{head}{tail}");
-        return truncated(&text, max);
-    }
-
-    // Each side keeps up to half, and a side shorter than that leaves the rest to the other
-    let heads = head.chars().count();
-    let tails = tail.chars().count();
-    let max = max.min(heads + tails);
-    let half = max / 2;
-    let tail_kept = match heads < max - half {
-        true => tails.min(max - heads),
-        false => tails.min(half),
-    };
-    let head_kept = heads.min(max - tail_kept);
-
-    let head: String = head.chars().take(head_kept).collect();
-    let tail: String = tail.chars().skip(tails - tail_kept).collect();
-    let dropped = heads - head_kept + cut + tails - tail_kept;
-    let marker = prompt::cut(dropped);
-
-    format!("{head}\n{marker}\n{tail}")
 }
 
 pub(crate) fn new_id() -> String {
@@ -253,6 +227,23 @@ pub(crate) fn read_cause(error: &reqwest::Error, wait: Duration) -> String {
     prompt::timed_out(seconds)
 }
 
+/// The mime type a response names, lowercase, and the charset it gives
+pub(crate) fn content_type(headers: &HeaderMap) -> (String, Option<String>) {
+    let header = headers.get(CONTENT_TYPE);
+    let header = header.and_then(|value| value.to_str().ok());
+    let mut parts = header.unwrap_or_default().split(';');
+    let mime = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    // Old sites send `Charset=gb2312`
+    let charset = |part: &str| {
+        let (key, value) = part.split_once('=')?;
+        let named = key.trim().eq_ignore_ascii_case("charset");
+        let value = value.trim().trim_matches('"');
+        named.then(|| value.to_owned())
+    };
+    let charset = parts.find_map(charset);
+    (mime, charset)
+}
+
 pub(crate) fn http_client(builder: ClientBuilder) -> Result<Client, String> {
     // An idle connection may have been closed by the peer or a proxy,
     // and reusing it fails with connection closed
@@ -270,7 +261,7 @@ pub(crate) fn http_client(builder: ClientBuilder) -> Result<Client, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::{block_on, excerpt, one_lined, read_cause};
+    use crate::utils::{block_on, cut_inline, excerpt, read_cause};
     use futures_util::stream;
     use http::Response;
     use reqwest::Body;
@@ -278,11 +269,11 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn middle_one_lined() {
+    fn middle_cut_inline() {
         let command = format!("python3 -c {} --café", "x = 1; ".repeat(10));
-        let cut = one_lined(&command, 20);
+        let cut = cut_inline(&command, 20);
         assert_eq!(cut, "python3 -c [68 characters cut] 1;  --café");
-        assert_eq!(one_lined("brew 🐍", 20), "brew 🐍");
+        assert_eq!(cut_inline("brew 🐍", 20), "brew 🐍");
     }
 
     #[test]

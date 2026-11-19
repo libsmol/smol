@@ -3,13 +3,13 @@ use crate::acp::rpc::{Notice, Peer, SessionPeer};
 use crate::acp::translator::Translator;
 use crate::acp::{rfc3339, task_of, to_value, App};
 use crate::agent::{
-    title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Sink, Task, Team,
+    title_of, Agent, Asking, Brief, Event, Nudging, Place, Queue, Sink, Task, TaskViews, Team,
 };
-use crate::config::{self, Access, McpConfig, Models, Skipped};
-use crate::history::{Lock, SessionMeta, Settings};
+use crate::config::{self, AgentConfig, McpConfig, Models};
+use crate::history::{Lock, Record, SessionMeta, Settings};
 use crate::spawn::{run_shell, Process};
 use crate::steps::{AgentMemory, Exit, MemoryStep};
-use crate::tools::memories::{Listed, Memories};
+use crate::tools::memories::{Digest, Memories};
 use crate::utils::Interrupt;
 use crate::worker::host::Worker;
 use crate::worker::venv::Venv;
@@ -38,7 +38,7 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 /// Starts once the closing turn is saved, and only the title is lost past serve's SAVE_WAIT
-const NAME_WAIT: Duration = Duration::from_secs(3);
+const TITLE_WAIT: Duration = Duration::from_secs(3);
 const MODEL_OPTION: &str = "model";
 const EFFORT_OPTION: &str = "effort";
 
@@ -73,9 +73,7 @@ pub(crate) struct Opening {
     /// and reading the saved session
     pub(crate) previous: Option<JoinHandle<()>>,
     pub(crate) models: Models,
-    pub(crate) servers: Vec<McpConfig>,
-    pub(crate) access: Access,
-    pub(crate) mcp_skipped: Vec<Skipped>,
+    pub(crate) agent: AgentConfig,
     pub(crate) app: Arc<App>,
     pub(crate) interrupt: Interrupt,
     pub(crate) enqueued: Arc<Notify>,
@@ -95,7 +93,7 @@ struct Session {
     worker: Worker,
     servers: McpPool,
     /// Programs that user commands left in the background, which end with the session
-    background: Vec<Process>,
+    shell_left: Vec<Process>,
     keeper: Keeper,
     _lock: Option<Lock>,
 }
@@ -103,12 +101,34 @@ struct Session {
 /// Lent to the agent during a turn to show events and save
 struct Keeper {
     meta: SessionMeta,
+    /// Saved with the session
+    team: Arc<Team>,
     app: Arc<App>,
-    /// The titling task, which sends None when it fails
-    titling: Option<(oneshot::Receiver<Option<String>>, AbortHandle)>,
+    titling: Option<Titling>,
     unsaved: Unsaved,
     translator: Translator,
     peer: SessionPeer,
+}
+
+/// The model choosing a title for the session, which stops when this is dropped
+struct Titling {
+    /// Closes without a title when the model fails
+    receiver: oneshot::Receiver<String>,
+    task: AbortHandle,
+}
+
+impl Titling {
+    /// Resolves once the model has chosen or failed
+    async fn chosen(&mut self) -> Option<String> {
+        let receiver = &mut self.receiver;
+        receiver.await.ok()
+    }
+}
+
+impl Drop for Titling {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// The messages the client queues during a turn, which the session's agent takes as task updates
@@ -138,9 +158,7 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
         loading,
         previous,
         models,
-        servers,
-        access,
-        mcp_skipped,
+        agent,
         app,
         interrupt,
         enqueued,
@@ -158,41 +176,25 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
         // Read the saved session only after locking because another process
         // saves its last step before releasing the lock
         let lock = app.store.lock(&cwd, &session)?;
-        let (mut meta, memory) = match loading {
+        let record = match loading {
             true => app.store.load(&cwd, &session)?,
-            false => {
-                let meta = SessionMeta::new(session.clone(), Settings::default());
-                (meta, AgentMemory::default())
-            }
+            false => Record {
+                meta: SessionMeta::new(session.clone(), Settings::default()),
+                memory: AgentMemory::default(),
+                agents: Vec::new(),
+            },
         };
+        let Record {
+            mut meta,
+            memory,
+            agents,
+        } = record;
+        // Agents the code started in earlier turns take further tasks
+        let team = Arc::new(Team::restored(agents));
         let peer = SessionPeer::new(Arc::clone(&app.peer), &meta.id);
 
-        let mut notices = Vec::new();
-        let previously = &meta.settings;
-        let names = models.names();
-        let model = match names.contains(&previously.model) {
-            true => previously.model.clone(),
-            false => names.first().cloned().unwrap_or_default(),
-        };
-        if !previously.model.is_empty() && model != previously.model {
-            let gone = &previously.model;
-            let notice = format!("model: {gone}: not in model.toml, using {model}");
-            notices.push(notice);
-        }
-
-        // A chosen effort belongs to its model, so a model that is gone takes it along
-        let kept = model == previously.model;
-        let mut effort = previously.effort.clone().filter(|_| kept);
-        let check = |chosen: &str| models.check_effort(&model, chosen);
-        let checked = effort.as_deref().map(check);
-        if let Some(Err(error)) = checked {
-            let notice = match models.effort(&model) {
-                Some(own) => format!("{error}, using {own}"),
-                None => error.to_string(),
-            };
-            notices.push(notice);
-            effort = None;
-        }
+        let (settings, mut notices) = meta.settings.resumed(&cwd, &models, &agent);
+        meta.settings = settings;
 
         let (instructions, skipped) = config::instructions(&app.config, &cwd);
         for problem in skipped {
@@ -204,47 +206,30 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             let notice = problem.to_string();
             notices.push(notice);
         }
-        for entry in &mcp_skipped {
+        for entry in &agent.skipped {
             let notice = entry.problem.to_string();
             notices.push(notice);
         }
-        let listed = match memories.listed().await {
-            Ok(listed) => listed,
+        let digest = match memories.digest().await {
+            Ok(digest) => digest,
             Err(problem) => {
                 let notice = Error::Memory(problem).to_string();
                 notices.push(notice);
-                Listed::default()
+                Digest::default()
             }
         };
-
-        let mut settings = Settings {
-            cwd: cwd.clone(),
-            model,
-            effort,
-            ..Settings::default()
-        };
-        for server in &servers {
-            if let Some(on) = previously.mcp.get(&server.name) {
-                settings.set_mcp(server, *on);
-            }
-        }
-        // A skipped entry keeps its saved switch, which the next save would otherwise drop
-        for entry in &mcp_skipped {
-            if let Some(on) = previously.mcp.get(&entry.name) {
-                settings.mcp.insert(entry.name.clone(), *on);
-            }
-        }
-        meta.settings = settings;
-        let effort = meta.settings.effort.as_deref();
-        let built = models.make(&meta.settings.model, effort)?;
-        let options = options(&models, &meta.settings, &servers);
 
         let copies = app.store.copies(&cwd, &meta.id)?;
+        let effort = meta.settings.effort.as_deref();
+        let built = models.make(&meta.settings.model, effort, &copies)?;
+        let options = options(&models, &meta.settings, &agent.servers);
+
         // Servers need neither the venv nor the worker, so they connect while those start
-        let pool = McpPool::new(servers, &meta.settings, &copies, peer.clone());
+        let pool = McpPool::new(agent.servers, &meta.settings, &copies, peer.clone());
         let window = built.context_window();
         let mut translator = Translator::new(peer.clone(), window, cwd.clone(), copies.clone());
-        translator.replay(&memory);
+        let agents = team.records();
+        translator.replay(&memory, &agents);
 
         let project = app.store.project(&cwd);
         let venv = Venv::open(&project, &cwd).await;
@@ -258,7 +243,7 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             venv,
             &app.config,
             &skills,
-            &access,
+            &agent.access,
         );
         let workplace = opening.map_err(Error::Python)?;
         let workplace = Arc::new(workplace);
@@ -267,17 +252,15 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             peer: peer.clone(),
             enqueued,
         };
-        // Agents the code started in earlier turns take further tasks
-        let team = Team::restored(&memory.steps);
         let place = Place::Main {
-            team: Arc::new(team),
+            team: Arc::clone(&team),
             queue: Arc::new(queue),
         };
 
         // No restart notice again when no code has run since the last restart
         let ran = memory.ran_code();
-        let delegation = place.delegation();
-        let launching = Worker::new(&interrupt, Arc::clone(&workplace), &[], delegation, ran);
+        let rank = place.rank();
+        let launching = Worker::new(&interrupt, Arc::clone(&workplace), &[], rank, ran);
         let worker = launching.await?;
 
         let response = match loading {
@@ -307,12 +290,13 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
         }
         pool.report();
 
+        let declared = app.peer.declared();
         let brief = Brief {
             instructions,
             skills,
-            listed,
-            images_shown: app.peer.images(),
-            background: app.peer.background(),
+            digest,
+            images_shown: declared.images,
+            background: declared.background,
         };
         let agent = Agent {
             model: Arc::from(built),
@@ -324,6 +308,7 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
         };
         let keeper = Keeper {
             meta,
+            team,
             app: Arc::clone(&app),
             titling: None,
             unsaved: Unsaved::default(),
@@ -337,7 +322,7 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             agent,
             worker,
             servers: pool,
-            background: Vec::new(),
+            shell_left: Vec::new(),
             keeper,
             _lock: lock,
         })
@@ -365,7 +350,7 @@ impl Session {
             let titling = &mut self.keeper.titling;
             let titled = async {
                 match titling {
-                    Some((receiver, _)) => receiver.await,
+                    Some(titling) => titling.chosen().await,
                     None => future::pending().await,
                 }
             };
@@ -378,8 +363,8 @@ impl Session {
                 }
                 title = titled => {
                     self.keeper.titling = None;
-                    if let Ok(Some(name)) = title {
-                        self.keeper.rename(name, &self.memory);
+                    if let Some(title) = title {
+                        self.keeper.retitle(title, &self.memory);
                     }
                     continue;
                 }
@@ -421,11 +406,11 @@ impl Session {
         }
 
         // When a turn finishes before its title, wait a little for the title before closing
-        if let Some((receiver, naming)) = self.keeper.titling.take() {
-            let title = time::timeout(NAME_WAIT, receiver).await;
-            naming.abort();
-            if let Ok(Ok(Some(name))) = title {
-                self.keeper.rename(name, &self.memory);
+        if let Some(mut titling) = self.keeper.titling.take() {
+            let chosen = titling.chosen();
+            let title = time::timeout(TITLE_WAIT, chosen).await;
+            if let Ok(Some(title)) = title {
+                self.keeper.retitle(title, &self.memory);
             }
         }
         info!("session: closed");
@@ -454,11 +439,13 @@ impl Session {
             let model = Arc::clone(&self.agent.model);
             let task = asked.to_owned();
             let (sender, receiver) = oneshot::channel();
-            let naming = task::spawn(async move {
-                let title = title_of(model, task).await;
-                sender.send(title).ok();
+            let choosing = task::spawn(async move {
+                if let Some(title) = title_of(model, task).await {
+                    sender.send(title).ok();
+                }
             });
-            self.keeper.titling = Some((receiver, naming.abort_handle()));
+            let task = choosing.abort_handle();
+            self.keeper.titling = Some(Titling { receiver, task });
         }
 
         let servers = self.servers.installed();
@@ -475,9 +462,7 @@ impl Session {
         // A refused task stays out of the record and so must the title made from it
         let refused = matches!(answer, Err(Error::Refused(_)));
         if titling && refused {
-            if let Some((_, naming)) = self.keeper.titling.take() {
-                naming.abort();
-            }
+            self.keeper.titling = None;
         }
 
         let peer = &self.keeper.app.peer;
@@ -512,7 +497,7 @@ impl Session {
         let mut shown = |output: &str| translator.shell_output(output);
         let cwd = &self.agent.workplace.cwd;
         let (ran, left) = run_shell(&shell.command, cwd, interrupt, &mut shown).await;
-        self.background.extend(left);
+        self.shell_left.extend(left);
 
         self.keeper.translator.shell_end(&ran);
         // Log only how the command ended because it may contain secrets
@@ -542,12 +527,12 @@ impl Session {
             // and rewrites the saved session
             (MODEL_OPTION, _, SessionConfigOptionValue::ValueId { value }) => {
                 if *value.0 != keeper.meta.settings.model {
-                    let model = self.models.make(&value.0, None)?;
+                    let copies = &self.agent.workplace.copies;
+                    let model = self.models.make(&value.0, None, copies)?;
                     let window = model.context_window();
                     self.agent.model = Arc::from(model);
                     keeper.translator.model_changed(window);
-                    keeper.meta.settings.model = value.0.to_string();
-                    keeper.meta.settings.effort = None;
+                    keeper.meta.settings.choose_model(value.0.to_string());
                     let name = &keeper.meta.settings.model;
                     info!("session: model switched [model={name}]");
                     keeper.save(&self.memory);
@@ -558,9 +543,10 @@ impl Session {
                 let effort = &*value.0;
                 self.models.check_effort(name, effort)?;
 
-                let current = current_effort(&self.models, &keeper.meta.settings);
+                let current = keeper.meta.settings.current_effort(&self.models);
                 if current != Some(effort) {
-                    let model = self.models.make(name, Some(effort))?;
+                    let copies = &self.agent.workplace.copies;
+                    let model = self.models.make(name, Some(effort), copies)?;
                     self.agent.model = Arc::from(model);
                     keeper.meta.settings.effort = Some(effort.to_owned());
                     info!("session: effort switched [effort={effort}]");
@@ -607,17 +593,19 @@ impl Keeper {
         }
 
         // The title may be ready in the middle of a turn
-        if let Some((receiver, _)) = &mut self.titling {
-            let title = receiver.try_recv();
+        if let Some(titling) = &mut self.titling {
+            let title = titling.receiver.try_recv();
             if !matches!(title, Err(TryRecvError::Empty)) {
                 self.titling = None;
             }
-            if let Ok(Some(name)) = title {
-                self.meta.model_title = name;
+            if let Ok(title) = title {
+                self.meta.model_title = title;
             }
         }
 
-        let stored = self.app.store.save(memory, &mut self.meta);
+        self.meta.update_title(memory);
+        let agents = self.team.records();
+        let stored = self.app.store.save(memory, &agents, &mut self.meta);
         let error = stored.as_ref().err().map(Error::to_string);
         if let Some(text) = self.unsaved.report(error) {
             error!("session: save failed, {text}");
@@ -628,7 +616,7 @@ impl Keeper {
         }
     }
 
-    fn rename(&mut self, title: String, memory: &AgentMemory) {
+    fn retitle(&mut self, title: String, memory: &AgentMemory) {
         self.meta.model_title = title;
         self.save(memory);
     }
@@ -643,8 +631,8 @@ impl Sink for Keeper {
         self.save(memory);
     }
 
-    fn helpers(&mut self, index: usize) -> Box<dyn Helpers> {
-        self.translator.helpers(index)
+    fn tasks(&mut self, index: usize) -> Box<dyn TaskViews> {
+        self.translator.tasks(index)
     }
 }
 
@@ -721,7 +709,7 @@ fn options<'a>(
     let mut options = vec![model];
 
     // A model without an effort in model.toml runs at the provider's default, which has no name
-    if let Some(current) = current_effort(models, settings) {
+    if let Some(current) = settings.current_effort(models) {
         let mut choices = Vec::new();
         for effort in models.offered(&settings.model) {
             let choice = SessionConfigSelectOption::new(effort.clone(), effort);
@@ -745,12 +733,6 @@ fn options<'a>(
     options
 }
 
-/// The chosen effort, or the model's own in model.toml without one
-fn current_effort<'a>(models: &'a Models, settings: &'a Settings) -> Option<&'a str> {
-    let own = models.effort(&settings.model);
-    settings.effort.as_deref().or(own)
-}
-
 fn update_session(peer: &SessionPeer, meta: &SessionMeta) {
     let updated = rfc3339(meta.updated_at);
     let title = meta.title.clone();
@@ -768,7 +750,7 @@ mod tests {
     use crate::agent::Queue;
     use crate::history::tests::saved;
     use crate::history::{HistoryStore, Settings};
-    use crate::prompt::{namer, RESTARTED};
+    use crate::prompt::{titler, RESTARTED};
     use crate::steps::tests::{asked, coded, one_task, replied};
     use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::{interpreter, temp_dir};
@@ -970,7 +952,7 @@ mod tests {
 
     fn naming(title: &'static str) -> String {
         model_server(move |body| {
-            let text = match system_prompt(body) == namer() {
+            let text = match system_prompt(body) == titler() {
                 true => title,
                 false => "Done.",
             };
@@ -1010,7 +992,7 @@ mod tests {
         let (session, seen) = block_on(running);
 
         let store = HistoryStore::new(&dir);
-        let (meta, _) = store.load(Path::new(CWD), &session).expect("load");
+        let meta = store.load(Path::new(CWD), &session).expect("load").meta;
         assert_eq!(meta.title, "Snake game");
         assert_eq!(meta.model_title, "Snake game");
 
@@ -1038,7 +1020,7 @@ mod tests {
         // The titling request replies with the start of the task, which follows the opening tag
         let api = model_server(|body| {
             let messages = body["messages"].as_array().cloned().unwrap_or_default();
-            let text: String = match system_prompt(body) == namer() {
+            let text: String = match system_prompt(body) == titler() {
                 true => {
                     let message = messages[1]["content"].as_str().unwrap_or_default();
                     let task = message.lines().nth(1).unwrap_or_default();
@@ -1061,7 +1043,7 @@ mod tests {
         let session = block_on(running);
 
         let store = HistoryStore::new(&dir);
-        let (meta, _) = store.load(Path::new(CWD), &session).expect("load");
+        let meta = store.load(Path::new(CWD), &session).expect("load").meta;
         assert_eq!(meta.title, "Make");
         fs::remove_dir_all(&dir).ok();
     }
@@ -1071,7 +1053,7 @@ mod tests {
         let dir = temp_dir("after-close");
         // A slow reply keeps the turn running when the session closes
         let api = model_server(|body| {
-            if system_prompt(body) != namer() {
+            if system_prompt(body) != titler() {
                 thread::sleep(Duration::from_millis(500));
             }
             Ok("Done.".to_owned())
@@ -1153,7 +1135,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
         let api = model_server(move |body| {
-            if system_prompt(body) != namer() {
+            if system_prompt(body) != titler() {
                 let sent = body["messages"].to_string();
                 seen.lock().expect("requests").push(sent);
                 thread::sleep(Duration::from_millis(500));
@@ -1182,7 +1164,7 @@ mod tests {
         assert_eq!(stop, Some(&json!("cancelled")));
 
         let store = HistoryStore::new(&dir);
-        let (_, memory) = store.load(Path::new(CWD), &session).expect("load");
+        let memory = store.load(Path::new(CWD), &session).expect("load").memory;
         let mut kinds = Vec::new();
         for step in &memory.steps {
             let kind = match step {
@@ -1228,7 +1210,7 @@ mod tests {
         let marked = |message: &Value| message["params"]["update"]["_meta"]["_smol/shell"] == true;
         assert!(seen.iter().any(marked), "{seen:?}");
         let store = HistoryStore::new(&dir);
-        let (_, saved) = store.load(Path::new(CWD), "s1").expect("load");
+        let saved = store.load(Path::new(CWD), "s1").expect("load").memory;
         let Some(MemoryStep::Shell(ran)) = saved.steps.last() else {
             panic!("{:?}", saved.steps);
         };
@@ -1356,7 +1338,7 @@ mod tests {
         let seen = Arc::clone(&prompts);
         let api = model_server(move |body| {
             let system = system_prompt(body);
-            if system != namer() {
+            if system != titler() {
                 seen.lock().expect("prompts").push(system);
             }
             Ok("Done.".to_owned())
@@ -1425,7 +1407,7 @@ mod tests {
         let efforts = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&efforts);
         let api = model_server(move |body| {
-            if system_prompt(body) != namer() {
+            if system_prompt(body) != titler() {
                 let effort = body["reasoning_effort"].clone();
                 seen.lock().expect("efforts").push(effort);
             }
@@ -1565,7 +1547,7 @@ mod tests {
         let released = Arc::new(AtomicBool::new(false));
         let holding = Arc::clone(&released);
         let api = model_server(move |body| {
-            while system_prompt(body) != namer() && !holding.load(Ordering::Relaxed) {
+            while system_prompt(body) != titler() && !holding.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(10));
             }
             Ok("Done.".to_owned())
@@ -1681,9 +1663,10 @@ mod tests {
         block_on(running);
 
         let store = HistoryStore::new(&dir);
-        let (meta, saved) = store.load(Path::new(CWD), "s1").expect("load");
-        assert!(matches!(saved.steps.last(), Some(MemoryStep::Shell(_))));
-        assert_eq!(meta.settings.mcp.get("fake"), Some(&false));
+        let record = store.load(Path::new(CWD), "s1").expect("load");
+        let last = record.memory.steps.last();
+        assert!(matches!(last, Some(MemoryStep::Shell(_))));
+        assert_eq!(record.meta.settings.mcp.get("fake"), Some(&false));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1694,7 +1677,7 @@ mod tests {
         let seen = Arc::clone(&prompts);
         let api = model_server(move |body| {
             let system = system_prompt(body);
-            if system != namer() {
+            if system != titler() {
                 seen.lock().expect("prompts").push(system);
             }
             Ok("Done.".to_owned())
@@ -1722,7 +1705,7 @@ mod tests {
         let code = "eval:import subprocess, sys\n\
             program = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.5)'])";
         move |body| {
-            if system_prompt(body) == namer() {
+            if system_prompt(body) == titler() {
                 return Ok("Café timer".to_owned());
             }
             let messages = body["messages"].as_array().cloned().unwrap_or_default();

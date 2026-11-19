@@ -2,6 +2,7 @@ use crate::prompt::{self, EMPTY_MEMORY, NESTED, NO_MEMORY};
 use crate::utils::{folded, Reply};
 use crate::worker::MemoryCall;
 use jieba_rs::Jieba;
+use reaper::wire::Memory;
 use reaper::{cause, tilde};
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde_json::{json, Value};
@@ -15,9 +16,9 @@ use tracing::info;
 const DB: &str = "memory.db";
 
 /// The worker puts it in the docs of `remember()`
-pub const MAX_MEMORY_CHARS: usize = 150;
+pub(crate) const MAX_MEMORY_CHARS: usize = 150;
 /// SQLite takes integers as `i64`, and the worker puts it in the docs of `recall()`
-pub const MAX_RECALLED: i64 = 10;
+pub(crate) const MAX_RECALLED: i64 = 10;
 const MAX_LISTED: i64 = 10;
 
 const BUSY_WAIT: Duration = Duration::from_secs(5);
@@ -43,20 +44,11 @@ pub(crate) struct Memories {
     folder: Vec<u8>,
 }
 
-/// A memory the working directory sees
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Kept {
-    pub(crate) id: i64,
-    pub(crate) text: String,
-    /// Kept for the working directory rather than for every directory
-    pub(crate) project: bool,
-}
-
 /// What the system prompt shows of them
 #[derive(Debug, Default, Clone, PartialEq)]
-pub(crate) struct Listed {
+pub(crate) struct Digest {
     /// The global memories up to `MAX_LISTED`, newest first
-    pub(crate) newest: Vec<(i64, String)>,
+    pub(crate) newest: Vec<Memory>,
     /// How many global memories there are
     pub(crate) global: usize,
     /// How many the working directory has
@@ -93,7 +85,7 @@ impl Memories {
     }
 
     /// The working directory's own memories and then the global ones, newest first in each
-    pub(crate) async fn seen(&self) -> Result<Vec<Kept>, String> {
+    pub(crate) async fn listed(&self) -> Result<Vec<Memory>, String> {
         let memories = self.clone();
         let listing = move || {
             let connection = opened(&memories.db)?;
@@ -101,20 +93,21 @@ impl Memories {
                 "SELECT id, text, folder IS NOT NULL FROM memories WHERE folder = ?1 OR folder IS NULL \
                  ORDER BY folder IS NULL, id DESC",
             )?;
-            let rows = seen.query_map([&memories.folder], kept)?;
+            let rows = seen.query_map([&memories.folder], memory)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         };
         self.run(listing).await
     }
 
-    pub(crate) async fn listed(&self) -> Result<Listed, String> {
+    pub(crate) async fn digest(&self) -> Result<Digest, String> {
         let memories = self.clone();
         let listing = move || {
             let connection = opened(&memories.db)?;
             let mut newest = connection.prepare(
-                "SELECT id, text FROM memories WHERE folder IS NULL ORDER BY id DESC LIMIT ?1",
+                "SELECT id, text, folder IS NOT NULL FROM memories WHERE folder IS NULL \
+                 ORDER BY id DESC LIMIT ?1",
             )?;
-            let rows = newest.query_map([MAX_LISTED], pair)?;
+            let rows = newest.query_map([MAX_LISTED], memory)?;
             let newest = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
             let (global, here): (i64, i64) = connection.query_row(
@@ -125,7 +118,7 @@ impl Memories {
             )?;
             let global = global as usize;
             let here = here as usize;
-            Ok(Listed {
+            Ok(Digest {
                 newest,
                 global,
                 here,
@@ -279,8 +272,8 @@ fn pair(row: &Row<'_>) -> rusqlite::Result<(i64, String)> {
     Ok((row.get(0)?, row.get(1)?))
 }
 
-fn kept(row: &Row<'_>) -> rusqlite::Result<Kept> {
-    Ok(Kept {
+fn memory(row: &Row<'_>) -> rusqlite::Result<Memory> {
+    Ok(Memory {
         id: row.get(0)?,
         text: row.get(1)?,
         project: row.get(2)?,
@@ -375,10 +368,11 @@ fn parts(text: &str) -> Vec<(bool, &str)> {
 mod tests {
     use crate::prompt::{self, EMPTY_MEMORY, NESTED, NO_MEMORY};
     use crate::tests::temp_dir;
-    use crate::tools::memories::{matched, terms, Kept, Listed, Memories};
+    use crate::tools::memories::{matched, terms, Digest, Memories};
     use crate::utils::block_on;
     use crate::worker::MemoryCall;
     use reaper::tilde;
+    use reaper::wire::Memory;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
@@ -386,6 +380,14 @@ mod tests {
     fn opened(config: &Path, cwd: &str) -> Memories {
         fs::create_dir_all(config).expect("config");
         Memories::new(config, Path::new(cwd))
+    }
+
+    fn memory(id: i64, text: &str, project: bool) -> Memory {
+        Memory {
+            id,
+            text: text.to_owned(),
+            project,
+        }
     }
 
     fn words(text: &str) -> Vec<String> {
@@ -520,38 +522,38 @@ mod tests {
     }
 
     #[test]
-    fn memories_listed() {
-        let dir = temp_dir("listed");
+    fn digest_counted() {
+        let dir = temp_dir("digest");
         let here = opened(&dir, "/home/zoë/café");
         let elsewhere = opened(&dir, "/home/zoë/naïve");
         let saving = async {
-            let empty = here.listed().await.expect("listed");
+            let empty = here.digest().await.expect("digest");
             let first = here.remember("Prefers résumé over CV", false).await;
             let second = elsewhere.remember("Replies in French", false).await;
             here.remember("Tests run with pytest", true).await.ok();
             elsewhere.remember("Builds with make", true).await.ok();
-            let listed = here.listed().await.expect("listed");
+            let digest = here.digest().await.expect("digest");
             (
                 empty,
                 first.expect("remember"),
                 second.expect("remember"),
-                listed,
+                digest,
             )
         };
-        let (empty, first, second, listed) = block_on(saving);
+        let (empty, first, second, digest) = block_on(saving);
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(empty, Listed::default());
+        assert_eq!(empty, Digest::default());
         let newest = vec![
-            (second, "Replies in French".to_owned()),
-            (first, "Prefers résumé over CV".to_owned()),
+            memory(second, "Replies in French", false),
+            memory(first, "Prefers résumé over CV", false),
         ];
-        let expected = Listed {
+        let expected = Digest {
             newest,
             global: 2,
             here: 1,
         };
-        assert_eq!(listed, expected);
+        assert_eq!(digest, expected);
     }
 
     #[test]
@@ -589,8 +591,8 @@ mod tests {
     }
 
     #[test]
-    fn seen_scoped() {
-        let dir = temp_dir("seen");
+    fn listed_scoped() {
+        let dir = temp_dir("listed");
         let here = opened(&dir, "/home/zoë/café");
         let there = opened(&dir, "/home/zoë/naïve");
         let saving = async {
@@ -598,28 +600,23 @@ mod tests {
             let own = here.remember("Tests run with pytest", true).await;
             there.remember("Builds with make", true).await.ok();
             let newer = there.remember("Replies in French", false).await;
-            let seen = here.seen().await.expect("seen");
+            let listed = here.listed().await.expect("listed");
             (
                 shared.expect("remember"),
                 own.expect("remember"),
                 newer.expect("remember"),
-                seen,
+                listed,
             )
         };
-        let (shared, own, newer, seen) = block_on(saving);
+        let (shared, own, newer, listed) = block_on(saving);
         fs::remove_dir_all(&dir).ok();
 
-        let kept = |id: i64, text: &str, project: bool| Kept {
-            id,
-            text: text.to_owned(),
-            project,
-        };
         let expected = [
-            kept(own, "Tests run with pytest", true),
-            kept(newer, "Replies in French", false),
-            kept(shared, "Prefers résumé over CV", false),
+            memory(own, "Tests run with pytest", true),
+            memory(newer, "Replies in French", false),
+            memory(shared, "Prefers résumé over CV", false),
         ];
-        assert_eq!(seen, expected);
+        assert_eq!(listed, expected);
     }
 
     #[test]
@@ -742,13 +739,13 @@ mod tests {
             )
         };
         let (a, b, c, d) = block_on(writing);
-        let listed = block_on(first.listed()).expect("listed");
+        let digest = block_on(first.digest()).expect("digest");
         fs::remove_dir_all(&dir).ok();
 
         let mut ids = vec![a.expect("a"), b.expect("b"), c.expect("c"), d.expect("d")];
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 4);
-        assert_eq!((listed.newest.len(), listed.global, listed.here), (2, 2, 1));
+        assert_eq!((digest.newest.len(), digest.global, digest.here), (2, 2, 1));
     }
 }

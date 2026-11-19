@@ -1,14 +1,12 @@
 use crate::agent::delegate::Records;
 use crate::agent::{generate, retry, Event, Failure, Streamed, Turn, MAX_RETRIES};
-use crate::model::{
-    ChatMessage, Finish, ModelError, Part, Purpose, Sealed, StreamDelta, Unread, MAX_NAME_CHARS,
-};
+use crate::model::{Finish, ModelError, Purpose, Sealed, StreamDelta, Unread, MAX_NAME_CHARS};
 use crate::prompt::{self, TOOL};
 use crate::spawn::SHOWN_EVERY;
 use crate::steps::{
     estimate, text_bytes, AgentStep, Call, CallError, CodeResult, StepError, MAX_OBSERVATION_CHARS,
 };
-use crate::utils::{seamed, truncated};
+use crate::utils::truncated;
 use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,21 +21,7 @@ impl Turn<'_> {
         let model = &*self.agent.model;
         let window = model.context_window();
         let takes = |kind| model.takes(kind);
-        let mut conversation = self.memory.conversation(&self.system, &takes, window);
-
-        // Saved sessions store only the file names of copies
-        let copies = &self.agent.workplace.copies;
-        for message in &mut conversation {
-            let parts = match message {
-                ChatMessage::User(parts) | ChatMessage::Tool { parts, .. } => parts,
-                ChatMessage::System(_) | ChatMessage::Assistant { .. } => continue,
-            };
-            for part in parts {
-                if let Part::Media(_, media) = part {
-                    media.file = copies.join(&media.file);
-                }
-            }
-        }
+        let conversation = self.memory.conversation(&self.system, &takes, window);
 
         let interrupt = &self.agent.interrupt;
         let mut tries = 0;
@@ -75,21 +59,7 @@ impl Turn<'_> {
                     }
                     StreamDelta::CallCode(code) => reply.push_code(code, &mut shown),
                     StreamDelta::CallEnd(ended) => reply.end_call(ended, &mut shown),
-                    StreamDelta::Sealed {
-                        provider,
-                        kind,
-                        item,
-                    } => {
-                        let first = Sealed {
-                            provider: provider.to_owned(),
-                            kind,
-                            items: Vec::new(),
-                            ends: Vec::new(),
-                        };
-                        let sealed = reply.sealed.get_or_insert(first);
-                        sealed.items.push(item.clone());
-                        sealed.ends.push(reply.text.len());
-                    }
+                    StreamDelta::Sealed(sealed) => reply.sealed = Some(sealed.clone()),
                 }
 
                 // Some models repeat closing tags after the code for minutes until the output limit
@@ -187,9 +157,8 @@ impl Turn<'_> {
             let call = &step.calls[index];
             self.sink.event(Event::Run(index, call));
 
-            let views = self.sink.helpers(index);
-            let at = self.memory.steps.len();
-            let records = Arc::new(Records::new(at, index));
+            let views = self.sink.tasks(index);
+            let records = Arc::new(Records::default());
             let mut serving = self.agent.serving(self.servers, views, &records);
             let code = &call.code;
             let mut shown = |output: &str| self.sink.event(Event::Output(index, call, output));
@@ -199,15 +168,13 @@ impl Turn<'_> {
             let evaluated = evaluating.await;
             step.usage.duration += started.elapsed().as_secs_f64();
             // Every call that could still change them has ended with the code
-            let mut recorded = records.helpers.lock().expect("records");
+            let mut recorded = records.lock().expect("records");
             let agents = mem::take(&mut *recorded);
             drop(recorded);
 
             let call = &mut step.calls[index];
             match evaluated {
                 Ok(output) => {
-                    let logs = output.logs.trim_end_matches('\n');
-
                     // Leaves room in the budget for the error that follows the output
                     let error = match output.error {
                         Some(CallError::Execution(text)) => {
@@ -222,12 +189,9 @@ impl Turn<'_> {
                     };
 
                     let quiet = error.is_none() && output.media.is_empty();
-                    let printed = if !logs.is_empty() {
-                        // Trimming may have taken the whole tail
-                        let seam = output.seam.min(logs.len());
-                        let (head, tail) = logs.split_at(seam);
-                        let budget = MAX_OBSERVATION_CHARS - ending;
-                        let shown = seamed(head, tail, output.cut, budget);
+                    let budget = MAX_OBSERVATION_CHARS - ending;
+                    let shown = output.printed.shown(budget);
+                    let printed = if !shown.is_empty() {
                         Some(shown)
                     } else if quiet {
                         Some(prompt::NO_OUTPUT.to_owned())
@@ -242,7 +206,7 @@ impl Turn<'_> {
                     call.error = error;
 
                     // Wrong tags stay out of history or the model copies them
-                    if let Some(repaired) = output.code {
+                    if let Some(repaired) = output.repaired {
                         let written = mem::replace(&mut call.code, repaired.trim().to_owned());
                         call.unrepaired = Some(written);
                     }
@@ -380,7 +344,7 @@ mod tests {
     use crate::agent::tests::{called, recorded, reply, scripted, Script, ScriptedModel, Tested};
     use crate::agent::Task;
     use crate::config::Kind;
-    use crate::model::{ModelError, TokenUsage};
+    use crate::model::{ChatMessage, ModelError, TokenUsage};
     use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::{content, Temp};
     use crate::utils::{new_id, Interrupt};
@@ -506,7 +470,7 @@ mod tests {
 
         let action = MemoryStep::Action(Box::new(step.clone()));
         let mut calls = 3;
-        let messages = action.messages(&mut calls);
+        let messages = action.messages(&mut calls, &|_| true);
         let ChatMessage::Assistant { calls: sent, .. } = &messages[0] else {
             panic!("{messages:?}");
         };
@@ -612,7 +576,11 @@ mod tests {
         assert!(printed(steps[0]).is_none());
 
         let action = MemoryStep::Action(Box::new(steps[0].clone()));
-        let sent: Vec<String> = action.messages(&mut 0).iter().map(content).collect();
+        let sent: Vec<String> = action
+            .messages(&mut 0, &|_| true)
+            .iter()
+            .map(content)
+            .collect();
         let told = "[not run: the call had no code]";
         assert_eq!(sent, ["eval:\n", told]);
     }
@@ -660,7 +628,11 @@ mod tests {
         assert_eq!(bash.arguments, arguments);
 
         let action = MemoryStep::Action(Box::new(step.clone()));
-        let sent: Vec<String> = action.messages(&mut 0).iter().map(content).collect();
+        let sent: Vec<String> = action
+            .messages(&mut 0, &|_| true)
+            .iter()
+            .map(content)
+            .collect();
         let expected = [
             "Let me look first.\neval:\nprint('alpha')\nbash:\n\neval:\nprint('beta')",
             "alpha",
@@ -1047,7 +1019,11 @@ mod tests {
 
         // The original stays in the record and is never sent to the model
         let action = MemoryStep::Action(Box::new(step.clone()));
-        let sent: Vec<String> = action.messages(&mut 0).iter().map(content).collect();
+        let sent: Vec<String> = action
+            .messages(&mut 0, &|_| true)
+            .iter()
+            .map(content)
+            .collect();
         assert!(
             sent.iter().all(|text| !text.contains("</parameter>")),
             "{sent:?}"

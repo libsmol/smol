@@ -1,15 +1,16 @@
-use crate::client::{Notice, Refusal};
+use crate::client::Refusal;
 use agent_client_protocol_schema::v1::{
-    ContentBlock, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
+    ContentBlock, Meta, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
 };
 use anyhow::Result;
 use reaper::wire::{
-    AGENT, BACKGROUND, DECODE_DURATION, DURATION, ERROR, ESTIMATED_OUTPUT, INPUT_TOKENS,
-    INTERRUPTED, NAME, OUTPUT_TOKENS, PARENT, SHELL, STEPS, TASK, UPDATE, WAITING,
+    Measured, Notice, AGENT, BACKGROUND, ERROR, NAME, PARENT, SHELL, TASK, UPDATE, WAITING,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::mem;
+use std::ops::AddAssign;
 use std::time::{Duration, Instant};
 
 pub(crate) const HUES: usize = 8;
@@ -57,9 +58,17 @@ pub(crate) struct Shell {
     pub(crate) id: String,
     pub(crate) command: String,
     pub(crate) output: String,
-    /// `None` while running, empty after a clean exit, otherwise the reason it ended
-    pub(crate) end: Option<String>,
-    pub(crate) interrupted: bool,
+    pub(crate) end: ShellEnd,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ShellEnd {
+    Running,
+    Exited,
+    /// With why it failed
+    Failed(String),
+    /// With how it was stopped
+    Interrupted(String),
 }
 
 #[derive(Clone)]
@@ -74,16 +83,39 @@ pub(crate) enum Outcome {
 pub(crate) struct Stats {
     pub(crate) turns: usize,
     pub(crate) steps: usize,
-    pub(crate) input: u64,
-    pub(crate) output: u64,
-    /// Tokens of the agents the code started, which count apart from the session's
-    pub(crate) agent_input: u64,
-    pub(crate) agent_output: u64,
+    pub(crate) tokens: Tokens,
+    /// Of the agents the code started, which count apart from the session's
+    pub(crate) agent_tokens: Tokens,
     pub(crate) context: Option<u64>,
     pub(crate) window: Option<u64>,
     /// Output estimated while the step is still generating, which makes the context an estimate too
     pub(crate) estimated: Option<u64>,
     stale: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Tokens {
+    pub(crate) input: u64,
+    pub(crate) output: u64,
+}
+
+impl Tokens {
+    fn of(measured: &Measured) -> Option<Self> {
+        let input = measured.input_tokens?;
+        let output = measured.output_tokens?;
+        Some(Self { input, output })
+    }
+
+    pub(crate) fn is_zero(&self) -> bool {
+        self.input + self.output == 0
+    }
+}
+
+impl AddAssign for Tokens {
+    fn add_assign(&mut self, other: Self) {
+        self.input += other.input;
+        self.output += other.output;
+    }
 }
 
 impl Stats {
@@ -164,7 +196,8 @@ impl Conversation {
     }
 
     pub(crate) fn shelling(&self) -> bool {
-        let running = |entry: &Entry| matches!(entry, Entry::Shell(shell) if shell.end.is_none());
+        let running =
+            |entry: &Entry| matches!(entry, Entry::Shell(shell) if shell.end == ShellEnd::Running);
         self.held.iter().any(running)
     }
 
@@ -232,18 +265,17 @@ impl Conversation {
     pub(crate) fn agents(&self) -> Vec<Agent<'_>> {
         let mut agents: Vec<Agent> = Vec::new();
         for helper in self.helpers() {
-            let (input, output) = helper.tokens.unwrap_or_default();
+            let tokens = helper.tokens.unwrap_or_default();
             let named =
                 |agent: &&mut Agent| helper.name.is_some() && agent.latest.name == helper.name;
             match agents.iter_mut().find(named) {
                 Some(agent) => {
                     agent.latest = helper;
-                    agent.tokens.0 += input;
-                    agent.tokens.1 += output;
+                    agent.tokens += tokens;
                 }
                 None => agents.push(Agent {
                     latest: helper,
-                    tokens: (input, output),
+                    tokens,
                 }),
             }
         }
@@ -290,10 +322,7 @@ impl Conversation {
 
     /// What the latest turn answered, empty when it gave no answer
     pub(crate) fn answer(&self) -> String {
-        let entries = self.entries.iter().chain(&self.held).rev();
-        let turn = entries.take_while(|entry| !entry.opens_turn());
-        let mut steps = turn.filter_map(Entry::step);
-        let Some(last) = steps.next() else {
+        let Some(last) = self.last_step() else {
             return String::new();
         };
 
@@ -304,6 +333,12 @@ impl Conversation {
             }
         }
         texts.join("\n")
+    }
+
+    fn last_step(&self) -> Option<&Step> {
+        let entries = self.entries.iter().chain(&self.held).rev();
+        let mut turn = entries.take_while(|entry| !entry.opens_turn());
+        turn.find_map(Entry::step)
     }
 
     pub(crate) fn sent(&self) -> Vec<String> {
@@ -324,118 +359,15 @@ impl Conversation {
 
     /// Returns true when a step ended
     pub(crate) fn update(&mut self, update: &SessionUpdate) -> bool {
-        // An agent the code started keeps updating after the step of its call has ended
-        if let SessionUpdate::ToolCallUpdate(call) = update {
-            let id = &*call.tool_call_id.0;
-            let mut place = None;
-            let mut named = None;
-            let mut taken = Vec::new();
-            for (spot, step) in self.working() {
-                for (at, item) in step.items.iter().enumerate() {
-                    let Item::Call(started) = item else {
-                        continue;
-                    };
-                    for (index, helper) in started.helpers.iter().enumerate() {
-                        if helper.id == id {
-                            place = Some((spot, at, index));
-                            named = helper.name.clone().filter(|_| helper.started.is_none());
-                        }
-                        if helper.state() == State::Running {
-                            taken.push(helper.hue);
-                        }
-                    }
-                }
+        // Updates of agents' tasks keep revisions of their own, which their arm sorts out,
+        // and a retry notice is followed by a usage update that withdraws the estimate
+        match update {
+            SessionUpdate::ToolCallUpdate(_) => {}
+            SessionUpdate::UsageUpdate(_) => self.revision += 1,
+            _ => {
+                self.revision += 1;
+                self.retry_at = None;
             }
-
-            // An agent keeps the hue of its earlier tasks, which only a task yet to start looks for
-            let same = |helper: &&Helper| helper.started.is_some() && helper.name == named;
-            let earlier = match named {
-                Some(_) => self.helpers().filter(same).last().map(|helper| helper.hue),
-                None => None,
-            };
-            if let Some((spot, at, index)) = place {
-                let step = match spot {
-                    Spot::Settled(entry) => self.entries.get_mut(entry).and_then(Entry::step_mut),
-                    Spot::Held(entry) => self.held.get_mut(entry).and_then(Entry::step_mut),
-                    Spot::Live => self.live.as_mut(),
-                };
-                let Some(step) = step else {
-                    return false;
-                };
-                let Some(Item::Call(started)) = step.items.get_mut(at) else {
-                    return false;
-                };
-                let helper = &mut started.helpers[index];
-
-                let fields = &call.fields;
-                if let Some(status) = fields.status {
-                    // The hue of its agent's earlier tasks or at its place in its call,
-                    // or the lowest free one when a running agent holds that
-                    if status == ToolCallStatus::InProgress && helper.started.is_none() {
-                        let wanted = earlier.unwrap_or(index % HUES);
-                        let free = (0..HUES).find(|hue| !taken.contains(hue));
-                        helper.hue = match taken.contains(&wanted) {
-                            true => free.unwrap_or(wanted),
-                            false => wanted,
-                        };
-                        helper.started = Some(Instant::now());
-                    }
-                    helper.status = status;
-                }
-
-                // A preview follows the status, and the last update holds only the answer or error
-                if let Some(content) = &fields.content {
-                    let (texts, _) = contents(content);
-                    let mut texts = texts.into_iter();
-                    helper.text = texts.next().unwrap_or_default();
-                    helper.preview = texts.collect();
-                }
-
-                let meta = call.meta.as_ref();
-                let get = |key: &str| meta.and_then(|meta| meta.get(key));
-                if get(INTERRUPTED).and_then(Value::as_bool) == Some(true) {
-                    helper.interrupted = true;
-                }
-                let count = |key: &str| get(key).and_then(Value::as_u64);
-                let tokens = count(INPUT_TOKENS).zip(count(OUTPUT_TOKENS));
-                if tokens.is_some() {
-                    helper.tokens = tokens;
-                }
-
-                // Every update carries its usage so far, so only the last one counts
-                let ended = matches!(
-                    fields.status,
-                    Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
-                );
-                if ended {
-                    if let Some(steps) = count(STEPS) {
-                        let duration = get(DURATION).and_then(Value::as_f64);
-                        let duration = duration.unwrap_or_default();
-                        helper.totals = Some(Totals { steps, duration });
-                    }
-                    let (input, output) = tokens.unwrap_or_default();
-                    self.stats.agent_input += input;
-                    self.stats.agent_output += output;
-                }
-
-                started.revision += 1;
-                let waiting = started.helpers.iter().any(Helper::waiting);
-                match spot {
-                    Spot::Settled(entry) if step.helping() == 0 => {
-                        self.lively.remove(&entry);
-                    }
-                    // The call's rows are drawn on their own only while its agents are at work
-                    Spot::Held(_) | Spot::Live if !waiting => self.revision += 1,
-                    _ => {}
-                }
-                return false;
-            }
-        }
-
-        self.revision += 1;
-        // A retry notice is followed by a usage update that withdraws the estimate
-        if !matches!(update, SessionUpdate::UsageUpdate(_)) {
-            self.retry_at = None;
         }
 
         match update {
@@ -473,8 +405,7 @@ impl Conversation {
                     id: call.tool_call_id.0.to_string(),
                     command: call.title.clone(),
                     output: String::new(),
-                    end: None,
-                    interrupted: false,
+                    end: ShellEnd::Running,
                 };
                 self.held.push(Entry::Shell(shell));
             }
@@ -486,10 +417,115 @@ impl Conversation {
             }
 
             SessionUpdate::ToolCallUpdate(call) => {
+                // An agent the code started keeps updating after the step of its call has ended
+                let id = &*call.tool_call_id.0;
+                let mut place = None;
+                let mut named = None;
+                let mut taken = Vec::new();
+                for (spot, step) in self.working() {
+                    for (at, item) in step.items.iter().enumerate() {
+                        let Item::Call(started) = item else {
+                            continue;
+                        };
+                        for (index, helper) in started.helpers.iter().enumerate() {
+                            if helper.id == id {
+                                place = Some((spot, at, index));
+                                named = helper.name.clone().filter(|_| helper.started.is_none());
+                            }
+                            if helper.state() == State::Running {
+                                taken.push(helper.hue);
+                            }
+                        }
+                    }
+                }
+
+                // An agent keeps the hue of its earlier tasks, which only a task yet to start looks for
+                let same = |helper: &&Helper| helper.started.is_some() && helper.name == named;
+                let earlier = match named {
+                    Some(_) => self.helpers().filter(same).last().map(|helper| helper.hue),
+                    None => None,
+                };
+                if let Some((spot, at, index)) = place {
+                    let step = match spot {
+                        Spot::Settled(entry) => {
+                            self.entries.get_mut(entry).and_then(Entry::step_mut)
+                        }
+                        Spot::Held(entry) => self.held.get_mut(entry).and_then(Entry::step_mut),
+                        Spot::Live => self.live.as_mut(),
+                    };
+                    let Some(step) = step else {
+                        return false;
+                    };
+                    let Some(Item::Call(started)) = step.items.get_mut(at) else {
+                        return false;
+                    };
+                    let helper = &mut started.helpers[index];
+
+                    let fields = &call.fields;
+                    if let Some(status) = fields.status {
+                        // The hue of its agent's earlier tasks or at its place in its call,
+                        // or the lowest free one when a running agent holds that
+                        if status == ToolCallStatus::InProgress && helper.started.is_none() {
+                            let wanted = earlier.unwrap_or(index % HUES);
+                            let free = (0..HUES).find(|hue| !taken.contains(hue));
+                            helper.hue = match taken.contains(&wanted) {
+                                true => free.unwrap_or(wanted),
+                                false => wanted,
+                            };
+                            helper.started = Some(Instant::now());
+                        }
+                        helper.status = status;
+                    }
+
+                    // A preview follows the status, and the last update holds only the answer or error
+                    if let Some(content) = &fields.content {
+                        let (texts, _) = contents(content);
+                        let mut texts = texts.into_iter();
+                        helper.text = texts.next().unwrap_or_default();
+                        helper.preview = texts.collect();
+                    }
+
+                    let measured = measured(call.meta.as_ref());
+                    if measured.interrupted {
+                        helper.interrupted = true;
+                    }
+                    let tokens = Tokens::of(&measured);
+                    if tokens.is_some() {
+                        helper.tokens = tokens;
+                    }
+
+                    // Every update carries its usage so far, so only the last one counts
+                    let ended = matches!(
+                        fields.status,
+                        Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+                    );
+                    if ended {
+                        if let Some(steps) = measured.steps {
+                            let duration = measured.duration.unwrap_or_default();
+                            helper.totals = Some(Totals { steps, duration });
+                        }
+                        self.stats.agent_tokens += tokens.unwrap_or_default();
+                    }
+
+                    started.revision += 1;
+                    let waiting = started.helpers.iter().any(Helper::waiting);
+                    match spot {
+                        Spot::Settled(entry) if step.helping() == 0 => {
+                            self.lively.remove(&entry);
+                        }
+                        // The call's rows are drawn on their own only while its agents are at work
+                        Spot::Held(_) | Spot::Live if !waiting => self.revision += 1,
+                        _ => {}
+                    }
+                    return false;
+                }
+
+                self.revision += 1;
+                self.retry_at = None;
                 let mut running = None;
                 for entry in self.held.iter_mut().rev() {
                     if let Entry::Shell(shell) = entry {
-                        if shell.id == *call.tool_call_id.0 && shell.end.is_none() {
+                        if shell.id == id && shell.end == ShellEnd::Running {
                             running = Some(shell);
                             break;
                         }
@@ -509,14 +545,15 @@ impl Conversation {
                     shell.output = texts.concat();
                 }
 
-                let get = |key: &str| call.meta.as_ref().and_then(|meta| meta.get(key));
-                let error = get(ERROR).and_then(Value::as_str).unwrap_or_default();
-                let interrupted = get(INTERRUPTED).and_then(Value::as_bool);
-                shell.interrupted = interrupted.unwrap_or(false);
-                shell.end = match fields.status {
-                    Some(ToolCallStatus::Completed) => Some(String::new()),
-                    Some(ToolCallStatus::Failed) => Some(error.to_owned()),
-                    _ => None,
+                let meta = call.meta.as_ref();
+                let error = meta.and_then(|meta| meta.get(ERROR));
+                let error = error.and_then(Value::as_str).unwrap_or_default().to_owned();
+                let interrupted = measured(meta).interrupted;
+                shell.end = match (fields.status, interrupted) {
+                    (Some(ToolCallStatus::Completed), _) => ShellEnd::Exited,
+                    (Some(ToolCallStatus::Failed), true) => ShellEnd::Interrupted(error),
+                    (Some(ToolCallStatus::Failed), false) => ShellEnd::Failed(error),
+                    _ => ShellEnd::Running,
                 };
             }
 
@@ -527,29 +564,26 @@ impl Conversation {
                     self.stats.context = Some(usage.used);
                 }
                 self.stats.window = (usage.size > 0).then_some(usage.size);
-                let get = |key: &str| usage.meta.as_ref().and_then(|meta| meta.get(key));
-                self.stats.estimated = get(ESTIMATED_OUTPUT).and_then(Value::as_u64);
+                let measured = measured(usage.meta.as_ref());
+                self.stats.estimated = measured.estimated_output;
 
                 // Model switches and mid-generation estimates carry no `duration` and are not steps
-                let Some(duration) = get(DURATION).and_then(Value::as_f64) else {
+                let Some(duration) = measured.duration else {
                     return false;
                 };
 
                 let stats = StepStats {
                     duration,
-                    decode: get(DECODE_DURATION).and_then(Value::as_f64),
-                    input: get(INPUT_TOKENS).and_then(Value::as_u64),
-                    output: get(OUTPUT_TOKENS).and_then(Value::as_u64),
+                    decode: measured.decode_duration,
+                    tokens: Tokens::of(&measured),
                 };
 
                 self.stats.steps += 1;
-                self.stats.input += stats.input.unwrap_or(0);
-                self.stats.output += stats.output.unwrap_or(0);
+                self.stats.tokens += stats.tokens.unwrap_or_default();
 
-                let flag = |key: &str| get(key).and_then(Value::as_bool).unwrap_or(false);
                 let mut step = self.live.take().unwrap_or_default();
                 // A replayed turn has no stop reason, which leaves this as the only sign of an interrupt
-                step.interrupted = flag(INTERRUPTED);
+                step.interrupted = measured.interrupted;
                 step.stats = Some(stats);
                 self.hold(step);
                 return true;
@@ -687,17 +721,7 @@ impl Conversation {
         self.finish_turn(Outcome::Failed(text.clone()));
 
         // Compaction in the turn's last step may have shown this error already
-        let mut last = None;
-        for entry in self.entries.iter().rev() {
-            match entry {
-                Entry::Step(step) => {
-                    last = Some(step);
-                    break;
-                }
-                entry if entry.opens_turn() => break,
-                _ => {}
-            }
-        }
+        let last = self.last_step();
         let shown = match last.and_then(|step| step.items.last()) {
             Some(Item::Call(call)) => call.parts().error,
             _ => None,
@@ -714,8 +738,7 @@ pub(crate) struct StepStats {
     pub(crate) duration: f64,
     /// Seconds, counted from the first token
     pub(crate) decode: Option<f64>,
-    pub(crate) input: Option<u64>,
-    pub(crate) output: Option<u64>,
+    pub(crate) tokens: Option<Tokens>,
 }
 
 #[derive(Debug, Default)]
@@ -786,8 +809,8 @@ pub(crate) struct Helper {
     /// Its agent's, or chosen at its start from the hues no running agent holds,
     /// which no later frame can work out
     pub(crate) hue: usize,
-    /// Input and output tokens so far
-    pub(crate) tokens: Option<(u64, u64)>,
+    /// So far
+    pub(crate) tokens: Option<Tokens>,
     /// Known once it ends
     pub(crate) totals: Option<Totals>,
 }
@@ -795,8 +818,8 @@ pub(crate) struct Helper {
 /// An agent the code started, as its tasks show it
 pub(crate) struct Agent<'a> {
     pub(crate) latest: &'a Helper,
-    /// Input and output tokens of all its tasks
-    pub(crate) tokens: (u64, u64),
+    /// Of all its tasks
+    pub(crate) tokens: Tokens,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1045,6 +1068,15 @@ fn subject(text: &str) -> &str {
     }
 }
 
+/// What `_meta` tells of usage and ends, nothing when there is no `_meta`
+fn measured(meta: Option<&Meta>) -> Measured {
+    let Some(meta) = meta else {
+        return Measured::default();
+    };
+    let object = Value::Object(meta.clone());
+    Measured::deserialize(&object).unwrap_or_default()
+}
+
 fn text_of(content: &ContentBlock) -> String {
     match content {
         ContentBlock::Text(text) => text.text.clone(),
@@ -1143,7 +1175,11 @@ mod tests {
 
         let stats = talk.stats();
         assert_eq!((stats.turns, stats.steps), (1, 2));
-        assert_eq!((stats.input, stats.output), (30, 3));
+        let tokens = Tokens {
+            input: 30,
+            output: 3,
+        };
+        assert_eq!(stats.tokens, tokens);
         assert_eq!((stats.context, stats.window), (Some(22), Some(100)));
         assert_eq!(stats.ratio(), Some(0.22));
 
@@ -1305,13 +1341,19 @@ mod tests {
         let hues: Vec<usize> = call.helpers.iter().map(|helper| helper.hue).collect();
         assert_eq!(hues, [0, 1, 2, 0]);
         let agents = talk.agents();
-        let named: Vec<(Option<&str>, (u64, u64))> = agents
+        let named: Vec<(Option<&str>, u64, u64)> = agents
             .iter()
-            .map(|agent| (agent.latest.name.as_deref(), agent.tokens))
+            .map(|agent| {
+                (
+                    agent.latest.name.as_deref(),
+                    agent.tokens.input,
+                    agent.tokens.output,
+                )
+            })
             .collect();
         assert_eq!(
             named,
-            [(Some("cafés"), (120, 10)), (None, (0, 0)), (None, (0, 0))]
+            [(Some("cafés"), 120, 10), (None, 0, 0), (None, 0, 0)]
         );
     }
 

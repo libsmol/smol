@@ -442,10 +442,10 @@ def help(request: object) -> None:
     text = "\n".join(parts)
     print(text, limit=None)
 
-# _AGENTS is false in the workers of agents that agent() starts, which only recall memories
-_MEMORY = [remember, recall, forget] if _AGENTS else [recall]
+# _MAIN_AGENT is false in the workers of agents that agent() starts, which only recall memories
+_MEMORY = [remember, recall, forget] if _MAIN_AGENT else [recall]
 _BUILTINS = [edit, ls, grep, fetch, view, *_MEMORY, help]
-if _AGENTS:
+if _MAIN_AGENT:
     _BUILTINS[-1:-1] = [agent, agent.wait, agent.stop]
 
 _FUNCTIONS = []

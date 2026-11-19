@@ -74,7 +74,8 @@ pub(crate) struct Workplace {
     pub(crate) sandbox: Sandbox,
     /// The file workers start from
     pub(crate) program: PathBuf,
-    writable: Option<Vec<PathBuf>>,
+    /// The places in `[allow] write` that existed when the session opened
+    extra: Vec<PathBuf>,
 }
 
 impl Workplace {
@@ -103,13 +104,20 @@ impl Workplace {
             fs::create_dir_all(folder).map_err(failed)?;
         }
 
+        let mut extra = Vec::new();
+        for path in &access.write {
+            if path.exists() {
+                extra.push(path.clone());
+            }
+        }
+
         let mut rules = Rules::default();
         for name in PASSED_ENV {
             rules.env.push(name.to_string());
         }
         rules.env.extend(access.env.iter().cloned());
         rules.write = vec![cwd.clone(), copies.clone(), venv.path.clone()];
-        rules.write.extend(access.write.iter().cloned());
+        rules.write.extend(extra.iter().cloned());
         for skill in skills {
             if let Some(folder) = skill.path.parent() {
                 rules.read.push(folder.to_owned());
@@ -126,13 +134,6 @@ impl Workplace {
         rules.hidden.extend(access.hidden.iter().cloned());
 
         let sandbox = Sandbox::new(&rules)?;
-        let mut existing = Vec::new();
-        for path in &access.write {
-            if path.exists() {
-                existing.push(path.clone());
-            }
-        }
-        let writable = sandbox.enforced().then_some(existing);
         let home = home_of(config);
         let program = worker::program(&home)?;
 
@@ -142,14 +143,14 @@ impl Workplace {
             venv,
             sandbox,
             program,
-            writable,
+            extra,
         })
     }
 
     /// The places in `[allow] write` that existed when the session opened, which the code may write
     /// besides its own, or `None` when files aren't isolated
     pub(crate) fn writable(&self) -> Option<&[PathBuf]> {
-        self.writable.as_deref()
+        self.sandbox.enforced().then_some(&self.extra)
     }
 }
 

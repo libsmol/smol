@@ -379,4 +379,4 @@ def _run(code):
 
     # Undecodable filename bytes become lone surrogates that Rust can't accept
     clean = lambda text: text if text is None else text.encode("utf-8", "backslashreplace").decode()
-    return {"error": clean(error), "code": clean(repaired)}
+    return {"error": clean(error), "repaired": clean(repaired)}

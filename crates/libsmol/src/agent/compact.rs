@@ -48,8 +48,8 @@ impl Turn<'_> {
         let mut recent = 0;
         let mut kept = 0;
         for step in visible.steps.iter().rev() {
-            let messages = step.messages(&mut 0);
-            let sent = bytes(&messages, &takes);
+            let messages = step.messages(&mut 0, &takes);
+            let sent = bytes(&messages);
             recent += estimate(sent);
             if recent > max_recent {
                 break;
@@ -79,8 +79,8 @@ impl Turn<'_> {
                 break;
             }
 
-            let messages = step.messages(&mut 0);
-            let sent = bytes(&messages, &takes);
+            let messages = step.messages(&mut 0, &takes);
+            let sent = bytes(&messages);
             unseen += estimate(sent);
             if unseen > window / 2 {
                 break;
@@ -235,7 +235,9 @@ mod tests {
     use crate::agent::tests::{called, recorded, reply, Run, Script};
     use crate::model::{Finish, Generating, MediaKind, Model, ModelError, StreamDelta, TokenUsage};
     use crate::steps::tests::{asked, coded, metered, replied};
-    use crate::steps::{AgentMemory, AgentStep, Attachment, Exit, ShellStep, StepError, TaskStep};
+    use crate::steps::{
+        AgentMemory, AgentStep, Attachment, Content, Exit, ShellStep, StepError, TaskStep,
+    };
     use crate::tests::content;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -522,8 +524,10 @@ mod tests {
         let mut run = agent(Some(4000), replies);
         let data = Attachment {
             path: "data.txt".to_owned(),
-            content: "café ".repeat(1800),
-            ..Attachment::default()
+            content: Content::File {
+                text: "café ".repeat(1800),
+                lines: None,
+            },
         };
         let task = TaskStep {
             files: vec![data],
@@ -806,8 +810,10 @@ mod tests {
         };
         let data = Attachment {
             path: "big.txt".to_owned(),
-            content: "crème brûlée ".repeat(3375),
-            ..Attachment::default()
+            content: Content::File {
+                text: "crème brûlée ".repeat(3375),
+                lines: None,
+            },
         };
         let update = TaskStep {
             files: vec![data],

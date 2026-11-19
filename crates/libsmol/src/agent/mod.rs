@@ -5,15 +5,15 @@ use crate::model::{
 };
 use crate::prompt;
 use crate::steps::{
-    bytes, estimate, AgentMemory, AgentStep, Call, Helper, MemoryStep, Program, StepError,
+    bytes, estimate, AgentMemory, AgentStep, Call, Content, Ending, MemoryStep, Program, StepError,
     SummaryStep, TaskStep, Usage,
 };
 use crate::tools::attach::{attach, Mention};
-use crate::tools::memories::{Listed, Memories};
+use crate::tools::memories::{Digest, Memories};
 use crate::utils::Interrupt;
-use crate::worker::host::{Added, Called, Calling, Serving, Worker};
+use crate::worker::host::{Added, Called, Calling, Rank, Serving, Worker};
 use crate::worker::workplace::Workplace;
-use crate::worker::{AgentCall, Delegation, Service};
+use crate::worker::{AgentCall, Service};
 use crate::{Error, Result};
 use std::fs;
 use std::future::Future;
@@ -32,9 +32,9 @@ mod step;
 
 pub(crate) use crate::agent::delegate::{Records, Team};
 
-pub use crate::agent::delegate::MAX_PARALLEL_AGENTS;
+pub(crate) use crate::agent::delegate::MAX_PARALLEL_AGENTS;
 
-const MAX_NAMING_CHARS: usize = 2000;
+const MAX_TITLING_CHARS: usize = 2000;
 const MAX_RETRIES: u32 = 3;
 const RETRY_WAIT: Duration = match cfg!(test) {
     true => Duration::from_millis(10),
@@ -83,7 +83,7 @@ pub(crate) trait Sink: Send {
     fn saved(&mut self, memory: &AgentMemory);
 
     /// Shows the agents that the code of the call at `index` starts
-    fn helpers(&mut self, index: usize) -> Box<dyn Helpers>;
+    fn tasks(&mut self, index: usize) -> Box<dyn TaskViews>;
 }
 
 pub(crate) type Asking<'a> = Pin<Box<dyn Future<Output = Vec<Task>> + Send + 'a>>;
@@ -98,19 +98,19 @@ pub(crate) trait Queue: Send + Sync {
     fn enqueued(&self) -> Nudging<'_>;
 }
 
-/// Helpers are numbered from 1 within the call that starts them,
-/// and each opens with the record it keeps until it ends
-pub(crate) trait Helpers: Send + Sync {
-    fn open(&self, number: usize, helper: &Helper) -> Box<dyn HelperView>;
+/// Tasks are numbered from 1 within the call that sends them
+pub(crate) trait TaskViews: Send + Sync {
+    fn open(&self, number: usize, name: &str, task: &str) -> Box<dyn TaskView>;
 
     /// The agents the call's code waits for, none once it stops waiting
     fn waiting(&self, names: &[String]);
 }
 
-pub(crate) trait HelperView: Send {
+pub(crate) trait TaskView: Send {
     fn shown(&mut self, status: &Status);
 
-    fn close(&mut self, helper: &Helper);
+    /// `steps` are those the task added to its agent's conversation
+    fn close(&mut self, end: &Ending, steps: &[MemoryStep]);
 }
 
 /// What an agent started by `agent()` is doing now,
@@ -129,18 +129,18 @@ pub(crate) struct Status {
 
 pub(crate) struct Unseen;
 
-impl Helpers for Unseen {
-    fn open(&self, _: usize, _: &Helper) -> Box<dyn HelperView> {
+impl TaskViews for Unseen {
+    fn open(&self, _: usize, _: &str, _: &str) -> Box<dyn TaskView> {
         Box::new(Unseen)
     }
 
     fn waiting(&self, _: &[String]) {}
 }
 
-impl HelperView for Unseen {
+impl TaskView for Unseen {
     fn shown(&mut self, _: &Status) {}
 
-    fn close(&mut self, _: &Helper) {}
+    fn close(&mut self, _: &Ending, _: &[MemoryStep]) {}
 }
 
 /// Logs how steps and compaction end before passing events on
@@ -181,8 +181,8 @@ impl Sink for Logged<'_> {
         self.0.saved(memory);
     }
 
-    fn helpers(&mut self, index: usize) -> Box<dyn Helpers> {
-        self.0.helpers(index)
+    fn tasks(&mut self, index: usize) -> Box<dyn TaskViews> {
+        self.0.tasks(index)
     }
 }
 
@@ -223,7 +223,7 @@ pub(crate) struct Agent {
 pub(crate) struct Brief {
     pub(crate) instructions: Vec<String>,
     pub(crate) skills: Vec<Skill>,
-    pub(crate) listed: Listed,
+    pub(crate) digest: Digest,
     pub(crate) images_shown: bool,
     /// The client declared `_smol/background`, so programs that end after an answer get a turn
     pub(crate) background: bool,
@@ -257,17 +257,11 @@ impl Place {
         }
     }
 
-    /// Whether its worker offers `agent()`
-    pub(crate) fn delegation(&self) -> Delegation {
+    pub(crate) fn rank(&self) -> Rank {
         match self {
-            Place::Main { .. } => Delegation::On,
-            Place::Delegated { .. } => Delegation::Off,
+            Place::Main { .. } => Rank::Main,
+            Place::Delegated { .. } => Rank::Delegated,
         }
-    }
-
-    /// The worker offers `remember()` and `forget()` exactly when it offers `agent()`
-    pub(crate) fn remembers(&self) -> bool {
-        self.delegation() != Delegation::Off
     }
 }
 
@@ -318,15 +312,15 @@ impl Agent {
     }
 
     /// Answers what the code of one call asks of the agent,
-    /// and keeps the record of each task it sends in `records`
+    /// and lists each task it sends in `records`
     pub(crate) fn serving<'a>(
         &'a self,
         servers: &'a [&'a Added],
-        views: Box<dyn Helpers>,
+        views: Box<dyn TaskViews>,
         records: &Arc<Records>,
     ) -> Box<Serving<'a>> {
         let mut delegate = self.delegate(servers, views, records);
-        let writable = self.place.remembers();
+        let writable = self.place.rank() == Rank::Main;
         let serving =
             move |service: Service| serve(service, &mut *delegate, &self.memories, writable);
         Box::new(serving)
@@ -384,9 +378,9 @@ impl Turn<'_> {
             if let Some(window) = self.agent.model.context_window() {
                 // Image and video estimates run high, so only text counts toward refusing
                 let text_only = |_: MediaKind| false;
-                let parts = prompt::task(&task);
+                let parts = prompt::task(&task, &text_only);
                 let asked = [ChatMessage::User(parts)];
-                let sent = bytes(&asked, &text_only);
+                let sent = bytes(&asked);
                 let size = estimate(sent);
                 if size > window / 2 {
                     discard(&task, copies);
@@ -491,7 +485,7 @@ impl Turn<'_> {
 
 fn discard(task: &TaskStep, copies: &Path) {
     for file in &task.files {
-        if let Some(media) = &file.media {
+        if let Content::Media { media } = &file.content {
             let copy = copies.join(&media.file);
             fs::remove_file(copy).ok();
         }
@@ -558,7 +552,10 @@ async fn generate(
             StreamDelta::Content(text) => blank &= text.trim().is_empty(),
             StreamDelta::CallCode(_) | StreamDelta::CallEnd(_) => blank = false,
             StreamDelta::Reasoning(text) => reasoned |= !text.is_empty(),
-            StreamDelta::Sealed { item, .. } => reasoned |= item["type"] == "reasoning",
+            StreamDelta::Sealed(sealed) => {
+                let last = sealed.items.last();
+                reasoned |= last.is_some_and(|item| item["type"] == "reasoning");
+            }
         }
         on_delta(delta);
     };
@@ -638,10 +635,10 @@ async fn text_reply(
 }
 
 pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<String> {
-    let task: String = task.chars().take(MAX_NAMING_CHARS).collect();
+    let task: String = task.chars().take(MAX_TITLING_CHARS).collect();
     let message = prompt::first_message(&task);
     let request = [
-        ChatMessage::System(prompt::namer()),
+        ChatMessage::System(prompt::titler()),
         ChatMessage::user(message),
     ];
 
@@ -667,25 +664,25 @@ pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::agent::{
-        title_of, Agent, Asking, Brief, Event, Helpers, Nudging, Place, Queue, Records, Sink,
-        Streamed, Task, Turn, Unseen, RETRY_WAIT,
+        title_of, Agent, Asking, Brief, Event, Nudging, Place, Queue, Records, Sink, Streamed,
+        Task, TaskViews, Turn, Unseen, RETRY_WAIT,
     };
     use crate::config::{Access, Kind};
     use crate::history::MAX_TITLE_CHARS;
     use crate::model::{
-        ChatMessage, Finish, Finished, Generating, MediaKind, Model, ModelError, Purpose,
+        ChatMessage, Finish, Finished, Generating, MediaKind, Model, ModelError, Purpose, Sealed,
         StreamDelta, TokenUsage, Unread,
     };
     use crate::prompt::{NESTED, RESTARTED};
-    use crate::steps::{AgentMemory, MemoryStep};
+    use crate::steps::{AgentMemory, Content, MemoryStep};
     use crate::tests::{content, temp_dir, write_file, Temp};
     use crate::tools::attach::tests::mentioned;
     use crate::tools::memories::Memories;
     use crate::utils::{block_on, Interrupt};
     use crate::worker::host::tests::unserved;
-    use crate::worker::host::Worker;
+    use crate::worker::host::{Rank, Worker};
     use crate::worker::workplace::tests::opened;
-    use crate::worker::{Delegation, MemoryCall, Service};
+    use crate::worker::{MemoryCall, Service};
     use crate::Result;
     use serde_json::{json, Value};
     use std::collections::VecDeque;
@@ -734,12 +731,16 @@ pub(crate) mod tests {
                 if let Some(reasoning) = &script.reasoning {
                     on_delta(StreamDelta::Reasoning(reasoning));
                 }
+                let mut sealed = Sealed {
+                    provider: "mock".to_owned(),
+                    kind: Kind::Responses,
+                    items: Vec::new(),
+                    ends: Vec::new(),
+                };
                 for item in &script.sealed {
-                    on_delta(StreamDelta::Sealed {
-                        provider: "mock",
-                        kind: Kind::Responses,
-                        item,
-                    });
+                    sealed.items.push(item.clone());
+                    sealed.ends.push(0);
+                    on_delta(StreamDelta::Sealed(&sealed));
                 }
                 // Yields after every line so cancels and early cutoffs can land
                 for line in script.content.split_inclusive('\n') {
@@ -856,7 +857,7 @@ pub(crate) mod tests {
             self.saves.push(memory.steps.len());
         }
 
-        fn helpers(&mut self, _: usize) -> Box<dyn Helpers> {
+        fn tasks(&mut self, _: usize) -> Box<dyn TaskViews> {
             Box::new(Unseen)
         }
     }
@@ -971,7 +972,7 @@ pub(crate) mod tests {
             &interrupt,
             Arc::clone(&workplace),
             &[],
-            Delegation::On,
+            Rank::Main,
             restarted,
         );
         let worker = block_on(starting).expect("worker");
@@ -1099,7 +1100,9 @@ pub(crate) mod tests {
         let MemoryStep::Task(task) = &memory.steps[0] else {
             panic!("{:?}", memory.steps);
         };
-        let media = task.files[0].media.as_ref().expect("media");
+        let Content::Media { media } = &task.files[0].content else {
+            panic!("{task:?}");
+        };
         assert!(copies.join(&media.file).exists());
     }
 
@@ -1190,7 +1193,7 @@ pub(crate) mod tests {
             ..tested.agent.clone()
         };
         let asked = |agent: &Agent, call: MemoryCall| {
-            let records = Arc::new(Records::new(0, 0));
+            let records = Arc::new(Records::default());
             let mut serving = agent.serving(&[], Box::new(Unseen), &records);
             let calling = serving(Service::Memory(call));
             block_on(calling).result

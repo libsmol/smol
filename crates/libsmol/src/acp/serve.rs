@@ -4,7 +4,7 @@ use crate::acp::{rfc3339, task_of, to_value, App};
 use crate::config;
 use crate::config::setup::SETUP_ARG;
 use crate::history::HistoryStore;
-use crate::tools::memories::{Kept, Memories};
+use crate::tools::memories::Memories;
 use crate::utils::{block_on, new_id, Interrupt};
 use crate::worker::sandbox;
 use crate::{Error, Result};
@@ -17,7 +17,7 @@ use agent_client_protocol_schema::v1::{
 };
 use agent_client_protocol_schema::ProtocolVersion;
 use reaper::cause;
-use reaper::wire::{BACKGROUND, ENQUEUED, FORGET, IMAGES, MEMORIES, QUEUED, SHELL};
+use reaper::wire::{self, BACKGROUND, ENQUEUED, FORGET, MEMORIES, SHELL};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -273,16 +273,14 @@ struct ForgetParams {
 impl Router {
     /// On None another task sends the reply
     fn request(&mut self, id: &Value, method: &str, params: Value) -> Result<Option<Value>> {
+        // A session whose task ended unclosed, as when one failed to open, is forgotten here
+        self.sessions.retain(|_, handle| !handle.sender.is_closed());
+
         let names = &AGENT_METHOD_NAMES;
         let result = match method {
             m if m == names.initialize => {
                 let client = &params["clientCapabilities"];
-                let queued = client["_meta"][QUEUED].as_bool() == Some(true);
-                self.app.peer.set_queued(queued);
-                let images = client["_meta"][IMAGES].as_bool() == Some(true);
-                self.app.peer.set_images(images);
-                let background = client["_meta"][BACKGROUND].as_bool() == Some(true);
-                self.app.peer.set_background(background);
+                self.app.peer.declare(&client["_meta"]);
                 let terminal = client["auth"]["terminal"].as_bool() == Some(true);
 
                 let close = SessionCloseCapabilities::new();
@@ -367,15 +365,9 @@ impl Router {
                 let memories = handle.memories.clone();
                 let span = handle.span.clone();
                 let listing = async move {
-                    let seen = memories.seen().await;
-                    let seen = seen.map_err(Error::Memory)?;
-
-                    let mut listed = Vec::new();
-                    for Kept { id, text, project } in seen {
-                        let memory = json!({ "id": id, "text": text, "project": project });
-                        listed.push(memory);
-                    }
-                    Ok(json!({ "memories": listed }))
+                    let listed = memories.listed().await;
+                    let memories = listed.map_err(Error::Memory)?;
+                    Ok(json!(wire::Memories { memories }))
                 };
                 self.answer(id, span, listing);
                 None
@@ -443,7 +435,7 @@ impl Router {
             true => self.app.store.locate(&cwd, &session),
             false => Ok(()),
         };
-        let (models, (servers, access, mcp_skipped)) = match (models, agent, located) {
+        let (models, agent) = match (models, agent, located) {
             (Ok(models), Ok(agent), Ok(())) => (models, agent),
             (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                 let _entered = span.enter();
@@ -460,9 +452,6 @@ impl Router {
             Some(old) => Some(old.close()),
             None => self.closing.remove(&session),
         };
-        // A session whose task ended unclosed would otherwise stay until a request names it
-        self.sessions.retain(|_, handle| !handle.sender.is_closed());
-
         let interrupt = Interrupt::default();
         let enqueued = Arc::new(Notify::new());
         let memories = Memories::new(&self.app.config, &cwd);
@@ -474,9 +463,7 @@ impl Router {
             loading,
             previous,
             models,
-            servers,
-            access,
-            mcp_skipped,
+            agent,
             app: Arc::clone(&self.app),
             interrupt: interrupt.clone(),
             enqueued: Arc::clone(&enqueued),
@@ -506,15 +493,7 @@ impl Router {
         Ok(handle.received)
     }
 
-    /// Forgets a session whose task ended unclosed, as when it failed to open
     fn handle(&mut self, session: &str) -> Result<&mut Handle> {
-        let ended = self
-            .sessions
-            .get(session)
-            .is_some_and(|handle| handle.sender.is_closed());
-        if ended {
-            self.sessions.remove(session);
-        }
         self.sessions
             .get_mut(session)
             .ok_or_else(|| unknown(session))

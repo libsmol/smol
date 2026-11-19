@@ -10,10 +10,10 @@ pub(crate) mod venv;
 pub(crate) mod workplace;
 
 /// Holds the `address/token` the agent listens on
-pub const CONTROL_ENV: &str = "SMOL_CONTROL";
-pub const COPIES_ENV: &str = "SMOL_COPIES";
-/// Holds `on`, and is unset for workers without `agent()`
-pub const AGENTS_ENV: &str = "SMOL_AGENTS";
+pub(crate) const CONTROL_ENV: &str = "SMOL_CONTROL";
+pub(crate) const COPIES_ENV: &str = "SMOL_COPIES";
+/// Holds `on` in the session's own worker, and is unset in those of agents that `agent()` starts
+pub(crate) const MAIN_ENV: &str = "SMOL_MAIN";
 /// Starts libsmol's executable as a session's worker, followed by the venv it runs as
 pub(crate) const WORKER_ARG: &str = "--worker";
 /// The worker cuts each `print()` to it
@@ -21,9 +21,19 @@ pub(crate) const MAX_PRINT_CHARS: usize = 8192;
 
 /// The marker the worker writes after each snippet's output,
 /// made from the token because the output may hold any fixed marker
-pub fn end_marker(token: &str) -> Vec<u8> {
+pub(crate) fn end_marker(token: &str) -> Vec<u8> {
     let marker = format!("\x02{token}\x03end\n");
     marker.into_bytes()
+}
+
+/// What `CONTROL_ENV` holds
+pub(crate) fn control(address: &str, token: &str) -> String {
+    format!("{address}/{token}")
+}
+
+/// The address and token in what `control` made
+pub(crate) fn controlled(control: &str) -> Option<(&str, &str)> {
+    control.split_once('/')
 }
 
 /// The worker's first line, with its version since one of another version would misread the messages
@@ -32,17 +42,23 @@ pub(crate) fn greeting(token: &str) -> String {
     format!("{token} {version}")
 }
 
+/// The version in a greeting with `token`, None for a line that isn't one
+pub(crate) fn greeted<'a>(line: &'a str, token: &str) -> Option<&'a str> {
+    let (said, version) = line.split_once(' ')?;
+    (said == token).then_some(version)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Function {
-    pub name: String,
-    pub header: String,
-    pub summary: String,
+pub(crate) struct Function {
+    pub(crate) name: String,
+    pub(crate) header: String,
+    pub(crate) summary: String,
 }
 
 /// `untagged` tries variants in order and `Note`, which ignores `id`, must come last
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum Message<C, N> {
+pub(crate) enum Message<C, N> {
     Request {
         id: u64,
         #[serde(flatten)]
@@ -60,7 +76,7 @@ pub enum Message<C, N> {
 }
 
 impl<C, N> Message<C, N> {
-    pub fn reply(id: u64, result: Reply) -> Self {
+    pub(crate) fn reply(id: u64, result: Reply) -> Self {
         match result {
             Ok(result) => Message::Answer { id, result },
             Err(error) => Message::Error { id, error },
@@ -68,12 +84,12 @@ impl<C, N> Message<C, N> {
     }
 }
 
-pub type ToWorker = Message<HostCall, HostNote>;
-pub type FromWorker = Message<WorkerCall, WorkerNote>;
+pub(crate) type ToWorker = Message<HostCall, HostNote>;
+pub(crate) type FromWorker = Message<WorkerCall, WorkerNote>;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub enum HostCall {
+pub(crate) enum HostCall {
     Run {
         code: String,
     },
@@ -88,14 +104,14 @@ pub enum HostCall {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub enum HostNote {
+pub(crate) enum HostNote {
     Cancel { id: u64 },
     RemoveServer { name: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub enum WorkerCall {
+pub(crate) enum WorkerCall {
     /// `called` is the `server.function` as written in the code, and the answer is `{"text"}`,
     /// with `"structured"` too when the result holds structured content
     Tool {
@@ -111,7 +127,7 @@ pub enum WorkerCall {
 /// What the agent answers itself rather than the worker
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum Service {
+pub(crate) enum Service {
     Agent(AgentCall),
     Memory(MemoryCall),
 }
@@ -119,7 +135,7 @@ pub enum Service {
 /// A call to `remember()`, `recall()` or `forget()`
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub enum MemoryCall {
+pub(crate) enum MemoryCall {
     /// Answered with the new memory's id
     Remember { text: String, project: bool },
     /// Answered with `[[id, text], ...]`
@@ -131,7 +147,7 @@ pub enum MemoryCall {
 /// A call to `agent()`, `agent.wait()` or `agent.stop()`, which name agents
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub enum AgentCall {
+pub(crate) enum AgentCall {
     /// Answered with null at once
     Send(Asked),
     /// Answered once the agents end or after `timeout` seconds with `{"answers", "working"}`,
@@ -146,21 +162,14 @@ pub enum AgentCall {
 
 /// A task for the agent named `name`
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Asked {
+pub(crate) struct Asked {
     pub(crate) name: String,
     pub(crate) task: String,
 }
 
-/// Whether a worker offers `agent()`
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Delegation {
-    Off,
-    On,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub enum WorkerNote {
+pub(crate) enum WorkerNote {
     Ready {
         functions: Vec<Function>,
     },

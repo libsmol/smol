@@ -1,11 +1,10 @@
-use crate::config::{Kind, ModelSpec};
+use crate::config::{Kind, ModelSpec, Provider};
 use crate::prompt::{self, ARGUMENT, TOOL};
 use crate::tools::attach::read_copy;
-use crate::utils::{excerpt, http_cause, http_client, read_cause};
+use crate::utils::{content_type, excerpt, http_cause, http_client, read_cause};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use reqwest::header::CONTENT_TYPE;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::env;
@@ -60,17 +59,11 @@ pub(crate) enum ChatMessage {
 pub(crate) struct Sealed {
     /// The `[model.<name>]` table, since no other provider can open them
     pub(crate) provider: String,
-    /// Sessions saved before Chat Completions sealed anything hold only items of Responses
-    #[serde(default = "responses")]
     pub(crate) kind: Kind,
     pub(crate) items: Vec<Value>,
     /// Bytes of reply text received as each item ended, which give each message its own text back
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) ends: Vec<usize>,
-}
-
-fn responses() -> Kind {
-    Kind::Responses
 }
 
 impl ChatMessage {
@@ -124,12 +117,12 @@ impl ToolCall {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Part {
     Text(String),
-    /// The display name and the media, whose file is read only when a request is sent
+    /// The display name and media the model takes, whose copy is read only when a request is sent
     Media(String, Media),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Media {
+pub(crate) struct Media {
     pub(crate) kind: MediaKind,
     pub(crate) mime: String,
     /// The file name in the copies directory, which still resolves after the config directory moves
@@ -200,12 +193,8 @@ pub(crate) enum StreamDelta<'a> {
     /// The code of an `eval` tool call, decoded as it streams in
     CallCode(&'a str),
     CallEnd(Result<(), Unread<'a>>),
-    /// What the reply holds beyond its text and calls, which only its provider reads
-    Sealed {
-        provider: &'a str,
-        kind: Kind,
-        item: &'a Value,
-    },
+    /// All the reply holds so far beyond its text and calls, which only its provider reads
+    Sealed(&'a Sealed),
 }
 
 /// A call to another tool, or one whose arguments yield no code, carried exactly as received
@@ -268,34 +257,36 @@ pub(crate) trait Model: Send + Sync {
 
 pub(crate) struct OpenAIModel {
     client: Client,
+    /// The `[model.<name>]` table it comes from
     provider: String,
     kind: Kind,
-    id: String,
-    api: String,
+    spec: ModelSpec,
+    url: String,
     key: Option<String>,
-    effort: Option<String>,
-    summary: Option<String>,
-    window: Option<u64>,
-    max_tokens: Option<u64>,
-    image: bool,
-    video: bool,
+    /// Where the media it sends was copied to
+    copies: PathBuf,
 }
 
 impl OpenAIModel {
     pub(crate) fn new(
-        provider: &str,
-        spec: &ModelSpec,
-        kind: Kind,
-        api: Option<String>,
-        key: Option<String>,
+        name: &str,
+        provider: &Provider,
+        spec: ModelSpec,
+        copies: PathBuf,
     ) -> Result<Self, ModelError> {
         // A key from the environment only goes to the default OpenAI endpoint
-        let key = match api.is_some() {
+        let key = provider.api_key.clone();
+        let key = match provider.api.is_some() {
             true => key,
             false => key.or_else(|| env::var("OPENAI_API_KEY").ok()),
         };
         let key = key.filter(|key| real_key(key));
-        let api = api.unwrap_or_else(|| DEFAULT_API.to_owned());
+        let api = provider.api.as_deref().unwrap_or(DEFAULT_API);
+        let api = api.trim_end_matches('/');
+        let path = match provider.kind {
+            Kind::Completions => "chat/completions",
+            Kind::Responses => "responses",
+        };
 
         let builder = Client::builder()
             .read_timeout(IDLE_WAIT)
@@ -306,23 +297,19 @@ impl OpenAIModel {
 
         Ok(Self {
             client,
-            provider: provider.to_owned(),
-            kind,
-            id: spec.id.clone(),
-            api,
+            provider: name.to_owned(),
+            kind: provider.kind,
+            spec,
+            url: format!("{api}/{path}"),
             key,
-            effort: spec.effort.clone(),
-            summary: spec.summary.clone(),
-            window: spec.context,
-            max_tokens: spec.max_tokens,
-            image: spec.image,
-            video: spec.video,
+            copies,
         })
     }
 
     /// Leaving it out still has the server reason at its default effort
     fn effort_for(&self, purpose: Purpose) -> Option<&str> {
-        self.effort.as_deref().filter(|_| purpose != Purpose::Title)
+        let effort = self.spec.effort.as_deref();
+        effort.filter(|_| purpose != Purpose::Title)
     }
 
     /// Sealed items go back only to the provider and API that wrote them
@@ -355,20 +342,11 @@ impl OpenAIModel {
                     Part::Media(label, media) => (label, media),
                 };
 
-                let accepted = self.takes(media.kind);
-                let read = accepted.then(|| read_copy(&media.file, media.kind));
-                let bytes = match read {
-                    Some(Ok(bytes)) => bytes,
-                    Some(Err(_)) => {
-                        let note = prompt::missing(label, media);
-                        lines.push(note);
-                        continue;
-                    }
-                    None => {
-                        let note = prompt::unseen(label, media);
-                        lines.push(note);
-                        continue;
-                    }
+                let copy = self.copies.join(&media.file);
+                let Ok(bytes) = read_copy(&copy, media.kind) else {
+                    let note = prompt::missing(label, media);
+                    lines.push(note);
+                    continue;
                 };
 
                 let tag = prompt::media_tag(label, media);
@@ -423,20 +401,12 @@ impl Model for OpenAIModel {
         purpose: Purpose,
         on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
     ) -> Generating<'a> {
-        let (path, body) = match self.kind {
-            Kind::Completions => {
-                let body = completions::body(self, conversation, purpose);
-                ("chat/completions", body)
-            }
-            Kind::Responses => {
-                let body = responses::body(self, conversation, purpose);
-                ("responses", body)
-            }
+        let body = match self.kind {
+            Kind::Completions => completions::body(self, conversation, purpose),
+            Kind::Responses => responses::body(self, conversation, purpose),
         };
 
-        let api = self.api.trim_end_matches('/');
-        let url = format!("{api}/{path}");
-        let mut request = self.client.post(&url).json(&body);
+        let mut request = self.client.post(&self.url).json(&body);
         if let Some(key) = &self.key {
             request = request.bearer_auth(key);
         }
@@ -448,13 +418,7 @@ impl Model for OpenAIModel {
                 Err(e) => return Err(network_error(&e)),
             };
 
-            let header = response.headers().get(CONTENT_TYPE);
-            let header = header
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default();
-            let (mime, _) = header.split_once(';').unwrap_or((header, ""));
-            let mime = mime.trim().to_ascii_lowercase();
-
+            let (mime, _) = content_type(response.headers());
             let status = response.status();
             if !status.is_success() {
                 let headers = response.headers();
@@ -467,13 +431,7 @@ impl Model for OpenAIModel {
                 let retry_after = wait.and_then(|wait| Duration::try_from_secs_f64(wait).ok());
 
                 let text = response.text().await.unwrap_or_default();
-                let json: Value = serde_json::from_str(&text).unwrap_or_default();
-                // An error page from a fronting proxy is only useful for its status
-                let said = match (json.is_null(), mime.as_str()) {
-                    (true, "text/html") => status.canonical_reason().unwrap_or_default().to_owned(),
-                    _ => error_text(&json, &text),
-                };
-
+                let said = said(status, &mime, &text);
                 let code = status.as_u16();
                 let mut message = prompt::http_status(code, &said);
                 let mut transient = retryable(code);
@@ -531,22 +489,30 @@ impl Model for OpenAIModel {
     }
 
     fn context_window(&self) -> Option<u64> {
-        self.window
+        self.spec.context
     }
 
     fn max_tokens(&self) -> Option<u64> {
-        self.max_tokens
+        self.spec.max_tokens
     }
 
     fn takes(&self, kind: MediaKind) -> bool {
         match kind {
-            MediaKind::Image => self.image,
-            MediaKind::Video => self.video,
+            MediaKind::Image => self.spec.image,
+            MediaKind::Video => self.spec.video,
         }
     }
 }
 
-/// Adjacent user messages are merged into one
+/// Adjacent user messages go together, since both APIs send them merged into one
+fn grouped(conversation: &[ChatMessage]) -> impl Iterator<Item = &[ChatMessage]> {
+    let together = |a: &ChatMessage, b: &ChatMessage| {
+        matches!((a, b), (ChatMessage::User(_), ChatMessage::User(_)))
+    };
+    conversation.chunk_by(together)
+}
+
+/// The parts of a group of user messages, one slice for each message
 fn merged(group: &[ChatMessage]) -> Vec<&[Part]> {
     let mut merged = Vec::new();
     for message in group {
@@ -605,15 +571,11 @@ pub(crate) async fn listed(api: &str, key: &str) -> Result<Vec<Offered>, ListErr
         }
     };
 
+    let (mime, _) = content_type(response.headers());
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
-    let json: Value = serde_json::from_str(&text).unwrap_or_default();
     if !status.is_success() {
-        // A page from a web server or proxy is only useful for its status
-        let said = match json.is_null() {
-            true => status.canonical_reason().unwrap_or_default().to_owned(),
-            false => error_text(&json, &text),
-        };
+        let said = said(status, &mime, &text);
         let code = status.as_u16();
         let reason = prompt::http_status(code, &said);
         let message = failed(&reason);
@@ -625,6 +587,7 @@ pub(crate) async fn listed(api: &str, key: &str) -> Result<Vec<Offered>, ListErr
         return Err(error);
     }
 
+    let json: Value = serde_json::from_str(&text).unwrap_or_default();
     let Some(entries) = json["data"].as_array() else {
         let message = failed("not a model list");
         return Err(ListError::Address(message));
@@ -659,22 +622,35 @@ pub(crate) async fn listed(api: &str, key: &str) -> Result<Vec<Offered>, ListErr
 }
 
 struct Stream {
-    kind: Kind,
-    provider: String,
     pending: Vec<u8>,
     usage: Option<TokenUsage>,
     finish: Option<Finish>,
     /// The call still being received, whose `eval` code is handed over as it arrives
     call: Option<Call>,
+    /// Bytes of reply text handed over, where the next sealed item ends
+    text: usize,
+    sealed: Sealed,
+    /// Only Responses breaks the text into paragraphs
+    paragraphs: Paragraphs,
+    /// Only Chat Completions sends fields the protocol doesn't define, which seal into one item
+    gathered: Gathered,
+}
+
+#[derive(Default)]
+struct Paragraphs {
     reasoned: bool,
     /// A summary part or reasoning item started after the last reasoning text
     parted: bool,
     said: bool,
     /// A message item started after the last text
     opened: bool,
-    /// Fields of the reply that only its provider reads
+}
+
+#[derive(Default)]
+struct Gathered {
+    /// The reply's fields beyond those of the protocol
     extras: Map<String, Value>,
-    /// The calls handed over, each with its id and the fields that only its provider reads
+    /// The calls handed over, each with its id and fields beyond those of the protocol
     called: Vec<Map<String, Value>>,
 }
 
@@ -697,19 +673,21 @@ struct Decoding {
 
 impl Stream {
     fn new(kind: Kind, provider: &str) -> Self {
-        Self {
-            kind,
+        let sealed = Sealed {
             provider: provider.to_owned(),
+            kind,
+            items: Vec::new(),
+            ends: Vec::new(),
+        };
+        Self {
             pending: Vec::new(),
             usage: None,
             finish: None,
             call: None,
-            reasoned: false,
-            parted: false,
-            said: false,
-            opened: false,
-            extras: Map::new(),
-            called: Vec::new(),
+            text: 0,
+            sealed,
+            paragraphs: Paragraphs::default(),
+            gathered: Gathered::default(),
         }
     }
 
@@ -751,7 +729,7 @@ impl Stream {
                 }
             };
 
-            let ended = match self.kind {
+            let ended = match self.sealed.kind {
                 Kind::Completions => self.chunk(&chunk, data, on_delta).map(|()| false),
                 Kind::Responses => self.event(&chunk, data, on_delta),
             };
@@ -820,11 +798,13 @@ impl Stream {
             let delta = StreamDelta::CallCode(&rest);
             on_delta(delta);
         }
-        let mut kept = mem::take(&mut call.extras);
-        if !call.id.is_empty() {
-            kept.insert("id".to_owned(), json!(call.id));
+        if self.sealed.kind == Kind::Completions {
+            let mut kept = mem::take(&mut call.extras);
+            if !call.id.is_empty() {
+                kept.insert("id".to_owned(), json!(call.id));
+            }
+            self.gathered.called.push(kept);
         }
-        self.called.push(kept);
 
         let ended = match read {
             true => Ok(()),
@@ -837,27 +817,36 @@ impl Stream {
         on_delta(delta);
     }
 
-    /// Hands over the fields the protocol doesn't define as one item shaped like the reply,
+    /// Hands over reply text, which moves where the next sealed item ends
+    fn say(&mut self, text: &str, on_delta: &mut dyn FnMut(StreamDelta)) {
+        self.text += text.len();
+        on_delta(StreamDelta::Content(text));
+    }
+
+    /// Seals an item that ends where the text handed over so far does
+    fn seal_item(&mut self, item: Value, on_delta: &mut dyn FnMut(StreamDelta)) {
+        self.sealed.items.push(item);
+        self.sealed.ends.push(self.text);
+        on_delta(StreamDelta::Sealed(&self.sealed));
+    }
+
+    /// Seals the fields Chat Completions gathered as one item shaped like the reply,
     /// whose `tool_calls` hold those of every call in order
     fn seal(&mut self, on_delta: &mut dyn FnMut(StreamDelta)) {
+        let gathered = &mut self.gathered;
         let extra = |call: &Map<String, Value>| call.keys().any(|key| key != "id");
-        if self.extras.is_empty() && !self.called.iter().any(extra) {
+        if gathered.extras.is_empty() && !gathered.called.iter().any(extra) {
             return;
         }
 
-        let mut reply = mem::take(&mut self.extras);
-        let called = mem::take(&mut self.called);
+        let mut reply = mem::take(&mut gathered.extras);
+        let called = mem::take(&mut gathered.called);
         if !called.is_empty() {
             let called = called.into_iter().map(Value::Object).collect();
             reply.insert("tool_calls".to_owned(), Value::Array(called));
         }
         let item = Value::Object(reply);
-        let sealed = StreamDelta::Sealed {
-            provider: &self.provider,
-            kind: self.kind,
-            item: &item,
-        };
-        on_delta(sealed);
+        self.seal_item(item, on_delta);
     }
 
     fn finished(self) -> Result<Finished, ModelError> {
@@ -990,6 +979,16 @@ fn real_key(key: &str) -> bool {
     !key.is_empty() && key != "none"
 }
 
+/// What a failed response says, except an error page from a web server or proxy,
+/// which is only useful for its status
+fn said(status: StatusCode, mime: &str, text: &str) -> String {
+    let json: Value = serde_json::from_str(text).unwrap_or_default();
+    match (json.is_null(), mime) {
+        (true, "text/html") => status.canonical_reason().unwrap_or_default().to_owned(),
+        _ => error_text(&json, text),
+    }
+}
+
 fn error_text(json: &Value, raw: &str) -> String {
     let fields = [
         &json["error"]["message"],
@@ -1036,6 +1035,18 @@ pub(crate) mod tests {
 
     pub(crate) const DONE: &str = "HTTP/1.1 200 OK\r\ncontent-length: 14\r\n\r\ndata: [DONE]\n\n";
 
+    /// Reaches `api` without a key, and reads the copies of media from where their names lead
+    pub(crate) fn mocked(kind: Kind, api: String, spec: &ModelSpec) -> OpenAIModel {
+        let provider = Provider {
+            kind,
+            api: Some(api),
+            api_key: None,
+            models: Vec::new(),
+        };
+        let built = OpenAIModel::new("mock", &provider, spec.clone(), PathBuf::new());
+        built.expect("model")
+    }
+
     pub(crate) fn png(file: &str) -> Media {
         Media {
             kind: MediaKind::Image,
@@ -1063,8 +1074,9 @@ pub(crate) mod tests {
                 let end = format!("[{} {}]", unread.name, unread.arguments);
                 content.push_str(&end);
             }
-            StreamDelta::Sealed { provider, item, .. } => {
-                let mark = format!("[{provider} {item}]");
+            StreamDelta::Sealed(sealed) => {
+                let item = sealed.items.last().expect("item");
+                let mark = format!("[{} {item}]", sealed.provider);
                 content.push_str(&mark);
             }
         };
@@ -1114,7 +1126,7 @@ pub(crate) mod tests {
         });
 
         let api = format!("http://{address}/v1");
-        let model = OpenAIModel::new("mock", spec, kind, Some(api), None).expect("model");
+        let model = mocked(kind, api, spec);
         let mut ignore = |_: StreamDelta| {};
         let generating = model.generate(conversation, purpose, &mut ignore);
         let finished = block_on(generating);
@@ -1434,10 +1446,10 @@ pub(crate) mod tests {
         let broken = reply("500 Internal Server Error", "text/plain", "");
         let cases = [
             (refused, "http 401: Invalid key for café"),
-            (missing, "http 404: Not Found"),
+            (missing, "http 404: 404 page not found"),
             (page, "not a model list"),
             (empty, "none listed"),
-            (broken, "http 500: Internal Server Error"),
+            (broken, "http 500"),
         ];
 
         let mut kinds = Vec::new();
@@ -1487,8 +1499,7 @@ pub(crate) mod tests {
 
         let api = format!("http://{address}/v1");
         let spec = ModelSpec::default();
-        let kind = Kind::Completions;
-        let model = OpenAIModel::new("mock", &spec, kind, Some(api), None).expect("model");
+        let model = mocked(Kind::Completions, api, &spec);
         let conversation = hello();
 
         let mut ignore = |_: StreamDelta| {};

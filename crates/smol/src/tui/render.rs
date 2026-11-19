@@ -1,11 +1,11 @@
-use crate::conversation::{Call, Entry, Helper, Item, Retry, State, Step};
+use crate::conversation::{Call, Entry, Helper, Item, Retry, ShellEnd, State, Step, Tokens};
 use crate::tui::highlight;
-use crate::tui::markdown::{self, Block, Text, LINK};
+use crate::tui::markdown::{self, Block, Kind, LINK};
 use crate::tui::picture::{self, Source};
 use crate::tui::theme::HELPERS;
 use crate::tui::transcript::Group;
 use crate::tui::{
-    clipped, in_out, joined, spinner, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG, YELLOW,
+    clipped, joined, spinner, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG, YELLOW,
 };
 use pulldown_cmark::Alignment;
 use ratatui::style::{Color, Modifier, Style};
@@ -25,6 +25,7 @@ const MAX_PREVIEW_ROWS: usize = 4;
 const MAX_TITLE_ROWS: usize = 2;
 const MAX_TITLE_COLUMNS: usize = 80;
 const MIN_CELL_COLUMNS: usize = 6;
+const MIN_RENDER_COLUMNS: usize = 8;
 
 const THINKING: Style = DIM.add_modifier(Modifier::ITALIC);
 const DIAGRAM: Style = Style::new().fg(theme::CYAN);
@@ -148,7 +149,7 @@ pub(crate) struct Row {
     pub(crate) spin: Option<(usize, Instant)>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub(crate) enum Target {
     Url(String),
     /// Mermaid source, drawn as a web page only when clicked
@@ -169,7 +170,7 @@ pub(crate) struct Render {
 impl Render {
     pub(crate) fn new(width: u16, expanded: bool) -> Self {
         Self {
-            width: usize::from(width).max(8),
+            width: usize::from(width).max(MIN_RENDER_COLUMNS),
             expanded,
             cwd: PathBuf::new(),
             rows: Vec::new(),
@@ -204,21 +205,22 @@ impl Render {
                 let lines = highlight::plain(shell.command.trim(), BOLD);
                 self.band(SHELL, lines);
 
-                let reason = shell.end.as_deref().filter(|end| !end.is_empty());
+                let ended = match &shell.end {
+                    ShellEnd::Failed(reason) => Some((reason, STEP_ERROR, RED)),
+                    ShellEnd::Interrupted(reason) => Some((reason, STOPPED, DIM)),
+                    ShellEnd::Running | ShellEnd::Exited => None,
+                };
+                let ended = ended.filter(|(reason, _, _)| !reason.is_empty());
                 let output = shell.output.trim_matches('\n');
                 if !output.is_empty() {
-                    let mark = match reason {
+                    let mark = match ended {
                         Some(_) => BRANCH,
                         None => LAST_BRANCH,
                     };
                     let lines = highlight::plain(output, Style::new());
                     self.fold(mark, lines, OUTPUT_HEAD, 0);
                 }
-                if let Some(reason) = reason {
-                    let (mark, style) = match shell.interrupted {
-                        true => (STOPPED, DIM),
-                        false => (STEP_ERROR, RED),
-                    };
+                if let Some((reason, mark, style)) = ended {
                     self.wrap(mark, reason, style);
                 }
             }
@@ -355,13 +357,13 @@ impl Render {
         let seconds = stats.duration;
         let elapsed = format!("{seconds:.1}s");
         let mut parts = vec![elapsed];
-        if let (Some(input), Some(output)) = (stats.input, stats.output) {
-            let tokens = in_out(input, output);
-            parts.push(tokens);
+        if let Some(tokens) = stats.tokens {
+            parts.push(tokens.to_string());
         }
 
         // Too short a generation gives no meaningful speed
-        let speed = match (stats.output, stats.decode) {
+        let output = stats.tokens.map(|tokens| tokens.output);
+        let speed = match (output, stats.decode) {
             (Some(tokens), Some(seconds)) if seconds >= 0.1 => Some(tokens as f64 / seconds),
             _ => None,
         };
@@ -589,8 +591,8 @@ impl Render {
                 format!("{} steps", totals.steps),
                 format!("{:.1}s", totals.duration),
             ];
-            if let Some((input, output)) = helper.tokens {
-                stats.push(in_out(input, output));
+            if let Some(tokens) = helper.tokens {
+                stats.push(tokens.to_string());
             }
             let stats = stats.join(" · ");
             self.push_status(body, vec![(stats, DIM)]);
@@ -677,116 +679,104 @@ impl Render {
 
         let mut lead = mark.first;
         for block in blocks {
-            match block {
-                Block::Text(text) => self.text_block(mark, lead, text),
+            self.block(mark, lead, block);
+            lead = mark.rest;
+        }
+    }
 
-                Block::Table {
-                    marker,
-                    indent,
-                    aligns,
-                    rows,
-                } => {
-                    let width = mark.rest.width() + indent.width();
-                    let room = self.width.saturating_sub(width);
-                    let lines = table_lines(&rows, &aligns, room);
-                    for (i, (spans, joint)) in lines.into_iter().enumerate() {
-                        let prefix = if i == 0 { &marker } else { &indent };
-                        let mut line = vec![
-                            Span::styled(lead, mark.style),
-                            Span::styled(prefix.clone(), ACCENT),
-                        ];
-                        for (text, style) in spans {
-                            line.push(Span::styled(text, style));
-                        }
+    /// `lead` goes before its first line in the style of `mark`
+    fn block(&mut self, mark: Mark, lead: &'static str, block: Block) {
+        let width = mark.rest.width() + block.indent.width();
+        let first = [
+            Span::styled(lead, mark.style),
+            Span::styled(block.marker, ACCENT),
+        ];
+        let rest = [
+            Span::styled(mark.rest, mark.style),
+            Span::styled(block.indent, ACCENT),
+        ];
 
-                        self.rows.push(Row {
-                            line: Line::from(line),
-                            mark_width: width,
-                            joint,
-                            ..Row::default()
-                        });
-                        lead = mark.rest;
+        match block.kind {
+            Kind::Text(text) => {
+                let mark_width = match text.copy_marker {
+                    true => mark.rest.width(),
+                    false => width,
+                };
+                self.push_rows(&first, &rest, mark_width, &text.spans, &text.links);
+            }
+
+            Kind::Table { aligns, rows } => {
+                let room = self.width.saturating_sub(width);
+                let lines = table_lines(&rows, &aligns, room);
+                self.push_drawn(&first, &rest, width, lines);
+            }
+
+            Kind::Diagram {
+                lines,
+                code,
+                source,
+            } => {
+                let room = self.width.saturating_sub(width);
+                let widest = lines.iter().map(|line| line.width()).max();
+                let widest = widest.unwrap_or(0);
+                if widest <= room {
+                    let mut drawn = Vec::new();
+                    for line in lines {
+                        drawn.push((vec![(line, DIAGRAM)], None));
                     }
+                    return self.push_drawn(&first, &rest, width, drawn);
                 }
 
-                Block::Diagram {
-                    marker,
-                    indent,
-                    lines,
-                    code,
-                    source,
-                } => {
-                    let width = mark.rest.width() + indent.width();
-                    let room = self.width.saturating_sub(width);
-                    let widest = lines.iter().map(|line| line.width()).max();
-                    let widest = widest.unwrap_or(0);
-
-                    // Wrapping garbles a diagram, so one too wide becomes a link to open it,
-                    // with its source listed when expanded
-                    match widest > room {
-                        true => {
-                            let mut note =
-                                format!("diagram {widest} columns wide, click to open in browser");
-                            if !self.expanded {
-                                note.push_str(" (ctrl+o for source)");
-                            }
-                            let start = self.rows.len();
-                            let link = Text {
-                                marker,
-                                indent,
-                                copy_marker: false,
-                                heading: false,
-                                spans: vec![(note, LINK)],
-                                links: Vec::new(),
-                            };
-                            self.text_block(mark, lead, link);
-                            for row in &mut self.rows[start..] {
-                                let target = Target::Diagram(code.clone());
-                                row.targets.push((0..usize::MAX, target));
-                            }
-
-                            if self.expanded {
-                                for text in source {
-                                    self.text_block(mark, mark.rest, text);
-                                }
-                            }
-                        }
-                        false => {
-                            for (i, drawn) in lines.into_iter().enumerate() {
-                                let prefix = if i == 0 { &marker } else { &indent };
-                                let line = vec![
-                                    Span::styled(lead, mark.style),
-                                    Span::styled(prefix.clone(), ACCENT),
-                                    Span::styled(drawn, DIAGRAM),
-                                ];
-
-                                self.rows.push(Row {
-                                    line: Line::from(line),
-                                    mark_width: width,
-                                    ..Row::default()
-                                });
-                                lead = mark.rest;
-                            }
-                        }
-                    }
+                // Wrapping garbles a diagram, so one too wide becomes a link to open it,
+                // with its source listed when expanded
+                let mut note = format!("diagram {widest} columns wide, click to open in browser");
+                if !self.expanded {
+                    note.push_str(" (ctrl+o for source)");
+                }
+                let start = self.rows.len();
+                self.push_rows(&first, &rest, width, &[(note, LINK)], &[]);
+                for row in &mut self.rows[start..] {
+                    let target = Target::Diagram(code.clone());
+                    row.targets.push((0..usize::MAX, target));
                 }
 
-                Block::Image {
-                    marker,
-                    indent,
-                    alt,
-                    url,
-                } => {
-                    let first = [Span::styled(lead, mark.style), Span::styled(marker, ACCENT)];
-                    let rest = [
-                        Span::styled(mark.rest, mark.style),
-                        Span::styled(indent, ACCENT),
-                    ];
-                    let source = Source::of(&url, &self.cwd);
-                    self.picture(&first, &rest, source, &alt);
+                if self.expanded {
+                    for block in source {
+                        self.block(mark, mark.rest, block);
+                    }
                 }
             }
-            lead = mark.rest;
+
+            Kind::Image { alt, url } => {
+                let source = Source::of(&url, &self.cwd);
+                self.picture(&first, &rest, source, &alt);
+            }
+        }
+    }
+
+    /// Lines drawn to fit the width, which never wrap
+    fn push_drawn(
+        &mut self,
+        first: &[Span<'static>],
+        rest: &[Span<'static>],
+        mark_width: usize,
+        lines: Vec<(Spans, Option<String>)>,
+    ) {
+        for (i, (spans, joint)) in lines.into_iter().enumerate() {
+            let mut line = match i {
+                0 => first.to_vec(),
+                _ => rest.to_vec(),
+            };
+            for (text, style) in spans {
+                line.push(Span::styled(text, style));
+            }
+
+            self.rows.push(Row {
+                line: Line::from(line),
+                mark_width,
+                joint,
+                ..Row::default()
+            });
         }
     }
 
@@ -838,24 +828,6 @@ impl Render {
                 self.push_rows(first, rest, width, &alt, &[]);
             }
         }
-    }
-
-    fn text_block(&mut self, mark: Mark, lead: &'static str, text: Text) {
-        let hidden = if text.copy_marker {
-            0
-        } else {
-            text.marker.width()
-        };
-        let width = mark.rest.width() + hidden;
-        let first = [
-            Span::styled(lead, mark.style),
-            Span::styled(text.marker, ACCENT),
-        ];
-        let rest = [
-            Span::styled(mark.rest, mark.style),
-            Span::styled(text.indent, ACCENT),
-        ];
-        self.push_rows(&first, &rest, width, &text.spans, &text.links);
     }
 
     /// `links` ranges are byte offsets into the joined text of `spans`
@@ -1109,13 +1081,12 @@ fn summary(helpers: &[&Helper], seconds: Option<u64>) -> String {
     if let Some(seconds) = seconds {
         parts.push(format!("{seconds}s"));
     }
-    let (mut input, mut output) = (0, 0);
-    for (spent_in, spent_out) in helpers.iter().filter_map(|helper| helper.tokens) {
-        input += spent_in;
-        output += spent_out;
+    let mut tokens = Tokens::default();
+    for spent in helpers.iter().filter_map(|helper| helper.tokens) {
+        tokens += spent;
     }
-    if input + output > 0 {
-        parts.push(in_out(input, output));
+    if !tokens.is_zero() {
+        parts.push(tokens.to_string());
     }
 
     parts.join(" · ")
@@ -1203,7 +1174,7 @@ fn last_sentence(text: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use crate::conversation::{Attachment, Call, Helper, Shell, StepStats, Totals};
+    use crate::conversation::{Attachment, Call, Helper, Shell, StepStats, Tokens, Totals};
     use crate::tui::render::*;
     use crate::tui::tests::{helper, settled, written};
     use agent_client_protocol_schema::v1::ToolCallStatus;
@@ -1224,6 +1195,10 @@ mod tests {
         }
     }
 
+    fn tokens(input: u64, output: u64) -> Tokens {
+        Tokens { input, output }
+    }
+
     fn text(rows: &[Row]) -> Vec<String> {
         rows.iter().map(|row| row.line.to_string()).collect()
     }
@@ -1234,7 +1209,7 @@ mod tests {
         let running = Helper {
             name: Some("cafés".to_owned()),
             preview: "print(len(cafés))".to_owned(),
-            tokens: Some((1200, 300)),
+            tokens: Some(tokens(1200, 300)),
             started: Some(Instant::now()),
             ..helper("Count the cafés", ToolCallStatus::InProgress, "running len")
         };
@@ -1244,8 +1219,8 @@ mod tests {
         assert_eq!(rows.len(), 5, "{rows:?}");
 
         // The summary spins like the agents below it, and only ones still queued leave it waiting
-        let tokens = in_out(1200, 300);
-        let summary = format!(" agents · 1 running · 0s · {tokens}");
+        let spent = tokens(1200, 300);
+        let summary = format!(" agents · 1 running · 0s · {spent}");
         assert!(rows[1].ends_with(&summary), "{rows:?}");
         assert!(!rows[1].contains('◌'), "{rows:?}");
         let waiting = helper("Spell naïve", ToolCallStatus::Pending, "");
@@ -1263,8 +1238,8 @@ mod tests {
         compact.pinned(&[&running, &running], 27);
         let rows = text(&compact.rows);
         assert_eq!(rows.len(), 4, "{rows:?}");
-        let tokens = in_out(2400, 600);
-        let summary = format!(" agents · 2 running · 0s · {tokens}");
+        let spent = tokens(2400, 600);
+        let summary = format!(" agents · 2 running · 0s · {spent}");
         assert!(rows[1].ends_with(&summary), "{rows:?}");
         let row = " cafés Count the cafés · running len · 0s";
         assert!(
@@ -1387,7 +1362,7 @@ mod tests {
         };
         let spelled = Helper {
             totals: Some(totals),
-            tokens: Some((3510, 211)),
+            tokens: Some(tokens(3510, 211)),
             ..helper("Spell the menu", ToolCallStatus::Completed, answer)
         };
         let step = helped(spelled);
@@ -1531,12 +1506,11 @@ mod tests {
 
     #[test]
     fn shell_rendered() {
-        let shell = |end: Option<&str>, interrupted: bool| Shell {
+        let shell = |end: ShellEnd| Shell {
             id: "call_1".to_owned(),
             command: "tail app.log".to_owned(),
             output: "first line\nsecond line\n".to_owned(),
-            end: end.map(str::to_owned),
-            interrupted,
+            end,
         };
         let rendered = |shell: Shell| {
             let mut render = Render::new(40, false);
@@ -1545,14 +1519,14 @@ mod tests {
         };
 
         // While running the output is the last part, and an interrupt is not an error
-        let running = rendered(shell(None, false));
+        let running = rendered(shell(ShellEnd::Running));
         let expected = ["", "! tail app.log", "  ╰ first line", "    second line"];
         assert_eq!(text(&running), expected);
         assert_eq!(running[1].fill, Some(theme::BAND));
-        let stopped = rendered(shell(Some("interrupted"), true));
+        let stopped = rendered(shell(ShellEnd::Interrupted("interrupted".to_owned())));
         assert_eq!(text(&stopped[4..]), ["  ✗ interrupted"]);
         assert_eq!(stopped[4].line.spans[0].style, STOPPED.style);
-        let done = rendered(shell(Some(""), false));
+        let done = rendered(shell(ShellEnd::Exited));
         assert_eq!(text(&done)[2..], ["  ╰ first line", "    second line"]);
     }
 
@@ -1665,8 +1639,7 @@ mod tests {
         let stats = StepStats {
             duration: 1.25,
             decode: Some(0.8),
-            input: Some(1234),
-            output: Some(56),
+            tokens: Some(tokens(1234, 56)),
         };
         let done = Item::Message {
             text: "Done.".to_owned(),

@@ -88,19 +88,12 @@ impl Desktop for Local {
     }
 
     fn open(&mut self, target: &Target) -> Result<(), String> {
-        match target {
-            Target::Url(url) => open(url),
-            Target::Diagram(code) => {
-                let html = diagram::page(code)?;
-                let path = saved("diagram", code, "html", html.as_bytes())?;
-                open(&path)
-            }
-            // Named after the format the bytes really have, as the system opens a file by its name,
-            // which the model chose
-            Target::Picture(source) => {
-                let (bytes, format) = picture::original(source)?;
-                let extension = format.extensions_str().first().unwrap_or(&"png");
-                let path = saved("image", source, extension, &bytes)?;
+        match opened(target)? {
+            Opened::Url(url) => open(url),
+            Opened::File {
+                kind, name, bytes, ..
+            } => {
+                let path = saved(kind, &name, &bytes)?;
                 open(&path)
             }
         }
@@ -111,12 +104,50 @@ impl Desktop for Local {
     }
 }
 
-/// The same key always gets the same file, which only the user can read
-fn saved(kind: &str, key: impl Hash, extension: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+/// What a target opens as
+pub(crate) enum Opened {
+    Url(String),
+    /// A diagram or picture, as a file whose name is the same for the same target
+    File {
+        /// Labels its errors
+        kind: &'static str,
+        name: String,
+        mime: &'static str,
+        bytes: Vec<u8>,
+    },
+}
+
+pub(crate) fn opened(target: &Target) -> Result<Opened, String> {
     let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
+    target.hash(&mut hasher);
     let hash = hasher.finish();
+
+    let (kind, extension, mime, bytes) = match target {
+        Target::Url(url) => return Ok(Opened::Url(url.clone())),
+        Target::Diagram(code) => {
+            let html = diagram::page(code)?;
+            let bytes = html.into_bytes();
+            ("diagram", "html", "text/html; charset=utf-8", bytes)
+        }
+        // Named after the format the bytes really have, as the system opens a file by its name,
+        // which the model chose
+        Target::Picture(source) => {
+            let (bytes, format) = picture::original(source)?;
+            let extension = format.extensions_str().first().unwrap_or(&"png");
+            ("image", *extension, format.to_mime_type(), bytes)
+        }
+    };
     let name = format!("smol-{kind}-{hash:016x}.{extension}");
+    Ok(Opened::File {
+        kind,
+        name,
+        mime,
+        bytes,
+    })
+}
+
+/// The file `name` in a folder private to the user where there is one
+fn saved(kind: &str, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     // /tmp is shared on Linux, while XDG_RUNTIME_DIR is private to the user and cleared at logout
     let dir = match env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) => PathBuf::from(dir),
@@ -128,8 +159,8 @@ fn saved(kind: &str, key: impl Hash, extension: &str, bytes: &[u8]) -> Result<Pa
         let reason = cause(&e);
         format!("{kind}: {}: {reason}", path.display())
     };
-    // Made anew, since where there is no private folder another user
-    // may have put a link or a file of their own under its name
+    // Made anew and readable only by the user, since where there is no private folder another
+    // user may have put a link or a file of their own under its name
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -208,9 +239,9 @@ mod tests {
     /// What another user planted under the name is replaced, and a link's target is left alone
     #[test]
     fn saved_private() {
-        let key = format!("café 🐍 {}", process::id());
-        let path = saved("test", &key, "txt", "naïve".as_bytes()).expect("save");
-        let again = saved("test", &key, "txt", "naïve".as_bytes());
+        let name = format!("smol-test-café-{}.txt", process::id());
+        let path = saved("test", &name, "naïve".as_bytes()).expect("save");
+        let again = saved("test", &name, "naïve".as_bytes());
         assert_eq!(again, Ok(path.clone()));
         assert_eq!(fs::read_to_string(&path).expect("read"), "naïve");
 
@@ -223,7 +254,7 @@ mod tests {
             fs::write(&target, "kept").expect("write");
             fs::remove_file(&path).expect("remove");
             symlink(&target, &path).expect("link");
-            saved("test", &key, "txt", "crème".as_bytes()).expect("save");
+            saved("test", &name, "crème".as_bytes()).expect("save");
             let kept = fs::read_to_string(&target).expect("read");
             fs::remove_file(&target).ok();
             assert_eq!(kept, "kept");

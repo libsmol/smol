@@ -1,5 +1,5 @@
 use crate::model::{
-    error_text, merged, retryable, tool_parameters, Call, ChatMessage, Finish, ModelError,
+    error_text, grouped, merged, retryable, tool_parameters, Call, ChatMessage, Finish, ModelError,
     OpenAIModel, Purpose, Stream, StreamDelta, TokenUsage,
 };
 use crate::prompt::{self, TOOL};
@@ -27,10 +27,7 @@ pub(crate) fn body(
     let mut attached = Vec::new();
     // Calls that go back under the ids their provider gave
     let mut renamed = HashMap::new();
-    let together = |a: &ChatMessage, b: &ChatMessage| {
-        matches!((a, b), (ChatMessage::User(_), ChatMessage::User(_)))
-    };
-    for group in conversation.chunk_by(together) {
+    for group in grouped(conversation) {
         let message = match &group[0] {
             ChatMessage::System(text) => json!({ "role": "system", "content": text }),
             ChatMessage::User(_) => {
@@ -119,9 +116,9 @@ pub(crate) fn body(
     if let Some(effort) = model.effort_for(purpose) {
         body.insert("reasoning_effort".into(), json!(effort));
     }
-    body.insert("model".into(), json!(model.id));
+    body.insert("model".into(), json!(model.spec.id));
     body.insert("messages".into(), Value::Array(sent));
-    if let Some(max_tokens) = model.max_tokens {
+    if let Some(max_tokens) = model.spec.max_tokens {
         body.insert("max_tokens".into(), json!(max_tokens));
     }
     body.insert("stream".into(), json!(true));
@@ -188,15 +185,14 @@ impl Stream {
             Some("") | None => fallback.or(thinking),
             thinking => thinking,
         };
-        let content = delta["content"].as_str().filter(|text| !text.is_empty());
-        let deltas = [
-            reasoning.map(StreamDelta::Reasoning),
-            content.map(StreamDelta::Content),
-        ];
-        for streamed in deltas.into_iter().flatten() {
-            on_delta(streamed);
+        if let Some(reasoning) = reasoning {
+            on_delta(StreamDelta::Reasoning(reasoning));
         }
-        add_fields(&mut self.extras, delta, &MESSAGE_FIELDS);
+        let content = delta["content"].as_str().filter(|text| !text.is_empty());
+        if let Some(content) = content {
+            self.say(content, on_delta);
+        }
+        add_fields(&mut self.gathered.extras, delta, &MESSAGE_FIELDS);
 
         if let Some(parts) = delta["tool_calls"].as_array() {
             for part in parts {
@@ -367,36 +363,21 @@ mod tests {
         let second = ChatMessage::User(vec![Part::Text("And a video".to_owned()), video, gone]);
         let conversation = [first, second];
 
-        let image = ModelSpec {
+        // Media the model takes no kind of became text before the conversation got here
+        let both = ModelSpec {
             image: true,
+            video: true,
             ..ModelSpec::default()
         };
-        let (finished, body) = served(
-            Kind::Completions,
-            DONE,
-            &image,
-            &conversation,
-            Purpose::Step,
-        );
+        let (finished, body) = served(Kind::Completions, DONE, &both, &conversation, Purpose::Step);
         finished.expect("finished");
         let expected = json!([
             {"type": "text", "text": "Look at this\n<image path=\"chart.png\"/>"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}},
-            {"type": "text", "text": "And a video\n[video clip.mp4: not shown, the model takes no videos]\n[image old.png: not shown, its copy was deleted]"},
+            {"type": "text", "text": "And a video\n[video clip.mp4: not shown, its copy was deleted]\n[image old.png: not shown, its copy was deleted]"},
         ]);
         assert_eq!(body["messages"][0]["content"], expected);
 
-        let text = ModelSpec::default();
-        let (_, unseen) = served(Kind::Completions, DONE, &text, &conversation, Purpose::Step);
-        let expected = "Look at this\n[image chart.png: not shown, the model takes no images]\n\n\
-            And a video\n[video clip.mp4: not shown, the model takes no videos]\n\
-            [image old.png: not shown, the model takes no images]";
-        assert_eq!(unseen["messages"][0]["content"], expected);
-
-        let both = ModelSpec {
-            video: true,
-            ..image
-        };
         let greeting = hello();
         let (_, plain) = served(Kind::Completions, DONE, &both, &greeting, Purpose::Step);
         assert_eq!(plain["messages"][0]["content"], "Hello");

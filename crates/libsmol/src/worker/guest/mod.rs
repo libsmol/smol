@@ -5,8 +5,8 @@ use crate::tools::ToolError;
 use crate::utils::{block_on, Waiting};
 use crate::worker::guest::builtins::{builtins, value_error};
 use crate::worker::{
-    end_marker, greeting, FromWorker, Function, HostCall, HostNote, Message, ToWorker, WorkerCall,
-    WorkerNote, AGENTS_ENV, CONTROL_ENV, COPIES_ENV, MAX_PRINT_CHARS, WORKER_ARG,
+    controlled, end_marker, greeting, FromWorker, Function, HostCall, HostNote, Message, ToWorker,
+    WorkerCall, WorkerNote, CONTROL_ENV, COPIES_ENV, MAIN_ENV, MAX_PRINT_CHARS, WORKER_ARG,
 };
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
 use pyo3::prelude::*;
@@ -74,7 +74,7 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
     // Programs the code starts would inherit these, and they must go before any thread starts
     let control: String = taken(&environ, CONTROL_ENV)?.extract()?;
     let copies: OsString = taken(&environ, COPIES_ENV)?.extract()?;
-    let agents: String = taken(&environ, AGENTS_ENV)?.extract()?;
+    let main: String = taken(&environ, MAIN_ENV)?.extract()?;
 
     // Taken before any code can close fd 1
     // Python's os makes it because a Windows fd belongs to the C runtime that opened it
@@ -92,7 +92,7 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
     let cwd = env::current_dir().unwrap_or_default();
     worker::enter(py, venv)?;
 
-    let Some((address, token)) = control.split_once('/') else {
+    let Some((address, token)) = controlled(&control) else {
         let message = format!("worker: {CONTROL_ENV}: not set by the agent");
         return Err(PyRuntimeError::new_err(message));
     };
@@ -110,13 +110,12 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
     let marker = end_marker(token);
 
     let globals = PyDict::new(py);
-    let delegates = !agents.is_empty();
     let copies = PathBuf::from(copies);
     for (name, function) in builtins(py, copies, cwd)? {
         globals.set_item(name, function)?;
     }
     globals.set_item("_OUTPUT", output)?;
-    globals.set_item("_AGENTS", delegates)?;
+    globals.set_item("_MAIN_AGENT", !main.is_empty())?;
     globals.set_item("_MAX_AGENTS", MAX_PARALLEL_AGENTS)?;
     globals.set_item("_MAX_RECALLED", MAX_RECALLED)?;
     globals.set_item("_MAX_MEMORY_CHARS", MAX_MEMORY_CHARS)?;
@@ -136,7 +135,15 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
     let run = scope.get_item("_run")?;
     let server = scope.get_item("_server")?;
     let unserver = scope.get_item("_unserver")?;
+    let described = scope.get_item("_described")?;
     let listed: Vec<(String, String, String)> = scope.get_item("_FUNCTIONS")?.extract()?;
+    let shown = |error: &PyErr| {
+        let value = error.value(py);
+        let text = described
+            .call1((value,))
+            .and_then(|text| text.extract::<String>());
+        text.unwrap_or_else(|_| error.to_string())
+    };
 
     // Added earlier, a file in the working directory named like a standard module breaks the bootstrap
     let sys = py.import("sys")?;
@@ -160,7 +167,7 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
             summary,
         });
     }
-    ended(&write, output, &marker);
+    mark_end(&write, output, &marker);
     let ready = WorkerNote::Ready { functions };
     send(&Message::Note(ready));
 
@@ -193,12 +200,12 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
                 let ran = ran.and_then(|result| json_of(&result));
 
                 // The output is all written and reading this tells the agent it is complete
-                ended(&write, output, &marker);
+                mark_end(&write, output, &marker);
                 // The agent takes an error reply to `Run` to mean the worker is gone
                 let result = match ran {
                     Ok(result) => result,
                     Err(error) => {
-                        let error = shown(py, &error);
+                        let error = shown(&error);
                         json!({ "error": error })
                     }
                 };
@@ -215,7 +222,7 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
                 let installed = python_of(py, &tools)
                     .and_then(|tools| server.call1((source, name, description, tools)))
                     .and_then(|installed| json_of(&installed));
-                installed.map_err(|error| shown(py, &error))
+                installed.map_err(|error| shown(&error))
             }
         };
         let reply = Message::reply(id, result);
@@ -271,7 +278,7 @@ fn interrupt() {
 }
 
 /// Marks the end of the output on `output`, the worker's own copy of the pipe the code writes to
-fn ended(write: &Bound<'_, PyAny>, output: i32, marker: &[u8]) {
+fn mark_end(write: &Bound<'_, PyAny>, output: i32, marker: &[u8]) {
     // C extensions print through C's stdio, which holds what goes to a pipe until flushed
     // SAFETY: A null stream flushes every open one
     unsafe { libc::fflush(ptr::null_mut()) };
@@ -312,17 +319,6 @@ impl Drop for Unanswered {
             let cancel = WorkerNote::Cancel { id: self.0 };
             send(&Message::Note(cancel));
         }
-    }
-}
-
-/// `Class: message`, or the class alone when the message is empty
-fn shown(py: Python<'_>, error: &PyErr) -> String {
-    let class = error.get_type(py).name();
-    let class = class.map(|name| name.to_string()).unwrap_or_default();
-    let message = error.value(py).to_string();
-    match message.is_empty() {
-        true => class,
-        false => format!("{class}: {message}"),
     }
 }
 

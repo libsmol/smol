@@ -19,42 +19,43 @@ pub(crate) const LINK: Style = Style::new()
     .add_modifier(Modifier::UNDERLINED);
 
 #[derive(Debug)]
-pub(crate) struct Text {
+pub(crate) struct Block {
+    /// Before its first line, such as a list marker or the bars of quotes
     pub(crate) marker: String,
+    /// Before its other lines
     pub(crate) indent: String,
+    pub(crate) kind: Kind,
+}
+
+#[derive(Debug)]
+pub(crate) enum Kind {
+    Text(Text),
+    /// The first row is the header
+    Table {
+        aligns: Vec<Alignment>,
+        rows: Vec<Vec<Spans>>,
+    },
+    /// `code` is the Mermaid source and `source` is the code block showing it
+    Diagram {
+        lines: Vec<String>,
+        code: String,
+        source: Vec<Block>,
+    },
+    /// An image alone on its line, with its address as written
+    Image {
+        alt: String,
+        url: String,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct Text {
     /// Copying keeps list markers but drops the bars of quotes and code blocks
     pub(crate) copy_marker: bool,
     pub(crate) heading: bool,
     pub(crate) spans: Spans,
     /// Clickable URLs, with ranges as byte offsets into the joined text of `spans`
     pub(crate) links: Vec<(Range<usize>, String)>,
-}
-
-#[derive(Debug)]
-pub(crate) enum Block {
-    Text(Text),
-    /// The first row is the header
-    Table {
-        marker: String,
-        indent: String,
-        aligns: Vec<Alignment>,
-        rows: Vec<Vec<Spans>>,
-    },
-    /// `code` is the Mermaid source and `source` is the code block showing it
-    Diagram {
-        marker: String,
-        indent: String,
-        lines: Vec<String>,
-        code: String,
-        source: Vec<Text>,
-    },
-    /// An image alone on its line, with its address as written
-    Image {
-        marker: String,
-        indent: String,
-        alt: String,
-        url: String,
-    },
 }
 
 pub(crate) fn blocks(text: &str) -> Vec<Block> {
@@ -176,13 +177,16 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
                     let mut source = Vec::new();
                     for (i, spans) in highlighted.into_iter().enumerate() {
                         let lead = if i == 0 { &marker } else { &indent };
-                        source.push(Text {
-                            marker: format!("{lead}│ "),
-                            indent: format!("{indent}│ "),
+                        let text = Text {
                             copy_marker: false,
                             heading: false,
                             spans,
                             links: Vec::new(),
+                        };
+                        source.push(Block {
+                            marker: format!("{lead}│ "),
+                            indent: format!("{indent}│ "),
+                            kind: Kind::Text(text),
                         });
                     }
 
@@ -197,17 +201,16 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
                         false => None,
                     };
                     match drawn {
-                        Some(lines) => builder.blocks.push(Block::Diagram {
+                        Some(lines) => builder.blocks.push(Block {
                             marker,
                             indent,
-                            lines,
-                            code: code.to_owned(),
-                            source,
+                            kind: Kind::Diagram {
+                                lines,
+                                code: code.to_owned(),
+                                source,
+                            },
                         }),
-                        None => {
-                            let texts = source.into_iter().map(Block::Text);
-                            builder.blocks.extend(texts);
-                        }
+                        None => builder.blocks.extend(source),
                     }
                 }
                 TagEnd::List(_) => {
@@ -250,11 +253,10 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
                     let rows = builder.table.take().unwrap_or_default();
                     let aligns = mem::take(&mut builder.aligns);
                     let (marker, indent) = builder.prefix();
-                    builder.blocks.push(Block::Table {
+                    builder.blocks.push(Block {
                         marker,
                         indent,
-                        aligns,
-                        rows,
+                        kind: Kind::Table { aligns, rows },
                     });
                 }
                 _ => {}
@@ -303,10 +305,10 @@ pub(crate) fn blocks(text: &str) -> Vec<Block> {
 pub(crate) fn first_line(text: &str) -> String {
     let mut first_heading = None;
     for block in blocks(text) {
-        let (shown, heading) = match block {
-            Block::Text(text) => (joined(&text.spans), text.heading),
-            Block::Image { alt, .. } => (alt, false),
-            Block::Table { .. } | Block::Diagram { .. } => continue,
+        let (shown, heading) = match block.kind {
+            Kind::Text(text) => (joined(&text.spans), text.heading),
+            Kind::Image { alt, .. } => (alt, false),
+            Kind::Table { .. } | Kind::Diagram { .. } => continue,
         };
 
         let shown = shown.trim();
@@ -496,7 +498,8 @@ impl Builder {
     fn gap(&mut self) {
         self.flush();
 
-        let blank = |block: &Block| matches!(block, Block::Text(text) if text.spans.is_empty());
+        let blank =
+            |block: &Block| matches!(&block.kind, Kind::Text(text) if text.spans.is_empty());
         let after_content = self.blocks.last().is_some_and(|block| !blank(block));
         let marking = self
             .prefixes
@@ -513,11 +516,10 @@ impl Builder {
             self.line.clear();
             self.line_links.clear();
             let (marker, indent) = self.prefix();
-            self.blocks.push(Block::Image {
+            self.blocks.push(Block {
                 marker,
                 indent,
-                alt,
-                url,
+                kind: Kind::Image { alt, url },
             });
             return;
         }
@@ -543,15 +545,17 @@ impl Builder {
 
     fn push_block(&mut self, spans: Spans, copy_marker: bool) {
         let (marker, indent) = self.prefix();
-        let links = mem::take(&mut self.line_links);
-        self.blocks.push(Block::Text(Text {
-            marker,
-            indent,
+        let text = Text {
             copy_marker,
             heading: self.heading,
             spans,
-            links,
-        }));
+            links: mem::take(&mut self.line_links),
+        };
+        self.blocks.push(Block {
+            marker,
+            indent,
+            kind: Kind::Text(text),
+        });
     }
 }
 
@@ -562,12 +566,13 @@ mod tests {
     fn lines(text: &str) -> Vec<String> {
         let mut lines = Vec::new();
         for block in blocks(text) {
-            match block {
-                Block::Text(text) => {
+            let marker = block.marker;
+            match block.kind {
+                Kind::Text(text) => {
                     let joined = joined(&text.spans);
-                    lines.push(text.marker + &joined);
+                    lines.push(marker + &joined);
                 }
-                Block::Table { marker, rows, .. } => {
+                Kind::Table { rows, .. } => {
                     for (i, row) in rows.iter().enumerate() {
                         let lead = if i == 0 { marker.as_str() } else { "" };
                         let cells = row.iter().map(Vec::as_slice).map(joined);
@@ -576,19 +581,13 @@ mod tests {
                         lines.push(lead.to_owned() + &cells);
                     }
                 }
-                Block::Diagram {
-                    marker,
-                    lines: drawn,
-                    ..
-                } => {
+                Kind::Diagram { lines: drawn, .. } => {
                     for (i, line) in drawn.into_iter().enumerate() {
                         let lead = if i == 0 { marker.as_str() } else { "" };
                         lines.push(lead.to_owned() + &line);
                     }
                 }
-                Block::Image {
-                    marker, alt, url, ..
-                } => lines.push(format!("{marker}![{alt}]({url})")),
+                Kind::Image { alt, url } => lines.push(format!("{marker}![{alt}]({url})")),
             }
         }
         lines
@@ -653,7 +652,7 @@ mod tests {
     #[test]
     fn inline_styles() {
         let parsed = blocks("plain **bold** *italic* `code`");
-        let Block::Text(first) = &parsed[0] else {
+        let Kind::Text(first) = &parsed[0].kind else {
             panic!("{parsed:?}");
         };
         let style = |text: &str| {
@@ -690,7 +689,7 @@ mod tests {
         let links = |text: &str| -> Vec<Vec<(String, String)>> {
             let mut found = Vec::new();
             for block in blocks(text) {
-                let Block::Text(text) = block else {
+                let Kind::Text(text) = block.kind else {
                     continue;
                 };
                 let joined = joined(&text.spans);
@@ -728,7 +727,7 @@ mod tests {
         let named = ("https://b.io".to_owned(), "https://b.io".to_owned());
         assert_eq!(links(text), [vec![bare, named]]);
         let parsed = blocks(text);
-        let Block::Text(first) = &parsed[0] else {
+        let Kind::Text(first) = &parsed[0].kind else {
             panic!("{parsed:?}");
         };
         let styled = first
@@ -742,7 +741,7 @@ mod tests {
         let after = ("https://b.io".to_owned(), "https://b.io".to_owned());
         assert_eq!(links(cells), [Vec::new(), vec![after]]);
         let parsed = blocks(cells);
-        let Block::Table { rows, .. } = &parsed[0] else {
+        let Kind::Table { rows, .. } = &parsed[0].kind else {
             panic!("{parsed:?}");
         };
         let styled = rows[1][0].iter().find(|(span, _)| span == "https://a.io");
@@ -787,7 +786,7 @@ mod tests {
         assert_eq!(lines("Café<br><br>naïve"), ["Café", "", "naïve"]);
 
         let table = blocks("| dish |\n|---|\n| crème<br>brûlée |");
-        let Block::Table { rows, .. } = &table[0] else {
+        let Kind::Table { rows, .. } = &table[0].kind else {
             panic!("{table:?}");
         };
         assert_eq!(joined(&rows[1][0]), "crème\nbrûlée");
@@ -834,11 +833,11 @@ mod tests {
         let diagram = "graph LR\n    A[read 🐍] --> B[write 🚀]";
         let closed = format!("```mermaid\n{diagram}\n```");
         let parsed = blocks(&closed);
-        let Block::Diagram {
+        let Kind::Diagram {
             lines: drawn,
             source,
             ..
-        } = &parsed[0]
+        } = &parsed[0].kind
         else {
             panic!("{parsed:?}");
         };
@@ -858,24 +857,26 @@ mod tests {
 
         let listed = format!("- Flow:\n\n  ```mermaid\n  {diagram}\n  ```");
         let parsed = blocks(&listed);
-        let Some(Block::Diagram { marker, .. }) = parsed.last() else {
+        let Some(diagram) = parsed.last() else {
             panic!("{parsed:?}");
         };
-        assert_eq!(marker, "  ");
+        assert!(matches!(diagram.kind, Kind::Diagram { .. }), "{diagram:?}");
+        assert_eq!(diagram.marker, "  ");
 
         let quoted = "> ```mermaid\n> graph LR\n>     A[read 🐍] --> B[write 🚀]\n> ```";
         let parsed = blocks(quoted);
-        let Some(Block::Diagram { marker, .. }) = parsed.first() else {
+        let Some(diagram) = parsed.first() else {
             panic!("{parsed:?}");
         };
-        assert_eq!(marker, "▏ ");
+        assert!(matches!(diagram.kind, Kind::Diagram { .. }), "{diagram:?}");
+        assert_eq!(diagram.marker, "▏ ");
     }
 
     #[test]
     fn python_highlighted() {
-        let code = |text: &str| match &blocks(text)[0] {
-            Block::Text(text) => text.spans.clone(),
-            table => panic!("{table:?}"),
+        let code = |text: &str| match &blocks(text)[0].kind {
+            Kind::Text(text) => text.spans.clone(),
+            other => panic!("{other:?}"),
         };
 
         assert_eq!(code("```py\nimport os  # system\n```")[0].0, "import");

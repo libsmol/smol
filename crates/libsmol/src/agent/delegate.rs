@@ -1,11 +1,12 @@
 use crate::agent::{
-    logged_tokens, Agent, Asking, Delegating, Event, HelperView, Helpers, Nudging, Place, Queue,
-    Sink, Status, Task, Turn, Unseen,
+    logged_tokens, Agent, Asking, Delegating, Event, Nudging, Place, Queue, Sink, Status, Task,
+    TaskView, TaskViews, Turn, Unseen,
 };
 use crate::prompt;
 use crate::spawn::SHOWN_EVERY;
 use crate::steps::{
-    spent, AgentMemory, CallError, DoneStep, Ending, Helper, MemoryStep, Returned, StepError,
+    spent, AgentMemory, AgentRecord, AgentTask, CallError, DoneStep, Ending, MemoryStep, Returned,
+    Sent, StepError,
 };
 use crate::utils::{Interrupt, Reply};
 use crate::worker::host::{Added, Called, Calling, Worker};
@@ -22,13 +23,13 @@ use tokio::task::{self, AbortHandle};
 use tokio::time;
 use tracing::{error_span, info, warn, Instrument};
 
-pub const MAX_PARALLEL_AGENTS: usize = 8;
+pub(crate) const MAX_PARALLEL_AGENTS: usize = 8;
 const MAX_PREVIEW_LINES: usize = 4;
 const MAX_PREVIEW_CHARS: usize = 800;
 const MAX_LINE_CHARS: usize = 100;
 /// Agents get this long to stop by themselves when the turn ends,
 /// and a worker of theirs may take `STOP_WAIT`
-const HELPERS_WAIT: Duration = Duration::from_secs(5);
+const AGENTS_WAIT: Duration = Duration::from_secs(5);
 /// Idle agents keep their Python, at most this many, the ones used last
 const MAX_IDLE_WORKERS: usize = 4;
 /// An idle agent's Python ends after this long unused
@@ -37,33 +38,9 @@ const IDLE_WAIT: Duration = match cfg!(test) {
     false => Duration::from_secs(30 * 60),
 };
 
-/// The records of the tasks the code of one call sent, in the order their views opened,
+/// The tasks the code of one call sent, in the order their views opened,
 /// which numbers them on replay too
-pub(crate) struct Records {
-    pub(crate) helpers: Mutex<Vec<Helper>>,
-    /// Where the call's step lands in memory,
-    /// which only grows at the end until the turn has filed its tasks' records
-    step: usize,
-    call: usize,
-}
-
-impl Records {
-    pub(crate) fn new(step: usize, call: usize) -> Self {
-        Self {
-            helpers: Mutex::default(),
-            step,
-            call,
-        }
-    }
-}
-
-/// Where the record of a task sits in memory
-#[derive(Clone, Copy)]
-struct Seat {
-    step: usize,
-    call: usize,
-    agent: usize,
-}
+pub(crate) type Records = Mutex<Vec<Sent>>;
 
 /// What a task at work shares with the team
 #[derive(Default)]
@@ -97,7 +74,7 @@ impl Queue for Inbox {
 }
 
 /// Shows the client which agents the code waits for until it is dropped
-struct Awaiting(Arc<dyn Helpers>);
+struct Awaiting(Arc<dyn TaskViews>);
 
 impl Drop for Awaiting {
     fn drop(&mut self) {
@@ -107,11 +84,11 @@ impl Drop for Awaiting {
 
 impl Agent {
     /// Runs the calls that the code of one call makes to `agent()` and its functions,
-    /// and keeps the record of each task it sends in `records`
+    /// and lists each task it sends in `records`
     pub(crate) fn delegate<'a>(
         &'a self,
         servers: &'a [&'a Added],
-        views: Box<dyn Helpers>,
+        views: Box<dyn TaskViews>,
         records: &Arc<Records>,
     ) -> Box<Delegating<'a>> {
         let Place::Main { team, queue } = &self.place else {
@@ -166,30 +143,27 @@ impl Agent {
 
     /// Starts a task for the agent `asked` names, or hands it to the task that agent is at work on
     fn send(&self, launcher: &Launcher, asked: Asked) -> Reply {
-        let Asked { name, task } = asked;
         let mut members = launcher.team.members.lock().expect("members");
-        let found = members.iter().position(|member| member.name() == name);
+        let found = members
+            .iter()
+            .position(|member| member.name() == asked.name);
         if let Some(id) = found {
             let member = &members[id];
-            if member.helper.running() {
-                member.inbox.sent.lock().expect("inbox").push(task);
+            if member.running() {
+                member.inbox.sent.lock().expect("inbox").push(asked.task);
                 member.inbox.arrived.notify_one();
                 return Ok(Value::Null);
             }
         }
 
-        let record = Helper {
-            task,
-            name: Some(name),
-            end: Ending::Running {},
-            memory: AgentMemory::default(),
-            resendable: true,
-        };
         let id = match found {
             Some(id) => id,
             None => {
-                let member = Member::new(record.clone());
-                members.push(member);
+                let record = AgentRecord {
+                    name: asked.name.clone(),
+                    ..AgentRecord::default()
+                };
+                members.push(Member::new(record));
                 members.len() - 1
             }
         };
@@ -202,28 +176,24 @@ impl Agent {
             interrupt: member.stop.clone(),
             ..self.clone()
         };
-        launcher.launch(agent, member, id, record, &self.interrupt);
+        launcher.launch(agent, member, id, asked, &self.interrupt);
         Ok(Value::Null)
     }
 
-    /// Works on the task `asked` records in the agent's conversation `memory`, on the Python its
-    /// last task kept if that has the same MCP servers, and returns the task's final record,
-    /// the conversation and the Python to keep, none once the task leaves programs running
-    async fn help(
+    /// Works on the task `asked` in the agent's conversation `memory`, on the Python its last task
+    /// kept if that has the same MCP servers, and returns how the task ended, the conversation
+    /// and the Python to keep, none once the task leaves programs running
+    async fn work(
         self,
-        asked: Helper,
+        asked: Asked,
         mut memory: AgentMemory,
         kept: Option<Kept>,
         mut watched: Watched,
         servers: Arc<[Added]>,
         slots: Arc<Semaphore>,
-    ) -> (Helper, AgentMemory, Option<Kept>) {
+    ) -> (Ending, AgentMemory, Option<Kept>) {
         let started = Instant::now();
-        // A resent task that failed before its first step leaves the conversation here rather than
-        // in the run, so the task's steps start at `start`
-        memory.withdraw(&asked.task);
-        let start = memory.steps.len();
-        watched.start = start;
+        let start = watched.start;
 
         // One still waiting for a slot stops on an interrupt without starting a worker
         let slot = select! {
@@ -234,7 +204,7 @@ impl Agent {
         let (answered, kept) = match slot {
             None => (Ok(None), kept),
             Some(_slot) => {
-                let name = asked.name.as_deref().unwrap_or_default();
+                let name = &asked.name;
                 info!("agent: started [name={name}]");
                 {
                     let mut live = watched.live.lock().expect("live");
@@ -250,10 +220,10 @@ impl Agent {
                     Some(kept) => Ok(kept.worker),
                     None => {
                         let workplace = Arc::clone(&self.workplace);
-                        let delegation = self.place.delegation();
+                        let rank = self.place.rank();
                         let restarted = memory.ran_code();
                         let interrupt = &self.interrupt;
-                        Worker::new(interrupt, workplace, &installed, delegation, restarted).await
+                        Worker::new(interrupt, workplace, &installed, rank, restarted).await
                     }
                 };
                 match starting {
@@ -315,10 +285,8 @@ impl Agent {
             }
         }
 
-        let added = AgentMemory {
-            steps: memory.steps[start..].to_vec(),
-        };
-        let (usage, steps) = spent(&added.steps);
+        let added = &memory.steps[start..];
+        let (usage, steps) = spent(added);
         let seconds = started.elapsed().as_secs_f64();
         let tokens = logged_tokens(&usage);
         let counted = format!("[steps={steps}, tokens={tokens}, elapsed={seconds:.1}s]");
@@ -329,15 +297,10 @@ impl Agent {
             _ => info!("agent: stopped {counted}"),
         }
 
-        let helper = Helper {
-            end,
-            memory: added,
-            ..asked
-        };
-        watched.view.close(&helper);
+        watched.view.close(&end, added);
         // Programs a task leaves running end with its Python, as no turn of the agent follows them
         let kept = kept.filter(|kept| kept.worker.running().is_empty());
-        (helper, memory, kept)
+        (end, memory, kept)
     }
 }
 
@@ -351,85 +314,93 @@ fn handed(end: &Ending) -> Value {
 
 /// What the tasks that the code of one call sends share
 struct Launcher<'a> {
-    views: Arc<dyn Helpers>,
+    views: Arc<dyn TaskViews>,
     records: Arc<Records>,
     servers: &'a [&'a Added],
     team: Arc<Team>,
 }
 
 impl Launcher<'_> {
-    /// Keeps the record of the task and opens its view, numbered by the record's place, and starts
-    /// it, with `id` its agent's place in the team, which `session` interrupts too
+    /// Adds the task to the agent's record and the call's, opens its view, numbered by its place in
+    /// the call, and starts it, with `id` its agent's place in the team, which `session` interrupts
     fn launch(
         &self,
         agent: Agent,
         member: &mut Member,
         id: usize,
-        record: Helper,
+        asked: Asked,
         session: &Interrupt,
     ) {
-        let index = {
-            let mut helpers = self.records.helpers.lock().expect("records");
-            helpers.push(record.clone());
-            helpers.len() - 1
-        };
-        let view = self.views.open(index + 1, &record);
-        let watched = Watched::new(view);
-
-        // The task before keeps its record and announcement until the turn files them
-        if let Some(seat) = member.seat.take() {
-            let returned = member.returned();
-            let earlier = (seat, member.helper.clone(), returned);
-            self.team.earlier.lock().expect("earlier").push(earlier);
+        // The answer the task before left is announced when the turn next takes in what ended
+        if let Some(returned) = member.returned() {
+            self.team.earlier.lock().expect("earlier").push(returned);
         }
-        member.tasks += 1;
-        member.stop.begin(member.tasks);
-        member.live = Arc::clone(&watched.live);
-        member.helper = record.clone();
-        member.taken = false;
-        member.seat = Some(Seat {
-            step: self.records.step,
-            call: self.records.call,
-            agent: index,
-        });
 
-        let memory = mem::take(&mut member.memory);
+        let record = &mut member.record;
+        // A resent task that failed before its first step leaves the conversation,
+        // so its steps start where those of the new one do
+        record.memory.withdraw(&asked.task);
+        let start = record.memory.steps.len();
+        let task = AgentTask {
+            task: asked.task.clone(),
+            start,
+            end: Ending::Running {},
+        };
+        record.tasks.push(task);
+        let number = record.tasks.len() - 1;
+
+        let index = {
+            let mut sent = self.records.lock().expect("records");
+            let name = asked.name.clone();
+            sent.push(Sent { name, number });
+            sent.len() - 1
+        };
+        let view = self.views.open(index + 1, &asked.name, &asked.task);
+        let watched = Watched::new(view, start);
+
+        let turn = member.turn();
+        member.stop.begin(turn);
+        member.live = Arc::clone(&watched.live);
+        member.taken = false;
+
+        // The task works on a copy, so the session saves the conversation as it was before the task
+        // until the task ends
+        let memory = member.record.memory.clone();
         let kept = member.kept.take();
         let servers: Arc<[Added]> = self.servers.iter().map(|added| (*added).clone()).collect();
         let slots = Arc::clone(&self.team.slots);
         let launched = self.team.launched.fetch_add(1, Ordering::Relaxed) + 1;
         let span = error_span!("", agent = launched);
-        let helping = agent.help(record.clone(), memory, kept, watched, servers, slots);
-        let mut helping = task::spawn(helping.instrument(span));
-        member.abort = Some(helping.abort_handle());
+        let working = agent.work(asked, memory, kept, watched, servers, slots);
+        let mut working = task::spawn(working.instrument(span));
+        member.abort = Some(working.abort_handle());
 
-        // One that panics or is aborted ends with the record its dropped view showed,
-        // and its agent starts over
-        let unfinished = Helper {
-            end: Ending::Unfinished {},
-            ..record
-        };
         let session = session.clone();
         let stop = member.stop.clone();
-        let turn = member.tasks;
         let team = Arc::clone(&self.team);
         let finishing = async move {
             let joined = select! {
-                joined = &mut helping => joined,
+                joined = &mut working => joined,
                 () = session.wait() => {
                     stop.cancel(turn);
-                    helping.await
+                    working.await
                 }
             };
-            let (helper, memory, kept) =
-                joined.unwrap_or((unfinished, AgentMemory::default(), None));
-            let keeps = kept.is_some();
 
             let mut members = team.members.lock().expect("members");
             let member = &mut members[id];
-            member.helper = helper;
-            member.memory = memory;
-            member.kept = kept;
+            // One that panics or is aborted ends with what its dropped view showed,
+            // and its agent keeps the conversation it had before the task
+            let end = match joined {
+                Ok((end, memory, kept)) => {
+                    member.record.memory = memory;
+                    member.kept = kept;
+                    end
+                }
+                Err(_) => Ending::Unfinished {},
+            };
+            member.record.tasks[number].end = end;
+            let keeps = member.kept.is_some();
             // Beyond the limit the Python used least recently ends
             let idle = members
                 .iter()
@@ -457,7 +428,7 @@ impl Launcher<'_> {
                     let mut members = team.members.lock().expect("members");
                     let member = &mut members[id];
                     // A later task took the Python, and what it kept has its own wait
-                    let unused = match member.tasks == turn {
+                    let unused = match member.turn() == turn {
                         true => member.kept.take(),
                         false => None,
                     };
@@ -475,9 +446,8 @@ impl Launcher<'_> {
 /// with their places as ids
 pub(crate) struct Team {
     members: Mutex<Vec<Member>>,
-    /// Tasks whose agents took another before the turn filed their records,
-    /// with how they are announced
-    earlier: Mutex<Vec<(Seat, Helper, Option<Returned>)>>,
+    /// Answers of tasks whose agents took another before the turn took in that they ended
+    earlier: Mutex<Vec<Returned>>,
     /// Counts the tasks that ended, which wakes everyone waiting for one
     ended: watch::Sender<usize>,
     /// Shared by all agents the session's code starts
@@ -495,62 +465,68 @@ struct Kept {
     used: Instant,
 }
 
-/// An agent the code started, named by its records
+/// An agent the code started
 struct Member {
-    /// The record of its latest task, which says it is running until the task ends
-    helper: Helper,
-    /// Its conversation, which its task holds while it works
-    memory: AgentMemory,
+    /// Its conversation as of the end of its last task, and its tasks, the latest of which says it
+    /// is running until it ends
+    record: AgentRecord,
     /// The Python its last task left without programs, while it is among the `MAX_IDLE_WORKERS`
     /// used last and for at most `IDLE_WAIT`
     kept: Option<Kept>,
     inbox: Arc<Inbox>,
     live: Arc<Mutex<Activity>>,
-    /// Interrupts its tasks alone, each a turn of its own numbered by `tasks`
+    /// Interrupts its tasks alone, each a turn of its own numbered by `turn()`
     stop: Interrupt,
-    tasks: u64,
     abort: Option<AbortHandle>,
     /// The code took the answer of its latest task, or it was announced or stopped
     taken: bool,
-    /// Where the turn files the record of its latest task, taken once it has
-    seat: Option<Seat>,
 }
 
 impl Member {
-    fn new(helper: Helper) -> Self {
+    /// A restored agent has at least one task, and a new one gets its first as it starts
+    fn new(record: AgentRecord) -> Self {
         Self {
-            helper,
-            memory: AgentMemory::default(),
+            record,
             kept: None,
             inbox: Arc::default(),
             live: Arc::default(),
             stop: Interrupt::default(),
-            tasks: 0,
             abort: None,
             taken: true,
-            seat: None,
         }
     }
 
     fn name(&self) -> &str {
-        self.helper.name.as_deref().unwrap_or_default()
+        &self.record.name
+    }
+
+    fn turn(&self) -> u64 {
+        self.record.tasks.len() as u64
+    }
+
+    fn end(&self) -> &Ending {
+        let latest = self.record.tasks.last().expect("task");
+        &latest.end
+    }
+
+    fn running(&self) -> bool {
+        *self.end() == (Ending::Running {})
     }
 
     /// How its latest task is announced, which it isn't once the code took the answer
     /// or the user interrupted it
     fn returned(&self) -> Option<Returned> {
-        let interrupted = matches!(self.helper.end, Ending::Interrupted {});
-        if self.taken || interrupted {
+        if self.taken {
+            return None;
+        }
+        let end = self.end();
+        if matches!(end, Ending::Interrupted {}) {
             return None;
         }
 
         let name = self.name().to_owned();
-        let end = self.helper.end.clone();
-        Some(Returned::Ended { name, end })
-    }
-
-    fn unfiled(&self) -> bool {
-        !self.helper.running() && self.seat.is_some()
+        let end = end.clone();
+        Some(Returned { name, end })
     }
 }
 
@@ -568,47 +544,18 @@ impl Default for Team {
 }
 
 impl Team {
-    /// The agents whose tasks the session's conversation `history` records, each idle with its
-    /// conversation, except those saved before agents kept their conversations
-    pub(crate) fn restored(history: &[MemoryStep]) -> Self {
-        let mut members: Vec<Member> = Vec::new();
-        for step in history {
-            let MemoryStep::Action(action) = step else {
+    /// The agents of a saved session, each idle with its conversation
+    pub(crate) fn restored(agents: Vec<AgentRecord>) -> Self {
+        let mut members = Vec::new();
+        for mut record in agents {
+            if record.tasks.is_empty() {
                 continue;
-            };
-            let results = action.calls.iter().filter_map(|call| call.result.as_ref());
-            for helper in results.flat_map(|result| &result.agents) {
-                let Some(name) = helper.name.as_deref().filter(|_| helper.resendable) else {
-                    continue;
-                };
-                let found = members.iter().position(|member| member.name() == name);
-                let id = match found {
-                    Some(id) => id,
-                    None => {
-                        let member = Member::new(helper.clone());
-                        members.push(member);
-                        members.len() - 1
-                    }
-                };
-
-                let member = &mut members[id];
-                // A resent task left the conversation as it did when the agent took the new one
-                if let Some(MemoryStep::Task(task)) = helper.memory.steps.first() {
-                    member.memory.withdraw(&task.text);
-                }
-                let steps = helper.memory.steps.iter().cloned();
-                member.memory.steps.extend(steps);
-                // A task that was running when libsmol exited never ends
-                let end = match &helper.end {
-                    Ending::Running {} => Ending::Unfinished {},
-                    end => end.clone(),
-                };
-                member.helper = Helper {
-                    end,
-                    memory: AgentMemory::default(),
-                    ..helper.clone()
-                };
             }
+            // A task that was running when libsmol exited never ends
+            for task in record.tasks.iter_mut().filter(|task| task.running()) {
+                task.end = Ending::Unfinished {};
+            }
+            members.push(Member::new(record));
         }
 
         Self {
@@ -617,13 +564,20 @@ impl Team {
         }
     }
 
+    /// The agents as the session saves them
+    pub(crate) fn records(&self) -> Vec<AgentRecord> {
+        let members = self.members.lock().expect("members");
+        let records = members.iter().map(|member| member.record.clone());
+        records.collect()
+    }
+
     /// The agents `names` asks for, or without names those at work or with an answer not yet taken
     fn awaited(&self, names: Vec<String>) -> Result<Vec<String>, String> {
         let members = self.members.lock().expect("members");
         if names.is_empty() {
             let outstanding = members
                 .iter()
-                .filter(|member| member.helper.running() || !member.taken);
+                .filter(|member| member.running() || !member.taken);
             let names = outstanding.map(|member| member.name().to_owned());
             return Ok(names.collect());
         }
@@ -641,7 +595,7 @@ impl Team {
     async fn wait(&self, names: &[String], timeout: Option<f64>, enqueued: Nudging<'_>) -> Reply {
         let working = |member: &Member| {
             let named = names.iter().any(|name| name == member.name());
-            named && member.helper.running()
+            named && member.running()
         };
         let ended = |members: &[Member]| !members.iter().any(working);
         let waiting = self.until(ended);
@@ -669,14 +623,14 @@ impl Team {
             let Some(member) = members.iter_mut().find(|member| member.name() == name) else {
                 continue;
             };
-            if member.helper.running() {
+            if member.running() {
                 let live = member.live.lock().expect("live");
                 let status = prompt::agent_status(&live.status);
                 statuses.push(json!([name, status]));
                 continue;
             }
             member.taken = true;
-            let handed = handed(&member.helper.end);
+            let handed = handed(member.end());
             answers.push(json!([name, handed]));
         }
         Ok(json!({ "answers": answers, "working": statuses }))
@@ -689,9 +643,9 @@ impl Team {
             let Some(member) = members.iter_mut().find(|member| member.name() == name) else {
                 return Err(prompt::no_agent(name));
             };
-            if member.helper.running() {
+            if member.running() {
                 member.live.lock().expect("live").stopped = Some(Ending::Stopped {});
-                member.stop.cancel(member.tasks);
+                member.stop.cancel(member.turn());
                 member.taken = true;
             }
         }
@@ -699,7 +653,7 @@ impl Team {
         let stopped = |members: &[Member]| {
             !members
                 .iter()
-                .any(|member| member.name() == name && member.helper.running())
+                .any(|member| member.name() == name && member.running())
         };
         self.until(stopped).await;
         Ok(Value::Null)
@@ -707,7 +661,7 @@ impl Team {
 
     pub(crate) fn running(&self) -> bool {
         let members = self.members.lock().expect("members");
-        members.iter().any(|member| member.helper.running())
+        members.iter().any(Member::running)
     }
 
     /// Resolves once `done` holds for the members, checking again whenever a task ends
@@ -728,56 +682,21 @@ impl Team {
 }
 
 impl Turn<'_> {
-    /// Saves the records of tasks that ended, and returns the agents whose answers the code
-    /// hasn't taken and the user didn't interrupt, which count as taken from then on
-    pub(crate) fn ended(&mut self) -> Vec<Returned> {
+    /// The agents whose tasks ended with answers the code hasn't taken and the user didn't interrupt,
+    /// which count as taken from then on
+    pub(crate) fn ended(&self) -> Vec<Returned> {
         let Some(team) = self.agent.place.team() else {
             return Vec::new();
         };
 
-        let mut records = Vec::new();
-        let mut untaken = Vec::new();
-        let earlier = mem::take(&mut *team.earlier.lock().expect("earlier"));
-        for (seat, record, returned) in earlier {
-            untaken.extend(returned);
-            records.push((seat, record));
-        }
+        let mut untaken = mem::take(&mut *team.earlier.lock().expect("earlier"));
         let mut members = team.members.lock().expect("members");
-        for member in members.iter_mut().filter(|member| !member.helper.running()) {
-            let Some(seat) = member.seat.take() else {
-                continue;
-            };
+        for member in members.iter_mut().filter(|member| !member.running()) {
             // The user's interrupt reaches them at once,
             // so some end before `stopped()` stops the rest
             untaken.extend(member.returned());
             member.taken = true;
-            let memory = mem::take(&mut member.helper.memory);
-            let record = Helper {
-                memory,
-                ..member.helper.clone()
-            };
-            records.push((seat, record));
         }
-        drop(members);
-        if records.is_empty() {
-            return untaken;
-        }
-
-        for (seat, record) in records {
-            let Some(MemoryStep::Action(step)) = self.memory.steps.get_mut(seat.step) else {
-                continue;
-            };
-            let Some(call) = step.calls.get_mut(seat.call) else {
-                continue;
-            };
-            let Some(result) = &mut call.result else {
-                continue;
-            };
-            if let Some(kept) = result.agents.get_mut(seat.agent) {
-                *kept = record;
-            }
-        }
-        self.sink.saved(self.memory);
 
         untaken
     }
@@ -789,8 +708,11 @@ impl Turn<'_> {
             return Vec::new();
         };
 
-        let unfiled = |members: &[Member]| members.iter().any(Member::unfiled);
-        let ended = team.until(unfiled);
+        let untaken = |members: &[Member]| {
+            let untaken = |member: &Member| !member.running() && !member.taken;
+            members.iter().any(untaken)
+        };
+        let ended = team.until(untaken);
         let exited = self.worker.ending();
         let enqueued = queue.enqueued();
         let queued = select! {
@@ -807,8 +729,8 @@ impl Turn<'_> {
         }
     }
 
-    /// Announces the tasks that ended, then stops the rest and saves their records, aborting those
-    /// that take longer than `HELPERS_WAIT`
+    /// Announces the tasks that ended, then stops the rest, aborting those that take longer than
+    /// `AGENTS_WAIT`, and saves the conversations they leave
     pub(crate) async fn stopped(&mut self) {
         // Taken before the rest are stopped, which aren't announced
         let done = self.ended();
@@ -821,39 +743,43 @@ impl Turn<'_> {
             self.sink.saved(self.memory);
         }
 
-        if let Some(team) = self.agent.place.team() {
-            let user = self.agent.interrupt.triggered();
-            {
-                let members = team.members.lock().expect("members");
-                for member in members.iter().filter(|member| member.helper.running()) {
-                    let mut live = member.live.lock().expect("live");
-                    if !user && live.stopped.is_none() {
-                        live.stopped = Some(Ending::Unfinished {});
-                    }
-                    drop(live);
-                    member.stop.cancel(member.tasks);
-                }
-            }
+        let Some(team) = self.agent.place.team() else {
+            return;
+        };
+        if !team.running() {
+            return;
+        }
 
-            let settled =
-                |members: &[Member]| !members.iter().any(|member| member.helper.running());
-            let stopping = team.until(settled);
-            if time::timeout(HELPERS_WAIT, stopping).await.is_err() {
-                {
-                    let members = team.members.lock().expect("members");
-                    for member in members.iter().filter(|member| member.helper.running()) {
-                        if let Some(abort) = &member.abort {
-                            abort.abort();
-                        }
-                    }
+        let user = self.agent.interrupt.triggered();
+        {
+            let members = team.members.lock().expect("members");
+            for member in members.iter().filter(|member| member.running()) {
+                let mut live = member.live.lock().expect("live");
+                if !user && live.stopped.is_none() {
+                    live.stopped = Some(Ending::Unfinished {});
                 }
-                // Only the task waiting on each one writes its record,
-                // an answer that came first included
-                team.until(settled).await;
+                drop(live);
+                member.stop.cancel(member.turn());
             }
         }
 
+        let settled = |members: &[Member]| !members.iter().any(Member::running);
+        let stopping = team.until(settled);
+        if time::timeout(AGENTS_WAIT, stopping).await.is_err() {
+            {
+                let members = team.members.lock().expect("members");
+                for member in members.iter().filter(|member| member.running()) {
+                    if let Some(abort) = &member.abort {
+                        abort.abort();
+                    }
+                }
+            }
+            // Only the task waiting on each one writes how it ended, an answer that came first included
+            team.until(settled).await;
+        }
+
         self.ended();
+        self.sink.saved(self.memory);
     }
 }
 
@@ -865,14 +791,14 @@ struct Watched {
     start: usize,
     /// The status last shown and when
     shown: Option<(Status, Instant)>,
-    view: Box<dyn HelperView>,
+    view: Box<dyn TaskView>,
 }
 
 impl Watched {
-    fn new(view: Box<dyn HelperView>) -> Self {
+    fn new(view: Box<dyn TaskView>, start: usize) -> Self {
         Self {
             live: Arc::default(),
-            start: 0,
+            start,
             shown: None,
             view,
         }
@@ -948,8 +874,7 @@ impl Sink for Watched {
         self.show(streamed);
     }
 
-    /// The task is saved with the call that sent it, and its steps and tokens so far
-    /// show as soon as a step or compaction is saved
+    /// Its steps and tokens so far show as soon as a step or compaction is saved
     fn saved(&mut self, memory: &AgentMemory) {
         let (usage, steps) = spent(&memory.steps[self.start..]);
         {
@@ -960,7 +885,7 @@ impl Sink for Watched {
         self.show(false);
     }
 
-    fn helpers(&mut self, _: usize) -> Box<dyn Helpers> {
+    fn tasks(&mut self, _: usize) -> Box<dyn TaskViews> {
         Box::new(Unseen)
     }
 }
@@ -993,16 +918,16 @@ mod tests {
         MAX_PREVIEW_CHARS,
     };
     use crate::agent::tests::{scripted, streamed};
-    use crate::agent::{Event, HelperView, Helpers, Sink, Status, Task, Unseen};
+    use crate::agent::{Agent, Event, Sink, Status, Task, TaskView, TaskViews, Unseen};
     use crate::config::Kind;
     use crate::model::{
-        ChatMessage, Finish, Finished, Generating, Model, ModelError, Purpose, StreamDelta,
+        ChatMessage, Finish, Finished, Generating, Model, ModelError, Purpose, Sealed, StreamDelta,
         TokenUsage,
     };
     use crate::prompt::RESTARTED;
     use crate::steps::tests::metered;
     use crate::steps::{
-        spent, AgentMemory, AgentStep, Call, DoneStep, Ending, Helper, MemoryStep, Returned,
+        spent, AgentMemory, AgentStep, Call, DoneStep, Ending, MemoryStep, Returned,
     };
     use crate::tests::{cancel_soon, content};
     use crate::tools::mcp::tests::fake;
@@ -1054,12 +979,13 @@ mod tests {
             Box::pin(async move {
                 let item =
                     json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-café" });
-                let sealed = StreamDelta::Sealed {
-                    provider: "mock",
+                let sealed = Sealed {
+                    provider: "mock".to_owned(),
                     kind: Kind::Responses,
-                    item: &item,
+                    items: vec![item],
+                    ends: vec![0],
                 };
-                on_delta(sealed);
+                on_delta(StreamDelta::Sealed(&sealed));
                 match code {
                     Some(code) => {
                         on_delta(StreamDelta::CallCode(code));
@@ -1098,7 +1024,21 @@ mod tests {
              'naïve': 'Answer: Spell naïve', 'deeper': {nested:?}}}"
         );
         assert_eq!(result.printed.as_deref(), Some(printed.as_str()));
-        let tasks: Vec<&str> = result.agents.iter().map(|helper| &*helper.task).collect();
+        let sent: Vec<(&str, usize)> = result
+            .agents
+            .iter()
+            .map(|sent| (sent.name.as_str(), sent.number))
+            .collect();
+        assert_eq!(
+            sent,
+            [("cafés", 0), ("crash", 0), ("naïve", 0), ("deeper", 0)]
+        );
+        let team = agent.agent.place.team().expect("team");
+        let records = team.records();
+        let tasks: Vec<&str> = records
+            .iter()
+            .map(|record| &*record.tasks[0].task)
+            .collect();
         let asked = [
             "Count the cafés",
             "Crash",
@@ -1106,16 +1046,17 @@ mod tests {
             "Start another agent",
         ];
         assert_eq!(tasks, asked);
-        // The crashed agent keeps the record its dropped view showed in its place
-        assert_eq!(result.agents[1].end, Ending::Unfinished {});
+        // The crashed agent ends as its dropped view showed
+        assert_eq!(records[1].tasks[0].end, Ending::Unfinished {});
         // The records hold the conversations of their agents, which go back to the provider
-        for index in [0, 2, 3] {
-            let helper = &result.agents[index];
-            assert!(matches!(helper.end, Ending::Answer(_)), "{helper:?}");
-            assert!(helper.resendable, "{helper:?}");
-            let (usage, _) = spent(&helper.memory.steps);
-            assert!(usage.tokens.is_some(), "{helper:?}");
-            for step in &helper.memory.steps {
+        for record in [&records[0], &records[2], &records[3]] {
+            assert!(
+                matches!(record.tasks[0].end, Ending::Answer(_)),
+                "{record:?}"
+            );
+            let (usage, _) = spent(&record.memory.steps);
+            assert!(usage.tokens.is_some(), "{record:?}");
+            for step in &record.memory.steps {
                 if let MemoryStep::Action(action) = step {
                     assert!(action.sealed.is_some(), "{action:?}");
                 }
@@ -1147,7 +1088,7 @@ mod tests {
         let adding = tested.worker.add_server(fake(), &[]);
         let added = block_on(adding).expect("add server");
 
-        let records = Arc::new(Records::new(0, 0));
+        let records = Arc::new(Records::default());
         let servers = [&added];
         let mut delegate = tested.agent.delegate(&servers, Box::new(Unseen), &records);
         let asked = Asked {
@@ -1177,22 +1118,18 @@ mod tests {
         let agent = tested.agent.clone();
         agent.interrupt.cancel(0);
 
-        let asked = Helper {
+        let asked = Asked {
+            name: "cafés".to_owned(),
             task: "Count the cafés".to_owned(),
-            name: Some("cafés".to_owned()),
-            end: Ending::Running {},
-            memory: AgentMemory::default(),
-            resendable: true,
         };
         let memory = AgentMemory::default();
-        let watched = Watched::new(Box::new(Unseen));
+        let watched = Watched::new(Box::new(Unseen), 0);
         let servers: Arc<[Added]> = Arc::new([]);
         let slots = Arc::new(Semaphore::new(0));
-        let helping = agent.help(asked, memory, None, watched, servers, slots);
-        let waiting = async { time::timeout(Duration::from_secs(5), helping).await };
-        let (helper, memory, worker) = block_on(waiting).expect("stopped");
-        assert_eq!(helper.end, Ending::Interrupted {});
-        assert!(helper.memory.steps.is_empty(), "{helper:?}");
+        let working = agent.work(asked, memory, None, watched, servers, slots);
+        let waiting = async { time::timeout(Duration::from_secs(5), working).await };
+        let (end, memory, worker) = block_on(waiting).expect("stopped");
+        assert_eq!(end, Ending::Interrupted {});
         assert!(memory.steps.is_empty(), "{memory:?}");
         assert!(worker.is_none());
     }
@@ -1274,12 +1211,18 @@ mod tests {
         result.printed.as_deref().unwrap_or_default()
     }
 
-    fn ends(call: &Call) -> Vec<(Option<&str>, &Ending)> {
+    /// The agent each task the call sent went to, with how the task ended
+    fn ends(agent: &Agent, call: &Call) -> Vec<(String, Ending)> {
         let result = call.result.as_ref().expect("ran");
-        let agents = result.agents.iter();
-        agents
-            .map(|helper| (helper.name.as_deref(), &helper.end))
-            .collect()
+        let records = agent.place.team().expect("team").records();
+        let mut ends = Vec::new();
+        for sent in &result.agents {
+            let found = records.iter().find(|record| record.name == sent.name);
+            let record = found.expect("agent");
+            let end = record.tasks[sent.number].end.clone();
+            ends.push((sent.name.clone(), end));
+        }
+        ends
     }
 
     /// What each request an agent made was sent after its system prompt, in order
@@ -1312,11 +1255,12 @@ mod tests {
         assert_eq!(printed(&memory, 1), format!("{taken}\n{taken}"));
         let cafés = Ending::Answer("Answer: Count the cafés".to_owned());
         let naïve = Ending::Answer("Answer: Spell naïve after 0.5".to_owned());
-        assert_eq!(
-            ends(ran(&memory, 1)),
-            [(Some("cafés"), &cafés), (Some("naïve"), &naïve)]
-        );
-        let returned = Returned::Ended {
+        let sent = [
+            ("cafés".to_owned(), cafés),
+            ("naïve".to_owned(), naïve.clone()),
+        ];
+        assert_eq!(ends(&agent.agent, ran(&memory, 1)), sent);
+        let returned = Returned {
             name: "naïve".to_owned(),
             end: naïve,
         };
@@ -1383,9 +1327,10 @@ mod tests {
         let MemoryStep::Action(step) = &memory.steps[1] else {
             panic!("{:?}", memory.steps);
         };
-        assert_eq!(ends(&step.calls[0]), []);
+        assert_eq!(ends(&agent.agent, &step.calls[0]), []);
         let naïve = Ending::Answer("Answer: Spell naïve after 0.5".to_owned());
-        assert_eq!(ends(&step.calls[1]), [(Some("naïve"), &naïve)]);
+        let sent = [("naïve".to_owned(), naïve)];
+        assert_eq!(ends(&agent.agent, &step.calls[1]), sent);
     }
 
     /// While the turn waits for an agent, a message the client queues arrives as a task update
@@ -1520,9 +1465,13 @@ mod tests {
 
         let shown = "{'slow': 'Answer: Spell naïve'}\nagent.stop: name: menu: no such agent";
         assert_eq!(printed(&memory, 2), shown);
-        assert_eq!(ends(ran(&memory, 1)), [(Some("slow"), &Ending::Stopped {})]);
+        let stopped = [("slow".to_owned(), Ending::Stopped {})];
+        assert_eq!(ends(&agent.agent, ran(&memory, 1)), stopped);
         let again = Ending::Answer("Answer: Spell naïve".to_owned());
-        assert_eq!(ends(ran(&memory, 2)), [(Some("slow"), &again)]);
+        assert_eq!(
+            ends(&agent.agent, ran(&memory, 2)),
+            [("slow".to_owned(), again)]
+        );
         let done = |step: &MemoryStep| matches!(step, MemoryStep::Done(_));
         assert!(!memory.steps.iter().any(done), "{:?}", memory.steps);
 
@@ -1618,7 +1567,7 @@ mod tests {
             (Vec::new(), "run print(x)"),
             (vec![&added], "run print(x)"),
         ] {
-            let records = Arc::new(Records::new(0, 0));
+            let records = Arc::new(Records::default());
             let mut delegate = tested.agent.delegate(&servers, Box::new(Unseen), &records);
             let waiting = async {
                 delegate(asked(task)).await;
@@ -1650,25 +1599,18 @@ mod tests {
         agent.turn(&mut memory, "Copy and count").expect("run");
 
         let team = agent.agent.place.team().expect("team");
-        let live = team.members.lock().expect("members");
-        let restored = Team::restored(&memory.steps);
-        let restored = restored.members.lock().expect("members");
-        let names: Vec<&str> = restored.iter().map(|member| member.name()).collect();
+        let mut saved = team.records();
+        let names: Vec<&str> = saved.iter().map(|record| record.name.as_str()).collect();
         assert_eq!(names, ["copy", "calc"]);
-        for (live, restored) in live.iter().zip(restored.iter()) {
-            assert_eq!(restored.memory, live.memory);
-            assert_eq!(restored.helper.end, live.helper.end);
-        }
-        drop(live);
+        let restored = Team::restored(saved.clone());
+        assert_eq!(restored.records(), saved);
 
-        // A task saved as running, as when libsmol exits, comes back ended
-        let MemoryStep::Action(step) = &mut memory.steps[1] else {
-            panic!("{:?}", memory.steps);
-        };
-        let result = step.calls[0].result.as_mut().expect("ran");
-        result.agents[0].end = Ending::Running {};
-        let restored = Team::restored(&memory.steps);
+        // A task saved as running, as when libsmol exits, comes back unfinished
+        saved[1].tasks[1].end = Ending::Running {};
+        let restored = Team::restored(saved);
         assert!(!restored.running());
+        let records = restored.records();
+        assert_eq!(records[1].tasks[1].end, Ending::Unfinished {});
     }
 
     /// A name finds its agent again after Python restarts
@@ -1706,10 +1648,8 @@ mod tests {
         let mut memory = AgentMemory::default();
         let answer = agent.turn(&mut memory, "Wait for it").expect("run");
         assert_eq!(answer, None);
-        assert_eq!(
-            ends(ran(&memory, 1)),
-            [(Some("slow"), &Ending::Interrupted {})]
-        );
+        let interrupted = [("slow".to_owned(), Ending::Interrupted {})];
+        assert_eq!(ends(&agent.agent, ran(&memory, 1)), interrupted);
         let done = |step: &MemoryStep| matches!(step, MemoryStep::Done(_));
         assert!(!memory.steps.iter().any(done), "{:?}", memory.steps);
     }
@@ -1725,10 +1665,8 @@ mod tests {
         let mut memory = AgentMemory::default();
         let failed = agent.turn(&mut memory, "Wait for it").expect_err("refused");
         assert!(failed.to_string().contains("bad request"), "{failed}");
-        assert_eq!(
-            ends(ran(&memory, 1)),
-            [(Some("slow"), &Ending::Unfinished {})]
-        );
+        let unfinished = [("slow".to_owned(), Ending::Unfinished {})];
+        assert_eq!(ends(&agent.agent, ran(&memory, 1)), unfinished);
     }
 
     /// An agent that answered during a step the user interrupts is still announced
@@ -1758,7 +1696,7 @@ mod tests {
         let mut memory = AgentMemory::default();
         let answer = agent.turn(&mut memory, "Count them").expect("run");
         assert_eq!(answer, None);
-        let returned = Returned::Ended {
+        let returned = Returned {
             name: "cafés".to_owned(),
             end: Ending::Answer("Answer: Count the cafés".to_owned()),
         };
@@ -1777,8 +1715,8 @@ mod tests {
         waited: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
-    impl Helpers for Followed {
-        fn open(&self, _: usize, _: &Helper) -> Box<dyn HelperView> {
+    impl TaskViews for Followed {
+        fn open(&self, _: usize, _: &str, _: &str) -> Box<dyn TaskView> {
             let ends = Arc::clone(&self.ends);
             Box::new(Closed(ends))
         }
@@ -1790,12 +1728,11 @@ mod tests {
 
     struct Closed(Arc<Mutex<Vec<Ending>>>);
 
-    impl HelperView for Closed {
+    impl TaskView for Closed {
         fn shown(&mut self, _: &Status) {}
 
-        fn close(&mut self, helper: &Helper) {
-            let end = helper.end.clone();
-            self.0.lock().expect("ends").push(end);
+        fn close(&mut self, end: &Ending, _: &[MemoryStep]) {
+            self.0.lock().expect("ends").push(end.clone());
         }
     }
 
@@ -1807,7 +1744,7 @@ mod tests {
         let tested = scripted(model, Box::new(|_| {}));
         let followed = Followed::default();
         let views = Box::new(followed.clone());
-        let records = Arc::new(Records::new(0, 0));
+        let records = Arc::new(Records::default());
         let mut delegate = tested.agent.delegate(&[], views, &records);
 
         let asked = Asked {
@@ -1840,19 +1777,19 @@ mod tests {
 
     struct Recorded(Arc<Mutex<Vec<Status>>>);
 
-    impl HelperView for Recorded {
+    impl TaskView for Recorded {
         fn shown(&mut self, status: &Status) {
             self.0.lock().expect("shown").push(status.clone());
         }
 
-        fn close(&mut self, _: &Helper) {}
+        fn close(&mut self, _: &Ending, _: &[MemoryStep]) {}
     }
 
     #[test]
     fn status_throttled() {
         let shown = Arc::<Mutex<Vec<Status>>>::default();
         let view = Recorded(Arc::clone(&shown));
-        let mut watched = Watched::new(Box::new(view));
+        let mut watched = Watched::new(Box::new(view), 0);
         watched.event(Event::Thought(streamed("Reading the menu")));
         watched.event(Event::Code(0, streamed("\nprint(len(cafés))\n")));
         let call = Call {

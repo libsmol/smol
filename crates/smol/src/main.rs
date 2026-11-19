@@ -81,7 +81,7 @@ fn run() -> Result<()> {
         }
     };
 
-    let command = [program.display().to_string()];
+    let command = [program.into_os_string()];
     let resume = cli.resume.as_deref();
     match cli.mode {
         Some(Mode::Web { listen, token }) => {
@@ -93,13 +93,14 @@ fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::client::Notice;
     use crate::conversation::Conversation;
     use agent_client_protocol_schema::v1::{
         ContentBlock, ContentChunk, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
         ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
     };
+    use reaper::wire::Notice;
     use serde_json::json;
+    use std::ffi::OsString;
 
     const FAKE_AGENT: &str = r#"
 model() {
@@ -189,12 +190,12 @@ while IFS= read -r line; do
 done
 "#;
 
-    pub(crate) fn shell(script: &str) -> Vec<String> {
-        let command = ["sh", "-c", script].map(str::to_owned);
+    pub(crate) fn shell(script: &str) -> Vec<OsString> {
+        let command = ["sh", "-c", script].map(OsString::from);
         command.to_vec()
     }
 
-    pub(crate) fn fake() -> Vec<String> {
+    pub(crate) fn fake() -> Vec<OsString> {
         shell(FAKE_AGENT)
     }
 

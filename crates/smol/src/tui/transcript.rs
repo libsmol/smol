@@ -1,6 +1,7 @@
 use crate::conversation::{Conversation, Entry, Step};
 use crate::tui::render::{Render, Row};
 use crate::tui::SPIN_EVERY;
+use ratatui::layout::{Position, Rect};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -56,6 +57,90 @@ impl<'a> Rows<'a> {
     }
 }
 
+/// Which rows of the conversation the screen shows, kept from frame to frame
+#[derive(Debug, Default)]
+pub(crate) struct Viewport {
+    /// Rows scrolled back from the bottom
+    pub(crate) back: usize,
+    /// The most rows the last frame could scroll back
+    bottom: usize,
+    /// `back` as the last frame left it, which only scrolling changes before the next
+    drawn_back: usize,
+    /// Where the last frame drew the scrollbar, empty without one
+    pub(crate) bar: Rect,
+}
+
+impl Viewport {
+    pub(crate) fn top(&self) -> usize {
+        self.bottom.saturating_sub(self.back)
+    }
+
+    pub(crate) fn scroll_up(&mut self, rows: usize) {
+        self.back = self.back.saturating_add(rows);
+    }
+
+    pub(crate) fn scroll_down(&mut self, rows: usize) {
+        self.back = self.back.saturating_sub(rows);
+    }
+
+    /// Inverts `thumb`, so the thumb is drawn on the cell it was dragged to
+    pub(crate) fn drag_to(&mut self, row: u16) {
+        let last = usize::from(self.bar.height.saturating_sub(1));
+        let offset = usize::from(row.saturating_sub(self.bar.top()));
+        let top = (offset.min(last) * self.bottom + last / 2).checked_div(last);
+        let top = top.unwrap_or(self.bottom);
+        self.back = self.bottom - top.min(self.bottom);
+    }
+
+    /// Shows `total` rows `height` at a time, where a view scrolled back stays on what it showed,
+    /// at the row `anchored` once everything was laid out again, and returns the first row shown
+    /// and whether scrolling moved it since the last frame
+    pub(crate) fn settle(
+        &mut self,
+        total: usize,
+        height: usize,
+        anchored: Option<usize>,
+    ) -> (usize, bool) {
+        let scrolled = self.back != self.drawn_back;
+        let bottom = total.saturating_sub(height);
+        match anchored {
+            Some(top) => self.back = bottom.saturating_sub(top),
+            // While scrolled back, content growing or shrinking must not shift what is being read
+            None if self.back > 0 => {
+                let moved = self.back.saturating_add(bottom);
+                self.back = moved.saturating_sub(self.bottom);
+            }
+            None => {}
+        }
+
+        self.back = self.back.min(bottom);
+        self.bottom = bottom;
+        self.drawn_back = self.back;
+        self.bar = Rect::default();
+        (self.top(), scrolled)
+    }
+
+    /// Puts the scrollbar in the last column of `track` and returns where its thumb goes,
+    /// or None when there is nothing to scroll
+    pub(crate) fn place_bar(&mut self, track: Rect) -> Option<Position> {
+        // Without a track the thumb would land on the corner
+        if self.bottom == 0 || track.is_empty() {
+            return None;
+        }
+
+        let column = track.right().saturating_sub(1);
+        self.bar = Rect::new(column, track.top(), 1, track.height);
+        let row = track.top() + thumb(self.top(), self.bottom, track.height);
+        Some(Position::new(column, row))
+    }
+}
+
+pub(crate) fn thumb(top: usize, bottom: usize, length: u16) -> u16 {
+    let last = usize::from(length.saturating_sub(1));
+    let row = (top * last + bottom / 2).checked_div(bottom).unwrap_or(0);
+    row.min(last) as u16
+}
+
 /// Caches settled entries per width and expansion and redraws the rest only after a change,
 /// so a new conversation needs a new transcript
 #[derive(Default)]
@@ -69,7 +154,7 @@ pub(crate) struct Transcript {
     /// Width, expansion, and how many pictures had loaded
     layout: (u16, bool, u64),
     /// How many pictures had loaded when the frame began, which `anchor` and `rows` must agree on
-    pub(crate) pictures: u64,
+    pub(crate) loaded: u64,
     /// When the spinners in `groups` were last drawn moving on
     spun: Option<Instant>,
     groups: Vec<Group>,
@@ -99,7 +184,7 @@ impl Transcript {
     /// Before a layout change, records which entry `row` belongs to and its offset there
     /// for `Rows::row_at` to find after relayout
     pub(crate) fn anchor(&self, row: usize, width: u16, expanded: bool) -> Option<(usize, usize)> {
-        if self.layout == (width, expanded, self.pictures) {
+        if self.layout == (width, expanded, self.loaded) {
             return None;
         }
 
@@ -122,7 +207,7 @@ impl Transcript {
 
     pub(crate) fn rows(&mut self, talk: &Conversation, width: u16, expanded: bool) -> Rows<'_> {
         // A picture that finished loading changes the height of its rows
-        let layout = (width, expanded, self.pictures);
+        let layout = (width, expanded, self.loaded);
         let relaid = self.layout != layout;
         if relaid {
             self.layout = layout;
@@ -179,12 +264,8 @@ impl Transcript {
                 Some(index) => index >= rendered,
                 None => redrawn,
             };
-            let start = match group.entry {
-                Some(index) => self.starts[index],
-                None => self.settled.len(),
-            };
-            let shown = start + group.rows.start..start + group.rows.end;
-            let hidden = group.entry.is_some() && !self.on_screen(shown);
+            let rows = self.placed(group);
+            let hidden = group.entry.is_some() && !self.on_screen(rows);
             if fresh || hidden {
                 at += 1;
                 continue;
@@ -264,13 +345,9 @@ impl Transcript {
                 let Some(group) = found else {
                     continue;
                 };
-                let start = match group.entry {
-                    Some(index) => self.starts[index],
-                    None => self.settled.len(),
-                };
                 // Hiding the area moves these rows again, so only scrolling takes agents back out of it
                 let kept = self.pins.contains(&call.id) && !self.scrolled;
-                let rows = start + group.rows.start..start + group.rows.end;
+                let rows = self.placed(group);
                 if !kept && self.on_screen(rows) {
                     continue;
                 }
@@ -287,6 +364,15 @@ impl Transcript {
         render.rows
     }
 
+    /// Where a group's rows are among all rows
+    fn placed(&self, group: &Group) -> Range<usize> {
+        let start = match group.entry {
+            Some(index) => self.starts[index],
+            None => self.settled.len(),
+        };
+        start + group.rows.start..start + group.rows.end
+    }
+
     /// Before the screen is known every row counts as on it
     fn on_screen(&self, rows: Range<usize>) -> bool {
         match &self.view {
@@ -298,8 +384,7 @@ impl Transcript {
 
 #[cfg(test)]
 mod tests {
-    use crate::client::Notice;
-    use crate::conversation::{Entry, Outcome};
+    use crate::conversation::{Entry, Outcome, ShellEnd};
     use crate::tests::{chunk, content, end_step, message, moved, retrying, started, told};
     use crate::tui::transcript::*;
     use crate::tui::SPINNER;
@@ -308,7 +393,17 @@ mod tests {
         ToolCallUpdateFields, ToolKind, UsageUpdate,
     };
     use anyhow::anyhow;
+    use reaper::wire::Notice;
     use serde_json::json;
+
+    #[test]
+    fn thumb_rows() {
+        assert_eq!(thumb(0, 100, 10), 0);
+        assert_eq!(thumb(50, 100, 10), 5);
+        assert_eq!(thumb(100, 100, 10), 9);
+        assert_eq!(thumb(0, 0, 10), 0);
+        assert_eq!(thumb(3, 7, 1), 0);
+    }
 
     fn rows(transcript: &mut Transcript, talk: &Conversation) -> Vec<String> {
         let rows = transcript.rows(talk, 40, false);
@@ -785,7 +880,7 @@ mod tests {
         let Some(Entry::Shell(shell)) = talk.held().last() else {
             panic!("shell");
         };
-        assert!(shell.interrupted);
+        assert_eq!(shell.end, ShellEnd::Interrupted("interrupted".to_owned()));
     }
 
     /// Only scrolling or a new layout takes a call's agents back out of the area at the bottom

@@ -34,7 +34,7 @@ pub(crate) struct Grid {
     size: Size,
     screen: Buffer,
     cursor: Position,
-    shown: bool,
+    cursor_shown: bool,
     drawn: Vec<Position>,
     cleared: bool,
     cursor_moved: bool,
@@ -63,7 +63,7 @@ impl Grid {
             size,
             screen: Buffer::empty(area),
             cursor: Position::ORIGIN,
-            shown: false,
+            cursor_shown: false,
             drawn: Vec::new(),
             cleared: true,
             cursor_moved: false,
@@ -80,7 +80,7 @@ impl Grid {
     }
 
     pub(crate) fn cursor(&self) -> Option<Position> {
-        self.shown.then_some(self.cursor)
+        self.cursor_shown.then_some(self.cursor)
     }
 
     pub(crate) fn take(&mut self) -> Changes {
@@ -138,14 +138,14 @@ impl Backend for Grid {
     }
 
     fn hide_cursor(&mut self) -> Result<(), Self::Error> {
-        self.cursor_moved |= self.shown;
-        self.shown = false;
+        self.cursor_moved |= self.cursor_shown;
+        self.cursor_shown = false;
         Ok(())
     }
 
     fn show_cursor(&mut self) -> Result<(), Self::Error> {
-        self.cursor_moved |= !self.shown;
-        self.shown = true;
+        self.cursor_moved |= !self.cursor_shown;
+        self.cursor_shown = true;
         Ok(())
     }
 
@@ -191,19 +191,18 @@ impl Backend for Grid {
     }
 }
 
-/// A frame for browsers and the Kitty images its tiles show, where `null` among the symbols of
-/// a run is a column the wide symbol before it covers
+/// A frame for browsers, where `null` among the symbols of a run is a column the wide symbol
+/// before it covers
 pub(crate) fn encode(
     screen: &Buffer,
     changes: &Changes,
     cursor: Option<Position>,
     input: Rect,
-) -> (String, Vec<u32>) {
+) -> String {
     let mut styles = Vec::new();
     let mut numbered: HashMap<(Color, Color, Modifier), usize> = HashMap::new();
     let mut runs: Vec<(u16, u16, usize, Vec<Value>)> = Vec::new();
     let mut tiles = Vec::new();
-    let mut images = Vec::new();
 
     for &at in &changes.cells {
         let cell = &screen[at];
@@ -219,9 +218,6 @@ pub(crate) fn encode(
                     tile.column,
                     tile.row
                 ]));
-                if !images.contains(&tile.image) {
-                    images.push(tile.image);
-                }
                 (" ", (Color::Reset, cell.bg, Modifier::empty()))
             }
             None => (cell.symbol(), (cell.fg, cell.bg, cell.modifier)),
@@ -270,7 +266,7 @@ pub(crate) fn encode(
         "cursor": cursor,
         "input": input,
     });
-    (frame.to_string(), images)
+    frame.to_string()
 }
 
 /// `null` leaves the page's own foreground or background
@@ -349,10 +345,9 @@ mod tests {
         let cursor = Some(Position::new(3, 1));
         let input = Rect::new(0, 1, 6, 1);
         let changes = grid.whole();
-        let (frame, images) = encode(grid.screen(), &changes, cursor, input);
+        let frame = encode(grid.screen(), &changes, cursor, input);
         let frame: Value = serde_json::from_str(&frame).expect("json");
 
-        assert!(images.is_empty());
         assert_eq!(
             frame["styles"],
             json!([[null, null, 0], ["#bd93f9", null, 1]])

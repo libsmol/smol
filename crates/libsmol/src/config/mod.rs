@@ -50,12 +50,12 @@ struct ModelFile {
 /// One `[model.<name>]` table, as `models` reads it and `save_model` writes it
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields, expecting = "a table")]
-struct Provider {
+pub(crate) struct Provider {
     #[serde(rename = "type")]
-    kind: Kind,
-    api: Option<String>,
-    api_key: Option<String>,
-    models: Vec<ModelSpec>,
+    pub(crate) kind: Kind,
+    pub(crate) api: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) models: Vec<ModelSpec>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -111,8 +111,14 @@ impl Models {
         None
     }
 
-    /// `effort` replaces the one model.toml gives
-    pub(crate) fn make(&self, name: &str, effort: Option<&str>) -> Result<Box<dyn Model>> {
+    /// `effort` replaces the one model.toml gives, and the model reads the media it sends from
+    /// `copies`
+    pub(crate) fn make(
+        &self,
+        name: &str,
+        effort: Option<&str>,
+        copies: &Path,
+    ) -> Result<Box<dyn Model>> {
         let Some((prefix, provider, model)) = self.find(name) else {
             let names = self.names().join(", ");
             let message = format!("model: {name}: not in model.toml (models: {names})");
@@ -124,9 +130,7 @@ impl Models {
             spec.effort = Some(effort.to_owned());
         }
 
-        let api = provider.api.clone();
-        let key = provider.api_key.clone();
-        let built = OpenAIModel::new(prefix, &spec, provider.kind, api, key)?;
+        let built = OpenAIModel::new(prefix, provider, spec, copies.to_owned())?;
         Ok(Box::new(built))
     }
 
@@ -361,25 +365,19 @@ pub(crate) struct Skill {
     pub(crate) path: PathBuf,
 }
 
-/// `name` in the config directory, then in each level's .smol from the root down to `project`
-fn layered(dir: &Path, project: &Path, name: &str) -> Vec<PathBuf> {
-    let mut paths = vec![dir.join(name)];
-    let mut above: Vec<&Path> = project.ancestors().collect();
-    above.reverse();
-    for layer in above {
-        let path = layer.join(".smol").join(name);
-        // The config directory may itself be the .smol of one of the levels
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    paths
-}
-
 /// Global skills live under the config directory's skills
 /// and project ones under each level's .smol/skills, and the deepest wins on a name clash
 pub(crate) fn skills(dir: &Path, project: &Path) -> (Vec<Skill>, Vec<Error>) {
-    let roots = layered(dir, project, "skills");
+    let mut roots = vec![dir.join("skills")];
+    let mut above: Vec<&Path> = project.ancestors().collect();
+    above.reverse();
+    for layer in above {
+        let root = layer.join(".smol").join("skills");
+        // The config directory may itself be the .smol of one of the levels
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
 
     let mut found = BTreeMap::new();
     let mut skipped = Vec::new();
@@ -657,13 +655,21 @@ pub(crate) struct Skipped {
     pub(crate) problem: Error,
 }
 
-/// MCP entries that can't be used are skipped and returned with their problems
-pub(crate) fn agent(dir: &Path) -> Result<(Vec<McpConfig>, Access, Vec<Skipped>)> {
+/// What agent.toml configures
+#[derive(Debug, Default)]
+pub(crate) struct AgentConfig {
+    pub(crate) servers: Vec<McpConfig>,
+    pub(crate) access: Access,
+    /// MCP entries that can't be used, with their problems
+    pub(crate) skipped: Vec<Skipped>,
+}
+
+pub(crate) fn agent(dir: &Path) -> Result<AgentConfig> {
     let path = dir.join("agent.toml");
     let invalid = invalid(&path);
     let text = match read_text(&path) {
         Ok(Some(text)) => text,
-        Ok(None) => return Ok((Vec::new(), Access::default(), Vec::new())),
+        Ok(None) => return Ok(AgentConfig::default()),
         Err(reason) => return Err(invalid(reason)),
     };
 
@@ -763,7 +769,11 @@ pub(crate) fn agent(dir: &Path) -> Result<(Vec<McpConfig>, Access, Vec<Skipped>)
         hidden,
     };
 
-    Ok((servers, access, skipped))
+    Ok(AgentConfig {
+        servers,
+        access,
+        skipped,
+    })
 }
 
 pub(crate) fn parse_url(url: &str) -> Result<Url, String> {
@@ -844,8 +854,8 @@ fn without_value(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        agent, front_matter, instructions, models, save_model, scalar, skills, Access, Kind,
-        McpConfig, McpKind, ModelSpec, Skill, MODEL_EXAMPLE,
+        agent, front_matter, instructions, models, save_model, scalar, skills, Access, AgentConfig,
+        Kind, McpConfig, McpKind, ModelSpec, Skill, MODEL_EXAMPLE,
     };
     use crate::model::MediaKind;
     use crate::tests::temp_dir;
@@ -887,13 +897,16 @@ models = [{ id = "m3", effort = "max", summary = "auto", image = true }]
         let (dir, _) = written(text);
         let read = models(&dir).expect("load");
         assert_eq!(read.names(), ["über/m1", "über/piñata-2", "slow/m3"]);
-        let built = read.make("über/piñata-2", Some("low")).expect("make");
+        let copies = dir.join("copies");
+        let built = read.make("über/piñata-2", Some("low"), &copies);
+        let built = built.expect("make");
         assert_eq!(built.context_window(), Some(8000));
         assert!(built.takes(MediaKind::Image) && built.takes(MediaKind::Video));
-        let built = read.make("slow/m3", None).expect("make");
+        let built = read.make("slow/m3", None, &copies).expect("make");
         assert!(built.takes(MediaKind::Image) && !built.takes(MediaKind::Video));
 
-        let missing = read.make("über", None).err().expect("missing").to_string();
+        let missing = read.make("über", None, &copies).err().expect("missing");
+        let missing = missing.to_string();
         let names = "über/m1, über/piñata-2, slow/m3";
         let expected = format!("model: über: not in model.toml (models: {names})");
         assert_eq!(missing, expected);
@@ -1036,7 +1049,9 @@ models = [{ id = "m3", effort = "max", summary = "auto", image = true }]
 
         let read = models(&dir).expect("load");
         assert_eq!(read.names(), ["über café.v2/piñata-2"]);
-        let built = read.make("über café.v2/piñata-2", None).expect("make");
+        let copies = dir.join("copies");
+        let built = read.make("über café.v2/piñata-2", None, &copies);
+        let built = built.expect("make");
         assert_eq!(built.context_window(), Some(8192));
         assert!(built.takes(MediaKind::Image) && !built.takes(MediaKind::Video));
         let text = fs::read_to_string(&path).expect("read");
@@ -1062,7 +1077,7 @@ models = [{ id = "m3", effort = "max", summary = "auto", image = true }]
             assert_eq!(mode & 0o777, 0o600);
         }
         let read = models(&dir).expect("load");
-        let built = read.make("local-1/qwen3:32b", None).expect("make");
+        let built = read.make("local-1/qwen3:32b", None, &copies).expect("make");
         assert_eq!(built.context_window(), None);
 
         // A link a dotfile manager made stays, and the file it leads to is rewritten
@@ -1239,14 +1254,20 @@ models = [{ id = "m3", effort = "max", summary = "auto", image = true }]
     fn servers_read() {
         let dir = temp_dir("mcp-config");
         fs::create_dir_all(&dir).expect("create");
-        let (servers, access, _) = agent(&dir).expect("missing");
+        let AgentConfig {
+            servers, access, ..
+        } = agent(&dir).expect("missing");
         assert!(servers.is_empty());
         assert_eq!(access, Access::default());
 
         let text = "[mcp.\"workspace\"]\ntype = \"stdio\"\ncommand = \"desktop-mcp\"\nargs = [\"--quiet\"]\nenv = { LANG = \"en_US.UTF-8\" }\n\n\
             [mcp.web]\ntype = \"http\"\nurl = \"http://127.0.0.1:1/mcp\"\nenabled = false\ndescription = \"Search the web\"\n";
         fs::write(dir.join("agent.toml"), text).expect("write");
-        let (read, _, skipped) = agent(&dir).expect("servers");
+        let AgentConfig {
+            servers: read,
+            skipped,
+            ..
+        } = agent(&dir).expect("servers");
         assert!(skipped.is_empty(), "{skipped:?}");
 
         let http = McpKind::Http {
@@ -1311,7 +1332,9 @@ models = [{ id = "m3", effort = "max", summary = "auto", image = true }]
         for (name, text, problem) in cases {
             let text = format!("{text}{kept}");
             fs::write(dir.join("agent.toml"), text).expect("write");
-            let (servers, _, skipped) = agent(&dir).expect("skipped");
+            let AgentConfig {
+                servers, skipped, ..
+            } = agent(&dir).expect("skipped");
             let names: Vec<&str> = servers.iter().map(|server| server.name.as_str()).collect();
             assert_eq!(names, ["kept"]);
             let mut said = Vec::new();
@@ -1353,7 +1376,7 @@ models = [{ id = "m3", effort = "max", summary = "auto", image = true }]
             "[allow]\nenv = [\"GITHUB_TOKEN\"]\nwrite = [\"~/.npm\", '{absolute}']\n\n[deny]\nread = [\"~\"]\n"
         );
         fs::write(dir.join("agent.toml"), text).expect("write");
-        let (_, access, _) = agent(&dir).expect("access");
+        let access = agent(&dir).expect("access").access;
 
         let expected = Access {
             env: vec!["GITHUB_TOKEN".to_owned()],

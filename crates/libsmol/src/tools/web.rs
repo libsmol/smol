@@ -1,12 +1,12 @@
 use crate::prompt;
 use crate::tools::ToolError;
-use crate::utils::{excerpt, http_client, read_cause};
+use crate::utils::{content_type, excerpt, http_client, read_cause};
 use encoding_rs::{Encoding, UTF_8};
 use html5ever::driver::{parse_fragment, ParseOpts};
 use html5ever::tendril::TendrilSink;
 use html5ever::tree_builder::TreeBuilderOpts;
 use html5ever::{local_name, ns, QualName};
-use reqwest::header::{CONTENT_TYPE, LOCATION};
+use reqwest::header::LOCATION;
 use reqwest::redirect::Policy;
 use reqwest::{Client, Url};
 use scraper::{ElementRef, Html, HtmlTreeSink, Node};
@@ -20,6 +20,8 @@ const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
 /// Error pages often put their message after a long block of styles
 const MAX_EXCERPT_BYTES: usize = 64 * 1024;
 const SNIFF_BYTES: usize = 8192;
+/// Where a page that declares its charset does so
+const CHARSET_BYTES: usize = 1024;
 /// Past this depth the recursive walk only takes text, as deep nesting would exhaust the stack
 const MAX_DEPTH: usize = 256;
 /// HTTP redirects and in-page refreshes count together
@@ -34,7 +36,7 @@ static CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
     http_client(builder)
 });
 
-pub async fn fetch(url: &str) -> Result<String, ToolError> {
+pub(crate) async fn fetch(url: &str) -> Result<String, ToolError> {
     let client = match &*CLIENT {
         Ok(client) => client,
         Err(reason) => {
@@ -66,11 +68,7 @@ pub async fn fetch(url: &str) -> Result<String, ToolError> {
             continue;
         }
 
-        let content_type = response.headers().get(CONTENT_TYPE);
-        let content_type = content_type.and_then(|value| value.to_str().ok());
-        let mut parts = content_type.unwrap_or_default().split(';');
-        let mime = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
-        let label = parts.find_map(charset);
+        let (mime, label) = content_type(response.headers());
         let encoding = label.and_then(|label| Encoding::for_label(label.as_bytes()));
         let html = matches!(mime.as_str(), "" | "text/html" | "application/xhtml+xml");
 
@@ -84,14 +82,13 @@ pub async fn fetch(url: &str) -> Result<String, ToolError> {
                 body.extend_from_slice(&chunk);
             }
 
-            let decoder = encoding.unwrap_or(UTF_8);
-            let (body, _, _) = decoder.decode(&body);
+            let body = decoded(&body, encoding, html);
             let body = match html {
                 true => {
                     let page = parsed(&body);
                     markdown(&page, &base)
                 }
-                false => body.into_owned(),
+                false => body,
             };
             let said = excerpt(&body);
 
@@ -134,12 +131,7 @@ pub async fn fetch(url: &str) -> Result<String, ToolError> {
         let cut = bytes.len() as u64 > MAX_PAGE_BYTES;
         bytes.truncate(MAX_PAGE_BYTES as usize);
 
-        let encoding = match encoding {
-            Some(encoding) => encoding,
-            None if html => declared(&bytes).unwrap_or(UTF_8),
-            None => UTF_8,
-        };
-        let (text, _, _) = encoding.decode(&bytes);
+        let text = decoded(&bytes, encoding, html);
         let text = match html {
             true => {
                 let page = parsed(&text);
@@ -150,7 +142,7 @@ pub async fn fetch(url: &str) -> Result<String, ToolError> {
                 }
                 markdown(&page, &base)
             }
-            false => text.into_owned(),
+            false => text,
         };
         if !cut {
             return Ok(text);
@@ -177,22 +169,25 @@ fn parsed(text: &str) -> Html {
     parser.one(text)
 }
 
-/// Old sites send `Charset=gb2312`
-fn charset(part: &str) -> Option<&str> {
-    let (key, value) = part.split_once('=')?;
-    let named = key.trim().eq_ignore_ascii_case("charset");
-    let value = value.trim().trim_matches('"');
-    named.then_some(value)
-}
-
 fn failed(url: &str, error: reqwest::Error) -> ToolError {
     let reason = read_cause(&error, FETCH_WAIT);
     let message = prompt::failure("fetch", url, &reason);
     ToolError::Failed(message)
 }
 
+/// In the encoding the response names, or for a page without one, the one the page declares
+fn decoded(bytes: &[u8], encoding: Option<&'static Encoding>, html: bool) -> String {
+    let encoding = match encoding {
+        Some(encoding) => encoding,
+        None if html => declared(bytes).unwrap_or(UTF_8),
+        None => UTF_8,
+    };
+    let (text, _, _) = encoding.decode(bytes);
+    text.into_owned()
+}
+
 fn declared(bytes: &[u8]) -> Option<&'static Encoding> {
-    let end = bytes.len().min(1024);
+    let end = bytes.len().min(CHARSET_BYTES);
     let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
     let (_, rest) = head.split_once("charset=")?;
     let rest = rest.trim_start_matches(['"', '\'']);

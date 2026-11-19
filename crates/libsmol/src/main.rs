@@ -9,9 +9,10 @@ fn main() -> ExitCode {
         process::exit(status);
     }
 
-    let args: Vec<String> = env::args().skip(1).collect();
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let ran = match args[..] {
+    // An argument that isn't UTF-8 is no known one, which `env::args` would panic on
+    let given = args.iter().skip(1).map(|arg| arg.to_str().unwrap_or(""));
+    let given: Vec<&str> = given.collect();
+    let ran = match given[..] {
         [] => libsmol::run(),
         ["--version" | "-V"] => {
             println!("libsmol {}", env!("CARGO_PKG_VERSION"));

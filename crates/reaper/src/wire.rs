@@ -1,3 +1,6 @@
+use serde::{Deserialize, Serialize};
+use std::ops::Not;
+
 // Methods, the markers on standard messages and the capabilities clients declare
 pub const NOTICE: &str = "_smol/notice";
 pub const MCP: &str = "_smol/mcp";
@@ -29,21 +32,79 @@ pub const MCP_PREFIX: &str = "mcp.";
 
 // Keys in the `rawInput` of `AGENT` calls
 pub const TASK: &str = "task";
-/// The agent's, which older sessions may lack
 pub const NAME: &str = "name";
 
-// Keys in `_meta`
-/// `true` on usage updates, shell ends and agent calls
-pub const INTERRUPTED: &str = "interrupted";
+// Keys in `_meta`, besides those of `Measured`
 /// The id of the call running the code, on `AGENT` calls
 pub const PARENT: &str = "parent";
 /// How a shell command ended, as a string
 pub const ERROR: &str = "error";
-pub const STEPS: &str = "steps";
-/// Seconds, on agent calls and the usage updates of steps and compactions
-pub const DURATION: &str = "duration";
-pub const DECODE_DURATION: &str = "decodeDuration";
-pub const INPUT_TOKENS: &str = "inputTokens";
-pub const OUTPUT_TOKENS: &str = "outputTokens";
-/// Tokens, on usage updates sent while a reply is generating
-pub const ESTIMATED_OUTPUT: &str = "estimatedOutput";
+
+/// What `NOTICE` carries besides the session's id
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Notice {
+    pub text: String,
+    /// Seconds until the step is tried again
+    pub retry_in: Option<f64>,
+    /// It belongs to the step in progress, also before that shows any text
+    pub step: bool,
+    /// A save failed
+    pub unsaved: bool,
+}
+
+/// A server in the list `MCP` sends
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpStatus {
+    pub name: String,
+    #[serde(flatten)]
+    pub state: McpState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum McpState {
+    Off,
+    Connecting,
+    Connected { tools: usize },
+    Failed { error: String },
+    Unauthorized { error: String },
+}
+
+/// The reply to `MEMORIES`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Memories {
+    pub memories: Vec<Memory>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Memory {
+    pub id: i64,
+    pub text: String,
+    /// Kept for the working directory rather than for every directory
+    pub project: bool,
+}
+
+/// What the `_meta` of usage updates, agent calls and shell ends tells of their usage and end
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Measured {
+    /// Seconds, on agent calls and the usage updates of steps and compactions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
+    /// Seconds since the first token
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_duration: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Tokens, on usage updates sent while a reply is generating
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_output: Option<u64>,
+    /// On agent calls
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Not::not")]
+    pub interrupted: bool,
+}

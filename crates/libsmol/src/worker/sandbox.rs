@@ -451,13 +451,12 @@ pub(crate) mod tests {
     use crate::tests::{temp_dir, write_file};
     use crate::utils::{block_on, new_id, Interrupt};
     use crate::worker::host::tests::unserved;
-    use crate::worker::host::Worker;
+    use crate::worker::host::{Rank, Worker};
     #[cfg(target_os = "linux")]
     use crate::worker::sandbox::{landlock_abi, spread, Grant};
     use crate::worker::sandbox::{profile, sweep, LOCK, PIP_CACHE_ENV, TEMP_PREFIX};
     use crate::worker::workplace::tests::opened;
     use crate::worker::workplace::{Workplace, PASSED_ENV};
-    use crate::worker::Delegation;
     use std::env;
     use std::fs;
     #[cfg(target_os = "linux")]
@@ -552,7 +551,7 @@ pub(crate) mod tests {
             &interrupt,
             Arc::new(workplace),
             &[],
-            Delegation::Off,
+            Rank::Delegated,
             restarted,
         );
         let mut worker = block_on(starting).expect("worker");
@@ -561,8 +560,9 @@ pub(crate) mod tests {
         let mut none = unserved;
         let evaluating = worker.evaluate(code, &[], &mut ignore, &mut none);
         let output = block_on(evaluating).expect("evaluate");
-        assert_eq!(output.error, None, "{}", output.logs);
-        output.logs
+        let printed = output.printed.shown(usize::MAX);
+        assert_eq!(output.error, None, "{printed}");
+        printed
     }
 
     /// Programs the code starts are confined too, and the folders the code writes stay in place
@@ -605,7 +605,7 @@ pub(crate) mod tests {
 
         let expected =
             "['ok', 'denied', 'ok', 'ok', 'denied', 'denied', 'ok', 'denied', 'denied', \
-                        'ok', 'ok', 'denied', 1]\n";
+                        'ok', 'ok', 'denied', 1]";
         assert_eq!(logs, expected);
     }
 
@@ -634,7 +634,7 @@ pub(crate) mod tests {
         let logs = evaluated(workplace, code);
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(logs, "['denied', 'denied']\n");
+        assert_eq!(logs, "['denied', 'denied']");
     }
 
     /// A hidden path made after the session opened stays hidden,
@@ -666,7 +666,7 @@ pub(crate) mod tests {
         let logs = evaluated(workplace, code);
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(logs, "['denied', 'ok', 'ok']\n");
+        assert_eq!(logs, "['denied', 'ok', 'ok']");
     }
 
     /// A link in a writable folder that holds a hidden path doesn't make where it leads writable
@@ -699,7 +699,7 @@ pub(crate) mod tests {
         let written = outside.join("naïve.txt").exists();
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(logs, "['denied', 'denied', ['.env', 'data']]\n");
+        assert_eq!(logs, "['denied', 'denied', ['.env', 'data']]");
         assert!(!written);
     }
 
@@ -756,10 +756,10 @@ pub(crate) mod tests {
                 true => "denied",
                 false => "ok",
             };
-            format!("['ok', '{sockets}', '{scoped}', True, '{scoped}']\n")
+            format!("['ok', '{sockets}', '{scoped}', True, '{scoped}']")
         };
         #[cfg(target_os = "macos")]
-        let expected = "['ok', 'denied', 'denied', True]\n".to_owned();
+        let expected = "['ok', 'denied', 'denied', True]".to_owned();
         assert_eq!(logs, expected);
     }
 
@@ -806,7 +806,7 @@ pub(crate) mod tests {
         let logs = evaluated(workplace, &code);
         fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(logs, format!("[True, False, True, {cached}]\n"));
+        assert_eq!(logs, format!("[True, False, True, {cached}]"));
     }
 
     /// Only folders whose lock nobody holds are removed

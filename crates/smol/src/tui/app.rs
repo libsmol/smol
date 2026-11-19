@@ -1,12 +1,12 @@
-use crate::chat::{image_placeholder, opens_mention, resolved, Output, Session};
-use crate::client::{McpState, Selector};
+use crate::chat::{image_placeholder, mention, resolved, typing_mention, Output, Session};
+use crate::client::{mcp_line, mcp_state, Selector};
 use crate::conversation::{Entry, Outcome};
 use crate::tui::desktop::Desktop;
+use crate::tui::draft::Draft;
 use crate::tui::picture::{self, Source};
 use crate::tui::render::Target;
 use crate::tui::select::{Point, Selection};
-use crate::tui::transcript::Transcript;
-use crate::tui::ui::input_box;
+use crate::tui::transcript::{Transcript, Viewport};
 use crate::tui::{clipped, markdown};
 use anyhow::Result;
 use chrono::{DateTime, Local};
@@ -17,6 +17,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 use ratatui_textarea::{CursorMove, DataCursor, TextArea};
+use reaper::wire::McpState;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::mem;
@@ -32,13 +33,13 @@ const TICK_EVERY: Duration = Duration::from_secs(1);
 
 const SHELL_USAGE: &str = "!<command>";
 
-const MAX_UNFOLDED_LINES: usize = 5;
-const MAX_UNFOLDED_CHARS: usize = 1000;
 /// On Windows, characters typed with AltGr carry Ctrl and Alt
-const ALTGR: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::ALT);
+pub(crate) const ALTGR: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::ALT);
 
 /// Keeps typing @ responsive even in the home directory
 const MAX_PATHS: usize = 20_000;
+/// The page's app.js scrolls this many rows too
+const SCROLL_ROWS: usize = 3;
 const MAX_MATCHES: usize = 200;
 
 pub(crate) struct App {
@@ -46,13 +47,7 @@ pub(crate) struct App {
     desktop: Box<dyn Desktop>,
     pub(crate) transcript: Transcript,
     pub(crate) queued: VecDeque<String>,
-    pub(crate) input: TextArea<'static>,
-    /// The leading ! is not in `input`, and `draft()` gives the whole text
-    pub(crate) shell: bool,
-    /// Must be reset whenever the input box is replaced
-    pub(crate) input_top: u16,
-    /// The k-th item is the original text of placeholder #k
-    pastes: Vec<String>,
+    pub(crate) draft: Draft,
     history: History,
     pub(crate) choices: Vec<Choice>,
     /// None after the input changes, until `refresh` highlights the exact, current or first choice
@@ -72,17 +67,12 @@ pub(crate) struct App {
     pub(crate) expanded: bool,
     pub(crate) animating: bool,
     drawn: Instant,
-    pub(crate) scrolled_back: usize,
-    /// The most rows the previous frame could scroll back
-    pub(crate) bottom: usize,
-    /// `scrolled_back` as the previous frame left it, which only scrolling changes before the next
-    pub(crate) drawn_back: usize,
+    pub(crate) viewport: Viewport,
     pub(crate) messages_area: Rect,
     pub(crate) pinned_area: Rect,
-    pub(crate) scrollbar: Rect,
     pub(crate) input_area: Rect,
     /// The pictures the last frame drew
-    pub(crate) shown: Vec<Source>,
+    pub(crate) pictures: Vec<Source>,
     pub(crate) selection: Option<Selection>,
     pressed: Option<Point>,
     dragging: bool,
@@ -151,14 +141,7 @@ impl Choice {
     }
 
     fn path(path: &str, typed: usize) -> Self {
-        let quoted = path.contains(char::is_whitespace);
-        let text = match (quoted, path.ends_with('/')) {
-            (false, false) => format!("@{path} "),
-            (false, true) => format!("@{path}"),
-            (true, false) => format!("@\"{path}\" "),
-            (true, true) => format!("@\"{path}"),
-        };
-
+        let text = mention(path);
         Self {
             label: path.to_owned(),
             detail: String::new(),
@@ -310,10 +293,7 @@ impl App {
             desktop,
             transcript: Transcript::new(cwd),
             queued: VecDeque::new(),
-            input: input_box(""),
-            shell: false,
-            input_top: 0,
-            pastes: Vec::new(),
+            draft: Draft::default(),
             history: History::default(),
             choices: Vec::new(),
             highlight: ListState::default(),
@@ -327,14 +307,11 @@ impl App {
             expanded: false,
             animating: false,
             drawn: Instant::now(),
-            scrolled_back: 0,
-            bottom: 0,
-            drawn_back: 0,
+            viewport: Viewport::default(),
             messages_area: Rect::default(),
             pinned_area: Rect::default(),
-            scrollbar: Rect::default(),
             input_area: Rect::default(),
-            shown: Vec::new(),
+            pictures: Vec::new(),
             selection: None,
             pressed: None,
             dragging: false,
@@ -354,8 +331,8 @@ impl App {
             self.dirty = true;
         }
         let loaded = picture::loaded();
-        if loaded != self.transcript.pictures {
-            self.transcript.pictures = loaded;
+        if loaded != self.transcript.loaded {
+            self.transcript.loaded = loaded;
             self.dirty = true;
         }
 
@@ -368,18 +345,6 @@ impl App {
             self.drawn = Instant::now();
         }
         dirty
-    }
-
-    pub(crate) fn draft(&self) -> String {
-        let text = self.input.lines().join("\n");
-        match self.shell {
-            true => format!("!{text}"),
-            false => text,
-        }
-    }
-
-    pub(crate) fn view_top(&self) -> usize {
-        self.bottom.saturating_sub(self.scrolled_back)
     }
 
     pub(crate) fn highlighted(&self) -> Option<usize> {
@@ -402,14 +367,14 @@ impl App {
 
     pub(crate) fn submit_text(&mut self, text: &str) {
         let Some(command) = Command::parse(text) else {
-            self.scrolled_back = 0;
+            self.viewport.back = 0;
             self.session.prompt(text);
             return;
         };
 
         // A queued command may run while a draft sits in the input box,
         // and then the list goes into the transcript
-        let drafting = !self.draft().is_empty();
+        let drafting = !self.draft.whole().is_empty();
         let result = match &command {
             Command::List(list) if drafting => {
                 let picks = self.picks(*list);
@@ -440,10 +405,10 @@ impl App {
             }
             Command::Mcp(on, name) => {
                 let switched = self.session.set_mcp(*on, name);
-                switched.map(|status| status.to_string())
+                switched.map(|status| mcp_line(&status))
             }
             Command::Shell(command) => {
-                self.scrolled_back = 0;
+                self.viewport.back = 0;
                 return self.session.shell(command);
             }
             Command::Invalid(text) => return self.failure(text),
@@ -503,13 +468,12 @@ impl App {
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                 let plain = key.modifiers.is_empty();
                 let running = self.session.running();
-                let idle = self.session.run.is_none() && self.draft().is_empty();
+                let idle = self.session.run.is_none() && self.draft.whole().is_empty();
                 let page = usize::from(self.messages_area.height);
                 // The input box wraps, so this counts screen rows
-                let top = self.input.screen_cursor().row == 0;
-                let first = self.input.cursor() == DataCursor(0, 0);
-                let text = self.input.lines().join("\n");
-                let last = offset(&self.input) == text.chars().count();
+                let top = self.draft.area.screen_cursor().row == 0;
+                let first = self.draft.area.cursor() == DataCursor(0, 0);
+                let last = self.draft.cursor() == self.draft.text().chars().count();
 
                 match (choice, key.code) {
                     (Some(_), KeyCode::Up) => {
@@ -565,16 +529,14 @@ impl App {
                         // The way out when an interrupt is stuck
                         Some(_) => self.quit = true,
                         None => {
-                            self.set_input("");
+                            self.draft.replace("");
                             self.history = History::default();
                         }
                     },
                     (_, KeyCode::Char('d')) if ctrl && idle => self.quit = true,
                     (_, KeyCode::Char('o')) if ctrl => self.expanded = !self.expanded,
                     // Windows Terminal keeps Ctrl+V for its own paste, which carries no image
-                    (_, KeyCode::Char('v')) if ctrl || alt => {
-                        self.paste_image(|app| app.desktop.image());
-                    }
+                    (_, KeyCode::Char('v')) if ctrl || alt => self.paste_image(None),
                     (_, KeyCode::Char('j')) if ctrl => {
                         self.edit(|input| input.insert_str("\n"));
                     }
@@ -582,49 +544,51 @@ impl App {
                     (_, KeyCode::Enter) => {
                         self.edit(|input| input.insert_str("\n"));
                     }
-                    (_, KeyCode::Esc) if self.scrolled_back > 0 => self.scrolled_back = 0,
+                    (_, KeyCode::Esc) if self.viewport.back > 0 => self.viewport.back = 0,
                     (_, KeyCode::Esc) if running => self.session.cancel(),
                     // An invisible ! sits before the cursor
-                    (_, KeyCode::Backspace) if self.shell && first => self.shell = false,
-                    (_, KeyCode::PageUp) => self.scroll_up(page),
-                    (_, KeyCode::PageDown) => self.scroll_down(page),
+                    (_, KeyCode::Backspace) if self.draft.shell && first => {
+                        self.draft.shell = false;
+                    }
+                    (_, KeyCode::PageUp) => self.viewport.scroll_up(page),
+                    (_, KeyCode::PageDown) => self.viewport.scroll_down(page),
                     // Must come before the history arm
                     (_, KeyCode::Up) if top && !self.queued.is_empty() => {
                         if let Some(text) = self.queued.pop_back() {
-                            let mut text = self.folded(text);
-                            let draft = self.draft();
+                            let mut text = self.draft.folded(text);
+                            let draft = self.draft.whole();
                             if !draft.is_empty() {
                                 text = format!("{text}\n{draft}");
                             }
-                            self.set_input(&text);
+                            self.draft.replace(&text);
                             // The next Up must still find the cursor on the first screen row
-                            self.input.move_cursor(CursorMove::Top);
-                            self.input.move_cursor(CursorMove::Head);
+                            self.draft.area.move_cursor(CursorMove::Top);
+                            self.draft.area.move_cursor(CursorMove::Head);
                             self.choices_closed = true;
                         }
                     }
                     (_, KeyCode::Up) if top => {
-                        let current = self.draft();
+                        let current = self.draft.whole();
                         let sent = self.session.conversation.sent();
                         if let Some(text) = self.history.back(&sent, current) {
-                            let text = self.folded(text);
-                            self.set_input(&text);
+                            let text = self.draft.folded(text);
+                            self.draft.replace(&text);
                             self.choices_closed = true;
                         }
                     }
                     (_, KeyCode::Down) => {
-                        let before = self.input.screen_cursor().row;
-                        self.input.move_cursor(CursorMove::Down);
+                        let before = self.draft.area.screen_cursor().row;
+                        self.draft.area.move_cursor(CursorMove::Down);
                         // Only a cursor that can't move down is on the last screen row
-                        if self.input.screen_cursor().row == before {
+                        if self.draft.area.screen_cursor().row == before {
                             let sent = self.session.conversation.sent();
                             if let Some((text, draft)) = self.history.forward(&sent) {
                                 // The user's own draft comes back exactly as typed
                                 let text = match draft {
                                     true => text,
-                                    false => self.folded(text),
+                                    false => self.draft.folded(text),
                                 };
-                                self.set_input(&text);
+                                self.draft.replace(&text);
                                 self.choices_closed = true;
                             }
                         }
@@ -647,7 +611,7 @@ impl App {
             Event::Paste(text) => {
                 self.selection = None;
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                let text = self.folded(text);
+                let text = self.draft.folded(text);
                 if self.edit(|input| input.insert_str(text)) {
                     self.highlight.select(None);
                     self.choices_closed = false;
@@ -661,12 +625,12 @@ impl App {
                 let area = self.messages_area;
                 let inside = area.contains(position);
                 let scrolls = inside || self.pinned_area.contains(position);
-                let on_bar = self.scrollbar.contains(position);
+                let on_bar = self.viewport.bar.contains(position);
 
                 match mouse.kind {
                     // A drag of the scrollbar ends wherever the button is let go
                     MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
-                        self.drag_to(mouse.row);
+                        self.viewport.drag_to(mouse.row);
                     }
                     MouseEventKind::Up(MouseButton::Left) if self.dragging => {
                         self.dragging = false;
@@ -676,13 +640,13 @@ impl App {
                     MouseEventKind::ScrollDown if on_choices => self.highlight.select_next(),
                     _ if on_choices => {}
 
-                    MouseEventKind::ScrollUp if scrolls => self.scroll_up(3),
-                    MouseEventKind::ScrollDown if scrolls => self.scroll_down(3),
+                    MouseEventKind::ScrollUp if scrolls => self.viewport.scroll_up(SCROLL_ROWS),
+                    MouseEventKind::ScrollDown if scrolls => self.viewport.scroll_down(SCROLL_ROWS),
 
                     MouseEventKind::Down(MouseButton::Left) if on_bar => {
                         self.dragging = true;
                         self.selection = None;
-                        self.drag_to(mouse.row);
+                        self.viewport.drag_to(mouse.row);
                     }
 
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -708,9 +672,9 @@ impl App {
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if let (Some(anchor), Some(cursor)) = (self.pressed, self.point(mouse)) {
                             if mouse.row < area.top() {
-                                self.scroll_up(1);
+                                self.viewport.scroll_up(1);
                             } else if mouse.row >= area.bottom() {
-                                self.scroll_down(1);
+                                self.viewport.scroll_down(1);
                             }
 
                             if cursor != anchor || self.selection.is_some() {
@@ -775,14 +739,7 @@ impl App {
         }
 
         if typed {
-            // A ! typed or pasted at the start is removed by `set_input`
-            let text = self.input.lines().join("\n");
-            if let Some(command) = shell_command(&text).filter(|_| !self.shell) {
-                let taken = text.chars().count() - command.chars().count();
-                let cursor = offset(&self.input).saturating_sub(taken);
-                self.set_input(&text);
-                jump(&mut self.input, cursor);
-            }
+            self.draft.take_bang();
             self.refresh();
         }
     }
@@ -866,17 +823,24 @@ impl App {
         }
     }
 
-    /// Puts the image `read` gives in the input as its placeholder, or flashes why it can't,
-    /// reading only once it could go in, as a terminal may ask the user first
-    pub(crate) fn paste_image(&mut self, read: impl FnOnce(&mut Self) -> Result<Vec<u8>, String>) {
+    /// Puts the image `given`, or else the clipboard's, in the input as its placeholder, or flashes
+    /// why it can't, reading the clipboard only once the image could go in, as a terminal may ask
+    /// the user first
+    pub(crate) fn paste_image(&mut self, given: Option<Vec<u8>>) {
         self.dirty = true;
-        let pasted = match (self.shell, self.session.client.image_prompts) {
+        let pasted = match (self.draft.shell, self.session.client.image_prompts) {
             (true, _) => Err("image: shell commands take none".to_owned()),
             (false, false) => {
                 let name = &self.session.client.agent.name;
                 Err(format!("image: {name} takes no images"))
             }
-            (false, true) => read(self).and_then(|data| self.session.paste_image(data)),
+            (false, true) => {
+                let read = match given {
+                    Some(data) => Ok(data),
+                    None => self.desktop.image(),
+                };
+                read.and_then(|data| self.session.paste_image(data))
+            }
         };
         let number = match pasted {
             Ok(number) => number,
@@ -897,7 +861,7 @@ impl App {
 
     /// The replayed history arrives before the `session/load` reply
     pub(crate) fn show_session(&mut self) {
-        self.scrolled_back = 0;
+        self.viewport.back = 0;
         self.pump();
         self.session.conversation.finish_turn(Outcome::Answered);
 
@@ -912,13 +876,13 @@ impl App {
             self.highlight.select_first();
         }
 
-        if self.shell {
+        if self.draft.shell {
             self.choices.clear();
             return;
         }
 
         let mut listing = None;
-        if let [line] = self.input.lines() {
+        if let [line] = self.draft.area.lines() {
             for spec in &COMMANDS {
                 let Command::List(list) = spec.bare else {
                     continue;
@@ -939,13 +903,13 @@ impl App {
             self.open_list(list);
         }
 
-        let DataCursor(row, col) = self.input.cursor();
-        let line = self.input.lines().get(row).map_or("", String::as_str);
+        let DataCursor(row, col) = self.draft.area.cursor();
+        let line = self.draft.area.lines().get(row).map_or("", String::as_str);
         let before: String = line.chars().take(col).collect();
-        let mention = typing_mention(&before);
-        let query = mention.map_or("", |(_, query)| query);
+        let typing = typing_mention(&before);
+        let query = typing.map_or("", |(_, query)| query);
         let scope = outside_dir(query).unwrap_or_default();
-        if mention.is_some() && !self.paths.contains_key(scope) {
+        if typing.is_some() && !self.paths.contains_key(scope) {
             let cwd = &self.session.client.cwd;
             let paths = if scope.is_empty() {
                 walk(cwd, MAX_PATHS)
@@ -978,7 +942,7 @@ impl App {
             return;
         }
 
-        if let (Some((typed, query)), Some(paths)) = (mention, self.paths.get(scope)) {
+        if let (Some((typed, query)), Some(paths)) = (typing, self.paths.get(scope)) {
             // Directories outside the cwd list hidden entries only after a typed .,
             // and they must go before sorting and truncation
             let name = query.rsplit(is_separator).next().unwrap_or_default();
@@ -995,7 +959,7 @@ impl App {
             return;
         }
 
-        let [line] = self.input.lines() else {
+        let [line] = self.draft.area.lines() else {
             return;
         };
         let Some(list) = listing else {
@@ -1141,7 +1105,7 @@ impl App {
 
             List::Servers => {
                 for server in &self.session.mcp {
-                    let state = server.state.to_string();
+                    let state = mcp_state(&server.state);
                     let completion = Completion::Input(format!("{prefix}{}", server.name));
                     picks.push(Pick {
                         value: server.name.clone(),
@@ -1202,7 +1166,7 @@ impl App {
         let right = area.right() - 1;
         let y = mouse.row.clamp(top, bottom);
         let x = mouse.column.clamp(left, right);
-        let row = self.view_top() + usize::from(y - top);
+        let row = self.viewport.top() + usize::from(y - top);
         let col = usize::from(x - left);
         Some(Point { row, col })
     }
@@ -1212,9 +1176,9 @@ impl App {
             Completion::Input(text) => self.complete(text),
             Completion::Mention { typed, text } => {
                 for _ in 0..*typed {
-                    self.input.delete_char();
+                    self.draft.area.delete_char();
                 }
-                self.input.insert_str(text);
+                self.draft.area.insert_str(text);
                 self.highlight.select(None);
             }
             Completion::Memory(_) => {}
@@ -1222,110 +1186,20 @@ impl App {
     }
 
     fn complete(&mut self, text: &str) {
-        self.set_input(text);
+        self.draft.replace(text);
         self.highlight.select(None);
         self.choices_closed = false;
         self.refresh();
     }
 
-    fn set_input(&mut self, text: &str) {
-        let command = shell_command(text);
-        self.shell = command.is_some();
-        let text = command.unwrap_or(text);
-        self.input = input_box(text);
-        self.input_top = 0;
-    }
-
-    /// A partly edited placeholder can't be expanded back,
-    /// so a deletion removes it whole and an insertion inside moves after it
+    /// The pasted images' placeholders stay whole like those of pastes
     fn edit(&mut self, change: impl FnOnce(&mut TextArea<'static>) -> bool) -> bool {
-        let before = self.input.lines().join("\n");
-        let old_cursor = offset(&self.input);
-        if !change(&mut self.input) {
-            return false;
-        }
-
-        let after = self.input.lines().join("\n");
-        let new_cursor = offset(&self.input);
-
-        // The edit lies between the unchanged ends,
-        // and repeated characters can carry the common prefix past it
-        let old: Vec<char> = before.chars().collect();
-        let new: Vec<char> = after.chars().collect();
-        let same = |(a, b): &(&char, &char)| a == b;
-        let head = old.iter().zip(&new).take_while(same).count();
-        let head = head.min(old_cursor).min(new_cursor);
-        let rest = old.len().min(new.len()) - head;
-        let ends = old.iter().rev().zip(new.iter().rev());
-        let tail = ends.take(rest).take_while(same).count();
-        let edited = (head, old.len() - tail);
-        let (mut start, mut end) = edited;
-
-        let mut placeholders = Vec::new();
-        for (index, paste) in self.pastes.iter().enumerate() {
-            let shown = placeholder(index + 1, paste);
-            placeholders.push(shown);
-        }
-        for &number in self.session.images.keys() {
-            let shown = image_placeholder(number);
-            placeholders.push(shown);
-        }
-        for shown in &placeholders {
-            for (at, _) in before.match_indices(shown.as_str()) {
-                let from = before[..at].chars().count();
-                let to = from + shown.chars().count();
-                if start < end && start < to && end > from {
-                    start = start.min(from);
-                    end = end.max(to);
-                } else if start == end && from < start && start < to {
-                    start = to;
-                    end = to;
-                }
-            }
-        }
-
-        if (start, end) == edited {
-            return true;
-        }
-
-        let inserted = &new[head..new.len() - tail];
-        let kept = old[..start].iter().chain(inserted).chain(&old[end..]);
-        let text: String = kept.collect();
-        let cursor = start + inserted.len();
-
-        // Not `set_input`, which would change `shell`
-        self.input = input_box(&text);
-        self.input_top = 0;
-        jump(&mut self.input, cursor);
-
-        true
-    }
-
-    fn folded(&mut self, text: String) -> String {
-        let short = text.chars().count() <= MAX_UNFOLDED_CHARS;
-        if short && text.lines().count() <= MAX_UNFOLDED_LINES {
-            return text;
-        }
-
-        // A ! hidden in the placeholder would still run the paste as a shell command
-        let (marker, text) = match shell_command(&text) {
-            Some(command) => ("!", command.to_owned()),
-            None => ("", text),
-        };
-        let number = self.pastes.len() + 1;
-        let shown = placeholder(number, &text);
-        self.pastes.push(text);
-        format!("{marker}{shown}")
+        let images = self.session.images.keys();
+        self.draft.edit(change, images)
     }
 
     fn submit(&mut self) {
-        let mut text = self.draft();
-        // A later paste may contain the placeholder of an earlier one
-        for (index, paste) in self.pastes.iter().enumerate().rev() {
-            let shown = placeholder(index + 1, paste);
-            text = text.replace(&shown, paste);
-        }
-
+        let text = self.draft.expanded();
         let text = text.trim().to_owned();
         if text.is_empty() {
             return;
@@ -1337,8 +1211,7 @@ impl App {
         }
 
         self.history = History::default();
-        self.set_input("");
-        self.pastes.clear();
+        self.draft = Draft::default();
         self.paths.clear();
 
         if self.session.run.is_none() {
@@ -1349,23 +1222,6 @@ impl App {
         if self.queued.iter().all(|text| plain(text)) {
             self.session.notify_queued();
         }
-    }
-
-    /// Inverts `ui::thumb`, so the thumb is drawn on the cell it was dragged to
-    fn drag_to(&mut self, row: u16) {
-        let last = usize::from(self.scrollbar.height.saturating_sub(1));
-        let offset = usize::from(row.saturating_sub(self.scrollbar.top()));
-        let top = (offset.min(last) * self.bottom + last / 2).checked_div(last);
-        let top = top.unwrap_or(self.bottom);
-        self.scrolled_back = self.bottom - top.min(self.bottom);
-    }
-
-    fn scroll_up(&mut self, lines: usize) {
-        self.scrolled_back = self.scrolled_back.saturating_add(lines);
-    }
-
-    fn scroll_down(&mut self, lines: usize) {
-        self.scrolled_back = self.scrolled_back.saturating_sub(lines);
     }
 
     fn info(&mut self, text: impl Into<String>) {
@@ -1414,95 +1270,9 @@ impl History {
     }
 }
 
-/// Windows sends a paste as one batch of key presses with newlines as Enter,
-/// and with `stalled` the batch may be keys typed during a freeze
-pub(crate) fn pasted(events: &[Event], stalled: bool) -> Option<String> {
-    let mut text = String::new();
-    for event in events {
-        let key = match event {
-            Event::Key(key) => key,
-            // The mouse moved during the paste
-            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => continue,
-            _ => return None,
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-
-        let modifiers = key.modifiers.difference(KeyModifiers::SHIFT);
-        match key.code {
-            KeyCode::Char(c) if modifiers.is_empty() || modifiers == ALTGR => text.push(c),
-            KeyCode::Enter if key.modifiers.is_empty() => text.push('\n'),
-            KeyCode::Tab if key.modifiers.is_empty() => text.push('\t'),
-            _ => return None,
-        }
-    }
-
-    // A long line is a paste too, since typing it in key by key diffs the input each time
-    let count = text.chars().count();
-    let burst = count > 1;
-    let long = count > MAX_UNFOLDED_CHARS;
-    let typed = stalled && text.ends_with('\n') && text.matches('\n').count() == 1;
-    match burst && (text.contains('\n') || long) && !typed {
-        true => Some(text),
-        false => None,
-    }
-}
-
-fn placeholder(number: usize, text: &str) -> String {
-    let lines = text.lines().count();
-    if lines > 1 {
-        return format!("[paste #{number}: {lines} lines]");
-    }
-
-    let chars = text.chars().count();
-    format!("[paste #{number}: {chars} characters]")
-}
-
 /// Queued text the running turn can take, as commands wait for it to end
 fn plain(text: &str) -> bool {
     Command::parse(text).is_none()
-}
-
-/// Strips leading whitespace first, as submitting does
-fn shell_command(text: &str) -> Option<&str> {
-    let command = text.trim_start().strip_prefix('!')?;
-    Some(command.trim_start())
-}
-
-/// A newline counts as one character
-fn offset(input: &TextArea) -> usize {
-    let DataCursor(row, col) = input.cursor();
-    let above = input.lines()[..row].iter();
-    above.map(|line| line.chars().count() + 1).sum::<usize>() + col
-}
-
-fn jump(input: &mut TextArea, cursor: usize) {
-    let text = input.lines().join("\n");
-    let placed: String = text.chars().take(cursor).collect();
-    let row = placed.matches('\n').count();
-    let line = placed.rsplit('\n').next().unwrap_or_default();
-    let col = line.chars().count();
-    let row = u16::try_from(row).unwrap_or(u16::MAX);
-    let col = u16::try_from(col).unwrap_or(u16::MAX);
-    input.move_cursor(CursorMove::Jump(row, col));
-}
-
-/// Returns the character count including the @, and the path typed so far
-fn typing_mention(before: &str) -> Option<(usize, &str)> {
-    let mut ats = before.rmatch_indices('@').map(|(at, _)| at);
-    let at = ats.find(|&at| opens_mention(&before[..at]))?;
-
-    let rest = &before[at + 1..];
-    let path = match rest.strip_prefix('"') {
-        Some(quoted) if quoted.contains('"') => return None,
-        Some(quoted) => quoted,
-        None if rest.contains(char::is_whitespace) => return None,
-        None => rest,
-    };
-
-    let count = before[at..].chars().count();
-    Some((count, path))
 }
 
 /// At most `limit` paths in `cwd` that its ignore files leave, a level at a time,
@@ -1670,11 +1440,12 @@ fn stamp(rfc3339: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::client::McpStatus;
     use crate::tui::app::*;
     use crate::tui::tests::{app, draw, fill, written};
-    use crate::tui::{theme, ui, ACCENT};
+    use crate::tui::transcript::thumb;
+    use crate::tui::{theme, ACCENT};
     use ratatui::crossterm::event::KeyEvent;
+    use reaper::wire::McpStatus;
     use std::env;
     use std::process;
     use std::thread;
@@ -1793,10 +1564,10 @@ mod tests {
         app.session.mcp.push(server);
         app.submit_text("first task");
         app.queued.push_back(":mcp".to_owned());
-        app.set_input("draft");
+        app.draft.replace("draft");
         settle(&mut app, |app| app.queued.is_empty());
 
-        assert_eq!(app.input.lines(), ["draft"]);
+        assert_eq!(app.draft.area.lines(), ["draft"]);
         let expected = ["", "❯ first task", "", "  web  off"];
         assert_eq!(shown(&mut app), expected);
     }
@@ -1854,7 +1625,7 @@ mod tests {
     fn memories_picked() {
         let mut app = app();
         app.submit_text(":memory");
-        assert_eq!(app.input.lines(), [":memory "]);
+        assert_eq!(app.draft.area.lines(), [":memory "]);
         let picked: Vec<(&str, &str)> = app
             .choices
             .iter()
@@ -1911,7 +1682,7 @@ mod tests {
 
         key(&mut app, KeyCode::Left);
         key(&mut app, KeyCode::Delete);
-        assert_eq!(app.input.lines(), [":memory naïv"]);
+        assert_eq!(app.draft.area.lines(), [":memory naïv"]);
         assert!(!app.marked());
         assert_eq!(shown(&mut app), expected);
     }
@@ -2032,12 +1803,12 @@ mod tests {
         assert!(idle.quit);
 
         let mut app = app();
-        app.set_input("éclair");
+        app.draft.replace("éclair");
         key(&mut app, KeyCode::Home);
         app.on_event(ctrl_d.clone());
-        assert_eq!(app.input.lines(), ["clair"]);
+        assert_eq!(app.draft.area.lines(), ["clair"]);
 
-        app.set_input("");
+        app.draft.replace("");
         app.submit_text("wait");
         app.on_event(ctrl_d);
         assert!(!app.quit);
@@ -2050,9 +1821,9 @@ mod tests {
             key(&mut app, KeyCode::Char(typed));
         }
         key(&mut app, KeyCode::Enter);
-        assert_eq!(app.input.lines(), [":model "]);
+        assert_eq!(app.draft.area.lines(), [":model "]);
 
-        app.set_input("");
+        app.draft.replace("");
         for typed in ":qu".chars() {
             key(&mut app, KeyCode::Char(typed));
         }
@@ -2082,7 +1853,7 @@ mod tests {
         let mut app = app();
         fill(&mut app, 15);
         draw(&mut app, 60, 20);
-        let bar = app.scrollbar;
+        let bar = app.viewport.bar;
         let left = MouseButton::Left;
         mouse(&mut app, MouseEventKind::Down(left), bar.left(), bar.top());
         assert!(app.dragging);
@@ -2099,26 +1870,26 @@ mod tests {
         // Fewer rows than twice the track keep the rounding in `drag_to` visible
         fill(&mut app, 15);
         draw(&mut app, 60, 20);
-        let bar = app.scrollbar;
-        let bottom = app.bottom;
+        let bar = app.viewport.bar;
+        let bottom = app.viewport.top();
         let column = bar.left();
         let on_bar = |app: &mut App, kind, row| mouse(app, kind, column, row);
 
         let left = MouseButton::Left;
         on_bar(&mut app, MouseEventKind::Down(left), bar.bottom() - 1);
         on_bar(&mut app, MouseEventKind::Drag(left), bar.top());
-        assert_eq!((app.view_top(), app.scrolled_back), (0, bottom));
+        assert_eq!((app.viewport.top(), app.viewport.back), (0, bottom));
         on_bar(&mut app, MouseEventKind::Up(left), bar.top());
         assert!(!app.dragging);
 
         for pressed in bar.top()..bar.bottom() {
             on_bar(&mut app, MouseEventKind::Down(left), pressed);
-            let row = ui::thumb(app.view_top(), bottom, bar.height);
+            let row = thumb(app.viewport.top(), bottom, bar.height);
             assert_eq!(bar.top() + row, pressed);
         }
 
         on_bar(&mut app, MouseEventKind::Down(left), bar.bottom() - 1);
-        assert_eq!((app.view_top(), app.scrolled_back), (bottom, 0));
+        assert_eq!((app.viewport.top(), app.viewport.back), (bottom, 0));
     }
 
     #[test]
@@ -2143,11 +1914,11 @@ mod tests {
         for typed in "ls docs".chars() {
             key(&mut app, KeyCode::Char(typed));
         }
-        assert_eq!(app.input.lines(), [":ls docs"]);
+        assert_eq!(app.draft.area.lines(), [":ls docs"]);
 
         key(&mut app, KeyCode::Home);
         key(&mut app, KeyCode::Backspace);
-        assert_eq!(app.input.lines(), [":ls docs"]);
+        assert_eq!(app.draft.area.lines(), [":ls docs"]);
         let (_, corner) = input_row(&mut app);
         assert_eq!(corner, ACCENT.fg);
 
@@ -2155,13 +1926,13 @@ mod tests {
         key(&mut app, KeyCode::Char('!'));
         key(&mut app, KeyCode::Home);
         key(&mut app, KeyCode::Backspace);
-        assert_eq!(app.draft(), "!:ls docs");
+        assert_eq!(app.draft.whole(), "!:ls docs");
 
-        app.set_input("résumé");
+        app.draft.replace("résumé");
         key(&mut app, KeyCode::Home);
         app.on_event(Event::Paste("! café\n!naïve ".to_owned()));
-        assert_eq!(app.input.lines(), ["café", "!naïve résumé"]);
-        assert_eq!(app.input.cursor(), DataCursor(1, 7));
+        assert_eq!(app.draft.area.lines(), ["café", "!naïve résumé"]);
+        assert_eq!(app.draft.area.cursor(), DataCursor(1, 7));
     }
 
     #[test]
@@ -2174,21 +1945,21 @@ mod tests {
         }
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.queued, ["!ls docs"]);
-        assert!(!app.shell);
+        assert!(!app.draft.shell);
 
         key(&mut app, KeyCode::Up);
-        assert!(app.shell);
-        assert_eq!(app.input.lines(), ["ls docs"]);
+        assert!(app.draft.shell);
+        assert_eq!(app.draft.area.lines(), ["ls docs"]);
     }
 
     #[test]
     fn esc_follows_first() {
         let mut app = app();
         app.submit_text("wait");
-        app.scrolled_back = 5;
+        app.viewport.back = 5;
 
         key(&mut app, KeyCode::Esc);
-        assert_eq!(app.scrolled_back, 0);
+        assert_eq!(app.viewport.back, 0);
         assert!(app.session.running());
 
         key(&mut app, KeyCode::Esc);
@@ -2201,47 +1972,50 @@ mod tests {
         let mut app = app();
         app.submit_text("wait");
         for text in ["one", "two"] {
-            app.set_input(text);
+            app.draft.replace(text);
             key(&mut app, KeyCode::Enter);
         }
         assert_eq!(app.queued, ["one", "two"]);
 
-        app.set_input("draft");
+        app.draft.replace("draft");
         key(&mut app, KeyCode::Up);
         key(&mut app, KeyCode::Up);
-        assert_eq!(app.input.lines(), ["one", "two", "draft"]);
+        assert_eq!(app.draft.area.lines(), ["one", "two", "draft"]);
         assert!(app.queued.is_empty() && app.session.running());
     }
 
     #[test]
     fn long_paste_folded() {
         let mut app = app();
-        app.set_input("Résumé: ");
+        app.draft.replace("Résumé: ");
         let lines: Vec<String> = (1..=7).map(|n| format!("line {n}")).collect();
         let pasted = lines.join("\n");
         app.on_event(Event::Paste(pasted.clone()));
-        assert_eq!(app.input.lines(), ["Résumé: [paste #1: 7 lines]"]);
+        assert_eq!(app.draft.area.lines(), ["Résumé: [paste #1: 7 lines]"]);
 
         key(&mut app, KeyCode::Backspace);
-        assert_eq!(app.input.lines(), ["Résumé: "]);
+        assert_eq!(app.draft.area.lines(), ["Résumé: "]);
 
         app.on_event(Event::Paste(pasted.clone()));
         app.on_event(Event::Paste("\nshort".to_owned()));
-        assert_eq!(app.input.lines(), ["Résumé: [paste #2: 7 lines]", "short"]);
+        assert_eq!(
+            app.draft.area.lines(),
+            ["Résumé: [paste #2: 7 lines]", "short"]
+        );
         key(&mut app, KeyCode::Enter);
         let sent = app.session.conversation.sent();
         let expected = format!("Résumé: {pasted}\nshort");
         assert_eq!(sent.last(), Some(&expected));
 
         key(&mut app, KeyCode::Up);
-        assert_eq!(app.input.lines(), ["[paste #1: 8 lines]"]);
+        assert_eq!(app.draft.area.lines(), ["[paste #1: 8 lines]"]);
 
         // One long line folds too, counted in characters rather than bytes
         settle(&mut app, |app| app.session.run.is_none());
-        app.set_input("");
+        app.draft.replace("");
         let line = "café 🐍 ".repeat(200);
         app.on_event(Event::Paste(line.clone()));
-        assert_eq!(app.input.lines(), ["[paste #2: 1400 characters]"]);
+        assert_eq!(app.draft.area.lines(), ["[paste #2: 1400 characters]"]);
         key(&mut app, KeyCode::Enter);
         let sent = app.session.conversation.sent();
         assert_eq!(sent.last().map(String::as_str), Some(line.trim()));
@@ -2254,18 +2028,18 @@ mod tests {
         let lines: Vec<String> = (1..=7).map(|n| format!("echo café {n}")).collect();
         let command = lines.join("\n");
         app.on_event(Event::Paste(format!("  ! {command}")));
-        assert!(app.shell);
-        assert_eq!(app.input.lines(), ["[paste #1: 7 lines]"]);
+        assert!(app.draft.shell);
+        assert_eq!(app.draft.area.lines(), ["[paste #1: 7 lines]"]);
 
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.queued, [format!("!{command}")]);
         key(&mut app, KeyCode::Up);
-        assert!(app.shell);
-        assert_eq!(app.input.lines(), ["[paste #1: 7 lines]"]);
+        assert!(app.draft.shell);
+        assert_eq!(app.draft.area.lines(), ["[paste #1: 7 lines]"]);
 
         key(&mut app, KeyCode::Home);
         key(&mut app, KeyCode::Backspace);
-        assert!(!app.shell);
+        assert!(!app.draft.shell);
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.queued, [command]);
     }
@@ -2275,25 +2049,25 @@ mod tests {
         let mut app = app();
         let lines: Vec<String> = (1..=7).map(|n| format!("line {n}")).collect();
         let pasted = lines.join("\n");
-        app.set_input("Résumé: ");
+        app.draft.replace("Résumé: ");
         app.on_event(Event::Paste(pasted.clone()));
         let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
         app.on_event(Event::Key(ctrl_w));
-        assert_eq!(app.input.lines(), ["Résumé: "]);
+        assert_eq!(app.draft.area.lines(), ["Résumé: "]);
 
         app.on_event(Event::Paste(pasted));
         for _ in 0..3 {
             key(&mut app, KeyCode::Left);
         }
         key(&mut app, KeyCode::Char('🚀'));
-        assert_eq!(app.input.lines(), ["Résumé: [paste #2: 7 lines]🚀"]);
+        assert_eq!(app.draft.area.lines(), ["Résumé: [paste #2: 7 lines]🚀"]);
 
         key(&mut app, KeyCode::Home);
         for _ in 0..8 {
             key(&mut app, KeyCode::Right);
         }
         key(&mut app, KeyCode::Delete);
-        assert_eq!(app.input.lines(), ["Résumé: 🚀"]);
+        assert_eq!(app.draft.area.lines(), ["Résumé: 🚀"]);
     }
 
     /// An image goes in as its placeholder, which goes whole and never gets its number again,
@@ -2305,18 +2079,18 @@ mod tests {
         let png = fs::read(&path).expect("png");
         fs::remove_dir_all(path.parent().expect("dir")).ok();
         app.desktop = Box::new(Clipped(Ok(png.clone())));
-        app.set_input("Look at ");
+        app.draft.replace("Look at ");
         let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
         app.on_event(Event::Key(ctrl_v));
-        assert_eq!(app.input.lines(), ["Look at [image #1]"]);
+        assert_eq!(app.draft.area.lines(), ["Look at [image #1]"]);
         key(&mut app, KeyCode::Backspace);
-        assert_eq!(app.input.lines(), ["Look at "]);
+        assert_eq!(app.draft.area.lines(), ["Look at "]);
 
         let alt_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT);
         app.on_event(Event::Key(alt_v));
         key(&mut app, KeyCode::Left);
         key(&mut app, KeyCode::Char('🐍'));
-        assert_eq!(app.input.lines(), ["Look at [image #2]🐍"]);
+        assert_eq!(app.draft.area.lines(), ["Look at [image #2]🐍"]);
         key(&mut app, KeyCode::Enter);
         settle(&mut app, |app| app.session.run.is_none());
         let rows = shown(&mut app);
@@ -2329,16 +2103,16 @@ mod tests {
         app.on_event(Event::Key(ctrl_v));
         let flash = app.flash.as_ref().map(|(text, _)| text.clone());
         assert_eq!(flash, Some(Err("clipboard: no image".to_owned())));
-        app.paste_image(|_| Ok("café".as_bytes().to_vec()));
+        app.paste_image(Some("café".as_bytes().to_vec()));
         let flash = app.flash.as_ref().map(|(text, _)| text.clone());
         assert_eq!(
             flash,
             Some(Err("image: not PNG, JPEG, GIF or WebP".to_owned()))
         );
-        assert!(app.input.lines().iter().all(String::is_empty));
+        assert!(app.draft.area.lines().iter().all(String::is_empty));
 
         // Neither a shell command nor an agent without images reads the clipboard
-        app.set_input("! ls ");
+        app.draft.replace("! ls ");
         app.desktop = Box::new(Clipped(Ok(png)));
         app.on_event(Event::Key(ctrl_v));
         let flash = app.flash.as_ref().map(|(text, _)| text.clone());
@@ -2346,12 +2120,12 @@ mod tests {
             flash,
             Some(Err("image: shell commands take none".to_owned()))
         );
-        app.set_input("");
+        app.draft.replace("");
         app.session.client.image_prompts = false;
         app.on_event(Event::Key(ctrl_v));
         let flash = app.flash.as_ref().map(|(text, _)| text.clone());
         assert_eq!(flash, Some(Err("image: agent takes no images".to_owned())));
-        assert!(app.input.lines().iter().all(String::is_empty));
+        assert!(app.draft.area.lines().iter().all(String::is_empty));
         assert_eq!(app.session.images.len(), 2);
     }
 
@@ -2359,29 +2133,29 @@ mod tests {
     fn brackets_beside_placeholder() {
         let mut app = app();
         let lines: Vec<String> = (1..=7).map(|n| format!("line {n}")).collect();
-        app.set_input("[");
+        app.draft.replace("[");
         app.on_event(Event::Paste(lines.join("\n")));
 
         key(&mut app, KeyCode::Home);
         key(&mut app, KeyCode::Right);
         key(&mut app, KeyCode::Char('['));
-        assert_eq!(app.input.lines(), ["[[[paste #1: 7 lines]"]);
+        assert_eq!(app.draft.area.lines(), ["[[[paste #1: 7 lines]"]);
         key(&mut app, KeyCode::Backspace);
         key(&mut app, KeyCode::Backspace);
-        assert_eq!(app.input.lines(), ["[paste #1: 7 lines]"]);
+        assert_eq!(app.draft.area.lines(), ["[paste #1: 7 lines]"]);
 
         key(&mut app, KeyCode::End);
         key(&mut app, KeyCode::Char(']'));
         key(&mut app, KeyCode::Left);
         key(&mut app, KeyCode::Backspace);
-        assert_eq!(app.input.lines(), ["]"]);
+        assert_eq!(app.draft.area.lines(), ["]"]);
     }
 
     #[test]
     fn interrupt_sends_queued() {
         let mut app = app();
         app.submit_text("wait");
-        app.set_input("try another way");
+        app.draft.replace("try another way");
         key(&mut app, KeyCode::Enter);
 
         key(&mut app, KeyCode::Esc);
@@ -2405,16 +2179,16 @@ mod tests {
     #[test]
     fn invalid_command_kept() {
         let mut app = app();
-        app.set_input(":undo");
+        app.draft.replace(":undo");
         key(&mut app, KeyCode::Enter);
-        assert_eq!(app.input.lines(), [":undo"]);
+        assert_eq!(app.draft.area.lines(), [":undo"]);
         assert!(app.session.run.is_none());
         let rows = shown(&mut app);
         assert!(rows[1].starts_with("✗ command: :undo: unknown"), "{rows:?}");
 
-        app.set_input(": what does this mean");
+        app.draft.replace(": what does this mean");
         key(&mut app, KeyCode::Enter);
-        assert_eq!(app.input.lines(), [""]);
+        assert_eq!(app.draft.area.lines(), [""]);
         let rows = shown(&mut app);
         assert!(
             rows.contains(&"❯ : what does this mean".to_owned()),
@@ -2451,51 +2225,6 @@ mod tests {
         let draft = ("draft".to_owned(), true);
         assert_eq!(history.forward(&sent), Some(draft));
         assert_eq!(history.forward(&sent), None);
-    }
-
-    #[test]
-    fn key_burst_pasted() {
-        let pressed = |code| Event::Key(KeyEvent::from(code));
-        let first = pressed(KeyCode::Char('é'));
-        let enter = pressed(KeyCode::Enter);
-        let second = pressed(KeyCode::Char('ñ'));
-        let shifted = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
-        let moved = Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Moved,
-            column: 3,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        });
-        let burst = [
-            first.clone(),
-            enter.clone(),
-            moved,
-            Event::Key(shifted),
-            second.clone(),
-        ];
-        assert_eq!(pasted(&burst, false).as_deref(), Some("é\nAñ"));
-        assert_eq!(pasted(&burst, true).as_deref(), Some("é\nAñ"));
-
-        // A line typed during a freeze, then Enter
-        let line = [first.clone(), second.clone(), enter.clone()];
-        assert_eq!(pasted(&line, true), None);
-        assert_eq!(pasted(&line, false).as_deref(), Some("éñ\n"));
-
-        // One long line too, which then folds
-        let long = vec![first.clone(); MAX_UNFOLDED_CHARS + 1];
-        let text = "é".repeat(MAX_UNFOLDED_CHARS + 1);
-        assert_eq!(pasted(&long, true), Some(text));
-        assert_eq!(pasted(&long[1..], false), None);
-
-        let up = pressed(KeyCode::Up);
-        let typed = [
-            vec![enter.clone()],
-            vec![first.clone(), second],
-            vec![first, up, enter],
-        ];
-        for events in typed {
-            assert_eq!(pasted(&events, false), None, "{events:?}");
-        }
     }
 
     #[test]
@@ -2720,7 +2449,7 @@ mod tests {
     fn empty_list_closed() {
         let mut app = app();
         app.submit_text(":resume");
-        assert_eq!(app.input.lines(), [""]);
+        assert_eq!(app.draft.area.lines(), [""]);
         assert_eq!(shown(&mut app), ["", "  no other sessions"]);
 
         app.session.options.clear();
@@ -2728,7 +2457,7 @@ mod tests {
             key(&mut app, KeyCode::Char(typed));
         }
         key(&mut app, KeyCode::Char('m'));
-        assert_eq!(app.input.lines(), [":model m"]);
+        assert_eq!(app.draft.area.lines(), [":model m"]);
         let expected = ["", "  no other sessions", "", "  no models"];
         assert_eq!(shown(&mut app), expected);
     }

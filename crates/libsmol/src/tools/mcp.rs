@@ -329,117 +329,8 @@ pub(crate) async fn connect(
     let call = move |function: String, arguments: Map<String, Value>, label: String| -> Calling {
         let connection = Arc::clone(&connection);
         let copies = copies.clone();
-        Box::pin(async move {
-            let mut media = Vec::new();
-            let calling = async {
-                // The server stays installed until the turn ends
-                if let Some(reason) = connection.refused.get() {
-                    return Err(reason.clone());
-                }
-                let failed = |e: ServiceError| {
-                    let reason = root_cause(&e, prompt::NO_SERVER);
-                    if unauthorized(&e) {
-                        connection.refuse(&reason);
-                    }
-                    reason
-                };
-
-                let params = CallToolRequestParams::new(function).with_arguments(arguments);
-                let request = CallToolRequest::new(params);
-                let request = ClientRequest::CallToolRequest(request);
-                let options = PeerRequestOptions::no_options();
-                let sent = connection.peer.send_cancellable_request(request, options);
-                let handle = sent.await.map_err(failed)?;
-
-                let mut unanswered = Unanswered {
-                    peer: handle.peer.clone(),
-                    id: Some(handle.id.clone()),
-                };
-                let replied = handle.await_response().await;
-                unanswered.id = None;
-
-                let replied = replied.map_err(failed)?;
-                let result = match replied {
-                    ServerResult::CallToolResult(result) => result,
-                    _ => {
-                        let unexpected = ServiceError::UnexpectedResponse;
-                        return Err(root_cause(&unexpected, prompt::NO_SERVER));
-                    }
-                };
-
-                let bytes = |base64: &str| base64.len() * 3 / 4;
-                let mut texts = Vec::new();
-                for block in result.content {
-                    let text = match block {
-                        ContentBlock::Text(text) => text.text,
-                        ContentBlock::Image(ImageContent {
-                            data, mime_type, ..
-                        }) => {
-                            let size = bytes(&data);
-                            let copies = copies.clone();
-                            let copying = move || {
-                                let decoded = STANDARD.decode(&data).ok()?;
-                                returned(&copies, &decoded)
-                            };
-                            let copied = task::spawn_blocking(copying).await.expect("copy");
-                            match copied {
-                                // The `<image>` tag in the observation already reports it
-                                Some(Ok(copy)) => {
-                                    media.push((label.clone(), copy));
-                                    continue;
-                                }
-                                Some(Err(reason)) => prompt::unkept(&label, &reason),
-                                None => prompt::unshown("image", &label, &mime_type, size),
-                            }
-                        }
-                        ContentBlock::Audio(audio) => {
-                            let size = bytes(&audio.data);
-                            prompt::unshown("audio", &label, &audio.mime_type, size)
-                        }
-                        ContentBlock::Resource(embedded) => match embedded.resource {
-                            ResourceContents::TextResourceContents { text, .. } => text,
-                            ResourceContents::BlobResourceContents {
-                                uri,
-                                mime_type,
-                                blob,
-                                ..
-                            } => {
-                                let mime = mime_type.as_deref().unwrap_or("binary");
-                                let size = bytes(&blob);
-                                let resource = format!("resource {uri}");
-                                prompt::unshown(&resource, &label, mime, size)
-                            }
-                            _ => continue,
-                        },
-                        ContentBlock::ResourceLink(link) => prompt::linked(&link.uri),
-                        _ => continue,
-                    };
-                    texts.push(text);
-                }
-
-                if result.is_error.unwrap_or(false) {
-                    let message = match texts.is_empty() {
-                        true => prompt::SILENT_ERROR.to_owned(),
-                        false => texts.join("; "),
-                    };
-                    return Err(message);
-                }
-
-                let text = match (texts.is_empty(), &result.structured_content) {
-                    (true, Some(content)) => content.to_string(),
-                    _ => texts.join("\n"),
-                };
-                let mut reply = Map::new();
-                reply.insert("text".to_owned(), Value::String(text));
-                if let Some(content) = result.structured_content {
-                    reply.insert("structured".to_owned(), content);
-                }
-                Ok(Value::Object(reply))
-            };
-
-            let result = calling.await;
-            Called { result, media }
-        })
+        let calling = call_tool(connection, copies, function, arguments, label);
+        Box::pin(calling)
     };
 
     let server = Server {
@@ -454,6 +345,126 @@ pub(crate) async fn connect(
         refused,
     };
     Ok((server, link))
+}
+
+/// `label` is the `server.function` from the code, which names the images and videos the call
+/// returns, and those go into `copies`
+async fn call_tool(
+    connection: Arc<Connection>,
+    copies: PathBuf,
+    function: String,
+    arguments: Map<String, Value>,
+    label: String,
+) -> Called {
+    let mut media = Vec::new();
+    let calling = async {
+        // The server stays installed until the turn ends
+        if let Some(reason) = connection.refused.get() {
+            return Err(reason.clone());
+        }
+        let failed = |e: ServiceError| {
+            let reason = root_cause(&e, prompt::NO_SERVER);
+            if unauthorized(&e) {
+                connection.refuse(&reason);
+            }
+            reason
+        };
+
+        let params = CallToolRequestParams::new(function).with_arguments(arguments);
+        let request = CallToolRequest::new(params);
+        let request = ClientRequest::CallToolRequest(request);
+        let options = PeerRequestOptions::no_options();
+        let sent = connection.peer.send_cancellable_request(request, options);
+        let handle = sent.await.map_err(failed)?;
+
+        let mut unanswered = Unanswered {
+            peer: handle.peer.clone(),
+            id: Some(handle.id.clone()),
+        };
+        let replied = handle.await_response().await;
+        unanswered.id = None;
+
+        let replied = replied.map_err(failed)?;
+        let result = match replied {
+            ServerResult::CallToolResult(result) => result,
+            _ => {
+                let unexpected = ServiceError::UnexpectedResponse;
+                return Err(root_cause(&unexpected, prompt::NO_SERVER));
+            }
+        };
+
+        let bytes = |base64: &str| base64.len() * 3 / 4;
+        let mut texts = Vec::new();
+        for block in result.content {
+            let text = match block {
+                ContentBlock::Text(text) => text.text,
+                ContentBlock::Image(ImageContent {
+                    data, mime_type, ..
+                }) => {
+                    let size = bytes(&data);
+                    let copies = copies.clone();
+                    let copying = move || {
+                        let decoded = STANDARD.decode(&data).ok()?;
+                        returned(&copies, &decoded)
+                    };
+                    let copied = task::spawn_blocking(copying).await.expect("copy");
+                    match copied {
+                        // The `<image>` tag in the observation already reports it
+                        Some(Ok(copy)) => {
+                            media.push((label.clone(), copy));
+                            continue;
+                        }
+                        Some(Err(reason)) => prompt::unkept(&label, &reason),
+                        None => prompt::unshown("image", &label, &mime_type, size),
+                    }
+                }
+                ContentBlock::Audio(audio) => {
+                    let size = bytes(&audio.data);
+                    prompt::unshown("audio", &label, &audio.mime_type, size)
+                }
+                ContentBlock::Resource(embedded) => match embedded.resource {
+                    ResourceContents::TextResourceContents { text, .. } => text,
+                    ResourceContents::BlobResourceContents {
+                        uri,
+                        mime_type,
+                        blob,
+                        ..
+                    } => {
+                        let mime = mime_type.as_deref().unwrap_or("binary");
+                        let size = bytes(&blob);
+                        let resource = format!("resource {uri}");
+                        prompt::unshown(&resource, &label, mime, size)
+                    }
+                    _ => continue,
+                },
+                ContentBlock::ResourceLink(link) => prompt::linked(&link.uri),
+                _ => continue,
+            };
+            texts.push(text);
+        }
+
+        if result.is_error.unwrap_or(false) {
+            let message = match texts.is_empty() {
+                true => prompt::SILENT_ERROR.to_owned(),
+                false => texts.join("; "),
+            };
+            return Err(message);
+        }
+
+        let text = match (texts.is_empty(), &result.structured_content) {
+            (true, Some(content)) => content.to_string(),
+            _ => texts.join("\n"),
+        };
+        let mut reply = Map::new();
+        reply.insert("text".to_owned(), Value::String(text));
+        if let Some(content) = result.structured_content {
+            reply.insert("structured".to_owned(), content);
+        }
+        Ok(Value::Object(reply))
+    };
+
+    let result = calling.await;
+    Called { result, media }
 }
 
 async fn last_lines(said: Option<JoinHandle<String>>) -> String {
