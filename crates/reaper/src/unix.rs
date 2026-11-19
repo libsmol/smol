@@ -655,8 +655,11 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Stdio};
+    #[cfg(target_os = "linux")]
     use std::thread;
-    use std::time::{Duration, Instant};
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
+    use std::time::Instant;
 
     /// The group gets SIGTERM first, and a program that handles it ends cleanly
     #[test]

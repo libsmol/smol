@@ -688,13 +688,12 @@ pub(crate) fn original(source: &Source) -> Result<(Vec<u8>, ImageFormat), String
     Ok((bytes, picture.format))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use crate::tui::picture::*;
 
     /// A device reports no size and would be read forever
     #[test]
-    #[cfg(unix)]
     fn devices_refused() {
         assert_eq!(read(Path::new("/dev/zero")), None);
         assert_eq!(read(Path::new("/dev")), None);

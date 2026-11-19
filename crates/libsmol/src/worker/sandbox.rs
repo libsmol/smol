@@ -449,7 +449,9 @@ pub(crate) fn sweep() {
 pub(crate) mod tests {
     use crate::config::Access;
     use crate::tests::{temp_dir, write_file};
-    use crate::utils::{block_on, new_id, Interrupt};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::utils::new_id;
+    use crate::utils::{block_on, Interrupt};
     use crate::worker::host::tests::unserved;
     use crate::worker::host::{Rank, Worker};
     #[cfg(target_os = "linux")]
