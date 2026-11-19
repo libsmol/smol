@@ -650,7 +650,7 @@ mod tests {
         let (ran, _) = shelled(&dir, line, &interrupt);
 
         assert_eq!(ran.end, Exit::Exited(3));
-        let expected = format!("café\nnaïve\nrésumé\n{}\n", dir.display());
+        let expected = format!("café\nnaïve\nrésumé\n{}", dir.display());
         assert_eq!(ran.output, expected);
         assert_eq!(ran.shell.to_lowercase(), "cmd");
         fs::remove_dir_all(&dir).ok();
