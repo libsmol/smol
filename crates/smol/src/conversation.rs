@@ -71,6 +71,14 @@ pub(crate) enum ShellEnd {
     Interrupted(String),
 }
 
+/// What the latest run said, which a user who looked away is told
+pub(crate) enum Said<'a> {
+    /// A turn's answer, empty when it gave none
+    Answer(String),
+    /// A command the user ran
+    Shell(&'a Shell),
+}
+
 #[derive(Clone)]
 pub(crate) enum Outcome {
     Answered,
@@ -84,8 +92,6 @@ pub(crate) struct Stats {
     pub(crate) turns: usize,
     pub(crate) steps: usize,
     pub(crate) tokens: Tokens,
-    /// Of the agents the code started, which count apart from the session's
-    pub(crate) agent_tokens: Tokens,
     pub(crate) context: Option<u64>,
     pub(crate) window: Option<u64>,
     /// Output estimated while the step is still generating, which makes the context an estimate too
@@ -203,10 +209,8 @@ impl Conversation {
 
     /// The agent sends the commands the user ran with the next task
     pub(crate) fn shell_unsent(&self) -> bool {
-        let mut entries = self.entries.iter().chain(&self.held).rev();
-        let last = entries.find(|entry| matches!(entry, Entry::Shell(_)) || entry.opens_turn());
-
-        matches!(last, Some(Entry::Shell(_)))
+        let shell = |entry: &Entry| matches!(entry, Entry::Shell(_));
+        self.latest().any(shell)
     }
 
     pub(crate) fn unstarted(&self) -> bool {
@@ -221,7 +225,7 @@ impl Conversation {
     }
 
     /// Agents still queued or running, wherever the call that started them is
-    pub(crate) fn helping(&self) -> usize {
+    fn helping(&self) -> usize {
         let working = self.working();
         working.iter().map(|(_, step)| step.helping()).sum()
     }
@@ -258,28 +262,6 @@ impl Conversation {
             true => self.helping(),
             false => 0,
         }
-    }
-
-    /// The agents the code started, in the order they took their first task, with each unnamed
-    /// one of an older session on its own
-    pub(crate) fn agents(&self) -> Vec<Agent<'_>> {
-        let mut agents: Vec<Agent> = Vec::new();
-        for helper in self.helpers() {
-            let tokens = helper.tokens.unwrap_or_default();
-            let named =
-                |agent: &&mut Agent| helper.name.is_some() && agent.latest.name == helper.name;
-            match agents.iter_mut().find(named) {
-                Some(agent) => {
-                    agent.latest = helper;
-                    agent.tokens += tokens;
-                }
-                None => agents.push(Agent {
-                    latest: helper,
-                    tokens,
-                }),
-            }
-        }
-        agents
     }
 
     /// Every task the code sent an agent, oldest first
@@ -320,25 +302,27 @@ impl Conversation {
         step.items.iter().any(writes)
     }
 
-    /// What the latest turn answered, empty when it gave no answer
-    pub(crate) fn answer(&self) -> String {
-        let Some(last) = self.last_step() else {
-            return String::new();
+    pub(crate) fn said(&self) -> Said<'_> {
+        let ran = |entry: &&Entry| matches!(entry, Entry::Step(_) | Entry::Shell(_));
+        let step = match self.latest().find(ran) {
+            Some(Entry::Shell(shell)) => return Said::Shell(shell),
+            Some(Entry::Step(step)) => step,
+            _ => return Said::Answer(String::new()),
         };
 
         let mut texts = Vec::new();
-        for item in &last.items {
+        for item in &step.items {
             if let Item::Message { text, answer: true } = item {
                 texts.push(text.as_str());
             }
         }
-        texts.join("\n")
+        Said::Answer(texts.join("\n"))
     }
 
-    fn last_step(&self) -> Option<&Step> {
+    /// The entries since the latest task or programs that ended, newest first
+    fn latest(&self) -> impl Iterator<Item = &Entry> {
         let entries = self.entries.iter().chain(&self.held).rev();
-        let mut turn = entries.take_while(|entry| !entry.opens_turn());
-        turn.find_map(Entry::step)
+        entries.take_while(|entry| !entry.opens_turn())
     }
 
     pub(crate) fn sent(&self) -> Vec<String> {
@@ -504,7 +488,6 @@ impl Conversation {
                             let duration = measured.duration.unwrap_or_default();
                             helper.totals = Some(Totals { steps, duration });
                         }
-                        self.stats.agent_tokens += tokens.unwrap_or_default();
                     }
 
                     started.revision += 1;
@@ -721,7 +704,7 @@ impl Conversation {
         self.finish_turn(Outcome::Failed(text.clone()));
 
         // Compaction in the turn's last step may have shown this error already
-        let last = self.last_step();
+        let last = self.latest().find_map(Entry::step);
         let shown = match last.and_then(|step| step.items.last()) {
             Some(Item::Call(call)) => call.parts().error,
             _ => None,
@@ -813,13 +796,6 @@ pub(crate) struct Helper {
     pub(crate) tokens: Option<Tokens>,
     /// Known once it ends
     pub(crate) totals: Option<Totals>,
-}
-
-/// An agent the code started, as its tasks show it
-pub(crate) struct Agent<'a> {
-    pub(crate) latest: &'a Helper,
-    /// Of all its tasks
-    pub(crate) tokens: Tokens,
 }
 
 #[derive(Debug, Clone, Copy)]

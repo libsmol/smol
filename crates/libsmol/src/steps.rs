@@ -1,5 +1,6 @@
 use crate::model::{ChatMessage, Media, MediaKind, Part, Sealed, TokenUsage, ToolCall};
 use crate::prompt;
+use reaper::wire::Program;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::Not;
@@ -288,18 +289,6 @@ pub(crate) struct Returned {
     /// Saved beside the name as one key named after how it ended
     #[serde(flatten)]
     pub(crate) end: Ending,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Program {
-    pub(crate) pid: u32,
-    pub(crate) command: String,
-}
-
-impl fmt::Display for Program {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "pid {}: {}", self.pid, self.command)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

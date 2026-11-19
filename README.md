@@ -295,8 +295,8 @@ went unused for less than 30 minutes. The turn stays open until every agent
 has ended. When one ends before code took its answer, the model gets it in an
 "[Agent done]" message, and what you type meanwhile reaches it as a task
 update, which also ends a wait for agents early. smol shows each task under
-the call that sent it, pins the running ones below the conversation while
-their rows are scrolled out of view, and lists the agents in the sidebar.
+the call that sent it and pins the running ones below the conversation while
+their rows are scrolled out of view.
 
 Programs the code leaves running, such as a build, a download or a server, go
 on after the call and don't keep the turn open. The model hears of each one

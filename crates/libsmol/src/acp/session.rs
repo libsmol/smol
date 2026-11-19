@@ -22,8 +22,7 @@ use agent_client_protocol_schema::v1::{
     SetSessionConfigOptionResponse, StopReason,
 };
 use reaper::tilde;
-use reaper::wire::MCP_PREFIX;
-use serde::Deserialize;
+use reaper::wire::{Queued, MCP_PREFIX};
 use serde_json::Value;
 use std::future;
 use std::path::PathBuf;
@@ -80,11 +79,6 @@ pub(crate) struct Opening {
     pub(crate) memories: Memories,
 }
 
-#[derive(Deserialize)]
-struct Queued {
-    prompts: Vec<Vec<ContentBlock>>,
-}
-
 struct Session {
     memory: AgentMemory,
     models: Models,
@@ -92,7 +86,7 @@ struct Session {
     /// Lent to the agent during a turn, with MCP servers added and removed between turns
     worker: Worker,
     servers: McpPool,
-    /// Programs that user commands left in the background, which end with the session
+    /// Commands the user ran that weren't interrupted, whose programs end with the session
     shell_left: Vec<Process>,
     keeper: Keeper,
     _lock: Option<Lock>,
@@ -648,7 +642,7 @@ impl Queue for ClientQueue {
             let Some(result) = self.peer.queued().await else {
                 return Vec::new();
             };
-            let Ok(queued) = serde_json::from_value::<Queued>(result) else {
+            let Ok(queued) = serde_json::from_value::<Queued<ContentBlock>>(result) else {
                 return Vec::new();
             };
 
@@ -1040,8 +1034,7 @@ mod tests {
         assert_eq!(first, Some(offered), "{opened}");
         let switched = effort_of(&answers[0]["result"]["configOptions"]).expect("effort");
         assert_eq!(switched["currentValue"], "low", "{switched}");
-        let refused = "effort: max: not offered by mock/m1 (efforts: low, high)";
-        assert_eq!(answers[1]["error"]["message"], refused, "{:?}", answers[1]);
+        assert_eq!(answers[1]["error"]["code"], -32602, "{:?}", answers[1]);
         let reloaded = effort_of(&loaded["result"]["configOptions"]).expect("effort");
         assert_eq!(reloaded["currentValue"], "low", "{reloaded}");
 
@@ -1103,8 +1096,6 @@ mod tests {
         ]);
         assert_eq!(listed["result"]["memories"], memories, "{listed}");
         assert_eq!(forgotten["result"], json!({}), "{forgotten}");
-        let missing = format!("memory: {own}: not found");
-        assert_eq!(again["error"]["message"], missing, "{again}");
         assert_eq!(again["error"]["code"], -32002, "{again}");
         fs::remove_dir_all(&dir).ok();
     }

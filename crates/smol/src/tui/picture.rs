@@ -164,20 +164,16 @@ pub(crate) fn kitty_here() -> bool {
     if cfg!(test) {
         return false;
     }
-    let term = env::var("TERM").unwrap_or_default();
-    let program = env::var("TERM_PROGRAM").unwrap_or_default();
-    let ssh = remote();
-    !multiplexed() && kitty_terminal(&term, &program, ssh)
-}
 
-/// Terminals known to draw Kitty's Unicode placeholders, by the TERM they set,
-/// since other variables pass on to terminals started from their shells
-fn kitty_terminal(term: &str, program: &str, ssh: bool) -> bool {
-    let own = matches!(term, "xterm-kitty" | "xterm-ghostty");
+    // Terminals are told by the TERM they set, since other variables pass on to terminals
+    // started from their shells
+    let term = env::var("TERM").unwrap_or_default();
+    let own = matches!(term.as_str(), "xterm-kitty" | "xterm-ghostty");
     // Ghostty's ssh-env sends TERM_PROGRAM with a plain xterm TERM, which a terminal started
     // from Ghostty's shell may also have
-    let forwarded = ssh && program == "ghostty" && term == "xterm-256color";
-    own || forwarded
+    let program = env::var("TERM_PROGRAM").unwrap_or_default();
+    let forwarded = remote() && program == "ghostty" && term == "xterm-256color";
+    !multiplexed() && (own || forwarded)
 }
 
 pub(crate) fn loaded() -> u64 {

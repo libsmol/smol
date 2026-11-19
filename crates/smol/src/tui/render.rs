@@ -1027,7 +1027,7 @@ fn spans_width(spans: &[(String, Style)]) -> usize {
 }
 
 /// The symbol of the state an agent is in, in the style its rows take
-pub(crate) fn signal(helper: &Helper) -> (char, Style) {
+fn signal(helper: &Helper) -> (char, Style) {
     match helper.state() {
         State::Queued => ('◌', DIM),
         State::Running => {

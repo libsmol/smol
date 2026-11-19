@@ -51,6 +51,8 @@ pub(crate) const HEADING: Style = BOLD.fg(theme::PURPLE);
 pub(crate) const RED: Style = Style::new().fg(theme::RED);
 pub(crate) const YELLOW: Style = Style::new().fg(theme::YELLOW);
 pub(crate) const BORDER: Style = Style::new().fg(theme::LINE);
+/// Text the user selected, in the transcript or the input
+pub(crate) const SELECTED: Style = Style::new().bg(theme::LINE);
 
 pub(crate) type Spans = Vec<(String, Style)>;
 

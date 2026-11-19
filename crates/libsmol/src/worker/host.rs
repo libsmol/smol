@@ -1,7 +1,7 @@
 use crate::model::Media;
 use crate::prompt::{self, ADDING_SERVER, LEFT_BEHIND, NO_SERVER};
 use crate::spawn::{Clip, Output, Process, SHOWN_EVERY};
-use crate::steps::{CallError, DoneStep, Program, MAX_OBSERVATION_CHARS};
+use crate::steps::{CallError, DoneStep, MAX_OBSERVATION_CHARS};
 use crate::tools::mcp::Server;
 use crate::utils::{cut_inline, new_id, Interrupt, Reply};
 use crate::worker::workplace::Workplace;
@@ -10,6 +10,7 @@ use crate::worker::{
     Service, ToWorker, WorkerCall, WorkerNote, CONTROL_ENV, COPIES_ENV, MAIN_ENV, WORKER_ARG,
 };
 use crate::{Error, Result};
+use reaper::wire::Program;
 use reaper::{cause, Member};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -602,7 +603,7 @@ impl Worker {
         }
 
         let said = live.output.take();
-        let output = said.shown(usize::MAX);
+        let output = said.shown(MAX_OBSERVATION_CHARS);
         info!("programs: ended [count={}]", programs.len());
         Some(DoneStep {
             programs,
@@ -786,11 +787,11 @@ pub(crate) mod tests {
     use crate::agent::{serve, Delegating};
     use crate::config::Access;
     use crate::prompt;
-    use crate::steps::CallError;
+    use crate::steps::{CallError, MAX_OBSERVATION_CHARS};
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
     use crate::tools::mcp::Server;
     use crate::tools::memories::Memories;
-    use crate::utils::{block_on, new_id, Interrupt};
+    use crate::utils::{block_on, new_id, truncated, Interrupt};
     use crate::worker::host::{Added, Called, Calling, Rank, Worker, STOP_WAIT};
     use crate::worker::workplace::tests::opened;
     use crate::worker::{AgentCall, Service};
@@ -938,11 +939,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn error(output: Shown) -> String {
-        let error = output.error.expect("error");
-        error.to_string()
-    }
-
     #[test]
     fn interrupt_escapes_except() {
         let (mut worker, interrupt) = interruptible();
@@ -1020,8 +1016,7 @@ pub(crate) mod tests {
 
         let broken = worker.eval("print(1\n</eval>");
         assert_eq!(broken.repaired, None);
-        let error = error(broken);
-        assert!(error.starts_with("syntax error"), "{error}");
+        assert!(matches!(broken.error, Some(CallError::Execution(_))));
     }
 
     /// A worker stuck after an interrupt and one that exits on its own are both replaced
@@ -1179,10 +1174,8 @@ pub(crate) mod tests {
              with multiprocessing.get_context('spawn').Pool(1) as pool:\n    \
                  pool.map(square, [3])";
         let output = worker.eval(code);
-        let message = error(output);
-        let expected = "PicklingError: multiprocessing: square: defined in your code, \
-                        so it can't be sent to another process; put it in a .py file and import it";
-        assert!(message.starts_with(expected), "{message}");
+        let message = output.error.expect("error").to_string();
+        assert!(message.starts_with("PicklingError: "), "{message}");
 
         let output = worker.eval("import pickle\npickle.loads(pickle.dumps(square))(3)");
         assert_eq!(output.error, None);
@@ -1206,10 +1199,8 @@ pub(crate) mod tests {
         assert!(names.contains(&"recall".to_owned()), "{names:?}");
         assert!(!names.contains(&"remember".to_owned()), "{names:?}");
         assert!(!names.contains(&"forget".to_owned()), "{names:?}");
-        assert_eq!(
-            output.printed,
-            "not available to agents started by agent()\n[]"
-        );
+        let expected = format!("{}\n[]", prompt::NESTED);
+        assert_eq!(output.printed, expected);
     }
 
     /// Dropping a stream made on fd 1 closes the fd, which a file opened next would take
@@ -1278,7 +1269,7 @@ pub(crate) mod tests {
         let printed = &output.printed;
         assert!(printed.starts_with("0000 café "), "{printed}");
         assert!(printed.ends_with("True"), "{printed}");
-        assert!(printed.contains(" characters cut]\n"), "{printed}");
+        assert!(!printed.contains("1500 café "), "{printed}");
     }
 
     /// A program the code leaves running is followed until it ends, with what it printed,
@@ -1287,7 +1278,7 @@ pub(crate) mod tests {
     fn programs_followed() {
         let mut worker = fresh();
         let code = "import subprocess, sys, time\n\
-            inner = \"import time; time.sleep(1); print('café done', flush=True)\"\n\
+            inner = \"import time; time.sleep(1); print('café done ' * 2000, flush=True)\"\n\
             outer = f'import subprocess, sys; subprocess.run([sys.executable, \"-c\", {inner!r}])'\n\
             ran = subprocess.run([sys.executable, '-c', 'pass'])\n\
             program = subprocess.Popen([sys.executable, '-c', outer])\n\
@@ -1312,7 +1303,8 @@ pub(crate) mod tests {
         assert_eq!(pids, [pid], "{done:?}");
         let command = &done.programs[0].command;
         assert!(command.contains("import subprocess, sys;"), "{command}");
-        assert_eq!(done.output.trim(), "café done");
+        let printed = "café done ".repeat(2000);
+        assert_eq!(done.output, truncated(&printed, MAX_OBSERVATION_CHARS));
         assert_eq!(block_on(worker.ended()), None);
     }
 

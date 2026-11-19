@@ -1,9 +1,9 @@
 use crate::acp::rpc::{Notice, SessionPeer};
 use crate::agent::{Event, Failure, Status, TaskView, TaskViews, Unseen};
-use crate::prompt::{SKIPPED, TOOL};
+use crate::prompt::{self, SKIPPED, TOOL};
 use crate::steps::{
     estimate, spent, text_bytes, AgentMemory, AgentRecord, AgentStep, Call, CallError, DoneStep,
-    Ending, Exit, MemoryStep, Program, ShellStep, StepError, SummaryStep, TaskStep, Usage,
+    Ending, Exit, MemoryStep, ShellStep, StepError, SummaryStep, TaskStep, Usage,
 };
 use agent_client_protocol_schema::v1::{
     ContentBlock, ContentChunk, MessageId, Meta, ResourceLink, SessionUpdate, ToolCall,
@@ -11,7 +11,7 @@ use agent_client_protocol_schema::v1::{
 };
 use reaper::one_line;
 use reaper::wire::{
-    Measured, AGENT, BACKGROUND, ERROR, NAME, PARENT, SHELL, TASK, UPDATE, WAITING,
+    Measured, Program, AGENT, BACKGROUND, ERROR, NAME, PARENT, SHELL, TASK, UPDATE, WAITING,
 };
 use reqwest::Url;
 use serde_json::{json, Value};
@@ -285,7 +285,7 @@ impl Translator {
         self.tasks += 1;
         let id = format!("task_{}", self.tasks);
         let id = MessageId::new(id);
-        let lines: Vec<String> = done.programs.iter().map(ToString::to_string).collect();
+        let lines: Vec<String> = done.programs.iter().map(prompt::program).collect();
         let text = lines.join("\n");
         let flag = (BACKGROUND.to_owned(), json!(true));
         let meta = Meta::from_iter([flag]);
@@ -962,7 +962,7 @@ mod tests {
         assert_eq!(opened["_meta"], marked);
         let working = updates[3];
         assert_eq!(working["status"], "in_progress");
-        assert_eq!(working["content"][0]["content"]["text"], "thinking");
+        assert_eq!(working["content"][0]["content"]["text"], prompt::THINKING);
         assert_eq!(working["content"][1]["content"]["text"], "Reading the menu");
         assert_eq!(working["_meta"], json!({ "duration": 0.0, "steps": 0 }));
         let running = updates[4];
@@ -970,7 +970,8 @@ mod tests {
         let spent = json!({ "duration": 0.0, "inputTokens": 100, "outputTokens": 20, "steps": 0 });
         assert_eq!(running["_meta"], spent);
         let content = &running["content"];
-        assert_eq!(content[0]["content"]["text"], "running print(len(cafés))");
+        let doing = format!("{} print(len(cafés))", prompt::RUNNING);
+        assert_eq!(content[0]["content"]["text"], doing);
         assert_eq!(content[1]["content"]["text"], "print(len(cafés))");
         let closed = updates[5];
         assert_eq!(closed["status"], "completed");

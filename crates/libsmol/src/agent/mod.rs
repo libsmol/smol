@@ -5,7 +5,7 @@ use crate::model::{
 };
 use crate::prompt;
 use crate::steps::{
-    bytes, estimate, AgentMemory, AgentStep, Call, Content, Ending, MemoryStep, Program, StepError,
+    bytes, estimate, AgentMemory, AgentStep, Call, Content, Ending, MemoryStep, StepError,
     SummaryStep, TaskStep, Usage,
 };
 use crate::tools::attach::{attach, Mention};
@@ -15,6 +15,7 @@ use crate::worker::host::{Added, Called, Calling, Rank, Serving, Worker};
 use crate::worker::workplace::Workplace;
 use crate::worker::{AgentCall, Service};
 use crate::{Error, Result};
+use reaper::wire::Program;
 use std::fs;
 use std::future::Future;
 use std::path::Path;

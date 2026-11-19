@@ -1,3 +1,4 @@
+use crate::tui::web;
 use anyhow::{bail, Result};
 use clap::builder::NonEmptyStringValueParser;
 use clap::{Parser, Subcommand};
@@ -44,7 +45,7 @@ enum Mode {
         #[arg(long, default_value = "127.0.0.1:8421")]
         listen: SocketAddr,
         /// token to use on every run instead, at least 16 letters, digits or `-._~`
-        #[arg(long, value_parser = tui::web::fixed_token)]
+        #[arg(long, value_parser = web::fixed_token)]
         token: Option<String>,
     },
 }
@@ -85,7 +86,7 @@ fn run() -> Result<()> {
     let resume = cli.resume.as_deref();
     match cli.mode {
         Some(Mode::Web { listen, token }) => {
-            tui::web::run(&command, cli.model, resume, listen, token, terminal)
+            web::run(&command, cli.model, resume, listen, token, terminal)
         }
         None => tui::run(&command, cli.model, resume, cli.prompt),
     }

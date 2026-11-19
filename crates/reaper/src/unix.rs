@@ -20,7 +20,7 @@ use std::process::Command;
 use std::ptr;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,6 +29,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const KILL_WAIT: Duration = Duration::from_secs(1);
 const CHECK_EVERY: Duration = Duration::from_millis(20);
+
+const LIVE: u8 = 0;
+const RELEASED: u8 = 1;
+const ENDED: u8 = 2;
 
 /// Processes that started a new session left the group and are found by this inherited variable
 #[cfg(target_os = "linux")]
@@ -189,8 +193,9 @@ pub fn prepare(command: &mut Command) -> Mark {
 pub struct Group {
     id: i32,
     mark: Mark,
-    /// Released or ending, after which this handle signals nothing more
-    settled: AtomicBool,
+    /// `LIVE`, `RELEASED` or `ENDED`, and only a live group is signaled by id, as a released one's
+    /// id may belong to another group
+    state: AtomicU8,
 }
 
 impl Group {
@@ -209,18 +214,24 @@ impl Group {
         Ok(Group {
             id,
             mark,
-            settled: AtomicBool::new(false),
+            state: AtomicU8::new(LIVE),
         })
     }
 
+    /// False once released or killed, as the id may belong to another group by then
     pub fn alive(&self) -> bool {
-        alive(self.id)
+        self.state.load(Ordering::SeqCst) == LIVE && alive(self.id)
     }
 
     /// Includes descendants in a session of their own, which leaves the group but not the tree,
-    /// leaves out zombies and reads /proc, which can block an async thread
+    /// leaves out zombies, is none once released or killed and reads /proc, which can block an async
+    /// thread
     #[cfg(target_os = "linux")]
     pub fn members(&self) -> io::Result<Vec<Member>> {
+        if self.state.load(Ordering::SeqCst) != LIVE {
+            return Ok(Vec::new());
+        }
+
         let entries = fs::read_dir("/proc")?;
 
         // All are read before following parents, which /proc may list after their children
@@ -302,9 +313,13 @@ impl Group {
     }
 
     /// Includes descendants in a session of their own, which leaves the group but not the tree,
-    /// and leaves out zombies
+    /// leaves out zombies and is none once released or killed
     #[cfg(target_os = "macos")]
     pub fn members(&self) -> io::Result<Vec<Member>> {
+        if self.state.load(Ordering::SeqCst) != LIVE {
+            return Ok(Vec::new());
+        }
+
         // SAFETY: The buffer holds `size` bytes
         let grouped = |buffer, size| unsafe { libc::proc_listpgrppids(self.id, buffer, size) };
         let mut inside = pids(grouped)?;
@@ -366,38 +381,49 @@ impl Group {
         Ok(members)
     }
 
-    /// Sends SIGTERM, then SIGKILL to what is left after `KILL_WAIT`, but never signals a released
-    /// group, whose id may already be reused
+    /// Sends SIGTERM, then SIGKILL to what is left after `KILL_WAIT`, and of a released group only
+    /// ends the processes that left it
     pub fn kill(&self) {
-        if self.settled.swap(true, Ordering::SeqCst) {
+        let released = match self.state.swap(ENDED, Ordering::SeqCst) {
+            ENDED => return,
+            state => state == RELEASED,
+        };
+        // Only Linux finds the processes that left a group
+        if released && cfg!(not(target_os = "linux")) {
             return;
         }
 
-        // Held while signaling, as `kill_all` must not send a second SIGTERM
-        let mut groups = GROUPS.lock().expect("groups lock");
-        let found = groups.iter_mut().find(|known| known.id == self.id);
-        if let Some(known) = found.filter(|known| !known.termed) {
-            known.termed = true;
-            kill(self.id, libc::SIGTERM);
+        if !released {
+            // Held while signaling, as `kill_all` must not send a second SIGTERM
+            let mut groups = GROUPS.lock().expect("groups lock");
+            let found = groups.iter_mut().find(|known| known.id == self.id);
+            if let Some(known) = found.filter(|known| !known.termed) {
+                known.termed = true;
+                kill(self.id, libc::SIGTERM);
+            }
         }
-        drop(groups);
 
         // Waiting and reading /proc must not hold up the caller's thread
         let (id, mark) = (self.id, self.mark);
-        let finishing = move || finish(id, mark);
+        let finishing = move || match released {
+            true => sweep(mark),
+            false => finish(id, mark),
+        };
         let spawned = thread::Builder::new().spawn(finishing);
         // At the process limit no thread can start, and a panic in Drop would abort
         if spawned.is_err() {
-            finish(id, mark);
+            finishing();
         }
     }
 
-    /// Forgets the group without killing it, since its id gets reused once the group is empty
+    /// Forgets the group without killing it, since its id gets reused once the group is empty,
+    /// while dropping it still ends the processes that left it
     pub fn release(&self) {
-        if self.settled.swap(true, Ordering::SeqCst) {
-            return;
+        let state = &self.state;
+        let released = state.compare_exchange(LIVE, RELEASED, Ordering::SeqCst, Ordering::SeqCst);
+        if released.is_ok() {
+            forget(self.id);
         }
-        forget(self.id);
     }
 }
 
@@ -647,11 +673,11 @@ fn marked(environ: &[u8], text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
-    use crate::unix::sweep;
     use crate::unix::{prepare, Group, KILL_WAIT};
     #[cfg(target_os = "linux")]
     use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::io::Read;
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, Stdio};
@@ -703,6 +729,8 @@ mod tests {
         assert!(waited < KILL_WAIT * 5, "{waited:?}");
     }
 
+    /// A group released once its first process ended, as when a command is done, still ends
+    /// what left it when dropped
     #[test]
     #[cfg(target_os = "linux")]
     fn new_session_swept() {
@@ -710,9 +738,13 @@ mod tests {
         let script = "setsid sleep 30 >/dev/null 2>&1 & echo $!";
         command.args(["-c", script]).stdout(Stdio::piped());
         let mark = prepare(&mut command);
-        let output = command.output().expect("run");
-        let pid = String::from_utf8_lossy(&output.stdout);
-        let pid: libc::pid_t = pid.trim().parse().expect("pid");
+        let mut child = command.spawn().expect("spawn");
+        let group = Group::new(child.id(), mark).expect("group");
+        let mut said = String::new();
+        let mut stdout = child.stdout.take().expect("stdout");
+        stdout.read_to_string(&mut said).expect("pid");
+        child.wait().expect("wait");
+        let pid: libc::pid_t = said.trim().parse().expect("pid");
 
         // Where PID 1 doesn't reap orphans the killed process stays a zombie
         let alive = || {
@@ -726,7 +758,8 @@ mod tests {
         };
         assert!(alive());
 
-        sweep(mark);
+        group.release();
+        drop(group);
         let started = Instant::now();
         while alive() {
             assert!(started.elapsed() < Duration::from_secs(5), "{pid}");

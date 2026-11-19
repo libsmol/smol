@@ -85,6 +85,52 @@ pub struct Memory {
     pub project: bool,
 }
 
+/// The params of a `_smol/` message, the session's id beside what its method carries
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Addressed<T> {
+    pub session_id: String,
+    #[serde(flatten)]
+    pub body: T,
+}
+
+/// What `FORGET` carries besides the session's id
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Forget {
+    pub id: i64,
+}
+
+/// What `SHELL` carries besides the session's id
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Shell {
+    pub command: String,
+}
+
+/// What `MCP` carries besides the session's id
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Servers {
+    pub servers: Vec<McpStatus>,
+}
+
+/// What `PROGRAMS` carries besides the session's id
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Programs {
+    pub programs: Vec<Program>,
+}
+
+/// A program the code left running, which a session also keeps among those that ended
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Program {
+    pub pid: u32,
+    pub command: String,
+}
+
+/// The reply to `QUEUED`, with the content blocks of each message it takes
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Queued<B> {
+    pub prompts: Vec<Vec<B>>,
+}
+
 /// What the `_meta` of usage updates, agent calls and shell ends tells of their usage and end
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

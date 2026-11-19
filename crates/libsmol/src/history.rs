@@ -570,7 +570,7 @@ pub(crate) mod tests {
         let older = r#"{"meta":{"format":2,"id":"b3","title":"t","cwd":"/older","created_at":1.0,"updated_at":2.0},"memory":{"steps":[]}}"#;
         fs::write(project.join("b3.json"), older).expect("write");
         let refused = store.load(cwd, "b3").expect_err("format");
-        assert_eq!(refused.to_string(), "session: b3: not found");
+        assert!(matches!(refused, Error::SessionNotFound(_)), "{refused}");
 
         fs::remove_dir_all(&dir).ok();
     }

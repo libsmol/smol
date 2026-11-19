@@ -2,7 +2,7 @@ use crate::client::tool_count;
 use crate::conversation::Stats;
 use crate::tui::app::App;
 use crate::tui::picture;
-use crate::tui::render::{signal, wrap_ranges, Target};
+use crate::tui::render::{wrap_ranges, Target};
 use crate::tui::{
     clipped, fitted, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG, YELLOW,
 };
@@ -70,18 +70,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             usage += &format!(" · context {share}");
         }
 
-        let working = talk.helping();
-        let mut agents = Vec::new();
-        if working > 0 {
-            agents.push(format!("{working} working"));
-        }
-        if !stats.agent_tokens.is_zero() {
-            agents.push(stats.agent_tokens.to_string());
-        }
-        if !agents.is_empty() {
-            let agents = agents.join(" · ");
-            usage += &format!(" · sub-agents {agents}");
-        }
         let programs = app.session.programs.len();
         if programs > 0 {
             usage += &format!(" · programs {programs}");
@@ -109,8 +97,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let side = panel();
         let inner = side.inner(sidebar);
         let width = usize::from(inner.width);
-
-        let title = fitted(title, width);
 
         let cwd = tilde(&app.session.client.cwd);
         let cwd = tail(&cwd, width);
@@ -150,7 +136,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let bar = gauge(ratio, width);
 
         let mut lines = vec![
-            Line::styled(title, BOLD),
             Line::styled(cwd, DIM),
             Line::default(),
             counts,
@@ -185,56 +170,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             lines.push(line);
         }
 
-        let mut team = Vec::new();
-        let agents = talk.agents();
-        if !agents.is_empty() {
-            let count = format!(" {}", agents.len());
-            let section = vec![
-                Span::styled("Sub-agents", HEADING),
-                Span::styled(count, DIM),
-            ];
-            let spent = match stats.agent_tokens.is_zero() {
-                true => String::new(),
-                false => stats.agent_tokens.to_string(),
-            };
-            let spent = vec![Span::styled(spent, DIM)];
-            let section = spread(section, spent, width);
-            team.extend([Line::default(), section]);
-        }
-        for agent in &agents {
-            let latest = agent.latest;
-            let (symbol, tint) = signal(latest);
-            let name = latest.name.as_deref().unwrap_or("sub-agent");
-            let spent = match agent.tokens.is_zero() {
-                true => String::new(),
-                false => agent.tokens.to_string(),
-            };
-            let room = width.saturating_sub(2 + 1 + spent.width());
-            let name = clipped(name, room);
-            let left = vec![Span::styled(format!("{symbol} "), tint), Span::raw(name)];
-            let right = vec![Span::styled(spent, DIM)];
-            let line = spread(left, right, width);
-            team.push(line);
-        }
-
-        let height = usize::from(inner.height);
         let programs = &app.session.programs;
-        // The programs keep their gap, heading and a row
-        let reserved = match programs.is_empty() {
-            true => 0,
-            false => 3,
-        };
-        let free = height.saturating_sub(lines.len() + reserved);
-        if team.len() > free {
-            // The gap and heading stay, and the last row that fits says how many are left out
-            let shown = free.saturating_sub(1).max(2);
-            let hidden = agents.len() - (shown - 2);
-            team.truncate(shown);
-            let more = format!("… +{hidden} more");
-            team.push(Line::styled(more, DIM));
-        }
-        lines.extend(team);
-
         if !programs.is_empty() {
             let section = vec![Span::styled("Programs", HEADING)];
             let count = vec![Span::styled(programs.len().to_string(), DIM)];
@@ -242,14 +178,20 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             lines.extend([Line::default(), section]);
         }
 
+        let height = usize::from(inner.height);
         let free = height.saturating_sub(lines.len());
         let shown = match programs.len() > free {
             true => free.saturating_sub(1),
             false => programs.len(),
         };
-        for program in &programs[..shown] {
+        for (program, since) in &programs[..shown] {
             let pid = format!("{} ", program.pid);
-            let elapsed = lasted(program.since.elapsed());
+            let seconds = since.elapsed().as_secs();
+            let elapsed = match seconds {
+                0..60 => format!("{seconds}s"),
+                60..3600 => format!("{}m", seconds / 60),
+                _ => format!("{}h", seconds / 3600),
+            };
             // A command ends with what tells programs apart, such as the script it runs
             let room = width.saturating_sub(pid.width() + 1 + elapsed.width());
             let command = one_line(&program.command, &app.session.client.cwd);
@@ -584,8 +526,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         app.choices_area = area;
     }
 
-    let name = model_label(app);
-    let name = format!(" · {name}");
+    let model = app.session.model();
+    let name = match app.session.effort() {
+        Some(effort) => format!(" · {model} · {effort}"),
+        None => format!(" · {model}"),
+    };
     let brand = vec![Span::styled(" smol", STRONG), Span::styled(name, DIM)];
 
     let help = if let Some((flash, _)) = &app.flash {
@@ -639,15 +584,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(line, status);
 }
 
-/// The model and the effort it runs at
-fn model_label(app: &App) -> String {
-    let model = app.session.model();
-    match app.session.effort() {
-        Some(effort) => format!("{model} · {effort}"),
-        None => model,
-    }
-}
-
 /// The first word of each part is the key
 fn keys(text: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
@@ -679,16 +615,6 @@ fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> 
     spans.push(Span::raw(padding));
     spans.extend(right);
     Line::from(spans)
-}
-
-/// Seconds under a minute, then minutes under an hour, then hours
-fn lasted(elapsed: Duration) -> String {
-    let seconds = elapsed.as_secs();
-    match seconds {
-        0..60 => format!("{seconds}s"),
-        60..3600 => format!("{}m", seconds / 60),
-        _ => format!("{}h", seconds / 3600),
-    }
 }
 
 fn approx(stats: &Stats) -> &'static str {

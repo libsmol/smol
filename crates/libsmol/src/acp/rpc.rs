@@ -1,10 +1,11 @@
-use crate::steps::Program;
 use crate::utils::Waiting;
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     Error as RpcError, ErrorCode, SessionNotification, SessionUpdate, CLIENT_METHOD_NAMES,
 };
-use reaper::wire::{self, McpStatus, BACKGROUND, IMAGES, MCP, NOTICE, PROGRAMS, QUEUED};
+use reaper::wire::{
+    self, Addressed, McpStatus, Program, BACKGROUND, IMAGES, MCP, NOTICE, PROGRAMS, QUEUED,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{self, Write};
@@ -153,19 +154,23 @@ impl SessionPeer {
             step,
             unsaved,
         };
-        let mut params = json!(notice);
-        params["sessionId"] = json!(&*self.id);
-        self.peer.notify(NOTICE, params);
+        self.send(NOTICE, notice);
     }
 
     pub(crate) fn servers(&self, servers: &[McpStatus]) {
-        let status = json!({ "sessionId": &*self.id, "servers": servers });
-        self.peer.notify(MCP, status);
+        let servers = servers.to_vec();
+        self.send(MCP, wire::Servers { servers });
     }
 
     pub(crate) fn programs(&self, running: &[Program]) {
-        let params = json!({ "sessionId": &*self.id, "programs": running });
-        self.peer.notify(PROGRAMS, params);
+        let programs = running.to_vec();
+        self.send(PROGRAMS, wire::Programs { programs });
+    }
+
+    fn send(&self, method: &str, body: impl Serialize) {
+        let session_id = self.id.to_string();
+        let params = Addressed { session_id, body };
+        self.peer.notify(method, params);
     }
 
     pub(crate) fn declared(&self) -> Declared {

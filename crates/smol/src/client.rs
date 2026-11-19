@@ -11,8 +11,9 @@ use agent_client_protocol_schema::v1::{
 use agent_client_protocol_schema::ProtocolVersion;
 use anyhow::{anyhow, bail, Result};
 use reaper::wire::{
-    McpState, McpStatus, Memories, Memory, Notice, BACKGROUND, ENQUEUED, FORGET, IMAGES, MCP,
-    MEMORIES, NOTICE, PROGRAMS, QUEUED, SHELL,
+    Addressed, Forget, McpState, McpStatus, Memories, Memory, Notice, Program, Programs, Queued,
+    Servers, Shell, BACKGROUND, ENQUEUED, FORGET, IMAGES, MCP, MEMORIES, NOTICE, PROGRAMS, QUEUED,
+    SHELL,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -67,15 +68,6 @@ pub(crate) enum Event {
     Background,
     /// The programs the code left running that still run
     Programs(Vec<Program>),
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Program {
-    pub(crate) pid: u32,
-    pub(crate) command: String,
-    /// When smol first heard it runs
-    #[serde(skip, default = "Instant::now")]
-    pub(crate) since: Instant,
 }
 
 /// The line that tells the user of a server's state
@@ -252,7 +244,7 @@ impl Asked {
             return;
         };
 
-        let result = json!({ "prompts": prompts });
+        let result = json!(Queued { prompts });
         let message = json!({ "jsonrpc": "2.0", "id": id, "result": result });
         self.connection.send(message);
     }
@@ -420,19 +412,17 @@ impl Client {
                         Err(_) => continue,
                     },
 
-                    (None, Some(MCP)) => match Vec::<McpStatus>::deserialize(&params["servers"]) {
-                        Ok(servers) => Event::Mcp(servers),
+                    (None, Some(MCP)) => match Servers::deserialize(params) {
+                        Ok(listed) => Event::Mcp(listed.servers),
                         Err(_) => continue,
                     },
 
                     (None, Some(BACKGROUND)) => Event::Background,
 
-                    (None, Some(PROGRAMS)) => {
-                        match Vec::<Program>::deserialize(&params["programs"]) {
-                            Ok(programs) => Event::Programs(programs),
-                            Err(_) => continue,
-                        }
-                    }
+                    (None, Some(PROGRAMS)) => match Programs::deserialize(params) {
+                        Ok(listed) => Event::Programs(listed.programs),
+                        Err(_) => continue,
+                    },
 
                     _ => continue,
                 };
@@ -595,7 +585,10 @@ impl Client {
     }
 
     pub(crate) fn forget(&self, session: &str, id: i64) -> Result<()> {
-        let params = json!({ "sessionId": session, "id": id });
+        let params = Addressed {
+            session_id: session.to_owned(),
+            body: Forget { id },
+        };
         let _: Value = self.connection.call(FORGET, params)?;
         Ok(())
     }
@@ -618,7 +611,11 @@ impl Client {
     }
 
     pub(crate) fn shell(&self, session: &str, command: &str) {
-        let params = json!({ "sessionId": session, "command": command });
+        let command = command.to_owned();
+        let params = Addressed {
+            session_id: session.to_owned(),
+            body: Shell { command },
+        };
         self.start_turn(SHELL, params);
     }
 
@@ -756,30 +753,35 @@ mod tests {
         let Ok(Incoming::Done(Err(error))) = inbox.recv() else {
             panic!("no failure");
         };
-        assert_eq!(error.to_string(), "agent: exited\ngoodbye");
+        let exited = format!("{EXITED}\ngoodbye");
+        assert_eq!(error.to_string(), exited);
 
         let switched = client.set_option(&opened.id, "model", "x");
         let error = switched.err().map(|error| error.to_string());
-        assert_eq!(error.as_deref(), Some("agent: exited\ngoodbye"));
+        assert_eq!(error, Some(exited));
     }
 
     #[test]
     fn mcp_wire_format() {
         let text = r#"{"sessionId":"s1","servers":[{"name":"web","state":"off"},{"name":"web","state":"connected","tools":3},{"name":"web","state":"failed","error":"connection refused"},{"name":"web","state":"unauthorized","error":"authorization required"}]}"#;
         let params: Value = serde_json::from_str(text).expect("json");
-        let servers = Vec::<McpStatus>::deserialize(&params["servers"]).expect("servers");
+        let listed = Servers::deserialize(&params).expect("servers");
 
-        let states: Vec<String> = servers
-            .iter()
-            .map(|server| mcp_state(&server.state))
+        let states: Vec<McpState> = listed
+            .servers
+            .into_iter()
+            .map(|server| server.state)
             .collect();
         let expected = [
-            "off",
-            "connected, 3 tools",
-            "failed: connection refused",
-            "unauthorized: authorization required",
+            McpState::Off,
+            McpState::Connected { tools: 3 },
+            McpState::Failed {
+                error: "connection refused".to_owned(),
+            },
+            McpState::Unauthorized {
+                error: "authorization required".to_owned(),
+            },
         ];
         assert_eq!(states, expected);
-        assert_eq!(mcp_line(&servers[1]), "mcp: web: connected, 3 tools");
     }
 }

@@ -17,7 +17,7 @@ use agent_client_protocol_schema::v1::{
 };
 use agent_client_protocol_schema::ProtocolVersion;
 use reaper::cause;
-use reaper::wire::{self, BACKGROUND, ENQUEUED, FORGET, MEMORIES, SHELL};
+use reaper::wire::{self, Addressed, BACKGROUND, ENQUEUED, FORGET, MEMORIES, SHELL};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -252,22 +252,8 @@ impl Handle {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ShellParams {
-    session_id: String,
-    command: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SessionParams {
     session_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ForgetParams {
-    session_id: String,
-    id: i64,
 }
 
 impl Router {
@@ -373,15 +359,16 @@ impl Router {
                 None
             }
             FORGET => {
-                let request: ForgetParams = parsed(params)?;
+                let request: Addressed<wire::Forget> = parsed(params)?;
                 let handle = self.handle(&request.session_id)?;
                 let memories = handle.memories.clone();
                 let span = handle.span.clone();
+                let memory = request.body.id;
                 let forgetting = async move {
-                    let forgotten = memories.forget(request.id).await;
+                    let forgotten = memories.forget(memory).await;
                     match forgotten.map_err(Error::Memory)? {
                         true => Ok(json!({})),
-                        false => Err(Error::MemoryNotFound(request.id)),
+                        false => Err(Error::MemoryNotFound(memory)),
                     }
                 };
                 self.answer(id, span, forgetting);
@@ -400,12 +387,12 @@ impl Router {
                 Some(to_value(response))
             }
             SHELL => {
-                let request: ShellParams = parsed(params)?;
+                let request: Addressed<wire::Shell> = parsed(params)?;
                 let session = &request.session_id;
                 let turn = self.next_turn(session)?;
                 let shell = Shell {
                     id: id.clone(),
-                    command: request.command,
+                    command: request.body.command,
                     turn,
                 };
                 self.send(session, Message::Shell(shell))?;

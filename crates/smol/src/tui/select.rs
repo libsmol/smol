@@ -1,14 +1,11 @@
 use crate::tui::render::Row;
-use crate::tui::theme::LINE;
 use crate::tui::transcript::Rows;
+use crate::tui::SELECTED;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-
-const SELECTED: Style = Style::new().bg(LINE);
 
 /// Rows count those scrolled off screen, and columns are display columns
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

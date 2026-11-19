@@ -89,11 +89,8 @@ impl Process {
         let held = Arc::downgrade(&group);
         let waiting = async move {
             let status = child.wait().await;
-            // Once reaped, an empty group's id may be reused, so it must not be killed by id
             if let Some(group) = held.upgrade() {
-                if !group.alive() {
-                    group.release();
-                }
+                release_empty(&group);
             }
             let end = status.ok().map(end_of);
             reaped.send(Reaped::Ended(end)).ok();
@@ -195,11 +192,6 @@ impl Process {
 
     pub(crate) fn kill(&self) {
         self.group.kill();
-    }
-
-    /// Includes programs it left in the background
-    pub(crate) fn alive(&self) -> bool {
-        self.group.alive()
     }
 
     /// The programs in its group besides itself, listed off the async runtime, or none when that fails
@@ -436,8 +428,8 @@ fn decoded(bytes: &[u8]) -> String {
     text.replace("\r\n", "\n")
 }
 
-/// Runs a command the user typed after !, giving `shown` clipped output now and then
-/// and handing back any programs left in the background
+/// Runs a command the user typed after !, giving `shown` clipped output now and then,
+/// and hands back the command unless interrupted, as dropping it ends what it left running
 pub(crate) async fn run_shell(
     line: &str,
     cwd: &Path,
@@ -500,9 +492,19 @@ pub(crate) async fn run_shell(
     step.output = said.shown(MAX_OBSERVATION_CHARS);
     step.end = end;
 
-    // An interrupt has already killed the whole group
-    let left = step.end != Exit::Interrupted && process.alive();
-    (step, left.then_some(process))
+    // What the command left, in its group or in a session of its own, ends with the session,
+    // while an interrupt has already ended all of it
+    release_empty(&process.group);
+    let kept = step.end != Exit::Interrupted;
+    (step, kept.then_some(process))
+}
+
+/// Once its first process is reaped, an empty group's id may be reused and must not be killed by
+/// id, while dropping it still ends the processes that left it
+fn release_empty(group: &Group) {
+    if !group.alive() {
+        group.release();
+    }
 }
 
 /// Crash exit codes on Windows are negative as i32, so a negative code can't stand for a signal
@@ -517,6 +519,7 @@ fn end_of(status: ExitStatus) -> Exit {
 
 #[cfg(test)]
 mod tests {
+    use crate::prompt;
     use crate::spawn::{run_shell, Clip};
     use crate::steps::{Exit, MAX_OBSERVATION_CHARS};
     use crate::utils::{block_on, truncated, Interrupt};
@@ -555,9 +558,11 @@ mod tests {
         let mut clip = Clip::new(20);
         clip.push(written.as_bytes());
 
-        let expected = "head line one, two!\n\n[436 characters cut]\nlast";
+        let marker = prompt::cut(436);
+        let expected = format!("head line one, two!\n\n{marker}\nlast");
         assert_eq!(clip.shown(1000), expected);
-        assert_eq!(clip.shown(10), "head l\n[450 characters cut]\nlast");
+        let marker = prompt::cut(450);
+        assert_eq!(clip.shown(10), format!("head l\n{marker}\nlast"));
     }
 
     /// Output written before the interrupt is kept too

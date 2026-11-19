@@ -10,6 +10,7 @@ use crate::utils::truncated;
 use crate::worker::host::{Added, Rank};
 use crate::worker::{Function, MAX_PRINT_CHARS};
 use chrono::Utc;
+use reaper::wire::Program;
 use std::env::consts::OS;
 use std::path::{Path, PathBuf};
 use worker::PYTHON_VERSION;
@@ -102,9 +103,8 @@ pub(crate) fn done(step: &DoneStep) -> String {
 
     if !step.programs.is_empty() {
         let mut lines = vec![format!("[{PROGRAM_DONE}]")];
-        for program in &step.programs {
-            lines.push(program.to_string());
-        }
+        let listed = step.programs.iter().map(program);
+        lines.extend(listed);
         let output = step.output.trim_end();
         if !output.is_empty() {
             let output = format!("<output>\n{output}\n</output>");
@@ -115,6 +115,11 @@ pub(crate) fn done(step: &DoneStep) -> String {
     }
 
     parts.join("\n\n")
+}
+
+/// Also how the user sees the programs that ended while no turn ran
+pub(crate) fn program(program: &Program) -> String {
+    format!("pid {}: {}", program.pid, program.command)
 }
 
 /// Errors of `remember()` and `forget()` go unlabeled too, as the worker labels them with the function

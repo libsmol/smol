@@ -146,69 +146,63 @@ fn initialize(role: Role<'_>) {
         match role {
             Role::Isolated => {
                 pre.utf8_mode = 1;
-                checked(ffi::Py_PreInitialize(&pre));
+                let status = ffi::Py_PreInitialize(&pre);
+                checked(status);
             }
             #[cfg(unix)]
             Role::Python(_) => {
                 let arguments = pointers.as_mut_ptr().cast();
-                checked(ffi::Py_PreInitializeFromBytesArgs(&pre, count, arguments));
+                let status = ffi::Py_PreInitializeFromBytesArgs(&pre, count, arguments);
+                checked(status);
             }
             #[cfg(windows)]
             Role::Python(_) => {
                 let arguments = pointers.as_mut_ptr();
-                checked(ffi::Py_PreInitializeFromArgs(&pre, count, arguments));
+                let status = ffi::Py_PreInitializeFromArgs(&pre, count, arguments);
+                checked(status);
             }
         }
 
         #[cfg(unix)]
-        checked(ffi::PyConfig_SetBytesArgv(
-            &mut config,
-            count,
-            pointers.as_mut_ptr(),
-        ));
+        let status = ffi::PyConfig_SetBytesArgv(&mut config, count, pointers.as_mut_ptr());
         #[cfg(windows)]
-        checked(ffi::PyConfig_SetArgv(
-            &mut config,
-            count,
-            pointers.as_mut_ptr().cast(),
-        ));
+        let status = ffi::PyConfig_SetArgv(&mut config, count, pointers.as_mut_ptr().cast());
+        checked(status);
 
         if let Role::Isolated = role {
             config.write_bytecode = 0;
             let executable = wide(exe.as_os_str());
             let field = &raw mut config.executable;
-            checked(ffi::PyConfig_SetString(
-                &mut config,
-                field,
-                executable.as_ptr(),
-            ));
+            let status = ffi::PyConfig_SetString(&mut config, field, executable.as_ptr());
+            checked(status);
             let field = &raw mut config.base_executable;
-            checked(ffi::PyConfig_SetString(
-                &mut config,
-                field,
-                executable.as_ptr(),
-            ));
+            let status = ffi::PyConfig_SetString(&mut config, field, executable.as_ptr());
+            checked(status);
         }
         // Frozen copies of os and the like have no file or source
         config.use_frozen_modules = 0;
         // Without a home, the prefix falls back to the build machine's
         let home = wide(home.as_os_str());
         let field = &raw mut config.home;
-        checked(ffi::PyConfig_SetString(&mut config, field, home.as_ptr()));
+        let status = ffi::PyConfig_SetString(&mut config, field, home.as_ptr());
+        checked(status);
 
         // Reads the command line's -E and -I, which decide whether PYTHONPATH counts
         if let Role::Python(_) = role {
-            checked(ffi::PyConfig_Read(&mut config));
+            let status = ffi::PyConfig_Read(&mut config);
+            checked(status);
         }
         let searched = stdlib::search_paths(config.use_environment != 0);
         config.module_search_paths_set = 1;
         let paths = &raw mut config.module_search_paths;
         for path in &searched {
             let entry = wide(path.as_os_str());
-            checked(ffi::PyWideStringList_Append(paths, entry.as_ptr()));
+            let status = ffi::PyWideStringList_Append(paths, entry.as_ptr());
+            checked(status);
         }
 
-        checked(ffi::Py_InitializeFromConfig(&config));
+        let status = ffi::Py_InitializeFromConfig(&config);
+        checked(status);
         ffi::PyConfig_Clear(&mut config);
     }
 

@@ -1,5 +1,5 @@
 use crate::chat::image_placeholder;
-use crate::tui::DIM;
+use crate::tui::{DIM, SELECTED};
 use ratatui::style::Style;
 use ratatui_textarea::{CursorMove, DataCursor, TextArea, WrapMode};
 
@@ -190,6 +190,7 @@ pub(crate) fn input_box(text: &str) -> TextArea<'static> {
 
     input.set_wrap_mode(WrapMode::Glyph);
     input.set_placeholder_style(DIM);
+    input.set_selection_style(SELECTED);
     input.set_cursor_line_style(Style::new());
     // Input methods place their candidate window at the hardware cursor,
     // so the textarea cursor is not drawn

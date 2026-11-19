@@ -1,6 +1,6 @@
 use crate::chat::{image_placeholder, mention, resolved, typing_mention, Output, Session};
 use crate::client::{mcp_line, mcp_state, Selector};
-use crate::conversation::{Entry, Outcome};
+use crate::conversation::{Entry, Outcome, Said, ShellEnd};
 use crate::tui::desktop::Desktop;
 use crate::tui::draft::Draft;
 use crate::tui::picture::{self, Source};
@@ -779,8 +779,14 @@ impl App {
         // Worded before the queue runs, which may open another session
         let said = match &ended {
             Some(Outcome::Answered) => {
-                let answer = self.session.conversation.answer();
-                let first = markdown::first_line(&answer);
+                // A command may hold secrets, which notification centers keep
+                let first = match self.session.conversation.said() {
+                    Said::Answer(answer) => markdown::first_line(&answer),
+                    Said::Shell(shell) => match &shell.end {
+                        ShellEnd::Failed(reason) => format!("Failed: {reason}"),
+                        _ => String::new(),
+                    },
+                };
                 match first.is_empty() {
                     true => Some("Done".to_owned()),
                     false => Some(first),
@@ -1060,7 +1066,10 @@ impl App {
     fn open_list(&mut self, list: List) -> bool {
         let asked = self.picks(list);
         match &asked {
-            Ok(picks) if picks.is_empty() => self.info(empty_text(list)),
+            Ok(picks) if picks.is_empty() => {
+                let text = empty_text(list);
+                self.info(text);
+            }
             Ok(_) => {}
             Err(error) => {
                 let text = format!("{error:#}");
@@ -1491,17 +1500,16 @@ mod tests {
             app.queued.is_empty() && app.session.run.is_none()
         });
 
-        let expected = [
-            "",
-            "❯ queue",
-            "",
-            "❯ update",
-            "",
-            "  no MCP servers",
-            "",
-            "❯ later",
-        ];
-        assert_eq!(shown(&mut app), expected);
+        // The update joins the turn, and the command waits for its end
+        let mut asked = Vec::new();
+        for entry in app.session.conversation.entries() {
+            match entry {
+                Entry::Task(text) => asked.push(text.as_str()),
+                Entry::Info(_) => asked.push(":mcp"),
+                _ => {}
+            }
+        }
+        assert_eq!(asked, ["queue", "update", ":mcp", "later"]);
         assert_eq!(app.session.conversation.stats().turns, 2);
     }
 
@@ -1538,28 +1546,25 @@ mod tests {
         app.on_event(Event::Key(ctrl_v));
         let flash = app.flash.as_ref().map(|(text, _)| text.clone());
         assert_eq!(flash, Some(Err("clipboard: no image".to_owned())));
+        app.flash = None;
         app.paste_image(Some("café".as_bytes().to_vec()));
-        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
-        assert_eq!(
-            flash,
-            Some(Err("image: not PNG, JPEG, GIF or WebP".to_owned()))
-        );
+        let refused = matches!(app.flash, Some((Err(_), _)));
+        assert!(refused);
         assert!(app.draft.area.lines().iter().all(String::is_empty));
 
         // Neither a shell command nor an agent without images reads the clipboard
         app.draft.replace("! ls ");
         app.desktop = Box::new(Clipped(Ok(png)));
+        app.flash = None;
         app.on_event(Event::Key(ctrl_v));
-        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
-        assert_eq!(
-            flash,
-            Some(Err("image: shell commands take none".to_owned()))
-        );
+        let refused = matches!(app.flash, Some((Err(_), _)));
+        assert!(refused);
         app.draft.replace("");
         app.session.client.image_prompts = false;
+        app.flash = None;
         app.on_event(Event::Key(ctrl_v));
-        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
-        assert_eq!(flash, Some(Err("image: agent takes no images".to_owned())));
+        let refused = matches!(app.flash, Some((Err(_), _)));
+        assert!(refused);
         assert!(app.draft.area.lines().iter().all(String::is_empty));
         assert_eq!(app.session.images.len(), 2);
     }

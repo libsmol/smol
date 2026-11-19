@@ -255,7 +255,8 @@ mod terminal {
             getrandom::fill(&mut bytes).ok();
             STANDARD.encode(bytes)
         };
-        let password = STANDARD.encode(PASSWORD.get_or_init(made));
+        let secret = PASSWORD.get_or_init(made);
+        let password = STANDARD.encode(secret);
         let encoded = STANDARD.encode(mime);
         let asked = format!("\x1b]5522;type=read:name={NAME}:pw={password};{encoded}\x1b\\");
         send(&asked).map_err(failed)?;

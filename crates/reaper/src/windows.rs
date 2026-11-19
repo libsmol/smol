@@ -135,7 +135,12 @@ impl Group {
         Ok(group)
     }
 
+    /// False once released, which closed the handle
     pub fn alive(&self) -> bool {
+        if self.released.load(Ordering::SeqCst) {
+            return false;
+        }
+
         let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = Default::default();
         let size = mem::size_of_val(&info) as u32;
         let info_ptr = (&raw mut info).cast::<c_void>();
@@ -153,8 +158,13 @@ impl Group {
         info.ActiveProcesses > 0
     }
 
-    /// Leaves out the processes that exited, which the job no longer lists
+    /// Leaves out the processes that exited, which the job no longer lists, and is none once
+    /// released, which closed the handle
     pub fn members(&self) -> io::Result<Vec<Member>> {
+        if self.released.load(Ordering::SeqCst) {
+            return Ok(Vec::new());
+        }
+
         // The list's pids follow its header, as many as the rest of the buffer holds
         let header = mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
         let header = header / mem::size_of::<usize>();

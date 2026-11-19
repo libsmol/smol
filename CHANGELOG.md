@@ -36,13 +36,14 @@ listed.
   the answer it needs, and a follow-up only what changed, which shortened
   follow-ups from about 430 characters to 110. An agent is told to report what
   it finds and to change files only when its task asks it to.
-- smol lists the agents in the sidebar between the MCP servers and the
-  programs, under a `Sub-agents` heading with their count and total tokens and
-  each with its state and tokens, tags a task with its agent's name, gives an
-  agent's later tasks its color, and counts as awaited only the agents the
-  code waits for. It calls them sub-agents wherever it shows them, as its
-  messages call libsmol the agent, and its sidebar no longer repeats the model
-  and effort, which the bottom bar shows.
+- smol tags a task with its agent's name, gives an agent's later tasks its
+  color, and counts as awaited only the agents the code waits for. It calls
+  them sub-agents wherever it shows them, as its messages call libsmol the
+  agent. The sidebar and the top border of a narrow screen no longer count
+  them or their tokens, as the conversation shows those at work under the call
+  that sent them, or below it while that call is scrolled out of view. The
+  sidebar also no longer repeats the session's title, which the conversation's
+  border shows, or the model and effort, which the bottom bar shows.
 - Roles are gone: `roles.toml` is no longer read and `agent()` takes no
   `role`, so agents run on the session's model and their tasks say what they
   should do.
@@ -90,6 +91,13 @@ listed.
   UTF-8.
 - `libsmol` given an argument that isn't valid Unicode prints its usage, where
   it panicked, and smol starts a `libsmol` whose path isn't valid Unicode.
+- On Linux, programs that a `!` command started in a session of their own, such
+  as `setsid`, `tmux new -d` or `ssh-agent`, end with the session, as the
+  command's other programs do, where they kept running until smol exited.
+- The notification for a `!` command that ends while you look away says whether
+  it failed, where it repeated the answer of the turn before.
+- Text selected in the input with Shift and the arrows is highlighted in the
+  theme's selection color rather than the terminal's light blue.
 
 ## 0.11.0 - 2026-11-16
 

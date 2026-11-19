@@ -219,7 +219,8 @@ impl Server {
 
             "/ws" => {
                 // SameSite still sends the cookie from a page of this site on another port
-                let host = header("x-forwarded-host").or(header("host"));
+                let forwarded = header("x-forwarded-host");
+                let host = forwarded.or_else(|| header("host"));
                 let origin = header("origin").and_then(|origin| origin.split_once("://"));
                 if origin.is_some_and(|(_, origin)| Some(origin) != host) {
                     reply(
