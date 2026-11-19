@@ -785,7 +785,6 @@ async fn start_error(mut process: Process, output: Output) -> String {
 pub(crate) mod tests {
     use crate::agent::{serve, Delegating};
     use crate::config::Access;
-    use crate::model::Media;
     use crate::prompt;
     use crate::steps::CallError;
     use crate::tests::{cancel_soon, temp_dir, write_file, Temp};
@@ -836,7 +835,6 @@ pub(crate) mod tests {
     struct Shown {
         printed: String,
         error: Option<CallError>,
-        media: Vec<(String, Media)>,
         repaired: Option<String>,
     }
 
@@ -855,7 +853,6 @@ pub(crate) mod tests {
             Shown {
                 printed: output.printed.shown(usize::MAX),
                 error: output.error,
-                media: output.media,
                 repaired: output.repaired,
             }
         }
@@ -912,10 +909,6 @@ pub(crate) mod tests {
         fs::create_dir_all(&dir).expect("dir");
         let worker = build(Interrupt::default(), dir.clone(), Rank::Main);
         (worker, dir)
-    }
-
-    fn run(code: &str) -> Shown {
-        fresh().eval(code)
     }
 
     fn interruptible() -> (Temp<Tried>, Interrupt) {
@@ -1070,8 +1063,12 @@ pub(crate) mod tests {
                     try:\n            mode = os.fstat(fd).st_mode\n        except OSError:\n            continue\n        \
                     if stat.S_ISSOCK(mode):\n            os.write(fd, (note + '\\n').encode())\n            return\n\
             for name in ['/etc/hostname', '../café.png', 'naïve.png']:\n    forge(name)";
-        let output = run(code);
-        assert_eq!(output.error, None, "{}", output.printed);
+        let mut worker = fresh();
+        let mut ignore = |_: &str| {};
+        let mut none = unserved;
+        let evaluating = worker.evaluate(code, &[], &mut ignore, &mut none);
+        let output = block_on(evaluating).expect("evaluate");
+        assert_eq!(output.error, None);
 
         let labels: Vec<&str> = output.media.iter().map(|(label, _)| &**label).collect();
         assert_eq!(labels, ["naïve.png"]);
