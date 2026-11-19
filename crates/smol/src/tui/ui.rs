@@ -80,7 +80,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         }
         if !agents.is_empty() {
             let agents = agents.join(" · ");
-            usage += &format!(" · agents {agents}");
+            usage += &format!(" · sub-agents {agents}");
         }
         let programs = app.session.programs.len();
         if programs > 0 {
@@ -114,9 +114,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
 
         let cwd = tilde(&app.session.client.cwd);
         let cwd = tail(&cwd, width);
-
-        let model = model_label(app);
-        let model = fitted(&model, width);
 
         // The row count is fixed, so rows hold their place even before data arrives
         let stats = talk.stats();
@@ -155,26 +152,12 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let mut lines = vec![
             Line::styled(title, BOLD),
             Line::styled(cwd, DIM),
-            Line::styled(model, DIM),
             Line::default(),
             counts,
             tokens,
             context,
             bar,
         ];
-
-        // The progress line already counts the agents at work, and both don't fit here
-        let helped = !stats.agent_tokens.is_zero();
-        let working = talk.helping();
-        let agents = match (helped, working) {
-            (true, _) => Some(stats.agent_tokens.to_string()),
-            (false, 0) => None,
-            (false, working) => Some(format!("{working} working")),
-        };
-        if let Some(agents) = agents {
-            let agents = labeled("agents", agents, width);
-            lines.push(agents);
-        }
 
         if !app.session.mcp.is_empty() {
             let section = Span::styled("MCP", HEADING);
@@ -205,15 +188,23 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let mut team = Vec::new();
         let agents = talk.agents();
         if !agents.is_empty() {
-            let section = vec![Span::styled("Agents", HEADING)];
-            let count = vec![Span::styled(agents.len().to_string(), DIM)];
-            let section = spread(section, count, width);
+            let count = format!(" {}", agents.len());
+            let section = vec![
+                Span::styled("Sub-agents", HEADING),
+                Span::styled(count, DIM),
+            ];
+            let spent = match stats.agent_tokens.is_zero() {
+                true => String::new(),
+                false => stats.agent_tokens.to_string(),
+            };
+            let spent = vec![Span::styled(spent, DIM)];
+            let section = spread(section, spent, width);
             team.extend([Line::default(), section]);
         }
         for agent in &agents {
             let latest = agent.latest;
             let (symbol, tint) = signal(latest);
-            let name = latest.name.as_deref().unwrap_or("agent");
+            let name = latest.name.as_deref().unwrap_or("sub-agent");
             let spent = match agent.tokens.is_zero() {
                 true => String::new(),
                 false => agent.tokens.to_string(),
@@ -329,8 +320,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             (false, None, _) if talk.shelling() => format!("running · {seconds}s"),
             (false, None, _) if helping > 0 => {
                 let agents = match helping {
-                    1 => "agent",
-                    _ => "agents",
+                    1 => "sub-agent",
+                    _ => "sub-agents",
                 };
                 format!("waiting for {helping} {agents} · {seconds}s")
             }
@@ -1109,9 +1100,10 @@ mod tests {
             .iter()
             .map(|row| row.split("││").nth(1).unwrap_or_default())
             .collect();
-        let heading = sidebar.iter().position(|row| row.contains(" Agents "));
+        let heading = sidebar
+            .iter()
+            .position(|row| row.contains(" Sub-agents 12 "));
         let heading = heading.expect("heading");
-        assert!(sidebar[heading].ends_with(" 12 │"), "{sidebar:#?}");
         let shown = sidebar.iter().filter(|row| row.contains("◌ ")).count();
         let more = format!("… +{} more", 12 - shown);
         assert!(sidebar[heading + shown + 1].contains(&more), "{sidebar:#?}");
@@ -1132,7 +1124,7 @@ mod tests {
             app.session.programs.push(program);
         }
 
-        let rows = screen(&mut app, 120, 20);
+        let rows = screen(&mut app, 120, 19);
         let sidebar: Vec<&str> = rows
             .iter()
             .map(|row| row.split("││").nth(1).unwrap_or_default())
@@ -1146,7 +1138,7 @@ mod tests {
 
         // A program that just fits takes the row the count would
         app.session.programs.truncate(4);
-        let rows = screen(&mut app, 120, 20);
+        let rows = screen(&mut app, 120, 19);
         let last = rows[heading + 4].split("││").nth(1).unwrap_or_default();
         assert!(last.contains("4 sleep 40 # café"), "{rows:#?}");
     }
@@ -1163,8 +1155,6 @@ mod tests {
         let mut app = app();
         let rows = screen(&mut app, 120, 20);
         assert!(rows[19].starts_with(" smol · m1 · high "), "{rows:#?}");
-        let sidebar = |row: &String| row.contains("││ m1 · high ");
-        assert!(rows.iter().any(sidebar), "{rows:#?}");
 
         app.session.choose(Selector::Effort, "low").expect("switch");
         let rows = screen(&mut app, 120, 20);
@@ -1351,10 +1341,11 @@ mod tests {
         let stats = app.session.conversation.stats();
         assert_eq!((stats.tokens.is_zero(), stats.steps), (true, 0));
         assert_eq!(app.session.conversation.helping(), 2);
-        let rows = screen(&mut app, 120, 30);
+        // Wide enough for every state and the tokens on the group's header
+        let rows = screen(&mut app, 128, 30);
         let wide = rows.join("\n");
         let header =
-            "╰ agents · 1 running · 1 queued · 1 done · 1 failed · 1 interrupted · ⇡1.2k ⇣340";
+            "╰ sub-agents · 1 running · 1 queued · 1 done · 1 failed · 1 interrupted · ⇡1.2k ⇣340";
         assert!(wide.contains(header), "{wide}");
         assert!(!wide.contains('✓'), "{wide}");
 
@@ -1382,7 +1373,7 @@ mod tests {
             "◌ menu Review menu.py",
             "queued",
         ];
-        let header = panel.iter().position(|row| row.contains("╰ agents"));
+        let header = panel.iter().position(|row| row.contains("╰ sub-agents"));
         let header = header.expect("header");
         let shown = &panel[header + 1..header + 1 + group.len()];
         for (row, expected) in shown.iter().zip(group) {
@@ -1392,12 +1383,10 @@ mod tests {
         let menu = header + group.len() - 1;
         let column = start(&panel[menu], "menu");
         assert_eq!(start(&panel[menu + 1], "queued"), column, "{panel:#?}");
-        assert!(wide.contains("waiting for 2 agents · "), "{wide}");
-        let sidebar = |row: &&str| row.contains("││ agents ") && row.ends_with(" ⇡1.2k ⇣340 │");
-        assert!(wide.lines().any(|row| sidebar(&row)), "{wide}");
-        // Each agent has a row in the sidebar, with its tokens
+        assert!(wide.contains("waiting for 2 sub-agents · "), "{wide}");
+        // Each agent has a row in the sidebar, with its tokens, and the heading counts them all
         let listed = [
-            "││ Agents                     5 │",
+            "││ Sub-agents 5      ⇡1.2k ⇣340 │",
             "││ ◆ names           ⇡1.2k ⇣340 │",
             "││ ✗ dates                      │",
             "││ ◌ menu                       │",
@@ -1437,7 +1426,7 @@ mod tests {
 
         let narrow = screen(&mut app, 80, 20);
         assert!(
-            narrow[0].contains(" · agents 2 working · ⇡1.2k ⇣340 "),
+            narrow[0].contains(" · sub-agents 2 working · ⇡1.2k ⇣340 "),
             "{narrow:?}"
         );
     }

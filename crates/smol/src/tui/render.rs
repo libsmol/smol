@@ -1069,7 +1069,7 @@ fn summary(helpers: &[&Helper], seconds: Option<u64>) -> String {
         (State::Failed, "failed"),
         (State::Interrupted, "interrupted"),
     ];
-    let mut parts = vec!["agents".to_owned()];
+    let mut parts = vec!["sub-agents".to_owned()];
     for (state, name) in states {
         let count = helpers.iter().filter(|helper| helper.state() == state);
         let count = count.count();
@@ -1220,14 +1220,14 @@ mod tests {
 
         // The summary spins like the agents below it, and only ones still queued leave it waiting
         let spent = tokens(1200, 300);
-        let summary = format!(" agents · 1 running · 0s · {spent}");
+        let summary = format!(" sub-agents · 1 running · 0s · {spent}");
         assert!(rows[1].ends_with(&summary), "{rows:?}");
         assert!(!rows[1].contains('◌'), "{rows:?}");
         let waiting = helper("Spell naïve", ToolCallStatus::Pending, "");
         let mut queued = Render::new(100, false);
         queued.pinned(&[&waiting], 27);
         let rows_queued = text(&queued.rows);
-        assert_eq!(rows_queued[1], "  ◌ agents · 1 queued");
+        assert_eq!(rows_queued[1], "  ◌ sub-agents · 1 queued");
 
         assert!(rows[2].starts_with("  ╰ "), "{rows:?}");
         assert!(rows[2].ends_with(" cafés Count the cafés"), "{rows:?}");
@@ -1239,7 +1239,7 @@ mod tests {
         let rows = text(&compact.rows);
         assert_eq!(rows.len(), 4, "{rows:?}");
         let spent = tokens(2400, 600);
-        let summary = format!(" agents · 2 running · 0s · {spent}");
+        let summary = format!(" sub-agents · 2 running · 0s · {spent}");
         assert!(rows[1].ends_with(&summary), "{rows:?}");
         let row = " cafés Count the cafés · running len · 0s";
         assert!(
@@ -1344,7 +1344,7 @@ mod tests {
         let expected = [
             "",
             "  │ agent(tasks)",
-            "  ├ agents · 1 done",
+            "  ├ sub-agents · 1 done",
             "  │   ◆ Count the menu",
             "  ╰ café: 3",
             "    naïve: 1",

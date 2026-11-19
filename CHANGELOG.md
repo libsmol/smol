@@ -37,9 +37,12 @@ listed.
   follow-ups from about 430 characters to 110. An agent is told to report what
   it finds and to change files only when its task asks it to.
 - smol lists the agents in the sidebar between the MCP servers and the
-  programs, each with its state and tokens, tags a task with its agent's name,
-  gives an agent's later tasks its color, and counts as awaited only the agents
-  the code waits for.
+  programs, under a `Sub-agents` heading with their count and total tokens and
+  each with its state and tokens, tags a task with its agent's name, gives an
+  agent's later tasks its color, and counts as awaited only the agents the
+  code waits for. It calls them sub-agents wherever it shows them, as its
+  messages call libsmol the agent, and its sidebar no longer repeats the model
+  and effort, which the bottom bar shows.
 - Roles are gone: `roles.toml` is no longer read and `agent()` takes no
   `role`, so agents run on the session's model and their tasks say what they
   should do.
