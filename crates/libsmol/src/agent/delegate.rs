@@ -928,6 +928,7 @@ mod tests {
         spent, AgentMemory, Call, DoneStep, Ending, MemoryStep, Returned, MAX_OBSERVATION_CHARS,
     };
     use crate::tests::{cancel_soon, content};
+    use crate::worker::host::Rank;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1305,7 +1306,7 @@ mod tests {
         let result = ran(&memory, 1).result.as_ref().expect("ran");
         assert_eq!(result.agents.len(), 1, "{result:?}");
 
-        let parts = prompt::update(&asked("Spell café too"), &|_| true);
+        let parts = prompt::update(&asked("Spell café too"), &|_| true, Rank::Delegated);
         let update = content(&ChatMessage::User(parts));
         let expected = [
             vec!["Spell naïve after 1"],

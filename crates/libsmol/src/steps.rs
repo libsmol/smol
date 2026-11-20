@@ -1,5 +1,6 @@
 use crate::model::{ChatMessage, Media, MediaKind, Part, Sealed, TokenUsage, ToolCall};
 use crate::prompt;
+use crate::worker::host::Rank;
 use crate::worker::Globals;
 use reaper::wire::Program;
 use serde::{Deserialize, Serialize};
@@ -363,11 +364,12 @@ pub(crate) enum MemoryStep {
 
 impl MemoryStep {
     /// [`AgentMemory::conversation`] places the summary, calls are numbered on from `calls`,
-    /// and media the model doesn't take, as `takes` tells, is a note
+    /// media the model doesn't take, as `takes` tells, is a note, and `rank` is the agent's
     pub(crate) fn messages(
         &self,
         calls: &mut usize,
         takes: &dyn Fn(MediaKind) -> bool,
+        rank: Rank,
     ) -> Vec<ChatMessage> {
         let step = match self {
             MemoryStep::Task(task) => {
@@ -375,7 +377,7 @@ impl MemoryStep {
                 return vec![ChatMessage::User(parts)];
             }
             MemoryStep::Update(update) => {
-                let parts = prompt::update(update, takes);
+                let parts = prompt::update(update, takes, rank);
                 return vec![ChatMessage::User(parts)];
             }
             MemoryStep::Shell(shell) => {
@@ -521,6 +523,7 @@ impl AgentMemory {
         &self,
         system: &str,
         takes: &dyn Fn(MediaKind) -> bool,
+        rank: Rank,
         window: Option<u64>,
     ) -> Vec<ChatMessage> {
         let visible = self.visible();
@@ -551,14 +554,25 @@ impl AgentMemory {
             }
             let updates = &visible.updates[visible.updates.len() - kept..];
 
-            let text = prompt::summarized(summary, task, updates);
+            let text = prompt::summarized(summary, task);
             messages.push(ChatMessage::user(text));
+            // Updates follow their task, as text only like it, and are left out without one
+            if task.is_some() {
+                for update in updates {
+                    let retold = TaskStep {
+                        text: (*update).to_owned(),
+                        files: Vec::new(),
+                    };
+                    let parts = prompt::update(&retold, takes, rank);
+                    messages.push(ChatMessage::User(parts));
+                }
+            }
         }
 
         // Numbered in order of appearance, so new steps never renumber earlier ones
         let mut calls = 0;
         for step in visible.steps {
-            let added = step.messages(&mut calls, takes);
+            let added = step.messages(&mut calls, takes, rank);
             messages.extend(added);
         }
 
@@ -589,6 +603,7 @@ impl AgentMemory {
         &self,
         system: &str,
         takes: &dyn Fn(MediaKind) -> bool,
+        rank: Rank,
         window: Option<u64>,
     ) -> u64 {
         let mut unmeasured = Vec::new();
@@ -620,18 +635,18 @@ impl AgentMemory {
 
             let mut added = 0;
             for step in unmeasured {
-                let messages = step.messages(&mut 0, takes);
+                let messages = step.messages(&mut 0, takes, rank);
                 added += bytes(&messages);
             }
 
             // The measurement omits this step's results and errors, which may hold viewed images
-            let mut after = step.messages(&mut 0, takes);
+            let mut after = step.messages(&mut 0, takes, rank);
             after.retain(|message| !matches!(message, ChatMessage::Assistant { .. }));
             let after = bytes(&after);
             return measured + estimate(added + after);
         }
 
-        let conversation = self.conversation(system, takes, window);
+        let conversation = self.conversation(system, takes, rank, window);
         let sent = bytes(&conversation);
         estimate(sent)
     }
@@ -870,7 +885,7 @@ pub(crate) mod tests {
 
         let mut calls = 0;
         let action = MemoryStep::Action(Box::new(step));
-        let messages = action.messages(&mut calls, &|_| true);
+        let messages = action.messages(&mut calls, &|_| true, Rank::Main);
         let ChatMessage::Assistant {
             text: seen,
             sealed: sent,
@@ -906,7 +921,7 @@ pub(crate) mod tests {
                 step.calls[0].result = Some(result);
                 steps.push(MemoryStep::Action(Box::new(step)));
             }
-            AgentMemory { steps }.conversation("", takes, None)
+            AgentMemory { steps }.conversation("", takes, Rank::Main, None)
         };
         let note = prompt::dropped("menu 0.png", &png("café.png"));
         let counted = |messages: &[ChatMessage]| {

@@ -418,7 +418,8 @@ impl Turn<'_> {
             let model = &self.agent.model;
             let takes = |kind| model.takes(kind);
             let window = model.context_window();
-            let used = self.memory.tokens(&self.system, &takes, window);
+            let rank = self.agent.place.rank();
+            let used = self.memory.tokens(&self.system, &takes, rank, window);
             let Some(MemoryStep::Action(step)) = self.memory.steps.last_mut() else {
                 panic!("action");
             };

@@ -21,10 +21,12 @@ pub(crate) const ARGUMENT: &str = "code";
 pub(crate) const TOOL_DOC: &str = "Runs Python code.";
 pub(crate) const ARGUMENT_DOC: &str = "The Python code to run.";
 
-/// Labels what arrived while the agent worked where libsmol retells a task, for the summarizer and after a summary
+/// Labels what arrived while the agent worked in the transcript the summarizer reads
 pub(crate) const UPDATE: &str = "Task update";
-const GO_ON: &str =
-    "[Answer this in your reply's text and go on with the task, unless it asks you to stop.]";
+const RESPOND_NOW: &str =
+    "[Respond to this in the text of your reply and go on with the task, unless it asks you to stop.]";
+const COVER_LATER: &str =
+    "[Go on with the task and cover this in your answer, unless it asks you to stop.]";
 
 const RULES: &str = "- Never make up data or functions; check unfamiliar ones with `help()`.
 - Do the task instead of describing it.
@@ -429,9 +431,14 @@ pub(crate) fn task(step: &TaskStep, takes: &dyn Fn(MediaKind) -> bool) -> Vec<Pa
 }
 
 /// The note follows what was written, since a label before it read to models as a note of work done
-pub(crate) fn update(step: &TaskStep, takes: &dyn Fn(MediaKind) -> bool) -> Vec<Part> {
+pub(crate) fn update(step: &TaskStep, takes: &dyn Fn(MediaKind) -> bool, rank: Rank) -> Vec<Part> {
     let mut parts = task(step, takes);
-    let note = format!("\n{GO_ON}");
+    let note = match rank {
+        Rank::Main => RESPOND_NOW,
+        // Only the answer of an agent that `agent()` started goes back to the code
+        Rank::Delegated => COVER_LATER,
+    };
+    let note = format!("\n{note}");
     parts.push(Part::Text(note));
     parts
 }
@@ -586,8 +593,7 @@ fn ended(end: &Exit) -> String {
     }
 }
 
-/// `updates` follow `task` and are left out without one
-pub(crate) fn summarized(step: &SummaryStep, task: Option<&str>, updates: &[&str]) -> String {
+pub(crate) fn summarized(step: &SummaryStep, task: Option<&str>) -> String {
     let summary = &step.summary;
     let mut text = format!(
         "[Summary of your work so far, replacing earlier messages]\n<summary>\n{summary}\n</summary>"
@@ -659,10 +665,6 @@ pub(crate) fn summarized(step: &SummaryStep, task: Option<&str>, updates: &[&str
 
     let current = format!("\n\n[Current task]\n{task}");
     text.push_str(&current);
-    for update in updates {
-        let update = format!("\n\n[{UPDATE}]\n{update}");
-        text.push_str(&update);
-    }
     text
 }
 

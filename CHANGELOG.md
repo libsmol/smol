@@ -18,20 +18,22 @@ but their files stay in `~/.smol/projects` untouched.
   otherwise by its type, so none of the code's own methods run. Past 4,096
   characters the rest are only counted, with a note that `dir()` lists them.
 - What the user writes while a task runs reaches the model as written, followed
-  by a note to answer it in the reply's text and go on with the task unless it
-  asks to stop, where it started with `[Task update]`. The system prompt says
-  such a message belongs to the current task and may add to or change it.
+  by a note to respond to it in the text of the reply and go on with the task
+  unless it asks to stop, where it started with `[Task update]`. The system
+  prompt says such a message belongs to the current task and may add to or
+  change it. An agent that `agent()` started, whose text only its answer passes
+  on, is told to cover the message in its answer instead, and after compaction
+  the messages follow the summary the same way rather than under a label.
   Replays of a real session with grok showed two problems. The label made the
   model take the user's words for a note of work done: asked mid-task to also
   rename something, it said the rename was done without making it in 14 of 48
-  tries, and in 1 of 18 with the note after the words. Asked how far it had
+  tries, and in none of 12 with the note after the words. Asked how far it had
   got, it reported and stopped, ending the task, in 4 of 6 tries without the
-  note and 1 of 18 with it, answering in the text of a reply that goes on
-  working in 13 of 18. deepseek went on working either way and answered in that
-  text in 15 of 18 tries with the note, where it did in 10 of 18 without.
-  Evaluation tasks where the message adds to the task, asks a side question or
-  for progress, refines it, changes its direction or replaces it passed on
-  both models. What `agent()` sends an agent at work arrives the same way.
+  note and 2 of 12 with it, answering in the text of a reply that goes on
+  working in 9 of 12. deepseek went on working in 12 of 12 tries with the note
+  and answered in that text in 11. Evaluation tasks where the message adds to
+  the task, asks a side question or for progress, refines it, changes its
+  direction, replaces it or goes on to an agent at work passed on both models.
 - Summaries state where the work stands instead of retelling what the agent
   read and ran. The format's Done section asked for what the output showed the
   agent read, so summaries listed files and line ranges in the order they were
