@@ -17,17 +17,21 @@ but their files stay in `~/.smol/projects` untouched.
   `class` wrote it only while it holds the object that statement bound, and
   otherwise by its type, so none of the code's own methods run. Past 4,096
   characters the rest are only counted, with a note that `dir()` lists them.
-- What the user writes while a task runs reaches the model as written, where it
-  started with `[Task update]`, and the system prompt says such a message
-  belongs to the current task and may add to or change it. A replay of a real
-  session with grok showed the label made the model take the user's words for
-  a note of work done: asked mid-task to also rename something, it answered that
-  the rename was done without making it in 14 of 48 tries with the label in any
-  wording, and in none of 18 without it. Four new evaluation tasks, where the
-  message adds to the task, asks a side question, refines it or replaces it,
-  passed every run with and without the label on grok and deepseek, so the
-  model neither answers early nor drops the task. What `agent()` sends an agent
-  at work arrives the same way.
+- What the user writes while a task runs reaches the model as written, followed
+  by a note to answer it in the reply's text and go on with the task unless it
+  asks to stop, where it started with `[Task update]`. The system prompt says
+  such a message belongs to the current task and may add to or change it.
+  Replays of a real session with grok showed two problems. The label made the
+  model take the user's words for a note of work done: asked mid-task to also
+  rename something, it said the rename was done without making it in 14 of 48
+  tries, and in 1 of 18 with the note after the words. Asked how far it had
+  got, it reported and stopped, ending the task, in 4 of 6 tries without the
+  note and 1 of 18 with it, answering in the text of a reply that goes on
+  working in 13 of 18. deepseek went on working either way and answered in that
+  text in 15 of 18 tries with the note, where it did in 10 of 18 without.
+  Evaluation tasks where the message adds to the task, asks a side question or
+  for progress, refines it, changes its direction or replaces it passed on
+  both models. What `agent()` sends an agent at work arrives the same way.
 - Summaries state where the work stands instead of retelling what the agent
   read and ran. The format's Done section asked for what the output showed the
   agent read, so summaries listed files and line ranges in the order they were

@@ -923,6 +923,7 @@ mod tests {
         TokenUsage,
     };
     use crate::prompt;
+    use crate::steps::tests::asked;
     use crate::steps::{
         spent, AgentMemory, Call, DoneStep, Ending, MemoryStep, Returned, MAX_OBSERVATION_CHARS,
     };
@@ -1069,7 +1070,7 @@ mod tests {
 
     /// The main agent runs each of the codes in turn, split into calls at lines `#---`, and with
     /// an empty one or none answers with the number of its reply, while an agent answers with the
-    /// last line it was sent that isn't in brackets, after the seconds that follow "after" in it,
+    /// last line it was sent that isn't empty or in brackets, after the seconds that follow "after" in it,
     /// or runs the code that follows "run " and answers with what that printed
     struct Background(Vec<&'static str>, Requests);
 
@@ -1088,7 +1089,9 @@ mod tests {
             let asked = |message: &&ChatMessage| matches!(message, ChatMessage::User(_));
             let texts: Vec<String> = conversation.iter().filter(asked).map(content).collect();
             let lines = texts.iter().rev().flat_map(|text| text.lines().rev());
-            let sent = lines.into_iter().find(|line| !line.starts_with('['));
+            let sent = lines
+                .into_iter()
+                .find(|line| !line.is_empty() && !line.starts_with('['));
             let sent = sent.unwrap_or_default().to_owned();
             let ran = matches!(conversation.last(), Some(ChatMessage::Tool { .. }));
 
@@ -1302,12 +1305,14 @@ mod tests {
         let result = ran(&memory, 1).result.as_ref().expect("ran");
         assert_eq!(result.agents.len(), 1, "{result:?}");
 
+        let parts = prompt::update(&asked("Spell café too"), &|_| true);
+        let update = content(&ChatMessage::User(parts));
         let expected = [
             vec!["Spell naïve after 1"],
             vec![
                 "Spell naïve after 1",
                 "Answer: Spell naïve after 1",
-                "Spell café too",
+                &update,
             ],
         ];
         assert_eq!(sent(&requests), expected);

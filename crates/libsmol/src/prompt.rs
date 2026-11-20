@@ -23,6 +23,8 @@ pub(crate) const ARGUMENT_DOC: &str = "The Python code to run.";
 
 /// Labels what arrived while the agent worked where libsmol retells a task, for the summarizer and after a summary
 pub(crate) const UPDATE: &str = "Task update";
+const GO_ON: &str =
+    "[Answer this in your reply's text and go on with the task, unless it asks you to stop.]";
 
 const RULES: &str = "- Never make up data or functions; check unfamiliar ones with `help()`.
 - Do the task instead of describing it.
@@ -404,8 +406,7 @@ fn one_line(text: &str) -> String {
     lines.join(" ")
 }
 
-/// A task or what arrived for it while the agent worked, unlabelled since models read a label as a note of work done,
-/// where `takes` tells the media the model takes, and the rest is a note
+/// `takes` tells the media the model takes, and the rest is a note
 pub(crate) fn task(step: &TaskStep, takes: &dyn Fn(MediaKind) -> bool) -> Vec<Part> {
     let mut parts = Vec::new();
     // Parts are sent joined by line breaks, so an empty text would start the message with one
@@ -424,6 +425,14 @@ pub(crate) fn task(step: &TaskStep, takes: &dyn Fn(MediaKind) -> bool) -> Vec<Pa
         parts.push(part);
     }
 
+    parts
+}
+
+/// The note follows what was written, since a label before it read to models as a note of work done
+pub(crate) fn update(step: &TaskStep, takes: &dyn Fn(MediaKind) -> bool) -> Vec<Part> {
+    let mut parts = task(step, takes);
+    let note = format!("\n{GO_ON}");
+    parts.push(Part::Text(note));
     parts
 }
 

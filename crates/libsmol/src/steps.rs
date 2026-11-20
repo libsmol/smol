@@ -370,8 +370,12 @@ impl MemoryStep {
         takes: &dyn Fn(MediaKind) -> bool,
     ) -> Vec<ChatMessage> {
         let step = match self {
-            MemoryStep::Task(task) | MemoryStep::Update(task) => {
+            MemoryStep::Task(task) => {
                 let parts = prompt::task(task, takes);
+                return vec![ChatMessage::User(parts)];
+            }
+            MemoryStep::Update(update) => {
+                let parts = prompt::update(update, takes);
                 return vec![ChatMessage::User(parts)];
             }
             MemoryStep::Shell(shell) => {
