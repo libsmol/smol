@@ -71,13 +71,25 @@ pub(crate) enum Mention {
     Image { data: String },
 }
 
+impl Mention {
+    /// The name `attach` gives it before reading it, which an image lacks until it is copied
+    pub(crate) fn name(&self, cwd: &Path) -> Option<String> {
+        match self {
+            Mention::File { path, .. } => Some(shown_path(path, cwd)),
+            Mention::Resource { uri, .. } => Some(uri.clone()),
+            Mention::Image { .. } => None,
+        }
+    }
+}
+
 /// Images and videos are copied into `copies` and the session keeps using the copy
 pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment {
+    let named = mention.name(cwd).unwrap_or_default();
     let (path, wanted) = match mention {
-        Mention::Resource { uri, text } => {
+        Mention::Resource { text, .. } => {
             let text = truncated(text, MAX_OBSERVATION_CHARS);
             return Attachment {
-                path: uri.clone(),
+                path: named,
                 content: Content::Resource { text },
             };
         }
@@ -119,13 +131,13 @@ pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment
         }
         // An editor sends what it shows, which may not be saved yet
         Mention::File {
-            path,
             lines,
             text: Some(text),
+            ..
         } => {
             let text = truncated(text, MAX_OBSERVATION_CHARS);
             return Attachment {
-                path: shown_path(path, cwd),
+                path: named,
                 content: Content::File {
                     text,
                     lines: *lines,
@@ -139,7 +151,7 @@ pub(crate) fn attach(mention: &Mention, cwd: &Path, copies: &Path) -> Attachment
         } => (path, *lines),
     };
 
-    let mut shown = shown_path(path, cwd);
+    let mut shown = named;
     let kind = kind_of(path);
     let limit = kind.map_or(MAX_ATTACH_BYTES, |_| MAX_MEDIA_BYTES);
     let metadata = fs::metadata(path);

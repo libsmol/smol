@@ -363,6 +363,15 @@ pub(crate) enum MemoryStep {
 }
 
 impl MemoryStep {
+    /// Programs that ended while no turn ran open a turn without a task, after which no task is at work
+    pub(crate) fn starts_turn(&self) -> bool {
+        match self {
+            MemoryStep::Task(_) => true,
+            MemoryStep::Done(done) => done.idle,
+            _ => false,
+        }
+    }
+
     /// [`AgentMemory::conversation`] places the summary, calls are numbered on from `calls`,
     /// media the model doesn't take, as `takes` tells, is a note, and `rank` is the agent's
     pub(crate) fn messages(
@@ -476,11 +485,12 @@ impl AgentMemory {
 
             let cut = visible.steps.len().saturating_sub(summary.kept);
             for dropped in visible.steps.drain(..cut) {
+                if dropped.starts_turn() {
+                    visible.task = None;
+                    visible.updates.clear();
+                }
                 match dropped {
-                    MemoryStep::Task(task) => {
-                        visible.task = Some(task);
-                        visible.updates.clear();
-                    }
+                    MemoryStep::Task(task) => visible.task = Some(task),
                     MemoryStep::Update(update) => visible.updates.push(&update.text),
                     MemoryStep::Action(_)
                     | MemoryStep::Summary(_)
@@ -531,42 +541,36 @@ impl AgentMemory {
         let mut messages = vec![message];
 
         if let Some(summary) = visible.summary {
-            let tasked = visible
-                .steps
-                .iter()
-                .any(|step| matches!(step, MemoryStep::Task(_)));
-            let task = visible.task.filter(|_| !tasked);
-            let task = task.map(|task| task.text.as_str());
+            // A turn opened since leaves no summarized task or update at work
+            let moved_on = visible.steps.iter().any(|step| step.starts_turn());
+            let mut current = Vec::new();
+            if !moved_on {
+                let task = visible.task.map(|task| task.text.as_str());
+                let task = task.filter(|text| !text.is_empty());
 
-            // Updates aren't refused when oversized like tasks are,
-            // so once they and the task pass half the window only the latest that fit come back
-            let mut kept = visible.updates.len();
-            if let Some(window) = window {
-                let mut size = task.map_or(0, text_bytes);
-                kept = 0;
-                for update in visible.updates.iter().rev() {
-                    size += text_bytes(update);
-                    if estimate(size) > window / 2 {
-                        break;
+                // Updates aren't refused when oversized like tasks are,
+                // so once they and the task pass half the window only the latest that fit come back
+                let mut kept = visible.updates.len();
+                if let Some(window) = window {
+                    let mut size = task.map_or(0, text_bytes);
+                    kept = 0;
+                    for update in visible.updates.iter().rev() {
+                        size += text_bytes(update);
+                        if estimate(size) > window / 2 {
+                            break;
+                        }
+                        kept += 1;
                     }
-                    kept += 1;
                 }
+                current.extend(task);
+                let updates = &visible.updates[visible.updates.len() - kept..];
+                // One sent with attachments only retells nothing
+                let worded = updates.iter().filter(|text| !text.is_empty());
+                current.extend(worded);
             }
-            let updates = &visible.updates[visible.updates.len() - kept..];
 
-            let text = prompt::summarized(summary, task);
+            let text = prompt::summarized(summary, &current);
             messages.push(ChatMessage::user(text));
-            // Updates follow their task, as text only like it, and are left out without one
-            if task.is_some() {
-                for update in updates {
-                    let retold = TaskStep {
-                        text: (*update).to_owned(),
-                        files: Vec::new(),
-                    };
-                    let parts = prompt::update(&retold, takes, rank);
-                    messages.push(ChatMessage::User(parts));
-                }
-            }
         }
 
         // Numbered in order of appearance, so new steps never renumber earlier ones
@@ -671,7 +675,7 @@ impl AgentMemory {
 
 pub(crate) struct Visible<'a> {
     pub(crate) summary: Option<&'a SummaryStep>,
-    /// The last task among the summarized steps
+    /// The task of the last turn among the summarized steps, if it had one
     task: Option<&'a TaskStep>,
     /// Updates after that task that were summarized too
     updates: Vec<&'a str>,
@@ -859,6 +863,51 @@ pub(crate) mod tests {
             panic!("{:?}", memory.steps);
         };
         assert!(summary.globals.is_empty(), "{:?}", summary.globals);
+    }
+
+    /// After a summary the task at work comes back with its updates as written, and once programs
+    /// that ended while no turn ran opened a turn, only what was written during that turn does
+    #[test]
+    fn current_task_retold() {
+        let summary = SummaryStep {
+            summary: "Counted the cafés".to_owned(),
+            kept: 1,
+            ..SummaryStep::default()
+        };
+        let all = |_| true;
+        let working = vec![
+            MemoryStep::Task(asked("Count the cafés")),
+            MemoryStep::Update(asked("Count the naïve ones too")),
+            MemoryStep::Action(Box::new(coded("print(2)", Some("2".to_owned())))),
+            MemoryStep::Summary(summary.clone()),
+        ];
+        let sent = AgentMemory { steps: working }.conversation("", &all, Rank::Main, None);
+        let retold = prompt::summarized(&summary, &["Count the cafés", "Count the naïve ones too"]);
+        assert_eq!(content(&sent[1]), retold);
+
+        let idle = DoneStep {
+            idle: true,
+            ..DoneStep::default()
+        };
+        let ended = vec![
+            MemoryStep::Task(asked("Count the cafés")),
+            MemoryStep::Action(Box::new(replied("2 cafés"))),
+            MemoryStep::Done(idle),
+            MemoryStep::Update(asked("Run the bench again")),
+            MemoryStep::Action(Box::new(replied("The bench ended"))),
+        ];
+        // The turn the programs opened is kept, or summarized with what was written in it
+        for (kept, current) in [(3, vec![]), (1, vec!["Run the bench again"])] {
+            let mut steps = ended.clone();
+            let summary = SummaryStep {
+                kept,
+                ..summary.clone()
+            };
+            steps.push(MemoryStep::Summary(summary.clone()));
+            let sent = AgentMemory { steps }.conversation("", &all, Rank::Main, None);
+            let retold = prompt::summarized(&summary, &current);
+            assert_eq!(content(&sent[1]), retold, "{kept}");
+        }
     }
 
     #[test]

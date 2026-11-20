@@ -374,7 +374,7 @@ mod tests {
         };
         assert_eq!(summary.globals, held);
         let after = contents(&requests[3]);
-        let summarized = prompt::summarized(summary, Some("Add 1 to x"));
+        let summarized = prompt::summarized(summary, &["Add 1 to x"]);
         assert_eq!(
             after[1..],
             [summarized.as_str(), "eval:\nprint('data')", "data"]
@@ -482,7 +482,7 @@ mod tests {
         let MemoryStep::Summary(summary) = &memory.steps[4] else {
             panic!("{:?}", memory.steps);
         };
-        let summarized = prompt::summarized(summary, None);
+        let summarized = prompt::summarized(summary, &[]);
         let after = contents(&requests[3]);
         assert_eq!(after[1..], [summarized.as_str(), "x is 41.", "Add 1 to x"]);
     }

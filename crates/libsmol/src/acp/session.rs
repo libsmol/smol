@@ -425,7 +425,19 @@ impl Session {
         let untitled = self.keeper.meta.model_title.is_empty();
         let asked = prompt.task.as_ref().map(|task| task.text.as_str());
         let asked = asked.unwrap_or_default();
-        let worded = !asked.trim().is_empty();
+        let mentions = prompt.task.as_ref().map(|task| task.mentions.as_slice());
+        let cwd = &self.agent.workplace.cwd;
+        let mut attached = Vec::new();
+        for mention in mentions.unwrap_or_default() {
+            let Some(name) = mention.name(cwd) else {
+                continue;
+            };
+            // Parts of one file name it again
+            if !attached.contains(&name) {
+                attached.push(name);
+            }
+        }
+        let worded = !asked.trim().is_empty() || !attached.is_empty();
         let tasked = |step: &MemoryStep| matches!(step, MemoryStep::Task(_));
         let first = !self.memory.steps.iter().any(tasked);
         let titling = first && untitled && worded && self.keeper.titling.is_none();
@@ -434,7 +446,7 @@ impl Session {
             let task = asked.to_owned();
             let (sender, receiver) = oneshot::channel();
             let choosing = task::spawn(async move {
-                if let Some(title) = title_of(model, task).await {
+                if let Some(title) = title_of(model, task, attached).await {
                     sender.send(title).ok();
                 }
             });

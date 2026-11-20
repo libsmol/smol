@@ -636,9 +636,13 @@ async fn text_reply(
     (replied, usage)
 }
 
-pub(crate) async fn title_of(model: Arc<dyn Model>, task: String) -> Option<String> {
+pub(crate) async fn title_of(
+    model: Arc<dyn Model>,
+    task: String,
+    attached: Vec<String>,
+) -> Option<String> {
     let task: String = task.chars().take(MAX_TITLING_CHARS).collect();
-    let message = prompt::first_message(&task);
+    let message = prompt::first_message(&task, &attached);
     let request = [
         ChatMessage::System(prompt::titler()),
         ChatMessage::user(message),
