@@ -438,11 +438,11 @@ impl Translator {
     fn content(&self, call: &Call) -> Vec<ToolCallContent> {
         let head = head(&call.code, call.arguments.as_deref());
         let mut content = vec![head];
-        let result = call.result.as_ref();
-        if let Some(printed) = result.and_then(|result| result.printed.as_ref()) {
+        if let Some(printed) = call.output() {
             let printed = ToolCallContent::from(printed);
             content.push(printed);
         }
+        let result = call.result.as_ref();
         for (path, media) in result.map(|result| &result.media).into_iter().flatten() {
             let copy = self.copies.join(&media.file);
             let Some(uri) = file_uri(&copy) else {

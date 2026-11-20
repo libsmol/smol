@@ -7,6 +7,43 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- After compaction the model is told which names its Python session still
+  holds: what it imported, with where from when renamed, the `def` and `class`
+  lines of what it defined, as written, and its other variables with their
+  type and length. Before, it saw only the summary, so it read files again or
+  rewrote helpers that still existed. A name shows as its import, `def` or
+  `class` wrote it only while it holds the object that statement bound, and
+  otherwise by its type, so none of the code's own methods run. Past 4,096
+  characters the rest are only counted, with a note that `dir()` lists them.
+- What the user writes while a task runs reaches the model as written, where it
+  started with `[Task update]`, and the system prompt says such a message
+  belongs to the current task and may add to or change it. A replay of a real
+  session with grok showed the label made the model take the user's words for
+  a note of work done: asked mid-task to also rename something, it answered that
+  the rename was done without making it in 14 of 48 tries with the label in any
+  wording, and in none of 18 without it. Four new evaluation tasks, where the
+  message adds to the task, asks a side question, refines it or replaces it,
+  passed every run with and without the label on grok and deepseek, so the
+  model neither answers early nor drops the task. What `agent()` sends an agent
+  at work arrives the same way.
+- Summaries state where the work stands instead of retelling what the agent
+  read and ran. The format's Done section asked for what the output showed the
+  agent read, so summaries listed files and line ranges in the order they were
+  opened. It is State now: what the last task changed and what that holds,
+  what it established and whether output shows it or only a message claims it,
+  and each agent it started, by name, with whether it answered. A rule says the
+  agent needs results, not the work that produced them. On nine real
+  conversations, judges who didn't know which prompt wrote which summary rated
+  the new ones half as much like a log and more useful for going on.
+- An agent's answer that arrives in an `[Agent done]` message is cut in the
+  middle past 16,384 characters, as a call's output is, with a note that
+  `agent.wait(name)` returns the whole answer, which the code can read in
+  parts. Before, several long answers could fill the context at once.
+- An interrupted call tells the model where the code stopped, such as
+  `line 8: time.sleep(0.05)`, after `[interrupted by the user]`.
+
 ## 0.12.0 - 2026-11-19
 
 Sessions are saved in format 9, so sessions from 0.11.0 and earlier are no longer

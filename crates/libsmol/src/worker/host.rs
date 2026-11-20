@@ -1,17 +1,19 @@
 use crate::model::Media;
-use crate::prompt::{self, ADDING_SERVER, LEFT_BEHIND, NO_SERVER};
+use crate::prompt::{self, ADDING_SERVER, LEFT_BEHIND, LISTING_GLOBALS, NO_SERVER};
 use crate::spawn::{Clip, Output, Process, SHOWN_EVERY};
 use crate::steps::{CallError, DoneStep, MAX_OBSERVATION_CHARS};
 use crate::tools::mcp::Server;
 use crate::utils::{cut_inline, new_id, Interrupt, Reply};
 use crate::worker::workplace::Workplace;
 use crate::worker::{
-    control, end_marker, greeted, greeting, FromWorker, Function, HostCall, HostNote, Message,
-    Service, ToWorker, WorkerCall, WorkerNote, CONTROL_ENV, COPIES_ENV, MAIN_ENV, WORKER_ARG,
+    control, end_marker, greeted, greeting, FromWorker, Function, Globals, HostCall, HostNote,
+    Message, Service, ToWorker, WorkerCall, WorkerNote, CONTROL_ENV, COPIES_ENV, MAIN_ENV,
+    WORKER_ARG,
 };
 use crate::{Error, Result};
 use reaper::wire::Program;
 use reaper::{cause, Member};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::{self, Future};
@@ -29,7 +31,7 @@ use tokio::select;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::{self, AbortHandle, JoinSet};
 use tokio::time::{self, Instant};
-use tracing::info;
+use tracing::{info, warn};
 
 const STOP_WAIT: Duration = Duration::from_secs(3);
 /// Code that swallows exceptions may have caught the previous interrupt
@@ -360,6 +362,28 @@ impl Worker {
         }
     }
 
+    /// Empty from a worker that is gone, which isn't restarted just for this
+    pub(crate) async fn globals(&mut self) -> Globals {
+        self.reap();
+        let Some(live) = self.live.as_mut() else {
+            return Globals::default();
+        };
+
+        let listing = live.request(HostCall::Globals, LISTING_GLOBALS);
+        let listed = select! {
+            biased;
+            () = self.interrupt.wait() => return Globals::default(),
+            listed = listing => listed,
+        };
+        match listed {
+            Ok(globals) => globals,
+            Err(reason) => {
+                warn!("worker: globals not listed, {reason}");
+                Globals::default()
+            }
+        }
+    }
+
     /// Doesn't restart a lost worker just for this
     pub(crate) fn remove_server(&self, name: &str) {
         if let Some(live) = &self.live {
@@ -396,7 +420,7 @@ impl Worker {
         let connected = select! {
             biased;
             connected = self.connect(servers) => connected.map_err(failed),
-            () = interrupt.wait() => Err(CallError::Interrupted),
+            () = interrupt.wait() => Err(CallError::Interrupted(None)),
         };
         connected?;
 
@@ -560,7 +584,7 @@ impl Worker {
                 }
 
                 let judged = |error: String| match interrupt.triggered() {
-                    true => CallError::Interrupted,
+                    true => CallError::Interrupted(Some(error)),
                     false => CallError::Execution(error),
                 };
                 output.error = ran.error.map(judged);
@@ -576,7 +600,7 @@ impl Worker {
         self.restarted = true;
         let error = match failure {
             Some(reason) if !interrupt.triggered() => failed(reason),
-            _ => CallError::Interrupted,
+            _ => CallError::Interrupted(None),
         };
         output.error = Some(error);
         Ok(output)
@@ -749,22 +773,31 @@ impl Live {
             description: server.description.clone(),
             tools: server.tools.clone(),
         };
+        self.request(call, ADDING_SERVER).await
+    }
+
+    /// Asks between snippets, refusing what threads the code started ask meanwhile with `busy`
+    async fn request<T: DeserializeOwned>(
+        &mut self,
+        call: HostCall,
+        busy: &str,
+    ) -> Result<T, String> {
         let id = self.send(call);
 
-        let installed = loop {
+        let answered = loop {
             match self.next().await {
                 Event::Answer(number, reply) if number == id => break reply?,
                 Event::Gone => return Err(prompt::exited(None)),
                 // A thread the code started waits for every call it makes
                 Event::Call(number, _) => {
-                    let refused = Err(ADDING_SERVER.to_owned());
+                    let refused = Err(busy.to_owned());
                     let reply = Message::reply(number, refused);
                     self.deliver(&reply);
                 }
                 Event::Answer(..) | Event::Ready(_) | Event::End(_) => {}
             }
         };
-        serde_json::from_value(installed).map_err(|e| e.to_string())
+        serde_json::from_value(answered).map_err(|e| e.to_string())
     }
 }
 
@@ -794,7 +827,7 @@ pub(crate) mod tests {
     use crate::utils::{block_on, new_id, truncated, Interrupt};
     use crate::worker::host::{Added, Called, Calling, Rank, Worker, STOP_WAIT};
     use crate::worker::workplace::tests::opened;
-    use crate::worker::{AgentCall, Service};
+    use crate::worker::{AgentCall, Imported, Service, Variable};
     use serde_json::{json, Map, Value};
     use std::env;
     use std::fs;
@@ -948,12 +981,77 @@ pub(crate) mod tests {
         let output = worker.eval(code);
 
         assert_eq!(output.printed, "");
-        assert_eq!(output.error, Some(CallError::Interrupted));
+        let Some(CallError::Interrupted(Some(at))) = &output.error else {
+            panic!("{:?}", output.error);
+        };
+        assert!(at.contains("line "), "{at}");
 
         interrupt.begin(1);
         let output = worker.eval("[noted, 1 + 1]");
         assert_eq!(output.printed, "['café', 2]");
         assert!(!worker.take_restarted());
+    }
+
+    /// Names show as their def, class or import wrote them while they still hold what it bound,
+    /// and listing them runs none of the code's own methods, metaclasses or annotations
+    #[test]
+    fn globals_listed() {
+        let mut worker = fresh();
+        let code = "import json, contextlib\nfrom os.path import join\n\
+            if True:\n    import collections as co\n\
+            class Meta(type):\n    def __getattribute__(cls, name):\n        raise RuntimeError('meta')\n    \
+            @property\n    def __name__(cls):\n        raise RuntimeError('name')\n\
+            class Trap(list, metaclass=Meta):\n    def __len__(self):\n        raise RuntimeError('len')\n\
+            @contextlib.contextmanager\ndef opened(path: Missing, mode='r') -> Missing:\n    yield\n\
+            def row[T](n: T, word='café') -> T:\n    return n\n\
+            trap = Trap()\nwords = ['café', 'naïve']\n_hidden = 1";
+        let output = worker.eval(code);
+        assert_eq!(output.error, None, "{}", output.printed);
+        // The import after the error never ran, though the line before it rebound its name
+        let output = worker.eval("join = 'résumé'\n1 / 0\nfrom os.path import join");
+        assert!(output.error.is_some(), "{}", output.printed);
+
+        let listing = worker.globals();
+        let globals = block_on(listing);
+        let imported = |name: &str, origin: Option<&str>| Imported {
+            name: name.to_owned(),
+            origin: origin.map(str::to_owned),
+        };
+        let imports = [
+            imported("json", None),
+            imported("contextlib", None),
+            imported("co", Some("collections")),
+        ];
+        assert_eq!(globals.imports, imports);
+        let defined = [
+            "class Meta(type)",
+            "class Trap(list, metaclass=Meta)",
+            "def opened(path: Missing, mode='r') -> Missing",
+            "def row[T](n: T, word='café') -> T",
+        ];
+        assert_eq!(globals.defined, defined);
+        let variable = |name: &str, kind: &str, length: Option<usize>| Variable {
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            length,
+        };
+        let values = [
+            variable("join", "str", Some(6)),
+            variable("trap", "Trap", None),
+            variable("words", "list", Some(2)),
+        ];
+        assert_eq!(globals.values, values);
+    }
+
+    /// A syntax error the tag repair can't fix comes back with the line it is on
+    #[test]
+    fn syntax_errors_reported() {
+        let mut worker = fresh();
+        let output = worker.eval("x = (1, 'café'");
+        let Some(CallError::Execution(error)) = &output.error else {
+            panic!("{:?}", output.error);
+        };
+        assert!(error.contains("x = (1, 'café'"), "{error}");
     }
 
     #[test]
@@ -1035,7 +1133,7 @@ pub(crate) mod tests {
             cancel_soon(&interrupt, turn);
             let stopped = worker.eval(code);
             assert_eq!(stopped.printed, said, "{code}");
-            assert_eq!(stopped.error, Some(CallError::Interrupted), "{code}");
+            assert_eq!(stopped.error, Some(CallError::Interrupted(None)), "{code}");
 
             turn += 1;
             interrupt.begin(turn);
@@ -1363,7 +1461,8 @@ pub(crate) mod tests {
         cancel_soon(&interrupt, 0);
         let started = Instant::now();
         let output = worker.eval("grep(r'a[ab]{30}c', 'random.txt')");
-        assert_eq!(output.error, Some(CallError::Interrupted));
+        let stopped = matches!(output.error, Some(CallError::Interrupted(Some(_))));
+        assert!(stopped, "{:?}", output.error);
         assert!(started.elapsed() < STOP_WAIT, "{:?}", started.elapsed());
 
         interrupt.begin(1);

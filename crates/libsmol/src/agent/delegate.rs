@@ -50,7 +50,7 @@ struct Activity {
     stopped: Option<Ending>,
 }
 
-/// What the code sends an agent at work, which takes it as `[Task update]` after its current call
+/// What the code sends an agent at work, which takes it after its current call
 #[derive(Default)]
 struct Inbox {
     sent: Mutex<Vec<String>>,
@@ -278,9 +278,10 @@ impl Agent {
                     action.error = Some(StepError::Stopped);
                 }
                 for call in &mut action.calls {
-                    if call.error == Some(CallError::Interrupted) {
-                        call.error = Some(CallError::Stopped);
-                    }
+                    call.error = match call.error.take() {
+                        Some(CallError::Interrupted(at)) => Some(CallError::Stopped(at)),
+                        other => other,
+                    };
                 }
             }
         }
@@ -922,7 +923,9 @@ mod tests {
         TokenUsage,
     };
     use crate::prompt;
-    use crate::steps::{spent, AgentMemory, Call, DoneStep, Ending, MemoryStep, Returned};
+    use crate::steps::{
+        spent, AgentMemory, Call, DoneStep, Ending, MemoryStep, Returned, MAX_OBSERVATION_CHARS,
+    };
     use crate::tests::{cancel_soon, content};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -1207,6 +1210,39 @@ mod tests {
         assert_eq!(told, prompt::done(&done));
     }
 
+    /// A long answer the code didn't take comes cut, and whole from `agent.wait()` by name
+    #[test]
+    fn long_answer_cut() {
+        let codes = vec![
+            "agent('scribe', 'Copy ' + 'café ' * 4000 + 'after 0.5')\nprint('sent')",
+            "",
+            "answer = agent.wait('scribe')['scribe']\nprint(len(answer))",
+        ];
+        let requests = Requests::default();
+        let model = Background(codes, Arc::clone(&requests));
+        let mut agent = scripted(model, Box::new(|_| {}));
+
+        let mut memory = AgentMemory::default();
+        agent.turn(&mut memory, "Copy the cafés").expect("run");
+
+        let MemoryStep::Done(done) = &memory.steps[3] else {
+            panic!("{:?}", memory.steps);
+        };
+        let answer = done.agents[0].end.outcome().expect("answer");
+        let whole = answer.chars().count();
+        assert!(whole > MAX_OBSERVATION_CHARS, "{whole}");
+        assert_eq!(printed(&memory, 4), whole.to_string());
+
+        let requests = requests.lock().expect("requests");
+        let mut main = requests
+            .iter()
+            .filter(|request| !content(&request[0]).contains("returned to the agent"));
+        let after = main.nth(2).expect("request");
+        let told = content(after.last().expect("message"));
+        assert_eq!(told, prompt::done(done));
+        assert!(told.chars().count() < whole, "{told}");
+    }
+
     /// A message the user queues ends the wait early, and reaches the model after the call
     #[test]
     fn wait_cut_short() {
@@ -1266,13 +1302,12 @@ mod tests {
         let result = ran(&memory, 1).result.as_ref().expect("ran");
         assert_eq!(result.agents.len(), 1, "{result:?}");
 
-        let update = format!("[{}]\nSpell café too", prompt::UPDATE);
         let expected = [
             vec!["Spell naïve after 1"],
             vec![
                 "Spell naïve after 1",
                 "Answer: Spell naïve after 1",
-                &update,
+                "Spell café too",
             ],
         ];
         assert_eq!(sent(&requests), expected);

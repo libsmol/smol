@@ -293,8 +293,9 @@ after its current call, and one sent to an agent that answered continues its
 conversation, on the same Python if it is among the 4 agents used last and
 went unused for less than 30 minutes. The turn stays open until every agent
 has ended. When one ends before code took its answer, the model gets it in an
-"[Agent done]" message, and what you type meanwhile reaches it as a task
-update, which also ends a wait for agents early. smol shows each task under
+"[Agent done]" message, cut in the middle past 16,384 characters, since
+`agent.wait()` still returns it whole. What you type meanwhile reaches it as a
+task update, which also ends a wait for agents early. smol shows each task under
 the call that sent it and pins the running ones below the conversation while
 their rows are scrolled out of view.
 

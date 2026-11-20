@@ -1,7 +1,7 @@
 use crate::agent::delegate::Records;
 use crate::agent::{generate, retry, Event, Failure, Streamed, Turn, MAX_RETRIES};
 use crate::model::{Finish, ModelError, Purpose, Sealed, StreamDelta, Unread, MAX_NAME_CHARS};
-use crate::prompt::{self, TOOL};
+use crate::prompt::TOOL;
 use crate::spawn::SHOWN_EVERY;
 use crate::steps::{
     estimate, text_bytes, AgentStep, Call, CallError, CodeResult, StepError, MAX_OBSERVATION_CHARS,
@@ -176,28 +176,18 @@ impl Turn<'_> {
             match evaluated {
                 Ok(output) => {
                     // Leaves room in the budget for the error that follows the output
-                    let error = match output.error {
-                        Some(CallError::Execution(text)) => {
-                            let text = truncated(&text, MAX_OBSERVATION_CHARS / 2);
-                            Some(CallError::Execution(text))
-                        }
-                        other => other,
-                    };
-                    let ending = match &error {
-                        Some(CallError::Execution(text)) => text.chars().count(),
-                        _ => 0,
-                    };
+                    let mut error = output.error;
+                    let mut ending = 0;
+                    if let Some(CallError::Execution(text) | CallError::Interrupted(Some(text))) =
+                        &mut error
+                    {
+                        *text = truncated(text, MAX_OBSERVATION_CHARS / 2);
+                        ending = text.chars().count();
+                    }
 
-                    let quiet = error.is_none() && output.media.is_empty();
                     let budget = MAX_OBSERVATION_CHARS - ending;
                     let shown = output.printed.shown(budget);
-                    let printed = if !shown.is_empty() {
-                        Some(shown)
-                    } else if quiet {
-                        Some(prompt::NO_OUTPUT.to_owned())
-                    } else {
-                        None
-                    };
+                    let printed = (!shown.is_empty()).then_some(shown);
                     call.result = Some(CodeResult {
                         printed,
                         media: output.media,
@@ -220,7 +210,7 @@ impl Turn<'_> {
                 continue;
             };
             // An interrupt while the code runs is recorded on the step too
-            if *error == CallError::Interrupted {
+            if let CallError::Interrupted(_) = error {
                 step.error = Some(StepError::Interrupted);
             }
             break;
@@ -343,6 +333,7 @@ mod tests {
     use crate::agent::step::*;
     use crate::agent::tests::{called, recorded, reply, scripted, Script, ScriptedModel, Tested};
     use crate::model::{ChatMessage, TokenUsage};
+    use crate::prompt;
     use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::{content, Temp};
     use std::sync::{Arc, Mutex};

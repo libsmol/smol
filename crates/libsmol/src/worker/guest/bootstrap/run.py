@@ -26,6 +26,14 @@ def _reads(tree, name):
             return True
     return False
 
+# The name an import binds, which for a dotted module is its first part
+def _named(alias):
+    return (alias.asname or alias.name).partition(".")[0]
+
+# What each def, class and import that ran bound, by name, with how the listing shows it
+# No entry outlives its name holding that object, or it would keep alive what the code let go of
+_BINDINGS = {}
+
 # Lines starting with < and any </ are never Python but stray tags or other tool call formats
 _TAG = _re.compile(r"^[ \t]*<[^\n]*>[ \t]*(?:\n|$)|</[^<>\n]*>", _re.M)
 # Only leading tags count because a tag mid-code may open a repeated call that stripping would run
@@ -187,7 +195,7 @@ def _run(code):
     filename = f"{_SNIPPET}{next(_RUNS)}>"
     error = repaired = None
     blocks = []
-    defined = {}
+    tracked = {}
     try:
         try:
             try:
@@ -241,9 +249,10 @@ def _run(code):
             else:
                 error = f"syntax error on line {exc.lineno}: {exc.msg}\n{source}\n{caret}"
 
-        # The last statement rebinding each global name,
+        # The last statement rebinding each global name, and how many do,
         # outside functions, classes and comprehensions
         bound = {}
+        binders = {}
         pending = [(node, node) for node in parsed.body] if blocks else []
         while pending:
             node, statement = pending.pop()
@@ -254,7 +263,7 @@ def _run(code):
             if isinstance(node, _DEFINITIONS):
                 names.append(node.name)
             elif isinstance(node, (_ast.Import, _ast.ImportFrom)):
-                imported = [(alias.asname or alias.name).partition(".")[0] for alias in node.names]
+                imported = [_named(alias) for alias in node.names]
                 names.extend(imported)
             elif isinstance(node, _ast.NamedExpr):
                 # The value is the right side of :=, not the whole statement around it
@@ -276,11 +285,14 @@ def _run(code):
                 at = (node.lineno, node.col_offset)
                 if name not in bound or at >= bound[name][0]:
                     bound[name] = (at, statement)
+                binders[name] = binders.get(name, 0) + 1
 
-        # Record the old values, which a def that never ran must not attach its source to
+        # A def or import alone in binding its name ran if the name's value changed,
+        # where with others, such as in try and except, any of them may have
         for name, (_, statement) in bound.items():
-            if isinstance(statement, _DEFINITIONS):
-                defined[name] = (statement, _STATE.get(name))
+            alone = binders[name] == 1
+            if alone and isinstance(statement, (*_DEFINITIONS, _ast.Import, _ast.ImportFrom)):
+                tracked[name] = (statement, _STATE.get(name))
 
         for block in blocks:
             value = eval(block, _STATE)
@@ -358,12 +370,35 @@ def _run(code):
             left = deadline - _time.monotonic()
             flusher.join(max(left, 0))
 
-    # An interrupt may land here and then no source is attached
+    # An interrupt may land here and then leaves the rest undone
     try:
-        for name, (statement, old) in defined.items():
+        for name, (statement, old) in tracked.items():
             value = _STATE.get(name)
             if value is old:
                 continue
+
+            if isinstance(statement, (_ast.Import, _ast.ImportFrom)):
+                alias = [alias for alias in statement.names if _named(alias) == name][-1]
+                if isinstance(statement, _ast.ImportFrom):
+                    origin = f"{statement.module}.{alias.name}"
+                else:
+                    # A module imported under its own name needs no origin
+                    origin = alias.name if alias.asname else None
+                _BINDINGS[name] = (value, "imports", {"name": name, "origin": origin})
+                continue
+
+            parameters = [_ast.unparse(parameter) for parameter in statement.type_params]
+            generic = f"[{', '.join(parameters)}]" if parameters else ""
+            if isinstance(statement, _ast.ClassDef):
+                bases = [_ast.unparse(base) for base in [*statement.bases, *statement.keywords]]
+                listed = f"({', '.join(bases)})" if bases else ""
+                header = f"class {name}{generic}{listed}"
+            else:
+                keyword = "async def" if isinstance(statement, _ast.AsyncFunctionDef) else "def"
+                arguments = _ast.unparse(statement.args)
+                returns = f" -> {_ast.unparse(statement.returns)}" if statement.returns else ""
+                header = f"{keyword} {name}{generic}({arguments}){returns}"
+            _BINDINGS[name] = (value, "defined", header)
 
             # The full code for help() to print, from the first decorator on and with comments kept
             linenos = [part.lineno for part in [statement, *statement.decorator_list]]
@@ -374,9 +409,49 @@ def _run(code):
                 value._smol_source = _textwrap.dedent(written)
             except (AttributeError, TypeError):
                 pass
+
+        for name, (value, _, _) in list(_BINDINGS.items()):
+            if _STATE.get(name) is not value:
+                del _BINDINGS[name]
     except BaseException:
         pass
 
     # Undecodable filename bytes become lone surrogates that Rust can't accept
     clean = lambda text: text if text is None else text.encode("utf-8", "backslashreplace").decode()
     return {"error": clean(error), "repaired": clean(repaired)}
+
+_SIZED = (str, bytes, bytearray, list, tuple, dict, set, frozenset)
+# type's own descriptors, which a metaclass the code wrote can't override as it can attribute lookups
+_NAME = type.__dict__["__name__"].__get__
+_MRO = type.__dict__["__mro__"].__get__
+_DICT = type.__dict__["__dict__"].__get__
+
+# A name still holding what its def, class or import bound shows as written there, and any other only by its type
+def _globals():
+    listing = {"imports": [], "defined": [], "values": []}
+    for name, value in list(_STATE.items()):
+        if type(name) is not str or name.startswith("_"):
+            continue
+
+        held = _BINDINGS.get(name)
+        kind = type(value)
+        if held is not None and held[0] is value:
+            _, section, entry = held
+            listing[section].append(entry)
+        elif issubclass(kind, _types.ModuleType):
+            listing["imports"].append({"name": name, "origin": None})
+        else:
+            mro = _MRO(kind)
+            # Private classes such as grep()'s result go by the public one they extend
+            public = [base for base in mro if base is not object and not _NAME(base).startswith("_")]
+            shown = _NAME(public[0] if public else kind)
+            # Only a built-in class first defining __len__ gives a length, found by identity as == would run a metaclass's __eq__
+            length = None
+            for base in mro:
+                if "__len__" in _DICT(base):
+                    if any(base is sized for sized in _SIZED):
+                        length = len(value)
+                    break
+            listing["values"].append({"name": name, "kind": shown, "length": length})
+
+    return listing

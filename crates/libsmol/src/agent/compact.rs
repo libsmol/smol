@@ -5,6 +5,7 @@ use crate::steps::{
     bytes, estimate, text_bytes, MemoryStep, SummaryStep, Usage, MAX_OBSERVATION_CHARS,
 };
 use crate::utils::truncated;
+use crate::worker::Globals;
 use crate::Result;
 use std::time::Instant;
 
@@ -97,6 +98,10 @@ impl Turn<'_> {
         if older.is_empty() {
             return Ok(());
         }
+        // A restart among the kept steps would read as undoing the names listed before them
+        let restarted = visible.steps[older.len()..]
+            .iter()
+            .any(|step| matches!(step, MemoryStep::Restarted));
 
         self.sink.event(Event::Compact);
         let interrupt = &self.agent.interrupt;
@@ -183,8 +188,13 @@ impl Turn<'_> {
         let summary = previous.expect("summary");
         // Covers every chunk and the time spent waiting to retry
         usage.duration = started.elapsed().as_secs_f64();
+        let globals = match restarted {
+            true => Globals::default(),
+            false => self.worker.globals().await,
+        };
         let summary = SummaryStep {
             summary,
+            globals,
             kept,
             usage,
             used: None,
@@ -237,6 +247,7 @@ mod tests {
     use crate::steps::tests::{asked, coded, metered, replied};
     use crate::steps::{AgentMemory, AgentStep};
     use crate::tests::content;
+    use crate::worker::Variable;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -346,8 +357,22 @@ mod tests {
         );
         assert!(!asked.contains("print('data')"), "{asked}");
 
+        // The names the code left in the worker follow the summary
+        let MemoryStep::Summary(summary) = &memory.steps[3] else {
+            panic!("{:?}", memory.steps);
+        };
+        let x = Variable {
+            name: "x".to_owned(),
+            kind: "int".to_owned(),
+            length: None,
+        };
+        let held = Globals {
+            values: vec![x],
+            ..Globals::default()
+        };
+        assert_eq!(summary.globals, held);
         let after = contents(&requests[3]);
-        let summarized = prompt::summarized("x holds 41.", Some("Add 1 to x"), &[]);
+        let summarized = prompt::summarized(summary, Some("Add 1 to x"), &[]);
         assert_eq!(
             after[1..],
             [summarized.as_str(), "eval:\nprint('data')", "data"]
@@ -375,10 +400,6 @@ mod tests {
 
         let events = events.lock().expect("events");
         assert_eq!(*events, ["compact", "summary: x holds 41."]);
-
-        let MemoryStep::Summary(summary) = &memory.steps[3] else {
-            panic!("{:?}", memory.steps);
-        };
         assert!(summary.used.is_some());
 
         let saved = serde_json::to_string(&memory).expect("serialize");
@@ -456,8 +477,11 @@ mod tests {
         assert!(asked.contains("Check x"), "{asked}");
         assert!(!asked.contains("Add 1 to x"), "{asked}");
 
+        let MemoryStep::Summary(summary) = &memory.steps[4] else {
+            panic!("{:?}", memory.steps);
+        };
+        let summarized = prompt::summarized(summary, None, &[]);
         let after = contents(&requests[3]);
-        let summarized = prompt::summarized("x holds 41.", None, &[]);
         assert_eq!(after[1..], [summarized.as_str(), "x is 41.", "Add 1 to x"]);
     }
 }

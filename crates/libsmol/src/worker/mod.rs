@@ -100,6 +100,41 @@ pub(crate) enum HostCall {
         description: String,
         tools: Vec<Value>,
     },
+    /// Answered with [`Globals`]
+    Globals,
+}
+
+/// The names the code left in the worker's globals
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Globals {
+    pub(crate) imports: Vec<Imported>,
+    /// The `def` and `class` lines of what the code defined, as written
+    pub(crate) defined: Vec<String>,
+    pub(crate) values: Vec<Variable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Imported {
+    pub(crate) name: String,
+    /// What the code imported under the name, unless it is the module of that name
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) origin: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Variable {
+    pub(crate) name: String,
+    /// The name of its type
+    pub(crate) kind: String,
+    /// Only a type that keeps the built-in `len()` of strings, bytes or containers gives one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) length: Option<usize>,
+}
+
+impl Globals {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.imports.is_empty() && self.defined.is_empty() && self.values.is_empty()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

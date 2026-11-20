@@ -313,7 +313,7 @@ def agent(name: str, task: str) -> None:
     An agent at work gets the task after its current call.
 
     - A new name starts a new agent with your files, built-in functions, MCP servers, skills and instructions, but not your Python session or this conversation.
-    - An agent at work gets task as "[Task update]" after its current call, and one that has answered continues its conversation with it.
+    - An agent at work adds task to what it is doing after its current call, and one that has answered continues its conversation with it.
     - Up to {agents} agents work at a time, and the rest wait for a slot.
     - Answers come from agent.wait(), or as an "[{done}]" message after your next call.
     - Agents started this way cannot call agent(), remember() or forget()."""
@@ -331,7 +331,7 @@ def _wait(*names: str, timeout: float | None = None) -> dict[str, str | RuntimeE
 
     - Without names it waits for every agent at work, and returns their answers with the earlier ones not yet taken.
     - A named agent that has answered gives its latest answer, again if it was taken.
-    - After timeout seconds, or once the user sends a message, which comes as "[Task update]" after your current call, it returns the answers so far and prints what each agent it waits for and still at work is doing.
+    - After timeout seconds, or once the user sends a message, which comes after your current call, it returns the answers so far and prints what each agent it waits for and still at work is doing.
     - An agent that failed or was stopped gives a RuntimeError in place of its answer.
     - An answer taken here comes in no "[{done}]" message."""
     for name in names:

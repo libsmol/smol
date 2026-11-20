@@ -1,5 +1,6 @@
 use crate::model::{ChatMessage, Media, MediaKind, Part, Sealed, TokenUsage, ToolCall};
 use crate::prompt;
+use crate::worker::Globals;
 use reaper::wire::Program;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -36,11 +37,13 @@ pub(crate) enum CallError {
     NoCode,
     #[error("{0}")]
     Execution(String),
+    /// With the error the worker reported where the code stopped,
+    /// none when the worker was killed or never got the code
     #[error("interrupted")]
-    Interrupted,
+    Interrupted(Option<String>),
     /// The agent that assigned the task interrupted it with `agent.stop()`
     #[error("stopped")]
-    Stopped,
+    Stopped(Option<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -218,6 +221,17 @@ impl Call {
     pub(crate) fn unread(&self) -> bool {
         matches!(self.error, Some(CallError::NoTool(_) | CallError::NoCode))
     }
+
+    /// What the code printed, or a note when it ran without printing or showing anything
+    pub(crate) fn output(&self) -> Option<&str> {
+        let result = self.result.as_ref()?;
+        if let Some(printed) = &result.printed {
+            return Some(printed);
+        }
+
+        let quiet = self.error.is_none() && result.media.is_empty();
+        quiet.then_some(prompt::NO_OUTPUT)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -325,6 +339,9 @@ pub(crate) fn exit_code(code: i32) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SummaryStep {
     pub(crate) summary: String,
+    /// As the worker listed them when the summary was written
+    #[serde(default, skip_serializing_if = "Globals::is_empty")]
+    pub(crate) globals: Globals,
     /// How many steps before the summary are kept verbatim
     pub(crate) kept: usize,
     pub(crate) usage: Usage,
@@ -353,12 +370,8 @@ impl MemoryStep {
         takes: &dyn Fn(MediaKind) -> bool,
     ) -> Vec<ChatMessage> {
         let step = match self {
-            MemoryStep::Task(task) => {
+            MemoryStep::Task(task) | MemoryStep::Update(task) => {
                 let parts = prompt::task(task, takes);
-                return vec![ChatMessage::User(parts)];
-            }
-            MemoryStep::Update(update) => {
-                let parts = prompt::update(update, takes);
                 return vec![ChatMessage::User(parts)];
             }
             MemoryStep::Shell(shell) => {
@@ -414,7 +427,7 @@ impl MemoryStep {
         for (call, id) in shown.iter().zip(ids) {
             let mut parts = Vec::new();
             if let Some(result) = &call.result {
-                let printed = result.printed.as_deref();
+                let printed = call.output();
                 let shown = prompt::result(printed, &result.media, takes);
                 parts.extend(shown);
             }
@@ -534,7 +547,7 @@ impl AgentMemory {
             }
             let updates = &visible.updates[visible.updates.len() - kept..];
 
-            let text = prompt::summarized(&summary.summary, task, updates);
+            let text = prompt::summarized(summary, task, updates);
             messages.push(ChatMessage::user(text));
         }
 
@@ -805,6 +818,28 @@ pub(crate) mod tests {
             number: 2,
         };
         assert_eq!(result.agents, [sent]);
+    }
+
+    /// Steps saved before interrupts kept where the code stopped
+    /// and before summaries listed the worker's names still load
+    #[test]
+    fn old_steps_read() {
+        let saved = r#"{"steps": [
+            {"type": "action", "calls": [
+                {"code": "while True: pass", "result": {}, "error": {"type": "interrupted"}}
+            ], "usage": {"duration": 1.5}},
+            {"type": "summary", "summary": "Counted the cafés", "kept": 0, "usage": {"duration": 2.5}}
+        ]}"#;
+        let memory: AgentMemory = serde_json::from_str(saved).expect("deserialize");
+
+        let MemoryStep::Action(action) = &memory.steps[0] else {
+            panic!("{:?}", memory.steps);
+        };
+        assert_eq!(action.calls[0].error, Some(CallError::Interrupted(None)));
+        let MemoryStep::Summary(summary) = &memory.steps[1] else {
+            panic!("{:?}", memory.steps);
+        };
+        assert!(summary.globals.is_empty(), "{:?}", summary.globals);
     }
 
     #[test]

@@ -130,16 +130,21 @@ impl Interrupt {
 }
 
 pub(crate) fn truncated(text: &str, max: usize) -> String {
-    middle_cut(text, max, "\n")
+    middle_cut(text, max, "\n", prompt::cut)
 }
 
 /// Like `truncated`, for text that must stay on one line
 pub(crate) fn cut_inline(text: &str, max: usize) -> String {
-    middle_cut(text, max, " ")
+    middle_cut(text, max, " ", prompt::cut)
 }
 
-/// Keeps `max` characters of `text` with the marker of the cut set off by `apart`
-fn middle_cut(text: &str, max: usize, apart: &str) -> String {
+/// Keeps `max` characters of `text` with the `marker` for how many were cut set off by `apart`
+pub(crate) fn middle_cut(
+    text: &str,
+    max: usize,
+    apart: &str,
+    marker: impl FnOnce(usize) -> String,
+) -> String {
     let count = text.chars().count();
     if count <= max {
         return text.to_owned();
@@ -148,7 +153,7 @@ fn middle_cut(text: &str, max: usize, apart: &str) -> String {
     let kept = max / 2;
     let head: String = text.chars().take(max - kept).collect();
     let tail: String = text.chars().skip(count - kept).collect();
-    let marker = prompt::cut(count - max);
+    let marker = marker(count - max);
 
     format!("{head}{apart}{marker}{apart}{tail}")
 }

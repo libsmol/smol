@@ -251,7 +251,7 @@ impl Place {
         }
     }
 
-    /// What arrives for the task at work, as `[Task update]`
+    /// What arrives for the task at work
     pub(crate) fn queue(&self) -> &dyn Queue {
         match self {
             Place::Main { queue, .. } | Place::Delegated { queue } => queue.as_ref(),

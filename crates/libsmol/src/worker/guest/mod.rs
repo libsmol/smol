@@ -133,6 +133,7 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
 
     let scope = globals.as_any();
     let run = scope.get_item("_run")?;
+    let listing = scope.get_item("_globals")?;
     let server = scope.get_item("_server")?;
     let unserver = scope.get_item("_unserver")?;
     let described = scope.get_item("_described")?;
@@ -223,6 +224,11 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
                     .and_then(|tools| server.call1((source, name, description, tools)))
                     .and_then(|installed| json_of(&installed));
                 installed.map_err(|error| shown(&error))
+            }
+
+            HostCall::Globals => {
+                let listed = listing.call0().and_then(|listed| json_of(&listed));
+                listed.map_err(|error| shown(&error))
             }
         };
         let reply = Message::reply(id, result);
