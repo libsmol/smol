@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
-## Unreleased
+## 0.13.0 - 2026-11-21
 
 - After compaction the model is told which names its Python session still
   holds: what it imported, with where from when renamed, the `def` and `class`
