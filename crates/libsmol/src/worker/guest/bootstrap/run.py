@@ -249,10 +249,11 @@ def _run(code):
             else:
                 error = f"syntax error on line {exc.lineno}: {exc.msg}\n{source}\n{caret}"
 
-        # The last statement rebinding each global name, and how many do,
+        # The statement binding each global name, or None where several do,
         # outside functions, classes and comprehensions
         bound = {}
-        binders = {}
+        # Names rebound from their own value, which keep a def's listing but not an import's
+        rewrapped = set()
         pending = [(node, node) for node in parsed.body] if blocks else []
         while pending:
             node, statement = pending.pop()
@@ -267,31 +268,31 @@ def _run(code):
                 names.extend(imported)
             elif isinstance(node, _ast.NamedExpr):
                 # The value is the right side of :=, not the whole statement around it
-                if not _reads(node.value, node.target.id):
+                if _reads(node.value, node.target.id):
+                    rewrapped.add(node.target.id)
+                else:
                     names.append(node.target.id)
                 pending.append((node.value, statement))
             elif isinstance(node, _ast.Name) and isinstance(node.ctx, _ast.Store):
-                # An assignment that reads the name's old value is not a rebinding
                 value = getattr(statement, "value", None)
                 reads = value is not None and _reads(value, node.id)
-                if not reads and not isinstance(statement, _ast.AugAssign):
+                if reads or isinstance(statement, _ast.AugAssign):
+                    rewrapped.add(node.id)
+                else:
                     names.append(node.id)
             elif not isinstance(node, _SCOPES):
                 children = [(child, statement) for child in _ast.iter_child_nodes(node)]
                 pending.extend(children)
 
             for name in names:
-                # One line may hold several assignments
-                at = (node.lineno, node.col_offset)
-                if name not in bound or at >= bound[name][0]:
-                    bound[name] = (at, statement)
-                binders[name] = binders.get(name, 0) + 1
+                bound[name] = None if name in bound else statement
 
         # A def or import alone in binding its name ran if the name's value changed,
         # where with others, such as in try and except, any of them may have
-        for name, (_, statement) in bound.items():
-            alone = binders[name] == 1
-            if alone and isinstance(statement, (*_DEFINITIONS, _ast.Import, _ast.ImportFrom)):
+        for name, statement in bound.items():
+            imported = isinstance(statement, (_ast.Import, _ast.ImportFrom))
+            defined = isinstance(statement, _DEFINITIONS)
+            if defined or (imported and name not in rewrapped):
                 tracked[name] = (statement, _STATE.get(name))
 
         for block in blocks:
@@ -374,7 +375,7 @@ def _run(code):
     try:
         for name, (statement, old) in tracked.items():
             value = _STATE.get(name)
-            if value is old:
+            if name not in _STATE or value is old:
                 continue
 
             if isinstance(statement, (_ast.Import, _ast.ImportFrom)):
@@ -405,9 +406,10 @@ def _run(code):
             start = min(linenos)
             lines = code.split("\n")[start - 1 : statement.end_lineno]
             written = "\n".join(lines)
+            # The code's own __setattr__ may refuse it in any way
             try:
                 value._smol_source = _textwrap.dedent(written)
-            except (AttributeError, TypeError):
+            except Exception:
                 pass
 
         for name, (value, _, _) in list(_BINDINGS.items()):
@@ -421,16 +423,18 @@ def _run(code):
     return {"error": clean(error), "repaired": clean(repaired)}
 
 _SIZED = (str, bytes, bytearray, list, tuple, dict, set, frozenset)
-# type's own descriptors, which a metaclass the code wrote can't override as it can attribute lookups
+# The builtins' own descriptors, which a metaclass or module class the code wrote can't override
 _NAME = type.__dict__["__name__"].__get__
 _MRO = type.__dict__["__mro__"].__get__
 _DICT = type.__dict__["__dict__"].__get__
+_MODULE_DICT = _types.ModuleType.__dict__["__dict__"].__get__
 
 # A name still holding what its def, class or import bound shows as written there, and any other only by its type
 def _globals():
     listing = {"imports": [], "defined": [], "values": []}
     for name, value in list(_STATE.items()):
-        if type(name) is not str or name.startswith("_"):
+        # A name that isn't an identifier may not even encode to UTF-8
+        if type(name) is not str or not name.isidentifier() or name.startswith("_"):
             continue
 
         held = _BINDINGS.get(name)
@@ -439,11 +443,16 @@ def _globals():
             _, section, entry = held
             listing[section].append(entry)
         elif issubclass(kind, _types.ModuleType):
-            listing["imports"].append({"name": name, "origin": None})
+            named = _MODULE_DICT(value).get("__name__")
+            # Any other name may not even encode to UTF-8
+            dotted = type(named) is str and all(part.isidentifier() for part in named.split("."))
+            origin = named if dotted and named != name else None
+            listing["imports"].append({"name": name, "origin": origin})
         else:
             mro = _MRO(kind)
-            # Private classes such as grep()'s result go by the public one they extend
-            public = [base for base in mro if base is not object and not _NAME(base).startswith("_")]
+            # Private classes such as grep()'s result go by the public one they extend, and a class
+            # named with a str subclass could run its own startswith
+            public = [base for base in mro if base is not object and not str.startswith(_NAME(base), "_")]
             shown = _NAME(public[0] if public else kind)
             # Only a built-in class first defining __len__ gives a length, found by identity as == would run a metaclass's __eq__
             length = None

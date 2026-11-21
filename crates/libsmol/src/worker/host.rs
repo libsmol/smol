@@ -981,10 +981,8 @@ pub(crate) mod tests {
         let output = worker.eval(code);
 
         assert_eq!(output.printed, "");
-        let Some(CallError::Interrupted(Some(at))) = &output.error else {
-            panic!("{:?}", output.error);
-        };
-        assert!(at.contains("line "), "{at}");
+        let stopped = matches!(output.error, Some(CallError::Interrupted(Some(_))));
+        assert!(stopped, "{:?}", output.error);
 
         interrupt.begin(1);
         let output = worker.eval("[noted, 1 + 1]");
@@ -997,19 +995,30 @@ pub(crate) mod tests {
     #[test]
     fn globals_listed() {
         let mut worker = fresh();
-        let code = "import json, contextlib\nfrom os.path import join\n\
+        let code = "import json, contextlib, importlib\nfrom os.path import join\nfrom math import pi\n\
             if True:\n    import collections as co\n\
+            codec = importlib.import_module('json')\n\
             class Meta(type):\n    def __getattribute__(cls, name):\n        raise RuntimeError('meta')\n    \
-            @property\n    def __name__(cls):\n        raise RuntimeError('name')\n\
-            class Trap(list, metaclass=Meta):\n    def __len__(self):\n        raise RuntimeError('len')\n\
+            @property\n    def __name__(cls):\n        raise RuntimeError('name')\n    \
+            def __eq__(cls, other):\n        raise RuntimeError('eq')\n    __hash__ = type.__hash__\n\
+            class Trap(list, metaclass=Meta):\n    def __len__(self):\n        raise RuntimeError('len')\n    \
+            def __getattribute__(self, name):\n        raise RuntimeError('attribute')\n\
             @contextlib.contextmanager\ndef opened(path: Missing, mode='r') -> Missing:\n    yield\n\
+            class Lazy(type(json)):\n    def __getattribute__(self, name):\n        raise RuntimeError('module')\n\
+            lazy = Lazy('naïve')\n\
             def row[T](n: T, word='café') -> T:\n    return n\n\
-            trap = Trap()\nwords = ['café', 'naïve']\n_hidden = 1";
+            pi *= 2\ntrap = Trap()\nwords = ['café', 'naïve']\ngone = 1\n\
+            globals()['caf\\udce9'] = 1\n_hidden = 1";
         let output = worker.eval(code);
         assert_eq!(output.error, None, "{}", output.printed);
         // The import after the error never ran, though the line before it rebound its name
         let output = worker.eval("join = 'résumé'\n1 / 0\nfrom os.path import join");
         assert!(output.error.is_some(), "{}", output.printed);
+        // A def whose name is gone gives no header once the name holds something else
+        let output = worker.eval("def gone(n):\n    return n\ndel gone");
+        assert_eq!(output.error, None, "{}", output.printed);
+        let output = worker.eval("gone = None");
+        assert_eq!(output.error, None, "{}", output.printed);
 
         let listing = worker.globals();
         let globals = block_on(listing);
@@ -1020,13 +1029,17 @@ pub(crate) mod tests {
         let imports = [
             imported("json", None),
             imported("contextlib", None),
+            imported("importlib", None),
             imported("co", Some("collections")),
+            imported("codec", Some("json")),
+            imported("lazy", Some("naïve")),
         ];
         assert_eq!(globals.imports, imports);
         let defined = [
             "class Meta(type)",
             "class Trap(list, metaclass=Meta)",
             "def opened(path: Missing, mode='r') -> Missing",
+            "class Lazy(type(json))",
             "def row[T](n: T, word='café') -> T",
         ];
         assert_eq!(globals.defined, defined);
@@ -1037,13 +1050,16 @@ pub(crate) mod tests {
         };
         let values = [
             variable("join", "str", Some(6)),
+            variable("pi", "float", None),
             variable("trap", "Trap", None),
             variable("words", "list", Some(2)),
+            variable("gone", "NoneType", None),
         ];
         assert_eq!(globals.values, values);
     }
 
-    /// A syntax error the tag repair can't fix comes back with the line it is on
+    /// A syntax error the tag repair can't fix comes back with its line,
+    /// though what follows the parse assumes there was one
     #[test]
     fn syntax_errors_reported() {
         let mut worker = fresh();

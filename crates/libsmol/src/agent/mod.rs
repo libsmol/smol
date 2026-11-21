@@ -641,8 +641,7 @@ pub(crate) async fn title_of(
     task: String,
     attached: Vec<String>,
 ) -> Option<String> {
-    let task: String = task.chars().take(MAX_TITLING_CHARS).collect();
-    let message = prompt::first_message(&task, &attached);
+    let message = prompt::first_message(&task, &attached, MAX_TITLING_CHARS);
     let request = [
         ChatMessage::System(prompt::titler()),
         ChatMessage::user(message),

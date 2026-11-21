@@ -19,7 +19,8 @@ const MIN_TRANSCRIPT_SHARE: f64 = 0.25;
 const MIN_OBSERVATION_CHARS: usize = 1024;
 
 impl Turn<'_> {
-    /// An interrupt yields no summary and is recorded by the next step
+    /// An interrupt before the summary is written yields none and is recorded by the next step,
+    /// and one while the names are listed keeps the summary without them
     pub(crate) async fn compact(&mut self) -> Result<()> {
         let model = &*self.agent.model;
         let Some(window) = model.context_window() else {

@@ -17,6 +17,9 @@ but their files stay in `~/.smol/projects` untouched.
   `class` wrote it only while it holds the object that statement bound, and
   otherwise by its type, so none of the code's own methods run. Past 4,096
   characters the rest are only counted, with a note that `dir()` lists them.
+  `help()` prints no code for a function that several statements of one call
+  define, such as both branches of an `if`, where it could print the one that
+  didn't run.
 - What the user writes while a task runs reaches the model as written, followed
   by a note to respond to it in the text of the reply and go on with the task
   unless it asks to stop, where it started with `[Task update]`. The system
@@ -38,7 +41,7 @@ but their files stay in `~/.smol/projects` untouched.
   direction, replaces it or goes on to an agent at work passed on both models.
 - After compaction in a turn that programs ending while no turn ran opened, the
   task answered before is no longer retold as the current task, and what the
-  user wrote during that turn is, where it was dropped.
+  user wrote during that turn comes back on its own.
 - The title of a session names the files and resources its first message came
   with, so a message such as "Fix this" with a file gets a title naming the
   file, and one with only files gets a title at all.
@@ -53,10 +56,12 @@ but their files stay in `~/.smol/projects` untouched.
   the new ones half as much like a log and more useful for going on.
 - An agent's answer that arrives in an `[Agent done]` message is cut in the
   middle past 16,384 characters, as a call's output is, with a note that
-  `agent.wait(name)` returns the whole answer, which the code can read in
-  parts. Before, several long answers could fill the context at once.
+  `agent.wait(name)` returns the whole answer until that agent gets another
+  task, which the code can read in parts. Before, several long answers could
+  fill the context at once.
 - An interrupted call tells the model where the code stopped, such as
-  `line 8: time.sleep(0.05)`, after `[interrupted by the user]`.
+  `line 8: time.sleep(0.05)`, after `[interrupted by the user]`, and the
+  summarizer sees it too.
 
 ## 0.12.0 - 2026-11-19
 

@@ -47,6 +47,16 @@ pub(crate) enum CallError {
     Stopped(Option<String>),
 }
 
+impl CallError {
+    /// Where interrupted code stopped, as the worker reported it
+    pub(crate) fn stopped_at(&self) -> Option<&str> {
+        match self {
+            CallError::Interrupted(at) | CallError::Stopped(at) => at.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub(crate) struct Usage {
     /// Seconds from the first request to its end, waits to retry and code that ran included
@@ -677,7 +687,7 @@ pub(crate) struct Visible<'a> {
     pub(crate) summary: Option<&'a SummaryStep>,
     /// The task of the last turn among the summarized steps, if it had one
     task: Option<&'a TaskStep>,
-    /// Updates after that task that were summarized too
+    /// What arrived during that turn that was summarized too
     updates: Vec<&'a str>,
     pub(crate) steps: Vec<&'a MemoryStep>,
 }

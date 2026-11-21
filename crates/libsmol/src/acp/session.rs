@@ -426,17 +426,10 @@ impl Session {
         let asked = prompt.task.as_ref().map(|task| task.text.as_str());
         let asked = asked.unwrap_or_default();
         let mentions = prompt.task.as_ref().map(|task| task.mentions.as_slice());
+        let mentions = mentions.unwrap_or_default();
         let cwd = &self.agent.workplace.cwd;
-        let mut attached = Vec::new();
-        for mention in mentions.unwrap_or_default() {
-            let Some(name) = mention.name(cwd) else {
-                continue;
-            };
-            // Parts of one file name it again
-            if !attached.contains(&name) {
-                attached.push(name);
-            }
-        }
+        let named = mentions.iter().filter_map(|mention| mention.name(cwd));
+        let attached: Vec<String> = named.collect();
         let worded = !asked.trim().is_empty() || !attached.is_empty();
         let tasked = |step: &MemoryStep| matches!(step, MemoryStep::Task(_));
         let first = !self.memory.steps.iter().any(tasked);

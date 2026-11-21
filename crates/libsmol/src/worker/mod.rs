@@ -104,7 +104,8 @@ pub(crate) enum HostCall {
     Globals,
 }
 
-/// The names the code left in the worker's globals
+/// The names the code left in the worker's globals, as `_globals` returns them
+/// and the session file saves them
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Globals {
     pub(crate) imports: Vec<Imported>,
