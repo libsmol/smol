@@ -59,6 +59,11 @@ but their files stay in `~/.smol/projects` untouched.
   `agent.wait(name)` returns the whole answer until that agent gets another
   task, which the code can read in parts. Before, several long answers could
   fill the context at once.
+- Through the Responses API, a call goes back under the id its provider gave,
+  where it went back as `call_N`. DeepSeek, which sometimes calls a tool
+  without reasoning first, finds what led to a call by that id, and refused the
+  next request with `The reasoning_text in the thinking mode must be passed
+  back` once it couldn't. Sessions saved before keep sending `call_N`.
 - An interrupted call tells the model where the code stopped, such as
   `line 8: time.sleep(0.05)`, after `[interrupted by the user]`, and the
   summarizer sees it too.

@@ -4,6 +4,7 @@ use crate::model::{
 };
 use crate::prompt::{self, TOOL};
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::mem;
 
 /// Media goes in the tool output that shows it, which this API takes
@@ -13,6 +14,8 @@ pub(crate) fn body(
     purpose: Purpose,
 ) -> Map<String, Value> {
     let mut input = Vec::new();
+    // Calls that go back under the ids their provider gave
+    let mut renamed = HashMap::new();
     for group in grouped(conversation) {
         match &group[0] {
             ChatMessage::System(text) => {
@@ -63,7 +66,13 @@ pub(crate) fn body(
                             let Some(call) = calls.next() else {
                                 continue;
                             };
-                            item["call_id"] = json!(call.id);
+                            // Items saved before kept no id
+                            match kept["call_id"].as_str() {
+                                Some(id) => {
+                                    renamed.insert(call.id.as_str(), id);
+                                }
+                                None => item["call_id"] = json!(call.id),
+                            }
                             item["name"] = json!(call.name);
                             item["arguments"] = json!(call.arguments);
                         }
@@ -94,6 +103,7 @@ pub(crate) fn body(
             }
             ChatMessage::Tool { id, parts } => {
                 let output = model.content(&[parts.as_slice()], None);
+                let id = renamed.get(id.as_str()).copied().unwrap_or(id);
                 let item =
                     json!({ "type": "function_call_output", "call_id": id, "output": output });
                 input.push(item);
@@ -157,7 +167,8 @@ impl Stream {
         if kind == "response.output_item.done" {
             let held: &[&str] = match item["type"].as_str() {
                 Some("message") => &["content"],
-                Some("function_call") => &["call_id", "name", "arguments"],
+                // The provider finds what led to a call by the id it gave, which goes back
+                Some("function_call") => &["name", "arguments"],
                 _ => &[],
             };
             let mut kept = item.clone();
@@ -469,10 +480,13 @@ mod tests {
             id: id.to_owned(),
             parts: vec![Part::Text("café".to_owned())],
         };
+        // The first call kept the id its provider gave, as items saved before kept none
+        let mut given = called("fc_1");
+        given["call_id"] = json!("call_00_xy");
         let items = vec![
             thought("rs_1"),
             said("msg_1"),
-            called("fc_1"),
+            given,
             thought("rs_2"),
             said("msg_2"),
             called("fc_2"),
@@ -524,11 +538,11 @@ mod tests {
             { "role": "user", "content": "Count the cafés" },
             thought("rs_1"),
             { "type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "phase": "commentary", "content": said_first },
-            { "type": "function_call", "id": "fc_1", "status": "completed", "call_id": "call_1", "name": "eval", "arguments": "{\"code\":\"print(1)\"}" },
+            { "type": "function_call", "id": "fc_1", "status": "completed", "call_id": "call_00_xy", "name": "eval", "arguments": "{\"code\":\"print(1)\"}" },
             thought("rs_2"),
             { "type": "message", "id": "msg_2", "role": "assistant", "status": "completed", "phase": "commentary", "content": said_then },
             { "type": "function_call", "id": "fc_2", "status": "completed", "call_id": "call_2", "name": "eval", "arguments": "{\"code\":\"print(2)\"}" },
-            output("call_1"),
+            output("call_00_xy"),
             output("call_2"),
             thought("rs_4"),
             { "role": "assistant", "content": "Once more for the résumé." },
