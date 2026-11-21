@@ -23,10 +23,6 @@ pub(crate) const ARGUMENT_DOC: &str = "The Python code to run.";
 
 /// Labels what arrived while the agent worked in the transcript the summarizer reads
 pub(crate) const UPDATE: &str = "Task update";
-const RESPOND_NOW: &str =
-    "[Respond to this in the text of your reply and go on with the task, unless it asks you to stop.]";
-const COVER_LATER: &str =
-    "[Go on with the task and cover this in your answer, unless it asks you to stop.]";
 
 const RULES: &str = "- Never make up data or functions; check unfamiliar ones with `help()`.
 - Do the task instead of describing it.
@@ -226,13 +222,16 @@ pub(crate) fn system(
         true => format!("\n\n{SHOWN_IMAGES}"),
         false => String::new(),
     };
-    let updates = |from: &str| {
-        format!("{from} may write while you work; what arrives then belongs to the current task and may add to or change it.")
+    let updates = |from: &str, handling: &str| {
+        format!("{from} may write while you work; what arrives then belongs to the current task and may add to or change it. {handling}, unless it asks you to stop.")
     };
     let (ending, note, trusting, lasting) = match place {
         Place::Main { .. } => (
             ", in Markdown, and ends the task. It goes to the user, and no hidden tests or graders check it.",
-            updates("The user"),
+            updates(
+                "The user",
+                "Respond to it in the text of your reply and go on with the task",
+            ),
             format!("\n- {TRUSTING}"),
             "",
         ),
@@ -240,7 +239,11 @@ pub(crate) fn system(
             " and ends the task.",
             format!(
                 "{HANDED_BACK}\n- {REPORTING}\n- {}",
-                updates("The agent that assigned your task")
+                // Only the answer of an agent that `agent()` started goes back to the code
+                updates(
+                    "The agent that assigned your task",
+                    "Go on with the task and cover it in your answer"
+                )
             ),
             String::new(),
             " until you answer",
@@ -427,19 +430,6 @@ pub(crate) fn task(step: &TaskStep, takes: &dyn Fn(MediaKind) -> bool) -> Vec<Pa
         parts.push(part);
     }
 
-    parts
-}
-
-/// The note follows what was written, since a label before it read to models as a note of work done
-pub(crate) fn update(step: &TaskStep, takes: &dyn Fn(MediaKind) -> bool, rank: Rank) -> Vec<Part> {
-    let mut parts = task(step, takes);
-    let note = match rank {
-        Rank::Main => RESPOND_NOW,
-        // Only the answer of an agent that `agent()` started goes back to the code
-        Rank::Delegated => COVER_LATER,
-    };
-    let note = format!("\n{note}");
-    parts.push(Part::Text(note));
     parts
 }
 

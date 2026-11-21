@@ -29,8 +29,7 @@ impl Turn<'_> {
         };
 
         let takes = |kind| model.takes(kind);
-        let rank = self.agent.place.rank();
-        let used = self.memory.tokens(&self.system, &takes, rank, Some(window));
+        let used = self.memory.tokens(&self.system, &takes, Some(window));
         let reserve = (window as f64 * RESERVE_SHARE) as u64;
         let reserve = reserve.min(MAX_RESERVE_TOKENS);
         // Servers may refuse a request whose input and output limit together pass the window,
@@ -53,7 +52,7 @@ impl Turn<'_> {
         let mut recent = 0;
         let mut kept = 0;
         for step in visible.steps.iter().rev() {
-            let messages = step.messages(&mut 0, &takes, rank);
+            let messages = step.messages(&mut 0, &takes);
             let sent = bytes(&messages);
             recent += estimate(sent);
             if recent > max_recent {
@@ -77,7 +76,7 @@ impl Turn<'_> {
                 _ => false,
             };
 
-            let messages = step.messages(&mut 0, &takes, rank);
+            let messages = step.messages(&mut 0, &takes);
             let sent = bytes(&messages);
             unseen += estimate(sent);
             if unseen > left / 2 {
@@ -206,7 +205,7 @@ impl Turn<'_> {
         };
 
         self.memory.steps.push(MemoryStep::Summary(summary));
-        let used = self.memory.tokens(&self.system, &takes, rank, Some(window));
+        let used = self.memory.tokens(&self.system, &takes, Some(window));
         let Some(MemoryStep::Summary(summary)) = self.memory.steps.last_mut() else {
             panic!("summary");
         };
@@ -253,7 +252,6 @@ mod tests {
     use crate::steps::tests::{asked, coded, metered, replied};
     use crate::steps::{AgentMemory, AgentStep};
     use crate::tests::content;
-    use crate::worker::host::Rank;
     use crate::worker::Variable;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -429,8 +427,8 @@ mod tests {
         let loaded: AgentMemory = serde_json::from_str(&saved).expect("deserialize");
         let all = |_| true;
         assert_eq!(
-            loaded.conversation("", &all, Rank::Main, None),
-            memory.conversation("", &all, Rank::Main, None)
+            loaded.conversation("", &all, None),
+            memory.conversation("", &all, None)
         );
     }
 

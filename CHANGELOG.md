@@ -20,25 +20,23 @@ but their files stay in `~/.smol/projects` untouched.
   `help()` prints no code for a function that several statements of one call
   define, such as both branches of an `if`, where it could print the one that
   didn't run.
-- What the user writes while a task runs reaches the model as written, followed
-  by a note to respond to it in the text of the reply and go on with the task
-  unless it asks to stop, where it started with `[Task update]`. The system
-  prompt says such a message belongs to the current task and may add to or
-  change it. An agent that `agent()` started, whose text only its answer passes
-  on, is told to cover the message in its answer instead. After compaction the
-  messages follow the current task under `[Current task]` as written, without
-  the note, since they are part of the task by then and may have been answered
-  already.
+- What the user writes while a task runs reaches the model as written, where it
+  started with `[Task update]`. The system prompt says such a message belongs
+  to the current task and may add to or change it, and that the model responds
+  to it in the text of its reply and goes on with the task unless it asks to
+  stop. An agent that `agent()` started, whose text only its answer passes on,
+  is told to cover the message in its answer instead. After compaction the
+  messages follow the current task under `[Current task]` as written.
   Replays of a real session with grok showed two problems. The label made the
   model take the user's words for a note of work done: asked mid-task to also
   rename something, it said the rename was done without making it in 14 of 48
-  tries, and in none of 12 with the note after the words. Asked how far it had
-  got, it reported and stopped, ending the task, in 4 of 6 tries without the
-  note and 2 of 12 with it, answering in the text of a reply that goes on
-  working in 9 of 12. deepseek went on working in 12 of 12 tries with the note
-  and answered in that text in 11. Evaluation tasks where the message adds to
+  tries, and in none of 12 without the label and with a note to respond after
+  the words. Asked how far it had got, it reported and stopped, ending the
+  task, in 4 of 6 tries without that note and 2 of 12 with it. With the note's
+  rule in the system prompt instead, evaluation tasks where the message adds to
   the task, asks a side question or for progress, refines it, changes its
-  direction, replaces it or goes on to an agent at work passed on both models.
+  direction, replaces it or goes on to an agent at work passed in 34 of 34 runs
+  on grok and deepseek, and with the note after each message in 33 of 34.
 - After compaction in a turn that programs ending while no turn ran opened, the
   task answered before is no longer retold as the current task, and what the
   user wrote during that turn comes back on its own.

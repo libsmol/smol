@@ -20,8 +20,7 @@ impl Turn<'_> {
         let model = &*self.agent.model;
         let window = model.context_window();
         let takes = |kind| model.takes(kind);
-        let rank = self.agent.place.rank();
-        let conversation = self.memory.conversation(&self.system, &takes, rank, window);
+        let conversation = self.memory.conversation(&self.system, &takes, window);
 
         let interrupt = &self.agent.interrupt;
         let mut tries = 0;
@@ -339,7 +338,6 @@ mod tests {
     use crate::prompt;
     use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::{content, Temp};
-    use crate::worker::host::Rank;
     use std::sync::{Arc, Mutex};
 
     fn agent(replies: Vec<Script>) -> Temp<Tested> {
@@ -390,7 +388,7 @@ mod tests {
 
         let action = MemoryStep::Action(Box::new(step.clone()));
         let mut calls = 3;
-        let messages = action.messages(&mut calls, &|_| true, Rank::Main);
+        let messages = action.messages(&mut calls, &|_| true);
         let ChatMessage::Assistant { calls: sent, .. } = &messages[0] else {
             panic!("{messages:?}");
         };
@@ -473,7 +471,7 @@ mod tests {
 
         let action = MemoryStep::Action(Box::new(steps[0].clone()));
         let sent: Vec<String> = action
-            .messages(&mut 0, &|_| true, Rank::Main)
+            .messages(&mut 0, &|_| true)
             .iter()
             .map(content)
             .collect();
@@ -506,7 +504,7 @@ mod tests {
 
         let action = MemoryStep::Action(Box::new(step.clone()));
         let sent: Vec<String> = action
-            .messages(&mut 0, &|_| true, Rank::Main)
+            .messages(&mut 0, &|_| true)
             .iter()
             .map(content)
             .collect();
