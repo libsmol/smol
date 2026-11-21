@@ -8,6 +8,7 @@ use crate::utils::truncated;
 use crate::worker::Globals;
 use crate::Result;
 use std::time::Instant;
+use tracing::{info, warn};
 
 /// Reserved for the next reply only, as the summary request has its own budget
 const RESERVE_SHARE: f64 = 0.15;
@@ -66,22 +67,15 @@ impl Turn<'_> {
         let mut unseen = 0;
         let mut pending = 0;
         for step in visible.steps.iter().rev() {
-            let unread = matches!(
-                step,
-                MemoryStep::Task(_)
-                    | MemoryStep::Update(_)
-                    | MemoryStep::Shell(_)
-                    | MemoryStep::Restarted
-                    | MemoryStep::Done(_)
-            );
-            // The model wrote the reply but hasn't seen its call replies or errors
+            // The model hasn't seen what came of a reply's calls or error, nor any other step
             let reported = match step {
-                MemoryStep::Action(action) => !action.calls.is_empty() || action.error.is_some(),
+                MemoryStep::Action(action) if action.calls.is_empty() && action.error.is_none() => {
+                    break;
+                }
+                MemoryStep::Action(_) => true,
+                // Visible steps hold no summaries
                 _ => false,
             };
-            if !unread && !reported {
-                break;
-            }
 
             let messages = step.messages(&mut 0, &takes, rank);
             let sent = bytes(&messages);
@@ -168,6 +162,10 @@ impl Turn<'_> {
                     continue;
                 }
 
+                match &failure {
+                    Failure::Interrupted => info!("compact: interrupted"),
+                    Failure::Model(error) => warn!("compact: failed, {error}"),
+                }
                 self.sink.event(Event::CompactEnd(Err(&failure)));
                 // The step still runs while the conversation and the output limit fit
                 let Failure::Model(error) = failure else {
@@ -213,6 +211,8 @@ impl Turn<'_> {
             panic!("summary");
         };
         summary.used = Some(used);
+        let seconds = summary.usage.duration;
+        info!("compact: done [kept={kept}, elapsed={seconds:.1}s]");
         self.sink.event(Event::CompactEnd(Ok(summary)));
         self.sink.saved(self.memory);
 
@@ -225,22 +225,21 @@ fn squeezed(steps: &[&MemoryStep], budget: u64) -> String {
     // Stored observations are already cut and a second cut would lose their count,
     // so try them as they are
     let mut max = usize::MAX;
-    let text = loop {
+    let (text, tokens) = loop {
         let text = prompt::transcript(steps, max);
         let size = text_bytes(&text);
-        if estimate(size) <= budget {
+        let tokens = estimate(size);
+        if tokens <= budget {
             return text;
         }
         if max <= MIN_OBSERVATION_CHARS {
-            break text;
+            break (text, tokens);
         }
         max = max.min(MAX_OBSERVATION_CHARS) / 2;
     };
 
     // Tokens become characters at the text's average rate,
     // so a denser head or tail may pass the budget a little
-    let size = text_bytes(&text);
-    let tokens = estimate(size).max(1);
     let chars = text.chars().count() as u64;
     let kept = budget.saturating_mul(chars) / tokens;
     truncated(&text, kept as usize)

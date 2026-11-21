@@ -8,26 +8,6 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::mem;
 
-/// The standard and bright colors as xterm draws them
-const ANSI: [(u8, u8, u8); 16] = [
-    (0x00, 0x00, 0x00),
-    (0xCD, 0x00, 0x00),
-    (0x00, 0xCD, 0x00),
-    (0xCD, 0xCD, 0x00),
-    (0x00, 0x00, 0xEE),
-    (0xCD, 0x00, 0xCD),
-    (0x00, 0xCD, 0xCD),
-    (0xE5, 0xE5, 0xE5),
-    (0x7F, 0x7F, 0x7F),
-    (0xFF, 0x00, 0x00),
-    (0x00, 0xFF, 0x00),
-    (0xFF, 0xFF, 0x00),
-    (0x5C, 0x5C, 0xFF),
-    (0xFF, 0x00, 0xFF),
-    (0x00, 0xFF, 0xFF),
-    (0xFF, 0xFF, 0xFF),
-];
-
 /// The screen every device shows, which keeps its cells for those that join later
 /// and the cells drawn since they were last sent
 pub(crate) struct Grid {
@@ -269,49 +249,13 @@ pub(crate) fn encode(
     frame.to_string()
 }
 
-/// `null` leaves the page's own foreground or background
+/// Only RGB colors, which are all smol draws, and `null` for any other, which leaves
+/// the page's own foreground or background as `Reset` does
 fn hex(color: Color) -> Value {
-    let (red, green, blue) = match color {
-        Color::Reset => return Value::Null,
-        Color::Rgb(red, green, blue) => (red, green, blue),
-        Color::Indexed(index) => indexed(index),
-        Color::Black => ANSI[0],
-        Color::Red => ANSI[1],
-        Color::Green => ANSI[2],
-        Color::Yellow => ANSI[3],
-        Color::Blue => ANSI[4],
-        Color::Magenta => ANSI[5],
-        Color::Cyan => ANSI[6],
-        Color::Gray => ANSI[7],
-        Color::DarkGray => ANSI[8],
-        Color::LightRed => ANSI[9],
-        Color::LightGreen => ANSI[10],
-        Color::LightYellow => ANSI[11],
-        Color::LightBlue => ANSI[12],
-        Color::LightMagenta => ANSI[13],
-        Color::LightCyan => ANSI[14],
-        Color::White => ANSI[15],
+    let Color::Rgb(red, green, blue) = color else {
+        return Value::Null;
     };
     Value::from(format!("#{red:02x}{green:02x}{blue:02x}"))
-}
-
-/// The 256-color palette: the 16 colors, a 6×6×6 cube and a grey ramp
-fn indexed(index: u8) -> (u8, u8, u8) {
-    let level = |step: u8| match step {
-        0 => 0,
-        step => 55 + step * 40,
-    };
-    match index {
-        0..=15 => ANSI[usize::from(index)],
-        16..=231 => {
-            let cube = index - 16;
-            (level(cube / 36), level(cube / 6 % 6), level(cube % 6))
-        }
-        232..=255 => {
-            let grey = 8 + (index - 232) * 10;
-            (grey, grey, grey)
-        }
-    }
 }
 
 #[cfg(test)]

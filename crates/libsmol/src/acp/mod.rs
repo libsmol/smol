@@ -24,31 +24,29 @@ pub(crate) struct App {
     pub(crate) config: PathBuf,
 }
 
-fn task_of(blocks: &[ContentBlock]) -> Task {
+fn task_of(blocks: Vec<ContentBlock>) -> Task {
     let mut texts = Vec::new();
     let mut mentions = Vec::new();
     for block in blocks {
         let (uri, text) = match block {
             ContentBlock::Text(text) => {
-                texts.push(text.text.as_str());
+                texts.push(text.text);
                 continue;
             }
             ContentBlock::Image(image) => {
-                let data = image.data.clone();
+                let data = image.data;
                 mentions.push(Mention::Image { data });
                 continue;
             }
-            ContentBlock::ResourceLink(link) => (link.uri.as_str(), None),
-            ContentBlock::Resource(embedded) => match &embedded.resource {
-                EmbeddedResourceResource::TextResourceContents(sent) => {
-                    (sent.uri.as_str(), Some(sent.text.clone()))
-                }
+            ContentBlock::ResourceLink(link) => (link.uri, None),
+            ContentBlock::Resource(embedded) => match embedded.resource {
+                EmbeddedResourceResource::TextResourceContents(sent) => (sent.uri, Some(sent.text)),
                 _ => continue,
             },
             _ => continue,
         };
 
-        let url = Url::parse(uri).ok();
+        let url = Url::parse(&uri).ok();
         let lines = url.as_ref().and_then(Url::fragment).and_then(line_range);
         // `to_file_path` takes any scheme, so zed:///agent/... would become /agent/...
         let local = url.filter(|url| url.scheme() == "file");
@@ -56,10 +54,7 @@ fn task_of(blocks: &[ContentBlock]) -> Task {
 
         let mention = match (path, text) {
             (Some(path), text) => Mention::File { path, lines, text },
-            (None, Some(text)) => {
-                let uri = uri.to_owned();
-                Mention::Resource { uri, text }
-            }
+            (None, Some(text)) => Mention::Resource { uri, text },
             // Clients don't always repeat links like web pages in the text
             (None, None) => {
                 texts.push(uri);
@@ -133,13 +128,13 @@ mod tests {
             ContentBlock::Resource(EmbeddedResource::new(resource))
         };
         let diagnostics = "zed:///agent/diagnostics?include_warnings=true";
-        let blocks = [
+        let blocks = vec![
             ContentBlock::ResourceLink(picked),
             sent(uri.as_str(), selected),
             sent(diagnostics, "error: unused café"),
         ];
 
-        let task = task_of(&blocks);
+        let task = task_of(blocks);
 
         let file = |text: Option<&str>| Mention::File {
             path: path.clone(),

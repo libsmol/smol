@@ -4,6 +4,8 @@ use landlock::{
     Access as _, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
     ABI,
 };
+use reaper::path_cause;
+#[cfg(target_os = "linux")]
 use reaper::{cause, tilde};
 #[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
@@ -91,12 +93,7 @@ impl Sandbox {
         let name = format!("{TEMP_PREFIX}{id}");
         let temp = env::temp_dir().join(name);
         let scratch = temp.join(SCRATCH);
-        let failed = |path: &Path, e: io::Error| {
-            let shown = tilde(path);
-            let reason = cause(&e);
-            format!("{shown}: {reason}")
-        };
-        fs::create_dir_all(&scratch).map_err(|e| failed(&scratch, e))?;
+        fs::create_dir_all(&scratch).map_err(|e| path_cause(&scratch, &e))?;
 
         // Dropping it when a step below fails removes the temporary folder
         let mut sandbox = Self {
@@ -106,8 +103,8 @@ impl Sandbox {
             isolation: None,
         };
         let path = temp.join(LOCK);
-        let lock = File::create(&path).map_err(|e| failed(&path, e))?;
-        lock.lock().map_err(|e| failed(&path, e))?;
+        let lock = File::create(&path).map_err(|e| path_cause(&path, &e))?;
+        lock.lock().map_err(|e| path_cause(&path, &e))?;
         sandbox.lock = Some(lock);
 
         for name in &rules.env {

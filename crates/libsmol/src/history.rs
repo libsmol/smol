@@ -2,7 +2,7 @@ use crate::config::{AgentConfig, McpConfig, Models};
 use crate::steps::{AgentMemory, AgentRecord, MemoryStep};
 use crate::utils::{folded, new_id};
 use crate::{Error, Result};
-use reaper::{cause, tilde};
+use reaper::{path_cause, tilde};
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 use sha2::{Digest, Sha256};
@@ -428,10 +428,7 @@ fn session_file(project: &Path, id: &str) -> Result<PathBuf> {
 }
 
 fn failed(path: &Path, error: &dyn error::Error) -> Error {
-    let path = tilde(path);
-    let reason = cause(error);
-
-    let message = format!("{path}: {reason}");
+    let message = path_cause(path, error);
     Error::History(message)
 }
 

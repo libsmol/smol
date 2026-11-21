@@ -157,8 +157,7 @@ impl SessionPeer {
         self.send(NOTICE, notice);
     }
 
-    pub(crate) fn servers(&self, servers: &[McpStatus]) {
-        let servers = servers.to_vec();
+    pub(crate) fn servers(&self, servers: Vec<McpStatus>) {
         self.send(MCP, wire::Servers { servers });
     }
 
@@ -181,8 +180,7 @@ impl SessionPeer {
     /// while no turn ran, for it to hand them the next turn
     pub(crate) fn background_ended(&self) {
         if self.declared().background {
-            let params = json!({ "sessionId": &*self.id });
-            self.peer.notify(BACKGROUND, params);
+            self.send(BACKGROUND, ());
         }
     }
 
@@ -192,7 +190,11 @@ impl SessionPeer {
             return None;
         }
 
-        let params = json!({ "sessionId": &*self.id });
+        let session_id = self.id.to_string();
+        let params = Addressed {
+            session_id,
+            body: (),
+        };
         self.peer.call(QUEUED, params).await
     }
 }

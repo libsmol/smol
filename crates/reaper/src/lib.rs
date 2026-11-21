@@ -122,6 +122,13 @@ pub fn cause(error: &dyn Error) -> String {
     first.to_lowercase().chain(chars).collect()
 }
 
+/// `path` and what went wrong with it, as an error's object and problem
+pub fn path_cause(path: &Path, error: &dyn Error) -> String {
+    let shown = tilde(path);
+    let reason = cause(error);
+    format!("{shown}: {reason}")
+}
+
 pub fn terminal_view(text: &str) -> String {
     if !text.contains(['\x1b', '\r']) {
         return text.to_owned();

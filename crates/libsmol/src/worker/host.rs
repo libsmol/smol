@@ -742,8 +742,9 @@ impl Live {
                         Message::Note(WorkerNote::Ready { functions }) => {
                             return Event::Ready(functions);
                         }
+                        // The worker no longer waits for a reply to the call it cancelled
                         Message::Note(WorkerNote::Cancel { id }) => {
-                            if let Some(abort) = self.running.get(&id) {
+                            if let Some(abort) = self.running.remove(&id) {
                                 abort.abort();
                             }
                         }

@@ -3,7 +3,7 @@ use crate::config::{Access, Skill};
 use crate::tests::profile_dir;
 use crate::worker::sandbox::{Rules, Sandbox};
 use crate::worker::venv::Venv;
-use reaper::{cause, tilde};
+use reaper::path_cause;
 use std::env;
 use std::fs;
 use std::io;
@@ -91,11 +91,7 @@ impl Workplace {
         // A Landlock rule holds on to the folder that exists when the rule is made.
         // An earlier session's code may have swapped one for a link, which the grant would follow
         for folder in [&copies, &venv.path] {
-            let failed = |e: io::Error| {
-                let shown = tilde(folder);
-                let reason = cause(&e);
-                format!("{shown}: {reason}")
-            };
+            let failed = |e: io::Error| path_cause(folder, &e);
             let swapped = fs::symlink_metadata(folder).is_ok_and(|found| !found.is_dir());
             if swapped {
                 let removed = fs::remove_file(folder).or_else(|_| fs::remove_dir(folder));

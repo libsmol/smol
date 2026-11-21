@@ -85,10 +85,10 @@ pub struct Memory {
     pub project: bool,
 }
 
-/// The params of a `_smol/` message, the session's id beside what its method carries
+/// The params of a `_smol/` message, the session's id beside what its method carries, if anything
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Addressed<T> {
+pub struct Addressed<T = ()> {
     pub session_id: String,
     #[serde(flatten)]
     pub body: T,

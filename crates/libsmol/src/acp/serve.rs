@@ -19,7 +19,6 @@ use agent_client_protocol_schema::ProtocolVersion;
 use reaper::cause;
 use reaper::wire::{self, Addressed, BACKGROUND, ENQUEUED, FORGET, MEMORIES, SHELL};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env::consts::OS;
@@ -158,7 +157,7 @@ pub(crate) async fn serve(mut input: Lines, app: Arc<App>) -> Result<()> {
             continue;
         }
 
-        let message = match serde_json::from_str::<Value>(&line) {
+        let mut message = match serde_json::from_str::<Value>(&line) {
             Ok(message) => message,
             Err(e) => {
                 let reason = e.to_string();
@@ -166,6 +165,10 @@ pub(crate) async fn serve(mut input: Lines, app: Arc<App>) -> Result<()> {
                 continue;
             }
         };
+        let params = message
+            .get_mut("params")
+            .map(Value::take)
+            .unwrap_or_default();
         let id = message.get("id");
         let Some(method) = message["method"].as_str() else {
             let replied = message.get("result").is_some() || message.get("error").is_some();
@@ -179,7 +182,6 @@ pub(crate) async fn serve(mut input: Lines, app: Arc<App>) -> Result<()> {
             }
             continue;
         };
-        let params = message["params"].clone();
 
         match id {
             Some(id) => match router.request(id, method, params) {
@@ -198,7 +200,7 @@ pub(crate) async fn serve(mut input: Lines, app: Arc<App>) -> Result<()> {
                 }
             }
             None if method == ENQUEUED => {
-                let Ok(enqueued) = serde_json::from_value::<SessionParams>(params) else {
+                let Ok(enqueued) = serde_json::from_value::<Addressed>(params) else {
                     continue;
                 };
                 if let Ok(session) = router.handle(&enqueued.session_id) {
@@ -251,12 +253,6 @@ impl Handle {
         self.interrupt.cancel(u64::MAX);
         self.task
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionParams {
-    session_id: String,
 }
 
 impl Router {
@@ -329,7 +325,7 @@ impl Router {
                 let marked = meta.and_then(|meta| meta.get(BACKGROUND));
                 let task = match marked.and_then(Value::as_bool) {
                     Some(true) => None,
-                    _ => Some(task_of(&request.prompt)),
+                    _ => Some(task_of(request.prompt)),
                 };
 
                 let session = &request.session_id.0;
@@ -349,7 +345,7 @@ impl Router {
                 None
             }
             MEMORIES => {
-                let request: SessionParams = parsed(params)?;
+                let request: Addressed = parsed(params)?;
                 let handle = self.handle(&request.session_id)?;
                 let memories = handle.memories.clone();
                 let span = handle.span.clone();

@@ -92,7 +92,7 @@ impl Agent {
         &'a self,
         servers: &'a [&'a Added],
         views: Box<dyn TaskViews>,
-        records: &Arc<Records>,
+        records: &'a Records,
     ) -> Box<Delegating<'a>> {
         let Place::Main { team, queue } = &self.place else {
             let refused = |_: AgentCall| -> Calling {
@@ -105,15 +105,15 @@ impl Agent {
 
         let launcher = Launcher {
             views: Arc::from(views),
-            records: Arc::clone(records),
+            records,
             servers,
             team: Arc::clone(team),
         };
         let delegate = move |call: AgentCall| -> Calling {
             match call {
                 AgentCall::Send(asked) => {
-                    let sent = self.send(&launcher, asked);
-                    let called = Called::from(sent);
+                    self.send(&launcher, asked);
+                    let called = Called::from(Ok(Value::Null));
                     Box::pin(future::ready(called))
                 }
                 AgentCall::Wait { names, timeout } => {
@@ -129,7 +129,7 @@ impl Agent {
                         let _awaiting = Awaiting(views);
                         let enqueued = queue.enqueued();
                         let waited = team.wait(&names, timeout, enqueued).await;
-                        Called::from(waited)
+                        Called::from(Ok(waited))
                     })
                 }
                 AgentCall::Stop { name } => {
@@ -145,7 +145,7 @@ impl Agent {
     }
 
     /// Starts a task for the agent `asked` names, or hands it to the task that agent is at work on
-    fn send(&self, launcher: &Launcher, asked: Asked) -> Reply {
+    fn send(&self, launcher: &Launcher, asked: Asked) {
         let mut members = launcher.team.members.lock().expect("members");
         let found = members
             .iter()
@@ -154,7 +154,7 @@ impl Agent {
             let member = &members[id];
             if member.running() {
                 member.inbox.sent.lock().expect("inbox").push(asked.task);
-                return Ok(Value::Null);
+                return;
             }
         }
 
@@ -179,7 +179,6 @@ impl Agent {
             ..self.clone()
         };
         launcher.launch(agent, member, id, asked, &self.interrupt);
-        Ok(Value::Null)
     }
 
     /// Works on the task `asked` in the agent's conversation `memory`, on the Python its last task
@@ -318,7 +317,7 @@ fn handed(end: &Ending) -> Value {
 /// What the tasks that the code of one call sends share
 struct Launcher<'a> {
     views: Arc<dyn TaskViews>,
-    records: Arc<Records>,
+    records: &'a Records,
     servers: &'a [&'a Added],
     team: Arc<Team>,
 }
@@ -596,7 +595,7 @@ impl Team {
 
     /// Takes the answers of the agents `names` once all have ended, or after `timeout` seconds
     /// or once the user queues a message those that have, with the status of the rest
-    async fn wait(&self, names: &[String], timeout: Option<f64>, enqueued: Nudging<'_>) -> Reply {
+    async fn wait(&self, names: &[String], timeout: Option<f64>, enqueued: Nudging<'_>) -> Value {
         let working = |member: &Member| {
             let named = names.iter().any(|name| name == member.name());
             named && member.running()
@@ -637,7 +636,7 @@ impl Team {
             let handed = handed(member.end());
             answers.push(json!([name, handed]));
         }
-        Ok(json!({ "answers": answers, "working": statuses }))
+        json!({ "answers": answers, "working": statuses })
     }
 
     /// Stops the task of the agent `name` and returns once it has stopped

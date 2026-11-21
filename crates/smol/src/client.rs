@@ -579,7 +579,10 @@ impl Client {
     }
 
     pub(crate) fn memories(&self, session: &str) -> Result<Vec<Memory>> {
-        let params = json!({ "sessionId": session });
+        let params = Addressed {
+            session_id: session.to_owned(),
+            body: (),
+        };
         let listed: Memories = self.connection.call(MEMORIES, params)?;
         Ok(listed.memories)
     }
@@ -651,7 +654,10 @@ impl Client {
 
     /// Tells the agent that a message is queued for the running turn, which it then asks for
     pub(crate) fn notify_queued(&self, session: &str) {
-        let params = json!({ "sessionId": session });
+        let params = Addressed {
+            session_id: session.to_owned(),
+            body: (),
+        };
         self.connection.notify(ENQUEUED, params);
     }
 }

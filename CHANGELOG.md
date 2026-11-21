@@ -94,6 +94,9 @@ but their files stay in `~/.smol/projects` untouched.
 - A sandbox's temporary folder that a program ending with its session still
   wrote in keeps its lock file, so the next sweep removes the rest, where the
   folder could lose its lock file and stay for good.
+- With a relative `SMOL_CONFIG_DIR`, the venv and the copies of viewed images
+  stay in the config directory, where the worker, which runs in the session's
+  directory, made the venv inside the working directory.
 - smol: the input box grows for emoji made of several characters, such as
   👩‍💻, where it was a row short and hid the first row. Programs that end
   while you send a task show before it, as a resume shows them, where your

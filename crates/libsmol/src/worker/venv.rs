@@ -1,7 +1,7 @@
 use crate::history::VENV;
 #[cfg(test)]
 use crate::tests::profile_dir;
-use reaper::{cause, tilde};
+use reaper::{path_cause, tilde};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -25,26 +25,21 @@ impl Venv {
     /// Also removes in the background the venvs of the projects next to `project`
     /// whose working directories are gone, once no session used them for `MIN_IDLE`
     pub(crate) async fn open(project: &Path, cwd: &Path) -> Result<Self, String> {
-        let failed = |e: io::Error| {
-            let reason = cause(&e);
-            let shown = tilde(project);
-            format!("{shown}: {reason}")
-        };
-        fs::create_dir_all(project).map_err(failed)?;
+        fs::create_dir_all(project).map_err(|e| path_cause(project, &e))?;
 
         // A working directory that isn't UTF-8 can't be named, and its venv stays
         let record = cwd.to_str().unwrap_or_default();
         let venv = venv_in(project);
         let hold = held(&venv, record).await?;
 
+        // The lock it holds keeps its own venv from the sweep
         if let Some(projects) = project.parent() {
             let projects = projects.to_owned();
-            let own = lock_of(&venv);
             let span = Span::current();
             // Tokio runs every session on one thread, which removing a large venv would hold for seconds
             let sweeping = move || {
                 let _entered = span.enter();
-                sweep_venvs(&projects, &own);
+                sweep_venvs(&projects);
             };
             task::spawn_blocking(sweeping);
         }
@@ -69,7 +64,7 @@ fn venv_in(_: &Path) -> PathBuf {
 
 /// Removes the venvs of the projects whose working directories are gone,
 /// once no session used them for `MIN_IDLE`, and then the projects left empty
-fn sweep_venvs(projects: &Path, own: &Path) {
+fn sweep_venvs(projects: &Path) {
     let Ok(entries) = fs::read_dir(projects) else {
         return;
     };
@@ -77,10 +72,6 @@ fn sweep_venvs(projects: &Path, own: &Path) {
         let project = entry.path();
         let venv = project.join(VENV);
         let lock = lock_of(&venv);
-        if lock == own {
-            continue;
-        }
-
         let recorded = fs::read_to_string(&lock).unwrap_or_default();
         // One that can't be looked up now is not gone
         let looked = Path::new(&recorded).try_exists();
@@ -120,8 +111,8 @@ fn sweep_venvs(projects: &Path, own: &Path) {
 
 /// Takes the venv's lock shared and dates it, which says when a session last used the venv
 async fn held(venv: &Path, record: &str) -> Result<File, String> {
-    let path = lock_of(venv);
-    let shown = tilde(&path);
+    let lock = lock_of(venv);
+    let path = lock.clone();
     let record = record.to_owned();
     let opening = move || {
         // Never truncated, since Windows refuses to write a file that another session holds
@@ -141,11 +132,7 @@ async fn held(venv: &Path, record: &str) -> Result<File, String> {
     };
     // Off the runtime's thread, since it waits while another session removes the venv
     let opened = task::spawn_blocking(opening).await.expect("lock");
-    let failed = |e: io::Error| {
-        let reason = cause(&e);
-        format!("{shown}: {reason}")
-    };
-    let file = opened.map_err(failed)?;
+    let file = opened.map_err(|e| path_cause(&lock, &e))?;
 
     // Windows allows changing the time of a file that other sessions hold
     file.set_modified(SystemTime::now()).ok();
@@ -200,7 +187,6 @@ pub(crate) mod tests {
             ("recent", &gone, now),
             ("present", &here, aged),
             ("held", &gone, aged),
-            ("own", &gone, aged),
         ];
         for (name, record, time) in venvs_made {
             let venv = projects.join(name).join(VENV);
@@ -214,8 +200,7 @@ pub(crate) mod tests {
         let holding = File::open(lock).expect("open");
         holding.lock_shared().expect("hold");
 
-        let own = lock_of(&projects.join("own").join(VENV));
-        sweep_venvs(&projects, &own);
+        sweep_venvs(&projects);
         let mut left: Vec<String> = Vec::new();
         for project in fs::read_dir(&projects).expect("projects").flatten() {
             let named = project.file_name().to_string_lossy().into_owned();
@@ -233,9 +218,6 @@ pub(crate) mod tests {
             "held",
             "held/.venv",
             "held/.venv.lock",
-            "own",
-            "own/.venv",
-            "own/.venv.lock",
             "present",
             "present/.venv",
             "present/.venv.lock",

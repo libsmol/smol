@@ -2,8 +2,8 @@ use crate::prompt::{self, EMPTY_MEMORY, NESTED, NO_MEMORY};
 use crate::utils::{folded, Reply};
 use crate::worker::MemoryCall;
 use jieba_rs::Jieba;
+use reaper::path_cause;
 use reaper::wire::Memory;
-use reaper::{cause, tilde};
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -249,12 +249,7 @@ impl Memories {
         F: FnOnce() -> rusqlite::Result<T> + Send + 'static,
     {
         let done = task::spawn_blocking(work).await.expect("memories");
-        let shown = tilde(&self.db);
-        let failed = |e: rusqlite::Error| {
-            let reason = cause(&e);
-            format!("{shown}: {reason}")
-        };
-        done.map_err(failed)
+        done.map_err(|e| path_cause(&self.db, &e))
     }
 }
 

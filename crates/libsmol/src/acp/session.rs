@@ -99,7 +99,8 @@ struct Keeper {
     team: Arc<Team>,
     app: Arc<App>,
     titling: Option<Titling>,
-    unsaved: Unsaved,
+    /// The error of the last save, if it failed
+    unsaved: Option<String>,
     translator: Translator,
     peer: SessionPeer,
 }
@@ -129,18 +130,6 @@ impl Drop for Titling {
 struct ClientQueue {
     peer: SessionPeer,
     enqueued: Arc<Notify>,
-}
-
-#[derive(Default)]
-struct Unsaved(Option<String>);
-
-impl Unsaved {
-    /// Pass None after a successful save, and the same error is returned only once
-    fn report(&mut self, error: Option<String>) -> Option<String> {
-        let repeated = self.0 == error;
-        self.0 = error.clone();
-        error.filter(|_| !repeated)
-    }
 }
 
 /// Only `Router` holds the sender of `inbox`, and dropping it closes the session
@@ -305,7 +294,7 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             team,
             app: Arc::clone(&app),
             titling: None,
-            unsaved: Unsaved::default(),
+            unsaved: None,
             translator,
             peer,
         };
@@ -492,13 +481,13 @@ impl Session {
 
         interrupt.begin(shell.turn);
         let translator = &mut self.keeper.translator;
-        translator.shell(&shell.command);
-        let mut shown = |output: &str| translator.shell_output(output);
+        let id = translator.shell(&shell.command);
+        let mut shown = |output: &str| translator.shell_output(&id, output);
         let cwd = &self.agent.workplace.cwd;
         let (ran, left) = run_shell(&shell.command, cwd, interrupt, &mut shown).await;
         self.shell_left.extend(left);
 
-        self.keeper.translator.shell_end(&ran);
+        self.keeper.translator.shell_end(id, &ran);
         // Log only how the command ended because it may contain secrets
         match &ran.end {
             Exit::Exited(0) => info!("shell: done"),
@@ -606,10 +595,14 @@ impl Keeper {
         let agents = self.team.records();
         let stored = self.app.store.save(memory, &agents, &mut self.meta);
         let error = stored.as_ref().err().map(Error::to_string);
-        if let Some(text) = self.unsaved.report(error) {
-            error!("session: save failed, {text}");
-            self.peer.notice(&text, Notice::Unsaved);
+        // The same error is reported only once
+        if error != self.unsaved {
+            if let Some(text) = &error {
+                error!("session: save failed, {text}");
+                self.peer.notice(text, Notice::Unsaved);
+            }
         }
+        self.unsaved = error;
         if stored.is_ok() {
             update_session(&self.peer, &self.meta);
         }
@@ -652,7 +645,7 @@ impl Queue for ClientQueue {
             };
 
             let mut tasks = Vec::new();
-            for blocks in &queued.prompts {
+            for blocks in queued.prompts {
                 let task = task_of(blocks);
                 tasks.push(task);
             }

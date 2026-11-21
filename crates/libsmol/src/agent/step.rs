@@ -1,5 +1,5 @@
 use crate::agent::delegate::Records;
-use crate::agent::{generate, retry, Event, Failure, Streamed, Turn, MAX_RETRIES};
+use crate::agent::{generate, retry, step_counts, Event, Failure, Streamed, Turn, MAX_RETRIES};
 use crate::model::{Finish, ModelError, Purpose, Sealed, StreamDelta, Unread, MAX_NAME_CHARS};
 use crate::prompt::TOOL;
 use crate::spawn::SHOWN_EVERY;
@@ -8,7 +8,6 @@ use crate::steps::{
 };
 use crate::utils::truncated;
 use std::mem;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::warn;
@@ -132,6 +131,9 @@ impl Turn<'_> {
                     break step;
                 }
                 Failure::Model(error) => {
+                    // The error is logged only by the line that ends the turn or the agent
+                    let counted = step_counts(&step);
+                    warn!("step: failed {counted}");
                     self.sink.event(Event::StepFailed(&step));
                     return Err(error);
                 }
@@ -159,7 +161,7 @@ impl Turn<'_> {
             self.sink.event(Event::Run(index, call));
 
             let views = self.sink.tasks(index);
-            let records = Arc::new(Records::default());
+            let records = Records::default();
             let mut serving = self.agent.serving(self.servers, views, &records);
             let code = &call.code;
             let mut shown = |output: &str| self.sink.event(Event::Output(index, call, output));

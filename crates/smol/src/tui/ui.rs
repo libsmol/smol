@@ -2,7 +2,7 @@ use crate::client::tool_count;
 use crate::conversation::Stats;
 use crate::tui::app::App;
 use crate::tui::picture;
-use crate::tui::render::{wrap_ranges, Target};
+use crate::tui::render::{kept_rows, Target};
 use crate::tui::{
     clipped, fitted, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG, YELLOW,
 };
@@ -272,7 +272,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         };
 
         // Lines up with the blank row that starts `Render::step`
-        if !talk.stepping() {
+        if talk.live().is_none() {
             progress.push(Line::default());
         }
         let italic = DIM.add_modifier(Modifier::ITALIC);
@@ -343,7 +343,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let marks = "❯ ".width() + QUEUED.width();
         let room = width.saturating_sub(marks).max(1);
         for message in &app.queued {
-            let first = first_row(message, room);
+            let rows = kept_rows(message.trim(), room, 1);
+            let (first, _) = rows.into_iter().next().unwrap_or_default();
             let text = format!("❯ {first}{QUEUED}");
             queued.push(Line::styled(text, DIM));
         }
@@ -641,21 +642,6 @@ fn widths(label: usize, detail: usize, room: usize) -> (usize, usize) {
     let label = label.min(floor);
     let detail = detail.min(room - label);
     (label, detail)
-}
-
-fn first_row(text: &str, width: usize) -> String {
-    let text = text.trim();
-    let wrapped = wrap_ranges(text, width);
-    let Some((range, _)) = wrapped.first() else {
-        return String::new();
-    };
-
-    let first = &text[range.clone()];
-    if wrapped.len() == 1 {
-        return first.to_owned();
-    }
-    let marked = format!("{first}…");
-    clipped(&marked, width)
 }
 
 /// The `width` columns of `text` shown `elapsed` after it was highlighted, and when they next change

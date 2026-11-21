@@ -16,7 +16,7 @@ use reaper::wire::{
 use reqwest::Url;
 use serde_json::{json, Value};
 use std::mem;
-use std::path::{self, Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const ESTIMATE_EVERY: Duration = Duration::from_secs(1);
@@ -33,8 +33,6 @@ pub(crate) struct Translator {
     calls: Vec<Opened>,
     /// The open compaction call
     compacting: Option<String>,
-    /// The call for the user command that is running
-    shell: Option<String>,
     /// The programs the client last heard are running
     programs: Vec<Program>,
     progress: Progress,
@@ -73,7 +71,6 @@ impl Translator {
             used: 0,
             calls: Vec::new(),
             compacting: None,
-            shell: None,
             programs: Vec::new(),
             progress: Progress::default(),
             cwd,
@@ -139,8 +136,8 @@ impl Translator {
                     self.compact_end(Ok(summary));
                 }
                 MemoryStep::Shell(shell) => {
-                    self.shell(&shell.command);
-                    self.shell_end(shell);
+                    let id = self.shell(&shell.command);
+                    self.shell_end(id, shell);
                 }
                 MemoryStep::Restarted => self.notice(RESTARTED, None),
                 MemoryStep::Done(done) if done.idle => self.ended(done),
@@ -222,7 +219,8 @@ impl Translator {
         self.peer.update(SessionUpdate::UsageUpdate(update));
     }
 
-    pub(crate) fn shell(&mut self, command: &str) {
+    /// Returns the id of the call that shows the command
+    pub(crate) fn shell(&mut self, command: &str) -> String {
         let id = self.next_id();
         let marked = (SHELL.to_owned(), json!(true));
         let meta = Meta::from_iter([marked]);
@@ -231,25 +229,18 @@ impl Translator {
             .status(ToolCallStatus::InProgress)
             .meta(meta);
         self.peer.update(SessionUpdate::ToolCall(started));
-        self.shell = Some(id);
+        id
     }
 
     /// `output` is all the clipped output so far
-    pub(crate) fn shell_output(&self, output: &str) {
-        let Some(id) = &self.shell else {
-            return;
-        };
+    pub(crate) fn shell_output(&self, id: &str, output: &str) {
         let content = vec![ToolCallContent::from(output)];
         let fields = ToolCallUpdateFields::new().content(content);
-        let update = ToolCallUpdate::new(id.clone(), fields);
+        let update = ToolCallUpdate::new(id.to_owned(), fields);
         self.peer.update(SessionUpdate::ToolCallUpdate(update));
     }
 
-    pub(crate) fn shell_end(&mut self, shell: &ShellStep) {
-        let Some(id) = self.shell.take() else {
-            return;
-        };
-
+    pub(crate) fn shell_end(&self, id: String, shell: &ShellStep) {
         let failed = !matches!(shell.end, Exit::Exited(0));
         let status = match failed {
             true => ToolCallStatus::Failed,
@@ -445,7 +436,7 @@ impl Translator {
         let result = call.result.as_ref();
         for (path, media) in result.map(|result| &result.media).into_iter().flatten() {
             let copy = self.copies.join(&media.file);
-            let Some(uri) = file_uri(&copy) else {
+            let Ok(uri) = Url::from_file_path(&copy) else {
                 continue;
             };
             let mime = media.mime.clone();
@@ -605,7 +596,13 @@ struct TaskCall {
 impl TaskViews for TaskCalls {
     fn open(&self, number: usize, name: &str, task: &str) -> Box<dyn TaskView> {
         let id = format!("{}.{number}", self.parent);
-        let title = agent_title(task, &self.cwd);
+        // The start of the task on one line
+        let line = one_line(task, &self.cwd);
+        let mut title: String = line.chars().take(MAX_TASK_CHARS).collect();
+        if title.len() < line.len() {
+            title.push('…');
+        }
+        let title = format!("agent: {title}");
         let asked = json!({ TASK: task, NAME: name });
         let marked = (AGENT.to_owned(), json!(true));
         let parent = (PARENT.to_owned(), json!(self.parent));
@@ -700,16 +697,6 @@ impl Drop for TaskCall {
     }
 }
 
-/// The start of a task on one line, for clients that show only the title
-fn agent_title(task: &str, cwd: &Path) -> String {
-    let line = one_line(task, cwd);
-    let mut title: String = line.chars().take(MAX_TASK_CHARS).collect();
-    if title.len() < line.len() {
-        title.push('…');
-    }
-    format!("agent: {title}")
-}
-
 /// A fence longer than every run of backticks in the code keeps the code in one block
 fn fenced(code: &str) -> ToolCallContent {
     let code = code.trim_matches('\n');
@@ -730,12 +717,6 @@ fn head(code: &str, arguments: Option<&str>) -> ToolCallContent {
 fn chunk(text: &str) -> ContentChunk {
     let block = ContentBlock::from(text);
     ContentChunk::new(block)
-}
-
-/// The config directory may be a relative path
-fn file_uri(path: &Path) -> Option<Url> {
-    let absolute = path::absolute(path).ok()?;
-    Url::from_file_path(absolute).ok()
 }
 
 #[cfg(test)]

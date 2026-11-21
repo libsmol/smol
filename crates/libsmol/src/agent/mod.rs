@@ -144,49 +144,6 @@ impl TaskView for Unseen {
     fn close(&mut self, _: &Ending, _: &[MemoryStep]) {}
 }
 
-/// Logs how steps and compaction end before passing events on
-struct Logged<'a>(&'a mut dyn Sink);
-
-impl Sink for Logged<'_> {
-    fn event(&mut self, event: Event) {
-        // Code errors contain task content and are not logged
-        match event {
-            Event::StepEnd(step) => {
-                let counted = step_counts(step);
-                match &step.error {
-                    None => info!("step: done {counted}"),
-                    Some(StepError::Interrupted) => info!("step: interrupted {counted}"),
-                    Some(StepError::Stopped) => info!("step: stopped {counted}"),
-                    Some(error) => warn!("step: failed, {error} {counted}"),
-                }
-            }
-            // A model error is logged only by the line that ends the turn or the agent
-            Event::StepFailed(step) => {
-                let counted = step_counts(step);
-                warn!("step: failed {counted}");
-            }
-            Event::CompactEnd(Ok(summary)) => {
-                let kept = summary.kept;
-                let seconds = summary.usage.duration;
-                info!("compact: done [kept={kept}, elapsed={seconds:.1}s]");
-            }
-            Event::CompactEnd(Err(Failure::Interrupted)) => info!("compact: interrupted"),
-            Event::CompactEnd(Err(Failure::Model(error))) => warn!("compact: failed, {error}"),
-            Event::Restarted => warn!("python: restarted"),
-            _ => {}
-        }
-        self.0.event(event);
-    }
-
-    fn saved(&mut self, memory: &AgentMemory) {
-        self.0.saved(memory);
-    }
-
-    fn tasks(&mut self, index: usize) -> Box<dyn TaskViews> {
-        self.0.tasks(index)
-    }
-}
-
 /// Input and output tokens as log lines show them, or - when the provider gave none
 fn logged_tokens(usage: &Usage) -> String {
     match usage.tokens {
@@ -297,14 +254,13 @@ impl Agent {
             &takes,
         );
 
-        let mut logged = Logged(sink);
         let mut turn = Turn {
             agent: self,
             worker,
             servers,
             memory,
             system,
-            sink: &mut logged,
+            sink,
         };
         let ran = turn.run(task).await;
         // However the turn ends, no agent its code started keeps working
@@ -318,7 +274,7 @@ impl Agent {
         &'a self,
         servers: &'a [&'a Added],
         views: Box<dyn TaskViews>,
-        records: &Arc<Records>,
+        records: &'a Records,
     ) -> Box<Serving<'a>> {
         let mut delegate = self.delegate(servers, views, records);
         let writable = self.place.rank() == Rank::Main;
@@ -407,6 +363,7 @@ impl Turn<'_> {
             // Pushed after compaction or it would be summarized away
             if self.worker.take_restarted() {
                 self.memory.steps.push(MemoryStep::Restarted);
+                warn!("python: restarted");
                 self.sink.event(Event::Restarted);
                 self.sink.saved(self.memory);
             }
@@ -424,6 +381,14 @@ impl Turn<'_> {
                 panic!("action");
             };
             step.used = Some(used);
+            // Code errors contain task content and are not logged
+            let counted = step_counts(step);
+            match &step.error {
+                None => info!("step: done {counted}"),
+                Some(StepError::Interrupted) => info!("step: interrupted {counted}"),
+                Some(StepError::Stopped) => info!("step: stopped {counted}"),
+                Some(error) => warn!("step: failed, {error} {counted}"),
+            }
             self.sink.event(Event::StepEnd(step));
             self.sink.saved(self.memory);
 

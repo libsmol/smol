@@ -375,7 +375,7 @@ fn read(path: &Path) -> Option<Vec<u8>> {
 /// with a cell about twice as tall as it is wide
 pub(crate) fn cells(width: u32, height: u32, room: usize) -> (u32, u32) {
     let (width, height) = (u64::from(width.max(1)), u64::from(height.max(1)));
-    let room = u64::try_from(room).unwrap_or(u64::MAX);
+    let room = room as u64;
     let natural = width.div_ceil(CELL_PIXELS);
     let mut columns = natural.min(room).clamp(1, MAX_COLUMNS);
     let mut rows = (columns * height).div_ceil(width * 2).max(1);

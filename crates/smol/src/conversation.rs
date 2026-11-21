@@ -220,10 +220,6 @@ impl Conversation {
         asked && !stepped && self.live.is_none()
     }
 
-    pub(crate) fn stepping(&self) -> bool {
-        self.live.is_some()
-    }
-
     /// Agents still queued or running, wherever the call that started them is
     fn helping(&self) -> usize {
         let working = self.working();
@@ -1016,20 +1012,16 @@ impl Step {
         }
     }
 
+    /// The answer follows the last call or notice
     fn mark_answer(&mut self) {
-        let start = self.answer_start();
+        let block = |item: &Item| matches!(item, Item::Call(_) | Item::Notice(_));
+        let found = self.items.iter().rposition(block);
+        let start = found.map_or(0, |index| index + 1);
         for item in &mut self.items[start..] {
             if let Item::Message { answer, .. } = item {
                 *answer = true;
             }
         }
-    }
-
-    /// The answer follows the last call or notice
-    fn answer_start(&self) -> usize {
-        let block = |item: &Item| matches!(item, Item::Call(_) | Item::Notice(_));
-        let found = self.items.iter().rposition(block);
-        found.map_or(0, |index| index + 1)
     }
 }
 
@@ -1060,8 +1052,7 @@ fn measured(meta: Option<&Meta>) -> Measured {
     let Some(meta) = meta else {
         return Measured::default();
     };
-    let object = Value::Object(meta.clone());
-    Measured::deserialize(&object).unwrap_or_default()
+    Measured::deserialize(meta).unwrap_or_default()
 }
 
 fn text_of(content: &ContentBlock) -> String {

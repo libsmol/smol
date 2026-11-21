@@ -523,18 +523,8 @@ impl Render {
             (false, false) => 1,
         };
         let task = one_line(&helper.task, &self.cwd);
-        let mut ranges = wrap_ranges(&task, limit);
-        let cut = ranges.len() > most;
-        if cut {
-            ranges.truncate(most);
-        }
-        let last = ranges.len().saturating_sub(1);
-        for (at, (range, joint)) in ranges.into_iter().enumerate() {
-            let mut title = task[range].to_owned();
-            if cut && at == last {
-                let marked = format!("{title}…");
-                title = clipped(&marked, limit);
-            }
+        let titles = kept_rows(&task, limit, most);
+        for (at, (title, joint)) in titles.into_iter().enumerate() {
             let (lead, mark_width) = match at {
                 0 => (&first[..], width),
                 _ => (&rest[..], rest_width),
@@ -1098,6 +1088,25 @@ fn tag(helper: &Helper) -> String {
         Some(name) => format!("{name} "),
         None => String::new(),
     }
+}
+
+/// The rows `text` wraps into at `width`, with what joins each to the one before, at most `most`
+/// of them and the last ending in … when more were cut
+pub(crate) fn kept_rows(text: &str, width: usize, most: usize) -> Vec<(String, Option<String>)> {
+    let mut ranges = wrap_ranges(text, width);
+    let cut = ranges.len() > most;
+    ranges.truncate(most);
+
+    let mut rows = Vec::new();
+    for (range, joint) in ranges {
+        let row = text[range].to_owned();
+        rows.push((row, joint));
+    }
+    if let Some((last, _)) = rows.last_mut().filter(|_| cut) {
+        let marked = format!("{last}…");
+        *last = clipped(&marked, width);
+    }
+    rows
 }
 
 pub(crate) fn wrap_ranges(text: &str, width: usize) -> Vec<(Range<usize>, Option<String>)> {

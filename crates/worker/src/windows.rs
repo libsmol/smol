@@ -1,6 +1,6 @@
 use crate::executable;
 use pyo3::ffi;
-use reaper::{cause, command_tail, tilde, Group};
+use reaper::{cause, command_tail, path_cause, tilde, Group};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
@@ -53,12 +53,7 @@ pub(crate) fn install() {
 /// The file a worker and the python of every venv start from: a link named after `NAME` in `home`
 /// to this executable, kept up to date along with `python3.dll` beside it
 pub fn program(home: &Path) -> Result<PathBuf, String> {
-    let failed = |path: &Path, e: io::Error| {
-        let shown = tilde(path);
-        let reason = cause(&e);
-        format!("{shown}: {reason}")
-    };
-    fs::create_dir_all(home).map_err(|e| failed(home, e))?;
+    fs::create_dir_all(home).map_err(|e| path_cause(home, &e))?;
 
     // Never truncated, since Windows refuses to write a file that another session holds
     let path = home.join(LOCK);
@@ -67,20 +62,20 @@ pub fn program(home: &Path) -> Result<PathBuf, String> {
         .write(true)
         .truncate(false)
         .open(&path);
-    let lock = lock.map_err(|e| failed(&path, e))?;
-    lock.lock().map_err(|e| failed(&path, e))?;
+    let lock = lock.map_err(|e| path_cause(&path, &e))?;
+    lock.lock().map_err(|e| path_cause(&path, &e))?;
 
     let program = home.join(format!("{NAME}.dll"));
     let exe = executable();
     if !same_build(&program, &exe) {
         let replaced = replace(&program, |fresh| link(&exe, fresh));
-        replaced.map_err(|e| failed(&program, e))?;
+        replaced.map_err(|e| path_cause(&program, &e))?;
     }
     let forwarder = home.join(FORWARDER_FILE);
     let written = fs::read(&forwarder).ok();
     if written.as_deref() != Some(FORWARDER) {
         let replaced = replace(&forwarder, |fresh| fs::write(fresh, FORWARDER));
-        replaced.map_err(|e| failed(&forwarder, e))?;
+        replaced.map_err(|e| path_cause(&forwarder, &e))?;
     }
 
     sweep(&program);
@@ -97,9 +92,8 @@ pub(crate) fn relay() -> i32 {
     let text = match fs::read_to_string(&config) {
         Ok(text) => text,
         Err(e) => {
-            let shown = tilde(&config);
-            let reason = cause(&e);
-            eprintln!("python: {shown}: {reason}");
+            let problem = path_cause(&config, &e);
+            eprintln!("python: {problem}");
             return 1;
         }
     };
@@ -139,9 +133,8 @@ pub(crate) fn relay() -> i32 {
     let mut child = match started {
         Ok(child) => child,
         Err(e) => {
-            let shown = tilde(&interpreter);
-            let reason = cause(&e);
-            eprintln!("python: {shown}: {reason}");
+            let problem = path_cause(&interpreter, &e);
+            eprintln!("python: {problem}");
             return 1;
         }
     };

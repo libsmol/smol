@@ -57,10 +57,9 @@ pub(crate) fn main(args: &[OsString]) -> Option<i32> {
     {
         let exe = worker::executable();
         let own = exe.file_name().unwrap_or_default();
-        if let Ok(name) = CString::new(own.as_encoded_bytes()) {
-            // SAFETY: Renames only the calling thread, which is the process's main one
-            unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
-        }
+        let name = CString::new(own.as_encoded_bytes()).expect("nul in path");
+        // SAFETY: Renames only the calling thread, which is the process's main one
+        unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
     }
     let serving = |py: Python<'_>| serve(py, Path::new(venv));
     let status = worker::isolated(serving);

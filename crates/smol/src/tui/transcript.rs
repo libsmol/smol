@@ -83,7 +83,7 @@ impl Viewport {
         self.back = self.back.saturating_sub(rows);
     }
 
-    /// Inverts `thumb`, so the thumb is drawn on the cell it was dragged to
+    /// Inverts where `place_bar` puts the thumb, so it is drawn on the cell it was dragged to
     pub(crate) fn drag_to(&mut self, row: u16) {
         let last = usize::from(self.bar.height.saturating_sub(1));
         let offset = usize::from(row.saturating_sub(self.bar.top()));
@@ -123,22 +123,18 @@ impl Viewport {
     /// Puts the scrollbar in the last column of `track` and returns where its thumb goes,
     /// or None when there is nothing to scroll
     pub(crate) fn place_bar(&mut self, track: Rect) -> Option<Position> {
-        // Without a track the thumb would land on the corner
+        // The thumb's row below divides by the rows to scroll and needs a row to move in
         if self.bottom == 0 || track.is_empty() {
             return None;
         }
 
         let column = track.right().saturating_sub(1);
         self.bar = Rect::new(column, track.top(), 1, track.height);
-        let row = track.top() + thumb(self.top(), self.bottom, track.height);
+        let last = usize::from(track.height - 1);
+        let offset = (self.top() * last + self.bottom / 2) / self.bottom;
+        let row = track.top() + offset.min(last) as u16;
         Some(Position::new(column, row))
     }
-}
-
-pub(crate) fn thumb(top: usize, bottom: usize, length: u16) -> u16 {
-    let last = usize::from(length.saturating_sub(1));
-    let row = (top * last + bottom / 2).checked_div(bottom).unwrap_or(0);
-    row.min(last) as u16
 }
 
 /// Caches settled entries per width and expansion and redraws the rest only after a change,

@@ -418,9 +418,10 @@ def _run(code):
     except BaseException:
         pass
 
-    # Undecodable filename bytes become lone surrogates that Rust can't accept
-    clean = lambda text: text if text is None else text.encode("utf-8", "backslashreplace").decode()
-    return {"error": clean(error), "repaired": clean(repaired)}
+    # Undecodable filename bytes in an error become lone surrogates that Rust can't accept
+    if error is not None:
+        error = error.encode("utf-8", "backslashreplace").decode()
+    return {"error": error, "repaired": repaired}
 
 _SIZED = (str, bytes, bytearray, list, tuple, dict, set, frozenset)
 # The builtins' own descriptors, which a metaclass or module class the code wrote can't override

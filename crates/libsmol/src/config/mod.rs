@@ -29,14 +29,16 @@ api = "https://api.deepseek.com/v1"
 api_key = "sk-..."
 models = [{ id = "deepseek-chat", context = 65536 }]"#;
 
+/// Absolute, as the worker that gets paths below it runs in the session's directory
 pub(crate) fn dir() -> PathBuf {
-    match env::var_os("SMOL_CONFIG_DIR") {
+    let dir = match env::var_os("SMOL_CONFIG_DIR") {
         Some(dir) => PathBuf::from(dir),
         None => {
             let home = env::home_dir().unwrap_or_default();
             home.join(".smol")
         }
-    }
+    };
+    path::absolute(&dir).unwrap_or(dir)
 }
 
 #[derive(Deserialize)]
@@ -428,7 +430,6 @@ pub(crate) fn skills(dir: &Path, project: &Path) -> (Vec<Skill>, Vec<Error>) {
                 .map(|name| name.to_string_lossy().into_owned());
             let name = named.or(dir_name).unwrap_or_default();
 
-            let path = path::absolute(&path).unwrap_or(path);
             let skill = Skill {
                 name: name.clone(),
                 description,

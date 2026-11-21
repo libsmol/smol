@@ -247,7 +247,7 @@ impl McpPool {
             listed.push(status);
         }
 
-        self.peer.servers(&listed);
+        self.peer.servers(listed);
     }
 
     fn attempt(&mut self, index: usize, dropped: Option<String>) {

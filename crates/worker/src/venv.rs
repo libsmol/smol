@@ -4,7 +4,7 @@ use crate::windows::{link, replace, same_build, sweep};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use reaper::{cause, tilde};
+use reaper::path_cause;
 use std::env;
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -78,9 +78,8 @@ pub fn enter(py: Python<'_>, venv: &Path) -> PyResult<()> {
         #[cfg(windows)]
         let relinked = replace(&linked, |fresh| link(&exe, fresh));
         if let Err(e) = relinked {
-            let reason = cause(&e);
-            let shown = tilde(&linked);
-            let message = format!("worker: {shown}: {reason}");
+            let problem = path_cause(&linked, &e);
+            let message = format!("worker: {problem}");
             return Err(PyRuntimeError::new_err(message));
         }
     }
