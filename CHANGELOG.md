@@ -87,6 +87,13 @@ but their files stay in `~/.smol/projects` untouched.
 - A provider in `model.toml` whose name is empty or holds `/`, which separates
   it from the model id, fails to load, as `libsmol setup` already refused it.
   Two such names could give one model choice two providers.
+- The sandbox hides the profiles of Firefox and of Chrome, Chromium, Brave and
+  Edge, and `Library/Cookies` on macOS, whose cookies, which Firefox keeps in
+  plain text, and saved passwords the code could read.
+- A call that stopped waiting for the end of its output, as on a machine too
+  loaded to read it within 2 seconds, leaves the rest of it before the next
+  call's output. Before, every later call showed the output of the one before
+  it.
 - A message that isn't a request, notification or reply, such as a batch, is
   answered with an invalid request error instead of nothing.
 - A sandbox's temporary folder that a program ending with its session still

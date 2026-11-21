@@ -428,6 +428,8 @@ impl Worker {
         let live = self.live.as_mut().expect("connected");
         // Views that arrived while a server was being added don't belong to this snippet
         live.media.clear();
+        // Taken first here, a part a late marker closed would make every later call show the one before
+        live.output.reopen();
 
         let run = HostCall::Run {
             code: code.to_owned(),

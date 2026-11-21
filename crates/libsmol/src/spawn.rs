@@ -232,6 +232,17 @@ impl Output {
         parts.open.fresh(max)
     }
 
+    /// Puts a part no call took, as when a call stopped waiting for its end marker, before what came
+    /// after it, as output between calls goes to the next one
+    pub(crate) fn reopen(&self) {
+        let mut parts = self.shared.lock();
+        let Some(closed) = parts.closed.take() else {
+            return;
+        };
+        let joined = closed.joined(&parts.open);
+        parts.open = joined;
+    }
+
     /// Everything since the last end marker
     pub(crate) fn take(&self) -> Clip {
         let mut parts = self.shared.lock();
@@ -520,11 +531,14 @@ fn end_of(status: ExitStatus) -> Exit {
 #[cfg(test)]
 mod tests {
     use crate::prompt;
-    use crate::spawn::{run_shell, Clip};
+    use crate::spawn::{run_shell, Clip, Process};
     use crate::steps::{Exit, MAX_OBSERVATION_CHARS};
+    use crate::tests::interpreter;
     use crate::utils::{block_on, truncated, Interrupt};
     use std::path::PathBuf;
+    use std::thread;
     use std::time::{Duration, Instant};
+    use tokio::process::Command;
 
     #[test]
     fn clip_matches_truncated() {
@@ -566,6 +580,28 @@ mod tests {
     }
 
     /// Output written before the interrupt is kept too
+    /// A part that a marker closed and no call took goes before what came after it
+    #[test]
+    fn late_part_reopened() {
+        let python = interpreter();
+        let mut command = Command::new(python);
+        let printed = "import sys; sys.stdout.write('café<end>naïve')";
+        command.args(["-I", "-c", printed]);
+        let marker = b"<end>".to_vec();
+        // Spawning needs the runtime
+        let starting = async { Process::start(command, Some(marker)) };
+        let (mut process, output) = block_on(starting).expect("start");
+        let waiting = process.wait();
+        block_on(waiting);
+        // The reader has read it all once the pipe closes
+        while !output.shared.lock().finished {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        output.reopen();
+        assert_eq!(output.take().text(), "cafénaïve");
+    }
+
     #[test]
     fn shell_interrupted() {
         let interrupt = Interrupt::default();
