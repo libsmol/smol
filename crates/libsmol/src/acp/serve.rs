@@ -445,8 +445,7 @@ impl Router {
         // Hidden itself, the directory would leave the code only its names
         let real = fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
         for place in workplace::hidden(&self.app.config, &agent.access) {
-            let place = fs::canonicalize(&place).unwrap_or(place);
-            if place == real {
+            if fs::canonicalize(&place).is_ok_and(|place| place == real) {
                 let message = format!("acp: invalid params: cwd: {shown}: hidden from the code");
                 return Err(Error::InvalidParams(message));
             }

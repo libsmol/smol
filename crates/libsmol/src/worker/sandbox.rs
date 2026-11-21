@@ -22,7 +22,6 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::ptr;
-use std::time::Duration;
 use tokio::process::Command;
 use tracing::info;
 #[cfg(target_os = "linux")]
@@ -33,8 +32,6 @@ const TEMP_PREFIX: &str = "smol-";
 const LOCK: &str = "lock";
 /// The folder in it that the code gets as its own temporary folder
 const SCRATCH: &str = "tmp";
-/// A younger folder may be one that `Sandbox::new` hasn't locked yet
-const MIN_STALE_AGE: Duration = Duration::from_secs(60);
 
 /// `LANDLOCK_CREATE_RULESET_VERSION`, which libc doesn't define
 #[cfg(target_os = "linux")]
@@ -222,13 +219,9 @@ impl Sandbox {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         match self.lock.take() {
-            Some(lock) => {
-                clear(&self.temp, lock);
-            }
-            None => {
-                fs::remove_dir_all(&self.temp).ok();
-            }
-        }
+            Some(lock) => clear(&self.temp, lock),
+            None => fs::remove_dir_all(&self.temp).is_ok(),
+        };
     }
 }
 
@@ -452,14 +445,6 @@ pub(crate) fn sweep() {
             continue;
         }
         let folder = entry.path();
-        let made = entry.metadata().and_then(|found| found.modified());
-        let fresh = match made {
-            Ok(made) => made.elapsed().unwrap_or_default() < MIN_STALE_AGE,
-            Err(_) => true,
-        };
-        if fresh {
-            continue;
-        }
         let Ok(lock) = File::open(folder.join(LOCK)) else {
             continue;
         };

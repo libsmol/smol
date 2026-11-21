@@ -364,7 +364,7 @@ impl Conversation {
                 let amends = meta.is_some_and(|meta| meta.contains_key(UPDATE));
                 let background = meta.is_some_and(|meta| meta.contains_key(BACKGROUND));
                 // Programs that ended as the user sent a task come before it, as a resume shows them,
-                // where a replayed task, which has an id, came before them
+                // and only a task sent here has no id
                 let sent =
                     matches!(self.held.first(), Some(Entry::Task(_))) && self.task_id.is_none();
                 let raced = background && sent && self.unstarted();

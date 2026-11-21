@@ -169,7 +169,7 @@ impl Turn<'_> {
                 }
 
                 self.sink.event(Event::CompactEnd(Err(&failure)));
-                // The step still runs while the conversation fits, or every later step would fail too
+                // The step still runs while the conversation and the output limit fit
                 let Failure::Model(error) = failure else {
                     return Ok(());
                 };

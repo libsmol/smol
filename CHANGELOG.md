@@ -92,9 +92,8 @@ but their files stay in `~/.smol/projects` untouched.
 - A message that isn't a request, notification or reply, such as a batch, is
   answered with an invalid request error instead of nothing.
 - A sandbox's temporary folder that a program ending with its session still
-  wrote in keeps its lock file, so the next sweep removes the rest, and the
-  sweep leaves folders less than a minute old, since a new one isn't locked at
-  once.
+  wrote in keeps its lock file, so the next sweep removes the rest, where the
+  folder could lose its lock file and stay for good.
 - smol: the input box grows for emoji made of several characters, such as
   👩‍💻, where it was a row short and hid the first row. Programs that end
   while you send a task show before it, as a resume shows them, where your
