@@ -67,6 +67,41 @@ but their files stay in `~/.smol/projects` untouched.
 - An interrupted call tells the model where the code stopped, such as
   `line 8: time.sleep(0.05)`, after `[interrupted by the user]`, and the
   summarizer sees it too.
+- Compaction keeps recent steps and steps the model hasn't seen within shares
+  of what the system prompt leaves of the window, not of the whole window. With
+  a large AGENTS.md and a small `context`, it ran again every step or two.
+- A summary that fails while the conversation and the output limit still fit
+  the window leaves the step to run instead of ending the turn, so a summary
+  that keeps failing no longer fails every prompt after it.
+- A reply the provider stopped for a reason other than its content filter,
+  such as an overloaded server, is retried like other transient errors.
+- The helpers that joblib's loky starts, as scikit-learn does with `n_jobs`,
+  no longer count as programs the code left running. They showed in the
+  sidebar for as long as the worker lived, opened a turn when they ended on
+  their own after idling, and kept an agent that `agent()` started from
+  keeping its Python.
+- A session whose working directory doesn't exist fails to open with an
+  error that names it, where libsmol made a project folder for it and, for a
+  load, replayed the conversation before failing to start Python. One whose
+  directory is itself hidden from the code, such as the config directory,
+  fails to open with an error that says so, where the code could only list
+  its names.
+- A provider in `model.toml` whose name is empty or holds `/`, which separates
+  it from the model id, fails to load, as `libsmol setup` already refused it.
+  Two such names could give one model choice two providers.
+- A message that isn't a request, notification or reply, such as a batch, is
+  answered with an invalid request error instead of nothing.
+- A sandbox's temporary folder that a program ending with its session still
+  wrote in keeps its lock file, so the next sweep removes the rest, and the
+  sweep leaves folders less than a minute old, since a new one isn't locked at
+  once.
+- smol: the input box grows for emoji made of several characters, such as
+  👩‍💻, where it was a row short and hid the first row. Programs that end
+  while you send a task show before it, as a resume shows them, where your
+  task became an empty turn of its own. Typing a list command such as
+  `:resume ` again no longer adds a note that the list is empty each time.
+- smol web refuses WebSocket requests whose origin names no host, such as
+  `null`.
 
 ## 0.12.0 - 2026-11-19
 

@@ -492,6 +492,9 @@ pub(crate) fn cut(count: usize) -> String {
     format!("[{count} characters cut]")
 }
 
+/// What the code's `print()` puts where it cut, a template for `str.format`
+pub(crate) const PRINT_CUT: &str = "[{cut} characters cut; print(..., limit=None) skips this cut]";
+
 /// Cut-off replies are never sent back, so the model cannot see the last reply this mentions
 const REPLY_CUT: &str =
     "Your last reply was too long and was discarded, so nothing ran: write less per reply";

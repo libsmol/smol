@@ -1,5 +1,5 @@
 use crate::agent::MAX_PARALLEL_AGENTS;
-use crate::prompt::{DONE, NO_MEMORY, SURROGATE};
+use crate::prompt::{DONE, NO_MEMORY, PRINT_CUT, SURROGATE};
 use crate::tools::memories::{MAX_MEMORY_CHARS, MAX_RECALLED};
 use crate::tools::ToolError;
 use crate::utils::{block_on, Waiting};
@@ -120,6 +120,7 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
     globals.set_item("_MAX_RECALLED", MAX_RECALLED)?;
     globals.set_item("_MAX_MEMORY_CHARS", MAX_MEMORY_CHARS)?;
     globals.set_item("_MAX_PRINT_CHARS", MAX_PRINT_CHARS)?;
+    globals.set_item("_PRINT_CUT", PRINT_CUT)?;
     globals.set_item("_DONE", DONE)?;
     globals.set_item("_NO_MEMORY", NO_MEMORY)?;
 

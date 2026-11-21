@@ -162,6 +162,7 @@ impl Stream {
             let reason = match reason {
                 "stop" | "end" | "tool_calls" | "function_call" => Finish::Stop,
                 "length" => Finish::Length,
+                "content_filter" => Finish::Filtered,
                 other => Finish::Other(other.to_owned()),
             };
             self.finish = Some(reason);
@@ -509,8 +510,7 @@ mod tests {
                 r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"eval","arguments":"{\"code\": \"print('café"}}]},"finish_reason":"content_filter"}]}"#,
             ],
         );
-        let filtered = Finish::Other("content_filter".to_owned());
-        assert_eq!(finished.expect("parse").finish, filtered);
+        assert_eq!(finished.expect("parse").finish, Finish::Filtered);
         assert_eq!(content, "print('café");
     }
 

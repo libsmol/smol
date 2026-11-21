@@ -45,8 +45,9 @@ const PROGRAMS_EVERY: Duration = match cfg!(test) {
     true => Duration::from_millis(50),
     false => Duration::from_secs(1),
 };
-/// In the command line of the helpers multiprocessing starts, which run as long as the worker
-const MULTIPROCESSING: &str = "from multiprocessing.";
+/// In the command lines of the helpers that multiprocessing and joblib's loky start,
+/// which run as long as the worker or end on their own once idle
+const HELPERS: [&str; 2] = ["from multiprocessing.", "loky.backend."];
 
 pub(crate) type Calling = Pin<Box<dyn Future<Output = Called> + Send>>;
 pub(crate) type Serving<'a> = dyn FnMut(Service) -> Calling + Send + 'a;
@@ -677,7 +678,7 @@ impl Followed {
         let mut tops = Vec::new();
         for member in &self.left {
             let parented = self.left.iter().any(|other| other.pid == member.parent);
-            let helper = member.command.contains(MULTIPROCESSING);
+            let helper = HELPERS.iter().any(|marker| member.command.contains(marker));
             if !parented && !helper {
                 tops.push(member);
             }
@@ -1387,7 +1388,8 @@ pub(crate) mod tests {
     }
 
     /// A program the code leaves running is followed until it ends, with what it printed,
-    /// and one it started belongs to it, while one that ended within the call is never followed
+    /// and one it started belongs to it, while one that ended within the call is never followed,
+    /// nor is a helper such as the one that joblib's loky starts
     #[test]
     fn programs_followed() {
         let mut worker = fresh();
@@ -1395,6 +1397,8 @@ pub(crate) mod tests {
             inner = \"import time; time.sleep(1); print('café done ' * 2000, flush=True)\"\n\
             outer = f'import subprocess, sys; subprocess.run([sys.executable, \"-c\", {inner!r}])'\n\
             ran = subprocess.run([sys.executable, '-c', 'pass'])\n\
+            helper = 'import time; time.sleep(0.8)  # joblib.externals.loky.backend.resource_tracker'\n\
+            tracker = subprocess.Popen([sys.executable, '-c', helper])\n\
             program = subprocess.Popen([sys.executable, '-c', outer])\n\
             time.sleep(0.5)\n\
             print(program.pid)";

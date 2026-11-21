@@ -47,7 +47,8 @@ impl Turn<'_> {
 
         let visible = self.memory.visible();
 
-        let max_recent = (window as f64 * MAX_RECENT_SHARE) as u64;
+        // What is kept counts against what the system prompt leaves, or it could fill that alone
+        let max_recent = (left as f64 * MAX_RECENT_SHARE) as u64;
         let mut recent = 0;
         let mut kept = 0;
         for step in visible.steps.iter().rev() {
@@ -61,7 +62,7 @@ impl Turn<'_> {
         }
 
         // Steps after the model's last reply are unseen and stay unsummarized
-        // unless together they pass half the window
+        // unless together they pass half of what the system prompt leaves
         let mut unseen = 0;
         let mut pending = 0;
         for step in visible.steps.iter().rev() {
@@ -85,7 +86,7 @@ impl Turn<'_> {
             let messages = step.messages(&mut 0, &takes, rank);
             let sent = bytes(&messages);
             unseen += estimate(sent);
-            if unseen > window / 2 {
+            if unseen > left / 2 {
                 break;
             }
             pending += 1;
@@ -168,9 +169,13 @@ impl Turn<'_> {
                 }
 
                 self.sink.event(Event::CompactEnd(Err(&failure)));
+                // The step still runs while the conversation fits, or every later step would fail too
                 let Failure::Model(error) = failure else {
                     return Ok(());
                 };
+                if used + limit < window {
+                    return Ok(());
+                }
                 return Err(error.into());
             };
             previous = Some(text);
@@ -258,6 +263,20 @@ mod tests {
         recorded(replies, window, Box::new(|_| {}))
     }
 
+    /// A window that leaves 1000 tokens past the system prompt of these agents,
+    /// and the measured input from which a step compacts first
+    fn sized() -> (u64, u64) {
+        let mut run = agent(None, vec![Ok(reply("Done"))]);
+        let mut memory = AgentMemory::default();
+        run.agent.turn(&mut memory, "Go").expect("run");
+        let requests = run.requests.lock().expect("requests");
+        let system = content(&requests[0][0]);
+        let size = text_bytes(&system);
+        let window = estimate(size) + 1000;
+        let reserve = (window as f64 * RESERVE_SHARE) as u64;
+        (window, window - reserve)
+    }
+
     /// Answers as `inner` does, with an output limit
     struct Limited {
         inner: Arc<dyn Model>,
@@ -319,13 +338,14 @@ mod tests {
         })
     }
 
-    /// With a 1000-token window this compacts before the third step and keeps only the second
-    fn filling() -> Vec<Result<Script, ModelError>> {
+    /// With the window of `sized`, which compacts from `start` on,
+    /// this compacts before the third step and keeps only the second
+    fn filling(start: u64) -> Vec<Result<Script, ModelError>> {
         vec![
-            measured(called("x = 41\nprint('a' * 600)"), 500),
-            measured(called("print('data')"), 840),
+            measured(called("x = 41\nprint('a' * 600)"), start - 400),
+            measured(called("print('data')"), start + 10),
             measured(reply("x holds 41."), 900),
-            measured(reply("42"), 100),
+            measured(reply("42"), start - 400),
         ]
     }
 
@@ -335,13 +355,14 @@ mod tests {
 
     #[test]
     fn older_steps_summarized() {
-        let mut replies = filling();
+        let (window, start) = sized();
+        let mut replies = filling(start);
         for script in replies.iter_mut().flatten() {
             let item =
                 json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-café" });
             script.sealed = vec![item];
         }
-        let (mut run, events) = watched(Some(1000), replies);
+        let (mut run, events) = watched(Some(window), replies);
         let mut memory = AgentMemory::default();
         let answer = run.agent.turn(&mut memory, "Add 1 to x").expect("run");
         assert_eq!(answer, Some("42".to_owned()));
@@ -461,15 +482,33 @@ mod tests {
         }
     }
 
+    /// A summary that fails while the conversation still fits leaves the step to run
+    #[test]
+    fn failed_summary_tolerated() {
+        let (window, start) = sized();
+        let mut replies = filling(start);
+        replies[2] = Err(ModelError::new("the café is closed"));
+        let (mut run, events) = watched(Some(window), replies);
+        let mut memory = AgentMemory::default();
+        let answer = run.agent.turn(&mut memory, "Add 1 to x").expect("run");
+
+        assert_eq!(answer, Some("42".to_owned()));
+        let summarized = |step: &MemoryStep| matches!(step, MemoryStep::Summary(_));
+        assert!(!memory.steps.iter().any(summarized), "{:?}", memory.steps);
+        let events = events.lock().expect("events");
+        assert_eq!(events.len(), 2, "{events:?}");
+    }
+
     #[test]
     fn new_task_kept() {
+        let (window, start) = sized();
         let replies = vec![
-            measured(called("x = 41\nprint('a' * 600)"), 500),
-            measured(reply("x is 41."), 840),
+            measured(called("x = 41\nprint('a' * 600)"), start - 400),
+            measured(reply("x is 41."), start + 10),
             measured(reply("x holds 41."), 900),
-            measured(reply("42"), 100),
+            measured(reply("42"), start - 400),
         ];
-        let mut run = agent(Some(1000), replies);
+        let mut run = agent(Some(window), replies);
         let mut memory = AgentMemory::default();
         run.agent.turn(&mut memory, "Check x").expect("run");
         let answer = run.agent.turn(&mut memory, "Add 1 to x").expect("run");

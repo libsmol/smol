@@ -221,8 +221,15 @@ impl Server {
                 // SameSite still sends the cookie from a page of this site on another port
                 let forwarded = header("x-forwarded-host");
                 let host = forwarded.or_else(|| header("host"));
-                let origin = header("origin").and_then(|origin| origin.split_once("://"));
-                if origin.is_some_and(|(_, origin)| Some(origin) != host) {
+                // An origin that names no host, such as `null`, is no page of this site either
+                let origin = header("origin");
+                let place = origin.map(|origin| origin.split_once("://"));
+                let foreign = match place {
+                    Some(Some((_, origin))) => Some(origin) != host,
+                    Some(None) => true,
+                    None => false,
+                };
+                if foreign {
                     reply(
                         &mut stream,
                         "403 Forbidden",
@@ -403,6 +410,7 @@ mod tests {
     use std::net::{SocketAddr, TcpStream};
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -424,6 +432,9 @@ mod tests {
     /// The whole response to a GET with these extra header lines
     fn get(address: SocketAddr, path: &str, headers: &str) -> String {
         let mut stream = TcpStream::connect(address).expect("connect");
+        // A WebSocket let in by mistake stays open, which would hang the test
+        let wait = Duration::from_secs(10);
+        stream.set_read_timeout(Some(wait)).expect("timeout");
         let request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n{headers}\r\n");
         stream.write_all(request.as_bytes()).expect("write");
         let mut response = String::new();
@@ -458,8 +469,13 @@ mod tests {
             page.starts_with("HTTP/1.1 200") && page.contains("frame-ancestors 'none'"),
             "{page}"
         );
-        let foreign = format!("{cookie}Origin: http://café.example\r\nSec-WebSocket-Key: a2V5\r\n");
-        assert!(get(address, "/ws", &foreign).starts_with("HTTP/1.1 403"));
+        for origin in ["http://café.example", "null"] {
+            let foreign = format!("{cookie}Origin: {origin}\r\nSec-WebSocket-Key: a2V5\r\n");
+            assert!(
+                get(address, "/ws", &foreign).starts_with("HTTP/1.1 403"),
+                "{origin}"
+            );
+        }
 
         assert!(get(address, "/image/1", &cookie).starts_with("HTTP/1.1 404"));
         let page = "<p>naïve</p>".as_bytes().to_vec();

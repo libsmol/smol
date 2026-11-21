@@ -125,13 +125,7 @@ impl Workplace {
         }
         // The worker and the venv's python are libsmol's own executable, wherever it is installed
         rules.read.push(worker::executable());
-        rules.hidden.push(config.to_owned());
-        if let Some(home) = env::home_dir() {
-            for name in CREDENTIALS {
-                rules.hidden.push(home.join(name));
-            }
-        }
-        rules.hidden.extend(access.hidden.iter().cloned());
+        rules.hidden = hidden(config, access);
 
         let sandbox = Sandbox::new(&rules)?;
         let home = home_of(config);
@@ -159,6 +153,18 @@ impl Drop for Workplace {
         // Removed only here, and only when empty, because the worker's rule is on the folder made at the start
         fs::remove_dir(&self.copies).ok();
     }
+}
+
+/// What the code never sees: the config directory, the credential locations and `[deny] read`
+pub(crate) fn hidden(config: &Path, access: &Access) -> Vec<PathBuf> {
+    let mut hidden = vec![config.to_owned()];
+    if let Some(home) = env::home_dir() {
+        for name in CREDENTIALS {
+            hidden.push(home.join(name));
+        }
+    }
+    hidden.extend(access.hidden.iter().cloned());
+    hidden
 }
 
 /// Where the interpreter's files live on Windows, which every venv's pyvenv.cfg names

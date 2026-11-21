@@ -197,6 +197,10 @@ pub(crate) fn models(dir: &Path) -> Result<Models> {
             }
         };
 
+        if let Err(problem) = check_name(&name) {
+            let problem = format!("[model.{name}]: {problem}");
+            return Err(invalid(problem));
+        }
         if let Some(api) = &provider.api {
             if let Err(problem) = parse_url(api) {
                 let problem = format!("[model.{name}]: api: {problem}");
@@ -774,6 +778,16 @@ pub(crate) fn agent(dir: &Path) -> Result<AgentConfig> {
         access,
         skipped,
     })
+}
+
+/// The name of a provider, which model choices write before the model id
+pub(crate) fn check_name(name: &str) -> Result<(), String> {
+    let problem = match name {
+        "" => "can't be empty",
+        name if name.contains('/') => "can't contain /, which separates it from the model id",
+        _ => return Ok(()),
+    };
+    Err(problem.to_owned())
 }
 
 pub(crate) fn parse_url(url: &str) -> Result<Url, String> {

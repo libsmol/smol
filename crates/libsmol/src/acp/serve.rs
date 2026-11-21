@@ -6,7 +6,7 @@ use crate::config::setup::SETUP_ARG;
 use crate::history::HistoryStore;
 use crate::tools::memories::Memories;
 use crate::utils::{block_on, new_id, Interrupt};
-use crate::worker::sandbox;
+use crate::worker::{sandbox, workplace};
 use crate::{Error, Result};
 use agent_client_protocol_schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodTerminal, CancelNotification, CloseSessionRequest,
@@ -169,10 +169,13 @@ pub(crate) async fn serve(mut input: Lines, app: Arc<App>) -> Result<()> {
         let id = message.get("id");
         let Some(method) = message["method"].as_str() else {
             let replied = message.get("result").is_some() || message.get("error").is_some();
-            match (replied, id) {
-                (true, _) => peer.answered(&message),
-                (false, Some(id)) => peer.respond(id, Err(Error::InvalidRequest)),
-                (false, None) => {}
+            match replied {
+                true => peer.answered(&message),
+                // Also what isn't an object, such as a batch
+                false => {
+                    let id = id.unwrap_or(&Value::Null);
+                    peer.respond(id, Err(Error::InvalidRequest));
+                }
             }
             continue;
         };
@@ -405,9 +408,14 @@ impl Router {
     }
 
     fn open(&mut self, id: &Value, session: String, cwd: PathBuf, loading: bool) -> Result<()> {
+        let shown = cwd.display();
         if !cwd.is_absolute() {
-            let shown = cwd.display();
             let message = format!("acp: invalid params: cwd: {shown}: not an absolute path");
+            return Err(Error::InvalidParams(message));
+        }
+        // A directory that is gone would get a project folder and venv made for it
+        if !cwd.is_dir() {
+            let message = format!("acp: invalid params: cwd: {shown}: not a directory");
             return Err(Error::InvalidParams(message));
         }
 
@@ -433,6 +441,16 @@ impl Router {
                 return Err(error);
             }
         };
+
+        // Hidden itself, the directory would leave the code only its names
+        let real = fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+        for place in workplace::hidden(&self.app.config, &agent.access) {
+            let place = fs::canonicalize(&place).unwrap_or(place);
+            if place == real {
+                let message = format!("acp: invalid params: cwd: {shown}: hidden from the code");
+                return Err(Error::InvalidParams(message));
+            }
+        }
 
         // A closed session may still be saving and must finish before it is read
         let previous = match self.sessions.remove(&session) {
@@ -598,18 +616,20 @@ mod tests {
         let (mut router, mut sent) = router(&dir);
         let app = Arc::clone(&router.app);
         let model = "[model.mock]\ntype = \"openai-completions\"\napi = \"http://127.0.0.1:1/v1\"\nmodels = [{ id = \"m1\" }]\n";
-        fs::create_dir_all(&dir).expect("dir");
+        // The config folder is hidden from the code, so the session works in one of its own
+        let work = dir.join("work");
+        fs::create_dir_all(&work).expect("dir");
         fs::write(dir.join("model.toml"), model).expect("model.toml");
         let memory = one_task("Last turn");
         let interrupt = Interrupt::default();
 
         let loading = async {
             // The old task saves a readable session only after it is cancelled
-            let project = app.store.project(&dir);
+            let project = app.store.project(&work);
             fs::create_dir_all(&project).expect("project");
             fs::write(project.join("s1.json"), "half saved").expect("write");
             let saving = Arc::clone(&app);
-            let cwd = dir.clone();
+            let cwd = work.clone();
             let old = task::spawn(async move {
                 time::sleep(Duration::from_millis(200)).await;
                 let settings = Settings {
@@ -626,11 +646,11 @@ mod tests {
                 received: 0,
                 span: Span::none(),
                 task: old,
-                memories: Memories::new(&dir, &dir),
+                memories: Memories::new(&dir, &work),
             };
             router.sessions.insert("s1".to_owned(), opened);
 
-            let params = json!({"sessionId": "s1", "cwd": dir, "mcpServers": []});
+            let params = json!({"sessionId": "s1", "cwd": work, "mcpServers": []});
             let asked = router.request(&json!(1), "session/load", params);
             assert!(matches!(asked, Ok(None)), "{asked:?}");
             assert!(interrupt.cancelled(0));
@@ -664,23 +684,42 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// A directory that is gone, or that the code can't see, is refused before the session opens
+    #[test]
+    fn gone_cwd_refused() {
+        let dir = temp_dir("gone-cwd");
+        let (mut router, _sent) = router(&dir);
+        let model = "[model.mock]\ntype = \"openai-completions\"\napi = \"http://127.0.0.1:1/v1\"\nmodels = [{ id = \"m1\" }]\n";
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("model.toml"), model).expect("model.toml");
+
+        for cwd in [dir.join("café"), dir.clone()] {
+            let params = json!({"cwd": cwd, "mcpServers": []});
+            let asked = router.request(&json!(1), "session/new", params);
+            assert!(matches!(asked, Err(Error::InvalidParams(_))), "{asked:?}");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// What was queued behind an open that fails is still answered, and the session is then unknown
     #[test]
     fn failed_open_drained() {
         let dir = temp_dir("failed-open");
         let (mut router, mut sent) = router(&dir);
         let model = "[model.mock]\ntype = \"openai-completions\"\napi = \"http://127.0.0.1:1/v1\"\nmodels = [{ id = \"m1\" }]\n";
-        fs::create_dir_all(&dir).expect("dir");
+        // The config folder is hidden from the code, so the session works in one of its own
+        let work = dir.join("work");
+        fs::create_dir_all(&work).expect("dir");
         fs::write(dir.join("model.toml"), model).expect("model.toml");
         let memory = one_task("Count the orders");
         let settings = Settings {
-            cwd: dir.clone(),
+            cwd: work.clone(),
             ..Settings::default()
         };
         let mut held = Vec::new();
         for session in ["s1", "s2"] {
             saved(&router.app.store, &memory, session, &settings);
-            let lock = router.app.store.lock(&dir, session).expect("lock");
+            let lock = router.app.store.lock(&work, session).expect("lock");
             held.push(lock);
         }
 
@@ -698,11 +737,11 @@ mod tests {
                 received: 0,
                 span: Span::none(),
                 task: old,
-                memories: Memories::new(&dir, &dir),
+                memories: Memories::new(&dir, &work),
             };
             router.sessions.insert("s1".to_owned(), opened);
 
-            let params = json!({"sessionId": "s1", "cwd": dir, "mcpServers": []});
+            let params = json!({"sessionId": "s1", "cwd": work, "mcpServers": []});
             router
                 .request(&json!(1), "session/load", params)
                 .expect("load");
@@ -729,7 +768,7 @@ mod tests {
             }
 
             // Opening another session drops the failed one, which no request named since
-            let params = json!({"sessionId": "s2", "cwd": dir, "mcpServers": []});
+            let params = json!({"sessionId": "s2", "cwd": work, "mcpServers": []});
             router
                 .request(&json!(3), "session/load", params)
                 .expect("load");

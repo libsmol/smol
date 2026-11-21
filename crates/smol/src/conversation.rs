@@ -363,7 +363,18 @@ impl Conversation {
                 let meta = chunk.meta.as_ref();
                 let amends = meta.is_some_and(|meta| meta.contains_key(UPDATE));
                 let background = meta.is_some_and(|meta| meta.contains_key(BACKGROUND));
+                // Programs that ended as the user sent a task come before it, as a resume shows them,
+                // where a replayed task, which has an id, came before them
+                let sent =
+                    matches!(self.held.first(), Some(Entry::Task(_))) && self.task_id.is_none();
+                let raced = background && sent && self.unstarted();
                 match (&self.live, self.held.last_mut()) {
+                    _ if raced => {
+                        let task = mem::take(&mut self.held);
+                        self.open_turn(Entry::Ended(text));
+                        self.finish_turn(Outcome::Answered);
+                        self.held = task;
+                    }
                     (None, Some(Entry::Task(task))) if id == self.task_id => {
                         task.push_str(&text);
                     }
@@ -1097,4 +1108,62 @@ fn fenced(text: &str) -> Option<(&str, &str)> {
     let (language, code) = rest.split_once('\n').unwrap_or((rest, ""));
     let code = code.trim_end().strip_suffix(fence).unwrap_or(code);
     Some((language.trim(), code.trim_matches('\n')))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::conversation::{Conversation, Entry, Outcome};
+    use agent_client_protocol_schema::v1::SessionUpdate;
+    use reaper::wire::BACKGROUND;
+    use serde_json::json;
+
+    fn chunk(text: &str, id: &str, background: bool) -> SessionUpdate {
+        let mut update = json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": { "type": "text", "text": text },
+            "messageId": id,
+        });
+        if background {
+            update["_meta"] = json!({ BACKGROUND: true });
+        }
+        serde_json::from_value(update).expect("update")
+    }
+
+    fn shown(conversation: &Conversation) -> Vec<String> {
+        let mut shown = Vec::new();
+        for entry in conversation.entries().iter().chain(conversation.held()) {
+            let text = match entry {
+                Entry::Task(text) => format!("task {text}"),
+                Entry::Ended(text) => format!("ended {text}"),
+                _ => continue,
+            };
+            shown.push(text);
+        }
+        shown
+    }
+
+    /// Programs that end as the user sends a task come before it live, as a resume replays them
+    #[test]
+    fn ended_before_task() {
+        let ended = chunk("Programs ended: café.py", "task_1", true);
+        let mut live = Conversation::default();
+        live.task("Count the cafés");
+        live.update(&ended);
+        live.finish_turn(Outcome::Answered);
+
+        let mut replayed = Conversation::default();
+        replayed.update(&ended);
+        replayed.update(&chunk("Count the cafés", "task_2", false));
+        replayed.finish_turn(Outcome::Answered);
+
+        assert_eq!(shown(&live), shown(&replayed));
+        assert_eq!(live.stats.turns, replayed.stats.turns);
+
+        // A task whose turn failed before its first step stays before programs that ended later
+        let mut failed = Conversation::default();
+        failed.update(&chunk("Count the cafés", "task_1", false));
+        failed.update(&chunk("Programs ended: café.py", "task_2", true));
+        let order = ["task Count the cafés", "ended Programs ended: café.py"];
+        assert_eq!(shown(&failed), order);
+    }
 }

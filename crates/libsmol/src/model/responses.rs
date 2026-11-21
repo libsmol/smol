@@ -249,6 +249,7 @@ impl Stream {
                 let finish = match (kind, reason) {
                     ("response.completed", _) => Finish::Stop,
                     (_, Some("max_output_tokens")) => Finish::Length,
+                    (_, Some("content_filter")) => Finish::Filtered,
                     (_, reason) => {
                         let reason = reason.unwrap_or("incomplete");
                         Finish::Other(reason.to_owned())

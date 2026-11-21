@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::select;
-use tokio::sync::{watch, Notify, Semaphore};
+use tokio::sync::{watch, Semaphore};
 use tokio::task::{self, AbortHandle};
 use tokio::time;
 use tracing::{error_span, info, warn, Instrument};
@@ -54,22 +54,25 @@ struct Activity {
 #[derive(Default)]
 struct Inbox {
     sent: Mutex<Vec<String>>,
-    arrived: Notify,
 }
 
 impl Queue for Inbox {
     fn queued(&self) -> Asking<'_> {
         let mut inbox = self.sent.lock().expect("inbox");
-        let sent = mem::take(&mut *inbox).into_iter();
-        let tasks = sent.map(|text| Task {
-            text,
-            mentions: Vec::new(),
-        });
-        Box::pin(future::ready(tasks.collect()))
+        let mut tasks = Vec::new();
+        for text in mem::take(&mut *inbox) {
+            let task = Task {
+                text,
+                mentions: Vec::new(),
+            };
+            tasks.push(task);
+        }
+        Box::pin(future::ready(tasks))
     }
 
+    /// Only the session's own agent waits for messages to arrive
     fn enqueued(&self) -> Nudging<'_> {
-        Box::pin(self.arrived.notified())
+        Box::pin(future::pending())
     }
 }
 
@@ -151,7 +154,6 @@ impl Agent {
             let member = &members[id];
             if member.running() {
                 member.inbox.sent.lock().expect("inbox").push(asked.task);
-                member.inbox.arrived.notify_one();
                 return Ok(Value::Null);
             }
         }
@@ -373,7 +375,8 @@ impl Launcher<'_> {
         let launched = self.team.launched.fetch_add(1, Ordering::Relaxed) + 1;
         let span = error_span!("", agent = launched);
         let working = agent.work(asked, memory, kept, watched, servers, slots);
-        let mut working = task::spawn(working.instrument(span));
+        let working = working.instrument(span);
+        let mut working = task::spawn(working);
         member.abort = Some(working.abort_handle());
 
         let session = session.clone();

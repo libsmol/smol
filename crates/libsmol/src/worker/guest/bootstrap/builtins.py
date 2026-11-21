@@ -58,7 +58,7 @@ def _print(*args, sep=" ", end="\n", file=None, flush=False, limit=_MAX_PRINT_CH
     text = separator.join(texts)
     if len(text) > limit:
         cut = len(text) - limit
-        marker = f"\n[{cut} characters cut; print(..., limit=None) skips this cut]\n"
+        marker = "\n" + _PRINT_CUT.format(cut=cut) + "\n"
         head = text[: limit - limit // 2]
         tail = text[len(text) - limit // 2 :]
         text = head + marker + tail

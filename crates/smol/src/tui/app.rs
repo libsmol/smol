@@ -905,8 +905,11 @@ impl App {
         if listing.is_none() {
             self.opened = None;
         }
+        // Only running the command reports a list that is empty or failed,
+        // since a prefix may be typed again and again
         if let Some(list) = listing.filter(|_| opened != listing) {
-            self.open_list(list);
+            let picks = self.picks(list).unwrap_or_default();
+            self.opened = Some((list, picks));
         }
 
         let DataCursor(row, col) = self.draft.area.cursor();

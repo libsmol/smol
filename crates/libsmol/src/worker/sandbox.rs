@@ -22,6 +22,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::ptr;
+use std::time::Duration;
 use tokio::process::Command;
 use tracing::info;
 #[cfg(target_os = "linux")]
@@ -30,6 +31,10 @@ use tracing::warn;
 const TEMP_PREFIX: &str = "smol-";
 /// The sandbox holds a lock on this file in its temporary folder while it lives
 const LOCK: &str = "lock";
+/// The folder in it that the code gets as its own temporary folder
+const SCRATCH: &str = "tmp";
+/// A younger folder may be one that `Sandbox::new` hasn't locked yet
+const MIN_STALE_AGE: Duration = Duration::from_secs(60);
 
 /// `LANDLOCK_CREATE_RULESET_VERSION`, which libc doesn't define
 #[cfg(target_os = "linux")]
@@ -88,7 +93,7 @@ impl Sandbox {
         let id = new_id();
         let name = format!("{TEMP_PREFIX}{id}");
         let temp = env::temp_dir().join(name);
-        let scratch = temp.join("tmp");
+        let scratch = temp.join(SCRATCH);
         let failed = |path: &Path, e: io::Error| {
             let shown = tilde(path);
             let reason = cause(&e);
@@ -216,10 +221,28 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        // Windows can't remove the lock file while it is open
-        self.lock.take();
-        fs::remove_dir_all(&self.temp).ok();
+        match self.lock.take() {
+            Some(lock) => {
+                clear(&self.temp, lock);
+            }
+            None => {
+                fs::remove_dir_all(&self.temp).ok();
+            }
+        }
     }
+}
+
+/// Removes the temporary folder that `lock` holds, which keeps its lock file while a program
+/// still ending writes in it, for a later sweep to find
+fn clear(temp: &Path, lock: File) -> bool {
+    let scratch = temp.join(SCRATCH);
+    let emptied = match fs::remove_dir_all(&scratch) {
+        Ok(()) => true,
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
+    };
+    // Windows can't remove the lock file while it is open
+    drop(lock);
+    emptied && fs::remove_dir_all(temp).is_ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -429,14 +452,21 @@ pub(crate) fn sweep() {
             continue;
         }
         let folder = entry.path();
+        let made = entry.metadata().and_then(|found| found.modified());
+        let fresh = match made {
+            Ok(made) => made.elapsed().unwrap_or_default() < MIN_STALE_AGE,
+            Err(_) => true,
+        };
+        if fresh {
+            continue;
+        }
         let Ok(lock) = File::open(folder.join(LOCK)) else {
             continue;
         };
         if lock.try_lock().is_err() {
             continue;
         }
-        drop(lock);
-        if fs::remove_dir_all(&folder).is_ok() {
+        if clear(&folder, lock) {
             removed += 1;
         }
     }
@@ -456,7 +486,7 @@ pub(crate) mod tests {
     use crate::worker::host::{Rank, Worker};
     #[cfg(target_os = "linux")]
     use crate::worker::sandbox::landlock_abi;
-    use crate::worker::sandbox::PIP_CACHE_ENV;
+    use crate::worker::sandbox::{PIP_CACHE_ENV, SCRATCH};
     use crate::worker::workplace::tests::opened;
     use crate::worker::workplace::{Workplace, PASSED_ENV};
     use std::env;
@@ -720,7 +750,7 @@ pub(crate) mod tests {
             ..Access::default()
         };
         let workplace = opened(&cwd, &dir, &access);
-        let scratch = workplace.sandbox.temp.join("tmp").display().to_string();
+        let scratch = workplace.sandbox.temp.join(SCRATCH).display().to_string();
         let cached = match workplace.sandbox.enforced() {
             true => "True",
             false => "False",

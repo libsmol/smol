@@ -1,4 +1,4 @@
-use crate::config::{self, parse_url, Kind, ModelSpec, MIN_CONTEXT, MODEL_FILE};
+use crate::config::{self, check_name, parse_url, Kind, ModelSpec, MIN_CONTEXT, MODEL_FILE};
 use crate::model::{listed, ListError, DEFAULT_API};
 use crate::utils::block_on;
 use crate::{Error, Result};
@@ -212,15 +212,6 @@ fn check_id(id: &str) -> Result<(), String> {
         true => Err("can't be empty".to_owned()),
         false => Ok(()),
     }
-}
-
-fn check_name(name: &str) -> Result<(), String> {
-    let problem = match name {
-        "" => "can't be empty",
-        name if name.contains('/') => "can't contain /, which separates it from the model id",
-        _ => return Ok(()),
-    };
-    Err(problem.to_owned())
 }
 
 /// Accepts digit separators, since windows are often written as 128,000

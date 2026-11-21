@@ -742,28 +742,35 @@ fn gauge(ratio: Option<f64>, width: usize) -> Line<'static> {
     Line::from(vec![full, empty])
 }
 
-/// Must agree with the textarea's `WrapMode::Glyph`
+/// Must agree with the textarea's `WrapMode::Glyph`, which breaks between graphemes
+/// and counts each as wide as its chars together
 fn input_rows(input: &TextArea, width: u16) -> u16 {
     let area = Rect::new(0, 0, width, 3);
     let width = panel().inner(area).width.max(1);
     let width = usize::from(width);
     let tab = input.tab_length();
     let tab = usize::from(tab);
-    let cells = |c: char, col: usize| match c {
-        '\t' => tab - col % tab,
-        c => c.width().unwrap_or(0),
+    let cells = |grapheme: &str, col: usize| {
+        let mut end = col;
+        for c in grapheme.chars() {
+            end += match c {
+                '\t' => tab - end % tab,
+                c => c.width().unwrap_or(0),
+            };
+        }
+        end - col
     };
 
     let mut rows = 0;
     for line in input.lines() {
         rows += 1;
         let mut col = 0;
-        for c in line.chars() {
-            let mut w = cells(c, col);
+        for grapheme in line.graphemes(true) {
+            let mut w = cells(grapheme, col);
             if col > 0 && col + w > width {
                 rows += 1;
                 col = 0;
-                w = cells(c, col);
+                w = cells(grapheme, col);
             }
             col += w;
         }

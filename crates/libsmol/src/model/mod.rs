@@ -178,6 +178,8 @@ pub(crate) enum Purpose {
 pub(crate) enum Finish {
     Stop,
     Length,
+    /// A content filter stopped it, which it would do to the same request again
+    Filtered,
     Other(String),
 }
 
@@ -789,7 +791,7 @@ impl Stream {
         let rest = renamed.unwrap_or(decoded);
         // When the server stops for another reason,
         // an incomplete call isn't malformed and the stop reason is reported
-        let stopped = matches!(self.finish, Some(Finish::Other(_)));
+        let stopped = matches!(self.finish, Some(Finish::Filtered | Finish::Other(_)));
         if stopped && !read {
             return;
         }

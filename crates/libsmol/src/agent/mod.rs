@@ -171,7 +171,7 @@ impl Sink for Logged<'_> {
                 info!("compact: done [kept={kept}, elapsed={seconds:.1}s]");
             }
             Event::CompactEnd(Err(Failure::Interrupted)) => info!("compact: interrupted"),
-            Event::CompactEnd(Err(_)) => warn!("compact: failed"),
+            Event::CompactEnd(Err(Failure::Model(error))) => warn!("compact: failed, {error}"),
             Event::Restarted => warn!("python: restarted"),
             _ => {}
         }
@@ -595,9 +595,11 @@ async fn generate(
         }
         Finish::Stop if blank => ModelError::transient("empty reply"),
         Finish::Length if blank => ModelError::new("hit the output limit before replying"),
+        Finish::Filtered => ModelError::new("stopped by provider (content filter)"),
+        // Such as an overloaded server
         Finish::Other(reason) => {
             let message = format!("stopped by provider ({reason})");
-            ModelError::new(message)
+            ModelError::transient(message)
         }
         finish => return Ok(finish),
     };
