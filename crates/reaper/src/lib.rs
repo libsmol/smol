@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 mod unix;
@@ -199,50 +199,6 @@ pub fn tilde(path: &Path) -> String {
         Some(rest) => Path::new("~").join(rest).display().to_string(),
         None => path.display().to_string(),
     }
-}
-
-/// The text on one line, with `cwd` as `.` and paths in it relative, and the home directory as `~`
-pub fn one_line(text: &str, cwd: &Path) -> String {
-    let cwd = cwd.display().to_string();
-    let mut text = shortened(text, &cwd, ".", "");
-    if let Some(home) = env::home_dir() {
-        let home = home.display().to_string();
-        let inside = format!("~{MAIN_SEPARATOR}");
-        text = shortened(&text, &home, "~", &inside);
-    }
-
-    let words: Vec<&str> = text.split_whitespace().collect();
-    words.join(" ")
-}
-
-/// Writes `root` as `name` and paths in it starting with `inside`,
-/// except where `root` only begins or ends a longer path or word
-fn shortened(text: &str, root: &str, name: &str, inside: &str) -> String {
-    // An empty root would match at every position and never advance
-    if root.is_empty() {
-        return text.to_owned();
-    }
-
-    let pathy = |c: char| c.is_alphanumeric() || matches!(c, '/' | '\\' | '.' | '-' | '_' | '~');
-    let mut kept = String::new();
-    let mut rest = text;
-    while let Some(at) = rest.find(root) {
-        let (before, after) = (&rest[..at], &rest[at + root.len()..]);
-        kept.push_str(before);
-        let joined = before.chars().next_back().is_some_and(pathy);
-        rest = after;
-        match after.chars().next() {
-            _ if joined => kept.push_str(root),
-            Some(MAIN_SEPARATOR) => {
-                kept.push_str(inside);
-                rest = &after[MAIN_SEPARATOR.len_utf8()..];
-            }
-            Some(next) if pathy(next) => kept.push_str(root),
-            _ => kept.push_str(name),
-        }
-    }
-    kept.push_str(rest);
-    kept
 }
 
 #[cfg(test)]

@@ -1,23 +1,9 @@
-use crate::conversation::{Conversation, Entry, Step};
+use crate::conversation::{Conversation, Entry};
 use crate::tui::render::{Render, Row};
-use crate::tui::SPIN_EVERY;
 use ratatui::layout::{Position, Rect};
-use std::ops::Range;
 use std::path::PathBuf;
-use std::time::Instant;
 
 const UNSENT_HINT: &str = "Goes to the model with your next message";
-
-/// The rows of the agents of one call with agents at work, counted from the start of its
-/// settled entry or, with no entry, of the held rows
-#[derive(Debug)]
-pub(crate) struct Group {
-    pub(crate) call: String,
-    pub(crate) entry: Option<usize>,
-    pub(crate) rows: Range<usize>,
-    /// The revision of the call these rows were drawn at
-    pub(crate) drawn: u64,
-}
 
 #[derive(Clone, Copy)]
 pub(crate) struct Rows<'a> {
@@ -64,8 +50,6 @@ pub(crate) struct Viewport {
     pub(crate) back: usize,
     /// The most rows the last frame could scroll back
     bottom: usize,
-    /// `back` as the last frame left it, which only scrolling changes before the next
-    drawn_back: usize,
     /// Where the last frame drew the scrollbar, empty without one
     pub(crate) bar: Rect,
 }
@@ -94,14 +78,7 @@ impl Viewport {
 
     /// Shows `total` rows `height` at a time, where a view scrolled back stays on what it showed,
     /// at the row `anchored` once everything was laid out again, and returns the first row shown
-    /// and whether scrolling moved it since the last frame
-    pub(crate) fn settle(
-        &mut self,
-        total: usize,
-        height: usize,
-        anchored: Option<usize>,
-    ) -> (usize, bool) {
-        let scrolled = self.back != self.drawn_back;
+    pub(crate) fn settle(&mut self, total: usize, height: usize, anchored: Option<usize>) -> usize {
         let bottom = total.saturating_sub(height);
         match anchored {
             Some(top) => self.back = bottom.saturating_sub(top),
@@ -115,9 +92,8 @@ impl Viewport {
 
         self.back = self.back.min(bottom);
         self.bottom = bottom;
-        self.drawn_back = self.back;
         self.bar = Rect::default();
-        (self.top(), scrolled)
+        self.top()
     }
 
     /// Puts the scrollbar in the last column of `track` and returns where its thumb goes,
@@ -151,16 +127,7 @@ pub(crate) struct Transcript {
     layout: (u16, bool, u64),
     /// How many pictures had loaded when the frame began, which `anchor` and `rows` must agree on
     pub(crate) loaded: u64,
-    /// When the spinners in `groups` were last drawn moving on
-    spun: Option<Instant>,
-    groups: Vec<Group>,
-    /// The rows on screen
-    view: Option<Range<usize>>,
-    /// Whether scrolling moved `view` since the frame before
-    scrolled: bool,
-    /// The calls whose agents the last frame drew at the bottom, by id
-    pins: Vec<String>,
-    /// The session's directory, which agents' tasks write as `.`
+    /// The session's directory, where relative paths start
     cwd: PathBuf,
 }
 
@@ -170,11 +137,6 @@ impl Transcript {
             cwd,
             ..Self::default()
         }
-    }
-
-    pub(crate) fn view(&mut self, rows: Range<usize>, scrolled: bool) {
-        self.view = Some(rows);
-        self.scrolled = scrolled;
     }
 
     /// Before a layout change, records which entry `row` belongs to and its offset there
@@ -195,12 +157,6 @@ impl Transcript {
         Some((entry, row - self.starts[entry]))
     }
 
-    fn render(&self, width: u16, expanded: bool) -> Render {
-        let mut render = Render::new(width, expanded);
-        render.cwd = self.cwd.clone();
-        render
-    }
-
     pub(crate) fn rows(&mut self, talk: &Conversation, width: u16, expanded: bool) -> Rows<'_> {
         // A picture that finished loading changes the height of its rows
         let layout = (width, expanded, self.loaded);
@@ -209,28 +165,19 @@ impl Transcript {
             self.layout = layout;
             self.settled.clear();
             self.starts.clear();
-            self.groups.clear();
-            // Rows are numbered anew, so the agents at the bottom are found again
-            self.view = None;
-            self.pins.clear();
         }
 
-        let mut render = self.render(width, expanded);
+        let mut render = Render::new(width, expanded);
+        render.cwd = self.cwd.clone();
         let rendered = self.starts.len();
-        for (index, entry) in talk.entries().iter().enumerate().skip(rendered) {
-            let start = render.rows.len();
-            self.starts.push(self.settled.len() + start);
+        for entry in talk.entries().iter().skip(rendered) {
+            let start = self.settled.len() + render.rows.len();
+            self.starts.push(start);
             render.entry(entry);
-            for mut group in render.groups.drain(..) {
-                group.entry = Some(index);
-                group.rows = group.rows.start - start..group.rows.end - start;
-                self.groups.push(group);
-            }
         }
         self.settled.append(&mut render.rows);
 
-        let redrawn = relaid || self.drawn != talk.revision();
-        if redrawn {
+        if relaid || self.drawn != talk.revision() {
             self.drawn = talk.revision();
             for entry in talk.held() {
                 render.entry(entry);
@@ -242,138 +189,13 @@ impl Transcript {
                 let hint = Entry::Info(UNSENT_HINT.to_owned());
                 render.entry(&hint);
             }
-            self.groups.retain(|group| group.entry.is_some());
-            self.groups.append(&mut render.groups);
             self.held = render.rows;
-        }
-
-        // Agents at work show a spinner and their time, so the rows of their calls are drawn again
-        // as these move on and after one of them changed, in settled entries only while on screen
-        let spinning = self.spun.is_none_or(|at| at.elapsed() >= SPIN_EVERY);
-        if spinning {
-            self.spun = Some(Instant::now());
-        }
-        let mut at = 0;
-        while at < self.groups.len() {
-            let group = &self.groups[at];
-            let fresh = match group.entry {
-                Some(index) => index >= rendered,
-                None => redrawn,
-            };
-            let rows = self.placed(group);
-            let hidden = group.entry.is_some() && !self.on_screen(rows);
-            if fresh || hidden {
-                at += 1;
-                continue;
-            }
-
-            let steps: Vec<&Step> = match group.entry {
-                Some(index) => talk.entries()[index].step().into_iter().collect(),
-                None => {
-                    let held = talk.held().iter().filter_map(Entry::step);
-                    held.chain(talk.live()).collect()
-                }
-            };
-            let mut calls = steps.into_iter().flat_map(Step::calls);
-            let Some(call) = calls.find(|call| call.id == group.call) else {
-                self.groups.remove(at);
-                continue;
-            };
-            if !spinning && call.revision == group.drawn {
-                at += 1;
-                continue;
-            }
-
-            let mut drawn = self.render(width, expanded);
-            drawn.helpers(call);
-
-            // The rows after these move by as many as they grew or shrank
-            let old = group.rows.clone();
-            let entry = group.entry;
-            let height = drawn.rows.len();
-            let moved = |at: usize| at + height - old.len();
-            match entry {
-                Some(index) => {
-                    let start = self.starts[index];
-                    let replaced = start + old.start..start + old.end;
-                    self.settled.splice(replaced, drawn.rows);
-                    for later in &mut self.starts[index + 1..] {
-                        *later = moved(*later);
-                    }
-                }
-                None => {
-                    self.held.splice(old.clone(), drawn.rows);
-                }
-            }
-            for later in &mut self.groups {
-                if later.entry == entry && later.rows.start >= old.end {
-                    later.rows = moved(later.rows.start)..moved(later.rows.end);
-                }
-            }
-
-            // A call keeps its rows apart only while its agents are at work
-            if drawn.groups.is_empty() {
-                self.groups.remove(at);
-                continue;
-            }
-            let group = &mut self.groups[at];
-            group.rows = old.start..old.start + height;
-            group.drawn = call.revision;
-            at += 1;
         }
 
         Rows {
             settled: &self.settled,
             held: &self.held,
             starts: &self.starts,
-        }
-    }
-
-    /// The agents at work of each call whose rows went off screen, for the bottom of a conversation
-    /// `height` rows tall
-    pub(crate) fn pinned(&mut self, talk: &Conversation, width: u16, height: usize) -> Vec<Row> {
-        let mut hidden = Vec::new();
-        let mut pins = Vec::new();
-        for (_, step) in talk.working() {
-            for call in step.calls() {
-                // Rows not drawn yet count as on screen
-                let found = self.groups.iter().find(|group| group.call == call.id);
-                let Some(group) = found else {
-                    continue;
-                };
-                // Hiding the area moves these rows again, so only scrolling takes agents back out of it
-                let kept = self.pins.contains(&call.id) && !self.scrolled;
-                let rows = self.placed(group);
-                if !kept && self.on_screen(rows) {
-                    continue;
-                }
-
-                pins.push(call.id.clone());
-                let waiting = call.helpers.iter().filter(|helper| helper.waiting());
-                hidden.extend(waiting);
-            }
-        }
-
-        let mut render = self.render(width, false);
-        render.pinned(&hidden, height);
-        self.pins = pins;
-        render.rows
-    }
-
-    /// Where a group's rows are among all rows
-    fn placed(&self, group: &Group) -> Range<usize> {
-        let start = match group.entry {
-            Some(index) => self.starts[index],
-            None => self.settled.len(),
-        };
-        start + group.rows.start..start + group.rows.end
-    }
-
-    /// Before the screen is known every row counts as on it
-    fn on_screen(&self, rows: Range<usize>) -> bool {
-        match &self.view {
-            Some(view) => rows.start < view.end && view.start < rows.end,
-            None => true,
         }
     }
 }

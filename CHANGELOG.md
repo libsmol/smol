@@ -7,6 +7,40 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- `agent()`, `agent.wait()` and `agent.stop()` are gone, and with them the
+  system prompt's Sub-agents section, the rule to take an agent's answer as a
+  result obtained, `[Agent done]` messages and the agents the summary tracked.
+  smol no longer shows agents under the call that sent them or pins them below
+  the conversation, and the status line no longer counts them.
+- ACP: `_smol/agent` tool calls, `_smol/waiting` and `_smol/enqueued` are gone.
+  Queued messages still reach a running turn after each step through
+  `_smol/queued`.
+- The session format is unchanged, so sessions saved before still open,
+  without the agents they kept and the answers only agents left. libsmol
+  0.13.0 and earlier can't open sessions saved from now on.
+- An answer ends the turn even when programs the code left running end as it
+  arrives, and the model hears of them as of programs that end after an answer.
+- The system prompt no longer says the answer goes to the user and no hidden
+  tests or graders check it. What the user writes while the model works gets
+  one shorter rule: answer it in the text of the next reply, follow it and keep
+  working unless told to stop. Asked mid-task how far it got, deepseek answered
+  right away and went on in 2 of 2 runs and grok in 1 of 1, and all 18 runs of
+  the six mid-task update tasks passed.
+- With a client that hands programs that end a turn of their own, as smol
+  does, the system prompt says the user can only wait while a call runs, that
+  slow commands go in the background without waiting for or checking on them,
+  and that an answer given while a program still runs doesn't end the task, as
+  its `[Program done]` message brings the model back to finish it. Asked to run
+  a one-minute benchmark and report its score, deepseek and grok answered first
+  and reported the score once it ended in 5 of 6 runs, where every earlier
+  wording made them wait or poll; three short scripts run one after another
+  still ran in the call. Other clients keep the rule to wait in the call.
+- The system prompt says the user sees the answer rendered as Markdown, and in
+  terminals that draw images, how to show one, as `view()` shows it only to
+  the model. It no longer explains how the value of the last expression shows.
+
 ## 0.13.0 - 2026-11-21
 
 - After compaction the model is told which names its Python session still

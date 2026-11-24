@@ -19,9 +19,7 @@ A real run with DeepSeek on smol's own source:
   passing through the context, so long tasks take far fewer turns and tokens.
 - **Orchestration in code.** MCP servers show up as Python objects, so the
   model chains, batches, loops over and retries their tools with ordinary
-  code, and keeps the results around for the next step. `agent()` hands tasks
-  to named agents the same way, several at once, and `agent.wait()` returns
-  only their answers.
+  code, and keeps the results around for the next step.
 - **One tool.** The model sees a single `eval(code)` tool. There is no menu of
   tools to choose from or route between; its attention goes to the task.
 - **Python.** The language models write most fluently, with a standard library
@@ -35,10 +33,9 @@ A real run with DeepSeek on smol's own source:
 - **Standard ACP.** `libsmol` speaks the
   [Agent Client Protocol](https://agentclientprotocol.com), so Zed or any other
   ACP client can drive it; `smol` is just one such client. The few extras that
-  ACP has no message for (`!` commands, queued updates, the agents `agent()`
-  starts, listing and forgetting memories, a client that shows the images an
-  answer links) use `_smol/` extensions, which other clients ignore as the
-  protocol requires.
+  ACP has no message for (`!` commands, queued updates, listing and forgetting
+  memories, a client that shows the images an answer links) use `_smol/`
+  extensions, which other clients ignore as the protocol requires.
 
 > [!WARNING]
 > **The sandbox guards your credentials and keeps other files from being
@@ -260,9 +257,6 @@ functions:
 | `remember(text, project=True)` | Keep a memory of up to 150 characters for this project, or with `project=False` a global one, and return its id. |
 | `recall(query="")` | Up to 10 of this project's and the global memories as `(id, text)`: those that best match the words of `query`, or the newest if none match. |
 | `forget(id)` | Delete a memory. |
-| `agent(name, task)` | Send a task to the agent with this name and return at once; a new name starts an agent, and up to 8 work at a time. |
-| `agent.wait(*names, timeout=None)` | The answers of the named agents, or of all not yet taken, by name, once they end, after `timeout` seconds or when you send a message; prints what each one still at work is doing. |
-| `agent.stop(name)` | Interrupt an agent's task; it keeps its conversation for the next one. |
 | `help(name)` | Print a function's signature and docs, including code defined in earlier steps. |
 
 MCP tools appear as Python objects named after their server, for example
@@ -272,32 +266,9 @@ Memories outlast sessions in `~/.smol/memory.db`, which the code reaches only
 through these functions. A project is the session's working directory. When
 a session opens, its system prompt lists the 10 newest global memories and
 says how many the project has, which the model finds with `recall()`; words
-are matched whole, Chinese ones too.
-Agents that `agent()` starts can only recall. In smol, `:memory` lists the
-memories a session sees, and `del` then `enter` forgets the selected one;
-deleting the file forgets everything.
-
-An agent started by `agent()` works in a context of its own: it reads,
-searches, reviews and judges, and reports back, while the agent that started it
-makes the changes. It gets its own Python session and the same files,
-functions, skills, instructions and MCP servers, but not the variables or the
-conversation of the agent that started it, and it can't start agents itself.
-Only its answer goes back; everything it did is saved with the session and
-shown as its own call, and its tokens are counted apart from the session's. A
-task that fails gives a `RuntimeError` in place of its answer.
-
-An agent works while the code goes on, so the model can do other work or
-answer meanwhile. Its name finds it again, also after Python restarts or the
-session is resumed. A task sent to an agent at work reaches it as a task update
-after its current call, and one sent to an agent that answered continues its
-conversation, on the same Python if it is among the 4 agents used last and
-went unused for less than 30 minutes. The turn stays open until every agent
-has ended. When one ends before code took its answer, the model gets it in an
-"[Agent done]" message, cut in the middle past 16,384 characters, since
-`agent.wait()` still returns it whole. What you type meanwhile reaches it as a
-task update, which also ends a wait for agents early. smol shows each task under
-the call that sent it and pins the running ones below the conversation while
-their rows are scrolled out of view.
+are matched whole, Chinese ones too. In smol, `:memory` lists the memories a
+session sees, and `del` then `enter` forgets the selected one; deleting the
+file forgets everything.
 
 Programs the code leaves running, such as a build, a download or a server, go
 on after the call and don't keep the turn open. The model hears of each one
@@ -308,13 +279,7 @@ at the bottom of the sidebar with the time since smol first saw them, those
 that don't fit counted in its last row, or counted above the conversation on a
 narrow screen. This covers the programs the code started and
 their children, also those in a session of their own, but not daemons that
-leave the process tree. Programs that an agent from `agent()` leaves running
-end when it answers.
-
-A real run with DeepSeek: four agents write and test a tool each while the
-main agent answers a question, then it checks their work:
-
-![four background agents writing tools in parallel](https://raw.githubusercontent.com/libsmol/smol/main/docs/agents.gif)
+leave the process tree.
 
 ## MCP servers
 
@@ -491,15 +456,15 @@ the default is `warn,libsmol=info,rmcp=off`, `SMOL_LOG=warn` keeps only problems
   venv kept for each working directory in `.venv` in its folder under
   `~/.smol/projects`, whose `python` is `libsmol` itself. `python`, `pip` and
   imports resolve to that venv, not to the Pythons and virtualenvs you
-  installed, which stay on `PATH` after it. Every session in the directory and
-  the agents they start share the venv and keep what it installed, until the
-  directory is gone and no session has used the venv for a week. To start
-  over, delete it while no session in that directory is open. `VIRTUAL_ENV`
-  names it, so tools such as uv or poetry install into it too, and a venv the
-  code makes for itself is based on it. The C headers aren't installed, so a
-  package with C code installs only from a wheel, as numpy and pandas do, not
-  from source. On Windows a package with deeply nested files may fail to
-  install unless long paths are turned on (`LongPathsEnabled` in the registry).
+  installed, which stay on `PATH` after it. Every session in the directory
+  shares the venv and keeps what it installed, until the directory is gone and
+  no session has used the venv for a week. To start over, delete it while no
+  session in that directory is open. `VIRTUAL_ENV` names it, so tools such as
+  uv or poetry install into it too, and a venv the code makes for itself is
+  based on it. The C headers aren't installed, so a package with C code
+  installs only from a wheel, as numpy and pandas do, not from source. On
+  Windows a package with deeply nested files may fail to install unless long
+  paths are turned on (`LongPathsEnabled` in the registry).
 - **Interrupting** stops code in place, and the session keeps its variables.
   Code blocked where an interrupt cannot reach it (for example `os.system`, a
   long call inside a C extension, or reading a pipe or socket on Windows) gets 3

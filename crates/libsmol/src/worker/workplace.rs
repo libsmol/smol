@@ -78,7 +78,7 @@ pub(crate) const PASSED_ENV: &[&str] = &[
     "OS",
 ];
 
-/// Where a session's workers run, which they share while the session lives
+/// Where a session's worker runs, across its restarts
 pub(crate) struct Workplace {
     pub(crate) cwd: PathBuf,
     /// Copies of the images and videos the code viewed

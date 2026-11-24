@@ -1,4 +1,3 @@
-use crate::conversation::HUES;
 use crate::tui::Spans;
 use ratatui::buffer::Cell;
 use ratatui::style::{Color, Style};
@@ -21,12 +20,6 @@ pub(crate) const GREEN: Color = Color::Rgb(0x50, 0xFA, 0x7B);
 pub(crate) const ORANGE: Color = Color::Rgb(0xFF, 0xB8, 0x6C);
 pub(crate) const RED: Color = Color::Rgb(0xFF, 0x55, 0x55);
 pub(crate) const YELLOW: Color = Color::Rgb(0xF1, 0xFA, 0x8C);
-const BLUE: Color = Color::Rgb(0x6C, 0xB6, 0xFF);
-const LIME: Color = Color::Rgb(0xB5, 0xF3, 0x6B);
-const TEAL: Color = Color::Rgb(0x3F, 0xE0, 0xC5);
-
-/// One for each agent at work, none of them the main agent's purple
-pub(crate) const HELPERS: [Color; HUES] = [CYAN, ORANGE, GREEN, PINK, YELLOW, BLUE, LIME, TEAL];
 
 /// Intensity of each level of the 6×6×6 cube in the 256-color palette
 const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
@@ -53,7 +46,7 @@ pub(crate) fn wave(column: usize) -> Color {
 }
 
 /// One span per grapheme, as ratatui drops a span of a zero-width character such as a joiner
-pub(crate) fn shimmer(text: &str, base: Style, glow: Color, started: Instant) -> Spans {
+pub(crate) fn shimmer(text: &str, base: Style, started: Instant) -> Spans {
     let graphemes: Vec<&str> = text.graphemes(true).collect();
     let count = graphemes.len();
     let steps = started.elapsed().as_millis() / SHIMMER_EVERY.as_millis();
@@ -63,7 +56,7 @@ pub(crate) fn shimmer(text: &str, base: Style, glow: Color, started: Instant) ->
     for (index, grapheme) in graphemes.into_iter().enumerate() {
         let style = match index.abs_diff(at) {
             0 => base.fg(FG),
-            1 => base.fg(glow),
+            1 => base.fg(PURPLE),
             _ => base,
         };
         spans.push((grapheme.to_owned(), style));

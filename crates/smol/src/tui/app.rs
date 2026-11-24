@@ -69,7 +69,6 @@ pub(crate) struct App {
     drawn: Instant,
     pub(crate) viewport: Viewport,
     pub(crate) messages_area: Rect,
-    pub(crate) pinned_area: Rect,
     pub(crate) input_area: Rect,
     /// The pictures the last frame drew
     pub(crate) pictures: Vec<Source>,
@@ -309,7 +308,6 @@ impl App {
             drawn: Instant::now(),
             viewport: Viewport::default(),
             messages_area: Rect::default(),
-            pinned_area: Rect::default(),
             input_area: Rect::default(),
             pictures: Vec::new(),
             selection: None,
@@ -624,7 +622,6 @@ impl App {
                 let on_choices = self.choices_area.contains(position);
                 let area = self.messages_area;
                 let inside = area.contains(position);
-                let scrolls = inside || self.pinned_area.contains(position);
                 let on_bar = self.viewport.bar.contains(position);
 
                 match mouse.kind {
@@ -640,8 +637,8 @@ impl App {
                     MouseEventKind::ScrollDown if on_choices => self.highlight.select_next(),
                     _ if on_choices => {}
 
-                    MouseEventKind::ScrollUp if scrolls => self.viewport.scroll_up(SCROLL_ROWS),
-                    MouseEventKind::ScrollDown if scrolls => self.viewport.scroll_down(SCROLL_ROWS),
+                    MouseEventKind::ScrollUp if inside => self.viewport.scroll_up(SCROLL_ROWS),
+                    MouseEventKind::ScrollDown if inside => self.viewport.scroll_down(SCROLL_ROWS),
 
                     MouseEventKind::Down(MouseButton::Left) if on_bar => {
                         self.dragging = true;
@@ -1230,10 +1227,6 @@ impl App {
             return self.submit_text(&text);
         }
         self.queued.push_back(text);
-        // A turn waiting on agents takes it now, unless a command ahead of it waits for the turn to end
-        if self.queued.iter().all(|text| plain(text)) {
-            self.session.notify_queued();
-        }
     }
 
     fn info(&mut self, text: impl Into<String>) {

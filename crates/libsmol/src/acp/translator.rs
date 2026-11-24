@@ -1,18 +1,15 @@
 use crate::acp::rpc::{Notice, SessionPeer};
-use crate::agent::{Event, Failure, Status, TaskView, TaskViews, Unseen};
+use crate::agent::{Event, Failure};
 use crate::prompt::{self, SKIPPED, TOOL};
 use crate::steps::{
-    estimate, spent, text_bytes, AgentMemory, AgentRecord, AgentStep, Call, CallError, DoneStep,
-    Ending, Exit, MemoryStep, ShellStep, StepError, SummaryStep, TaskStep, Usage,
+    estimate, text_bytes, AgentMemory, AgentStep, Call, CallError, DoneStep, Exit, MemoryStep,
+    ShellStep, StepError, SummaryStep, TaskStep, Usage,
 };
 use agent_client_protocol_schema::v1::{
     ContentBlock, ContentChunk, MessageId, Meta, ResourceLink, SessionUpdate, ToolCall,
     ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
-use reaper::one_line;
-use reaper::wire::{
-    Measured, Program, AGENT, BACKGROUND, ERROR, NAME, PARENT, SHELL, TASK, UPDATE, WAITING,
-};
+use reaper::wire::{Measured, Program, BACKGROUND, ERROR, SHELL, UPDATE};
 use reqwest::Url;
 use serde_json::{json, Value};
 use std::mem;
@@ -20,7 +17,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const ESTIMATE_EVERY: Duration = Duration::from_secs(1);
-const MAX_TASK_CHARS: usize = 80;
 const COMPACTING: &str = "Compact context";
 const RESTARTED: &str = "python: restarted, earlier variables are gone";
 
@@ -36,7 +32,6 @@ pub(crate) struct Translator {
     /// The programs the client last heard are running
     programs: Vec<Program>,
     progress: Progress,
-    cwd: PathBuf,
     copies: PathBuf,
 }
 
@@ -57,12 +52,7 @@ struct Progress {
 }
 
 impl Translator {
-    pub(crate) fn new(
-        peer: SessionPeer,
-        window: Option<u64>,
-        cwd: PathBuf,
-        copies: PathBuf,
-    ) -> Self {
+    pub(crate) fn new(peer: SessionPeer, window: Option<u64>, copies: PathBuf) -> Self {
         Self {
             peer,
             ids: 0,
@@ -73,13 +63,11 @@ impl Translator {
             compacting: None,
             programs: Vec::new(),
             progress: Progress::default(),
-            cwd,
             copies,
         }
     }
 
-    /// `agents` are the session's, whose tasks the calls that sent them show
-    pub(crate) fn replay(&mut self, memory: &AgentMemory, agents: &[AgentRecord]) {
+    pub(crate) fn replay(&mut self, memory: &AgentMemory) {
         for step in &memory.steps {
             match step {
                 MemoryStep::Task(task) => self.task(task, false),
@@ -108,21 +96,6 @@ impl Translator {
                             self.unread(index, call);
                         }
 
-                        let result = call.result.as_ref();
-                        let sent = result.map(|result| result.agents.as_slice());
-                        let views = self.tasks(index);
-                        for (offset, sent) in sent.unwrap_or_default().iter().enumerate() {
-                            let found = agents.iter().find(|agent| agent.name == sent.name);
-                            let Some(agent) = found else {
-                                continue;
-                            };
-                            let Some(task) = agent.tasks.get(sent.number) else {
-                                continue;
-                            };
-                            let mut view = views.open(offset + 1, &agent.name, &task.task);
-                            let steps = agent.steps(sent.number);
-                            view.close(&task.end, steps);
-                        }
                         if call.result.is_some() || call.error.is_some() {
                             self.ran(index, call);
                         }
@@ -141,7 +114,7 @@ impl Translator {
                 }
                 MemoryStep::Restarted => self.notice(RESTARTED, None),
                 MemoryStep::Done(done) if done.idle => self.ended(done),
-                // As live, programs that end within a turn show nothing and agents showed their end
+                // As live, programs that end within a turn show nothing
                 MemoryStep::Done(_) => {}
             }
         }
@@ -150,20 +123,20 @@ impl Translator {
     pub(crate) fn translate(&mut self, event: Event) {
         match event {
             Event::Thought(text) => {
-                self.streamed(text.added);
-                let chunk = chunk(text.added);
+                self.streamed(text);
+                let chunk = chunk(text);
                 self.peer.update(SessionUpdate::AgentThoughtChunk(chunk));
             }
             Event::Text(text) => {
-                self.streamed(text.added);
-                self.said(text.added);
+                self.streamed(text);
+                self.said(text);
             }
             Event::Code(index, code) => {
                 self.streamed(code.added);
                 self.code(index, code.whole);
             }
             Event::Unread(index, call) => self.unread(index, call),
-            Event::Run(index, _) => {
+            Event::Run(index) => {
                 if let Some(opened) = self.opened(index) {
                     let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
                     let update = ToolCallUpdate::new(opened.id.clone(), fields);
@@ -394,19 +367,6 @@ impl Translator {
         self.calls.iter().find(|call| call.index == index)
     }
 
-    /// A call that was never opened shows none of the agents it starts
-    pub(crate) fn tasks(&self, index: usize) -> Box<dyn TaskViews> {
-        let Some(opened) = self.opened(index) else {
-            return Box::new(Unseen);
-        };
-
-        Box::new(TaskCalls {
-            peer: self.peer.clone(),
-            parent: opened.id.clone(),
-            cwd: self.cwd.clone(),
-        })
-    }
-
     fn ran(&mut self, index: usize, ran: &Call) {
         let opened = self.calls.iter_mut().find(|call| call.index == index);
         let Some(opened) = opened else {
@@ -559,7 +519,7 @@ impl Translator {
     }
 }
 
-/// What steps and agents report of their usage
+/// What steps report of their usage
 fn measured(usage: &Usage) -> Measured {
     let tokens = usage.tokens;
     Measured {
@@ -576,124 +536,6 @@ fn meta_of(measured: &Measured) -> Meta {
     match value {
         Value::Object(meta) => meta,
         _ => Meta::new(),
-    }
-}
-
-struct TaskCalls {
-    peer: SessionPeer,
-    parent: String,
-    cwd: PathBuf,
-}
-
-struct TaskCall {
-    peer: SessionPeer,
-    id: String,
-    started: bool,
-    /// Agents still running when their snippet ends are aborted before they close
-    closed: bool,
-}
-
-impl TaskViews for TaskCalls {
-    fn open(&self, number: usize, name: &str, task: &str) -> Box<dyn TaskView> {
-        let id = format!("{}.{number}", self.parent);
-        // The start of the task on one line
-        let line = one_line(task, &self.cwd);
-        let mut title: String = line.chars().take(MAX_TASK_CHARS).collect();
-        if title.len() < line.len() {
-            title.push('…');
-        }
-        let title = format!("agent: {title}");
-        let asked = json!({ TASK: task, NAME: name });
-        let marked = (AGENT.to_owned(), json!(true));
-        let parent = (PARENT.to_owned(), json!(self.parent));
-        let meta = Meta::from_iter([marked, parent]);
-        let opened = ToolCall::new(id.clone(), title)
-            .kind(ToolKind::Other)
-            .status(ToolCallStatus::Pending)
-            .raw_input(asked)
-            .meta(meta);
-        self.peer.update(SessionUpdate::ToolCall(opened));
-
-        let view = TaskCall {
-            peer: self.peer.clone(),
-            id,
-            started: false,
-            closed: false,
-        };
-        Box::new(view)
-    }
-
-    fn waiting(&self, names: &[String]) {
-        let fields = ToolCallUpdateFields::new();
-        let waiting = (WAITING.to_owned(), json!(names));
-        let meta = Meta::from_iter([waiting]);
-        let update = ToolCallUpdate::new(self.parent.clone(), fields).meta(meta);
-        self.peer.update(SessionUpdate::ToolCallUpdate(update));
-    }
-}
-
-impl TaskCall {
-    fn send(&self, fields: ToolCallUpdateFields, meta: Meta) {
-        let update = ToolCallUpdate::new(self.id.clone(), fields).meta(meta);
-        self.peer.update(SessionUpdate::ToolCallUpdate(update));
-    }
-
-    /// Replay closes it right after opening it, and an aborted one ends as its saved record does,
-    /// so every way it ends sends the same last update
-    fn finish(&mut self, end: &Ending, steps: &[MemoryStep]) {
-        let (status, text) = match end.outcome() {
-            Ok(text) => (ToolCallStatus::Completed, text),
-            Err(text) => (ToolCallStatus::Failed, text),
-        };
-
-        let (usage, steps) = spent(steps);
-        // The client recognizes interrupts as it does on usage updates
-        let measured = Measured {
-            steps: Some(steps as u64),
-            interrupted: matches!(end, Ending::Interrupted {} | Ending::Stopped {}),
-            ..measured(&usage)
-        };
-        let meta = meta_of(&measured);
-
-        let content = vec![ToolCallContent::from(text)];
-        let fields = ToolCallUpdateFields::new().status(status).content(content);
-        self.send(fields, meta);
-        self.closed = true;
-    }
-}
-
-impl TaskView for TaskCall {
-    fn shown(&mut self, status: &Status) {
-        let mut content = vec![ToolCallContent::from(status.doing.clone())];
-        if !status.preview.is_empty() {
-            content.push(ToolCallContent::from(status.preview.clone()));
-        }
-        let mut fields = ToolCallUpdateFields::new().content(content);
-        if !self.started {
-            fields = fields.status(ToolCallStatus::InProgress);
-        }
-        self.started = true;
-
-        let measured = Measured {
-            steps: Some(status.steps as u64),
-            ..measured(&status.usage)
-        };
-        let meta = meta_of(&measured);
-        self.send(fields, meta);
-    }
-
-    fn close(&mut self, end: &Ending, steps: &[MemoryStep]) {
-        self.finish(end, steps);
-    }
-}
-
-impl Drop for TaskCall {
-    fn drop(&mut self) {
-        if self.closed {
-            return;
-        }
-
-        self.finish(&Ending::Unfinished {}, &[]);
     }
 }
 
@@ -724,10 +566,8 @@ mod tests {
     use crate::acp::rpc::{Lines, Out, Peer};
     use crate::acp::tests::drained;
     use crate::acp::translator::*;
-    use crate::agent::tests::{called, reply, scripted, streamed, Script, ScriptedModel};
+    use crate::agent::tests::{called, reply, scripted, Script, ScriptedModel};
     use crate::model::Finish;
-    use crate::steps::tests::{asked, metered, replied};
-    use crate::steps::{AgentTask, CodeResult, Sent};
     use serde_json::Value;
     use std::env;
     use tokio::sync::mpsc;
@@ -736,9 +576,8 @@ mod tests {
         let (lines, sent) = mpsc::unbounded_channel();
         let peer = Peer::new(Out::Lines(lines));
         let peer = SessionPeer::new(peer, "session-1");
-        let cwd = env::temp_dir();
-        let copies = cwd.join("copies");
-        let translator = Translator::new(peer, Some(window), cwd, copies);
+        let copies = env::temp_dir().join("copies");
+        let translator = Translator::new(peer, Some(window), copies);
         (translator, sent)
     }
 
@@ -846,166 +685,9 @@ mod tests {
         assert_eq!(thoughts, expected);
 
         let (mut replaying, mut sent) = translator(1000);
-        replaying.replay(&memory, &[]);
+        replaying.replay(&memory);
         let replayed = drained(&mut sent);
         assert_eq!(shown(&replayed)[1..], shown(&live));
         assert!(replayed.len() < live.len(), "{replayed:?}");
-    }
-
-    /// Each task the code sends an agent is a tool call of its own, the same live and on replay
-    #[test]
-    fn tasks_shown() {
-        let (mut live, mut sent) = translator(1000);
-        live.translate(Event::Code(
-            0,
-            streamed("agent('cafés', 'Count the cafés')\n"),
-        ));
-        let running = Call {
-            code: "agent('cafés', 'Count the cafés')".to_owned(),
-            ..Call::default()
-        };
-        live.translate(Event::Run(0, &running));
-        let started = live.tasks(0);
-        let counted = AgentStep {
-            usage: metered(100, 20),
-            ..replied("3 cafés")
-        };
-        let task = "Count the cafés\nin menu.txt";
-        let memory = AgentMemory {
-            steps: vec![
-                MemoryStep::Task(asked(task)),
-                MemoryStep::Action(Box::new(counted)),
-            ],
-        };
-        let end = Ending::Answer("3 cafés".to_owned());
-        let mut call = started.open(1, "cafés", task);
-        let status = |doing: &str, preview: &str| Status {
-            doing: doing.to_owned(),
-            preview: preview.to_owned(),
-            ..Status::default()
-        };
-        call.shown(&status("thinking", "Reading the menu"));
-        let spent = Status {
-            usage: metered(100, 20),
-            ..status("running print(len(cafés))", "print(len(cafés))")
-        };
-        call.shown(&spent);
-        call.close(&end, &memory.steps);
-        let named = Sent {
-            name: "cafés".to_owned(),
-            number: 0,
-        };
-        let result = CodeResult {
-            printed: Some("3 cafés".to_owned()),
-            agents: vec![named],
-            ..CodeResult::default()
-        };
-        let ran = Call {
-            result: Some(result),
-            ..running
-        };
-        live.translate(Event::RunEnd(0, &ran));
-        let step = AgentStep {
-            calls: vec![ran],
-            ..AgentStep::default()
-        };
-        live.translate(Event::StepEnd(&step));
-        let told = drained(&mut sent);
-
-        let session = AgentMemory {
-            steps: vec![MemoryStep::Action(Box::new(step))],
-        };
-        let tasked = AgentTask {
-            task: task.to_owned(),
-            start: 0,
-            end,
-        };
-        let agent = AgentRecord {
-            name: "cafés".to_owned(),
-            memory,
-            tasks: vec![tasked],
-        };
-        let (mut replaying, mut sent) = translator(1000);
-        replaying.replay(&session, &[agent]);
-        let again = drained(&mut sent);
-        assert_eq!(shown(&again), shown(&told));
-
-        let updates: Vec<&Value> = told
-            .iter()
-            .map(|message| &message["params"]["update"])
-            .collect();
-        let opened = updates[2];
-        assert_eq!(opened["toolCallId"], "call_1.1");
-        assert_eq!(opened["title"], "agent: Count the cafés in menu.txt");
-        let asked = json!({ "task": "Count the cafés\nin menu.txt", "name": "cafés" });
-        assert_eq!(opened["rawInput"], asked);
-        let marked = json!({ "_smol/agent": true, "parent": "call_1" });
-        assert_eq!(opened["_meta"], marked);
-        let working = updates[3];
-        assert_eq!(working["status"], "in_progress");
-        assert_eq!(working["content"][0]["content"]["text"], prompt::THINKING);
-        assert_eq!(working["content"][1]["content"]["text"], "Reading the menu");
-        assert_eq!(working["_meta"], json!({ "duration": 0.0, "steps": 0 }));
-        let running = updates[4];
-        assert!(running.get("status").is_none(), "{running}");
-        let spent = json!({ "duration": 0.0, "inputTokens": 100, "outputTokens": 20, "steps": 0 });
-        assert_eq!(running["_meta"], spent);
-        let content = &running["content"];
-        let doing = format!("{} print(len(cafés))", prompt::RUNNING);
-        assert_eq!(content[0]["content"]["text"], doing);
-        assert_eq!(content[1]["content"]["text"], "print(len(cafés))");
-        let closed = updates[5];
-        assert_eq!(closed["status"], "completed");
-        assert_eq!(closed["content"][0]["content"]["text"], "3 cafés");
-        let meta = json!({
-            "inputTokens": 100,
-            "outputTokens": 20,
-            "steps": 1,
-            "duration": 0.0,
-        });
-        assert_eq!(closed["_meta"], meta);
-
-        // An interrupted agent is marked like an interrupted command
-        let (mut stopping, mut sent) = translator(1000);
-        let code = streamed("agent('counter', 'Count the cafés')\n");
-        stopping.translate(Event::Code(0, code));
-        let started = stopping.tasks(0);
-        let mut call = started.open(1, "counter", "Count the cafés");
-        call.close(&Ending::Interrupted {}, &[]);
-
-        // One aborted before it closes still ends, and so does one replayed while running
-        let dropped = started.open(2, "counter", "Spell naïve");
-        drop(dropped);
-        let mut replayed = started.open(3, "counter", "Spell naïve");
-        replayed.close(&Ending::Running {}, &[]);
-
-        // The code's call says which agents it waits for, until it stops waiting
-        started.waiting(&["counter".to_owned()]);
-        started.waiting(&[]);
-
-        let messages = drained(&mut sent);
-        let opened = &messages[1]["params"]["update"]["rawInput"];
-        assert_eq!(
-            *opened,
-            json!({ "task": "Count the cafés", "name": "counter" })
-        );
-        let closed = &messages[2]["params"]["update"];
-        assert_eq!(closed["status"], "failed");
-        assert_eq!(closed["_meta"]["interrupted"], true);
-        let aborted = &messages[4]["params"]["update"];
-        assert_eq!(aborted["toolCallId"], "call_1.2");
-        assert_eq!(aborted["status"], "failed");
-        let reason = &aborted["content"][0]["content"]["text"];
-        assert_eq!(reason, "stopped before it answered");
-        let unfinished = &messages[6]["params"]["update"];
-        assert_eq!(unfinished["status"], "failed");
-        assert_eq!(unfinished["content"], aborted["content"]);
-        assert_eq!(unfinished["_meta"], aborted["_meta"]);
-        let waiting = &messages[7]["params"]["update"];
-        assert_eq!(waiting["toolCallId"], "call_1");
-        assert_eq!(waiting["_meta"], json!({ "_smol/waiting": ["counter"] }));
-        let waited = &messages[8]["params"]["update"];
-        assert_eq!(waited["_meta"], json!({ "_smol/waiting": [] }));
-        assert_eq!(messages.len(), 9, "{messages:?}");
     }
 }

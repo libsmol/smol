@@ -12,8 +12,7 @@ use agent_client_protocol_schema::ProtocolVersion;
 use anyhow::{anyhow, bail, Result};
 use reaper::wire::{
     Addressed, Forget, McpState, McpStatus, Memories, Memory, Notice, Program, Programs, Queued,
-    Servers, Shell, BACKGROUND, ENQUEUED, FORGET, IMAGES, MCP, MEMORIES, NOTICE, PROGRAMS, QUEUED,
-    SHELL,
+    Servers, Shell, BACKGROUND, FORGET, IMAGES, MCP, MEMORIES, NOTICE, PROGRAMS, QUEUED, SHELL,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -650,15 +649,6 @@ impl Client {
         let session = session.to_owned();
         let params = CancelNotification::new(session);
         self.connection.notify(method, params);
-    }
-
-    /// Tells the agent that a message is queued for the running turn, which it then asks for
-    pub(crate) fn notify_queued(&self, session: &str) {
-        let params = Addressed {
-            session_id: session.to_owned(),
-            body: (),
-        };
-        self.connection.notify(ENQUEUED, params);
     }
 }
 

@@ -3,12 +3,12 @@ use crate::prompt::{self, ADDING_SERVER, LEFT_BEHIND, LISTING_GLOBALS, NO_SERVER
 use crate::spawn::{Clip, Output, Process, SHOWN_EVERY};
 use crate::steps::{CallError, DoneStep, MAX_OBSERVATION_CHARS};
 use crate::tools::mcp::Server;
+use crate::tools::memories::Memories;
 use crate::utils::{cut_inline, new_id, Interrupt, Reply};
 use crate::worker::workplace::Workplace;
 use crate::worker::{
     control, end_marker, greeted, greeting, FromWorker, Function, Globals, HostCall, HostNote,
-    Message, Service, ToWorker, WorkerCall, WorkerNote, CONTROL_ENV, COPIES_ENV, MAIN_ENV,
-    WORKER_ARG,
+    Message, ToWorker, WorkerCall, WorkerNote, CONTROL_ENV, COPIES_ENV, WORKER_ARG,
 };
 use crate::{Error, Result};
 use reaper::wire::Program;
@@ -22,7 +22,6 @@ use std::mem;
 use std::path::Component;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::tcp::OwnedReadHalf;
@@ -50,7 +49,6 @@ const PROGRAMS_EVERY: Duration = match cfg!(test) {
 const HELPERS: [&str; 2] = ["from multiprocessing.", "loky.backend."];
 
 pub(crate) type Calling = Pin<Box<dyn Future<Output = Called> + Send>>;
-pub(crate) type Serving<'a> = dyn FnMut(Service) -> Calling + Send + 'a;
 
 /// The result of work done for the worker, with the images and videos it produced
 pub(crate) struct Called {
@@ -75,7 +73,6 @@ pub(crate) struct Evaluated {
     pub(crate) repaired: Option<String>,
 }
 
-#[derive(Clone)]
 pub(crate) struct Added {
     /// The name used in code
     pub(crate) name: String,
@@ -84,22 +81,14 @@ pub(crate) struct Added {
     pub(crate) stubs: Vec<String>,
 }
 
-/// The session's own worker, which offers `agent()`, `remember()` and `forget()`,
-/// or one of an agent that `agent()` started
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Rank {
-    Main,
-    Delegated,
-}
-
 /// Callers keep track of the installed MCP servers and pass them in on every call
 pub(crate) struct Worker {
     /// Dropped before the workplace, which removes the worker's temporary folder and lets go of the venv
     live: Option<Live>,
-    /// Shared with the workers of agents the code starts
-    workplace: Arc<Workplace>,
+    workplace: Workplace,
     interrupt: Interrupt,
-    rank: Rank,
+    /// Answers the memory functions the code calls
+    memories: Memories,
     functions: Vec<Function>,
     restarted: bool,
 }
@@ -175,25 +164,28 @@ impl Worker {
     /// `restarted` means earlier code in the session defined names this new worker lacks
     pub(crate) async fn new(
         interrupt: &Interrupt,
-        workplace: Arc<Workplace>,
-        servers: &[&Added],
-        rank: Rank,
+        workplace: Workplace,
+        memories: Memories,
         restarted: bool,
     ) -> Result<Self> {
         let mut worker = Self {
             workplace,
             interrupt: interrupt.clone(),
-            rank,
+            memories,
             functions: Vec::new(),
             restarted,
             live: None,
         };
-        worker.connect(servers).await.map_err(Error::Python)?;
+        worker.connect(&[]).await.map_err(Error::Python)?;
         Ok(worker)
     }
 
     pub(crate) fn functions(&self) -> &[Function] {
         &self.functions
+    }
+
+    pub(crate) fn workplace(&self) -> &Workplace {
+        &self.workplace
     }
 
     /// Turns true again only when the worker is replaced
@@ -225,7 +217,7 @@ impl Worker {
             sandbox,
             program,
             ..
-        } = &*self.workplace;
+        } = &self.workplace;
         let mut command = sandbox.command(program, cwd);
         // Process lists would show it as `/proc/self/exe`
         #[cfg(target_os = "linux")]
@@ -249,9 +241,6 @@ impl Worker {
             .env(CONTROL_ENV, control)
             .env(COPIES_ENV, copies)
             .stdin(Stdio::null());
-        if self.rank == Rank::Main {
-            command.env(MAIN_ENV, "on");
-        }
         let marker = end_marker(&token);
         let (mut process, output) = Process::start(command, Some(marker)).map_err(failed)?;
 
@@ -394,14 +383,13 @@ impl Worker {
         }
     }
 
-    /// `shown` gets the clipped output so far now and then, `serve` answers what the code asks
-    /// of the agent, and stopping before the code is sent returns Err
+    /// `shown` gets the clipped output so far now and then, and stopping before the code is sent
+    /// returns Err
     pub(crate) async fn evaluate(
         &mut self,
         code: &str,
         servers: &[&Added],
         shown: &mut (dyn FnMut(&str) + Send),
-        serve: &mut Serving<'_>,
     ) -> Result<Evaluated, CallError> {
         let interrupt = self.interrupt.clone();
         let failed = |reason: String| {
@@ -532,7 +520,13 @@ impl Worker {
                         }
                     }
                 }
-                WorkerCall::Service(service) => serve(service),
+                WorkerCall::Memory(call) => {
+                    let memories = self.memories.clone();
+                    Box::pin(async move {
+                        let reply = memories.answer(call).await;
+                        Called::from(reply)
+                    })
+                }
             };
             let abort = live.calls.spawn(async move { (number, calling.await) });
             live.running.insert(number, abort);
@@ -821,7 +815,6 @@ async fn start_error(mut process: Process, output: Output) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::agent::{serve, Delegating};
     use crate::config::Access;
     use crate::prompt;
     use crate::steps::{CallError, MAX_OBSERVATION_CHARS};
@@ -829,9 +822,9 @@ pub(crate) mod tests {
     use crate::tools::mcp::Server;
     use crate::tools::memories::Memories;
     use crate::utils::{block_on, new_id, truncated, Interrupt};
-    use crate::worker::host::{Added, Called, Calling, Rank, Worker, STOP_WAIT};
+    use crate::worker::host::{Added, Called, Calling, Worker, STOP_WAIT};
     use crate::worker::workplace::tests::opened;
-    use crate::worker::{AgentCall, Imported, Service, Variable};
+    use crate::worker::{Imported, Variable};
     use serde_json::{json, Map, Value};
     use std::env;
     use std::fs;
@@ -841,18 +834,10 @@ pub(crate) mod tests {
     use std::time::{Duration, Instant};
     use tokio::time;
 
-    /// Keeps track of installed servers in place of the MCP pool, and answers as the agent would
+    /// Keeps track of installed servers in place of the MCP pool
     struct Tried {
         worker: Worker,
         servers: Vec<Added>,
-        delegate: Box<Delegating<'static>>,
-        memories: Memories,
-        writable: bool,
-    }
-
-    /// For code that asks the agent for nothing
-    pub(crate) fn unserved(service: Service) -> Calling {
-        panic!("{service:?}");
     }
 
     impl Deref for Tried {
@@ -880,13 +865,7 @@ pub(crate) mod tests {
         fn eval(&mut self, code: &str) -> Shown {
             let mut ignore = |_: &str| {};
             let servers: Vec<&Added> = self.servers.iter().collect();
-            let delegate = &mut *self.delegate;
-            let memories = &self.memories;
-            let writable = self.writable;
-            let mut serving = |service: Service| serve(service, delegate, memories, writable);
-            let evaluating = self
-                .worker
-                .evaluate(code, &servers, &mut ignore, &mut serving);
+            let evaluating = self.worker.evaluate(code, &servers, &mut ignore);
             let output = block_on(evaluating).expect("evaluate");
             Shown {
                 printed: output.printed.shown(usize::MAX),
@@ -918,21 +897,16 @@ pub(crate) mod tests {
         }
     }
 
-    fn build(interrupt: Interrupt, cwd: PathBuf, rank: Rank) -> Temp<Tried> {
+    fn build(interrupt: Interrupt, cwd: PathBuf) -> Temp<Tried> {
         let dir = temp_dir("session");
         let workplace = opened(&cwd, &dir, &Access::default());
-        let restarted = false;
-        let building = Worker::new(&interrupt, Arc::new(workplace), &[], rank, restarted);
+        let memories = Memories::new(&dir, &cwd);
+        let building = Worker::new(&interrupt, workplace, memories, false);
         let worker = block_on(building).expect("worker");
 
-        let no_agents = |call: AgentCall| -> Calling { panic!("{call:?}") };
         let value = Tried {
             worker,
             servers: Vec::new(),
-            delegate: Box::new(no_agents),
-            memories: Memories::new(&dir, &cwd),
-            // Agents that agent() starts only recall
-            writable: rank == Rank::Main,
         };
         Temp { value, dir }
     }
@@ -945,14 +919,14 @@ pub(crate) mod tests {
     fn workspace(name: &str) -> (Temp<Tried>, PathBuf) {
         let dir = temp_dir(name);
         fs::create_dir_all(&dir).expect("dir");
-        let worker = build(Interrupt::default(), dir.clone(), Rank::Main);
+        let worker = build(Interrupt::default(), dir.clone());
         (worker, dir)
     }
 
     fn interruptible() -> (Temp<Tried>, Interrupt) {
         let interrupt = Interrupt::default();
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let worker = build(interrupt.clone(), cwd, Rank::Main);
+        let worker = build(interrupt.clone(), cwd);
         (worker, interrupt)
     }
 
@@ -1178,8 +1152,7 @@ pub(crate) mod tests {
             for name in ['/etc/hostname', '../café.png', 'naïve.png']:\n    forge(name)";
         let mut worker = fresh();
         let mut ignore = |_: &str| {};
-        let mut none = unserved;
-        let evaluating = worker.evaluate(code, &[], &mut ignore, &mut none);
+        let evaluating = worker.evaluate(code, &[], &mut ignore);
         let output = block_on(evaluating).expect("evaluate");
         assert_eq!(output.error, None);
 
@@ -1300,25 +1273,19 @@ pub(crate) mod tests {
         assert_eq!(output.printed, "9");
     }
 
-    /// Agents that agent() started only recall, even when their code asks the agent directly
+    /// The memory functions reach the session's memories through the agent
     #[test]
-    fn memories_nested() {
-        let dir = temp_dir("nested");
-        fs::create_dir_all(&dir).expect("dir");
-        let mut worker = build(Interrupt::default(), dir.clone(), Rank::Delegated);
-        let names: Vec<String> = worker.functions().iter().map(|f| f.name.clone()).collect();
-        let code = "ask = recall.__globals__['_ask']\n\
-             try:\n    ask('remember', {'text': 'Uses tabs', 'project': True})\n\
-             except ValueError as error:\n    print(error)\n\
-             recall('tabs')";
+    fn memories_answered() {
+        let mut worker = fresh();
+        let code = "i = remember('Uses tabs in the café menu')\n\
+             print(recall('tabs') == [(i, 'Uses tabs in the café menu')])\n\
+             forget(i)\n\
+             print(recall('tabs'))\n\
+             try:\n    forget(i)\nexcept ValueError as error:\n    print(type(error).__name__)";
         let output = worker.eval(code);
-        fs::remove_dir_all(&dir).ok();
 
-        assert!(names.contains(&"recall".to_owned()), "{names:?}");
-        assert!(!names.contains(&"remember".to_owned()), "{names:?}");
-        assert!(!names.contains(&"forget".to_owned()), "{names:?}");
-        let expected = format!("{}\n[]", prompt::NESTED);
-        assert_eq!(output.printed, expected);
+        assert_eq!(output.error, None);
+        assert_eq!(output.printed, "True\n[]\nValueError");
     }
 
     /// Dropping a stream made on fd 1 closes the fd, which a file opened next would take
@@ -1478,7 +1445,7 @@ pub(crate) mod tests {
         }
         write_file(&dir.join("random.txt"), text.as_bytes());
         let interrupt = Interrupt::default();
-        let mut worker = build(interrupt.clone(), dir.clone(), Rank::Main);
+        let mut worker = build(interrupt.clone(), dir.clone());
 
         worker.eval("noted = 1");
         cancel_soon(&interrupt, 0);

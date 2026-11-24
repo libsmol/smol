@@ -91,7 +91,7 @@ def _builtin(function):
     builtin.__qualname__ = function.__qualname__
     builtin.__signature__ = signature
     # The agent sets these values too, so docs name them in braces
-    builtin.__doc__ = function.__doc__.format(agents=_MAX_AGENTS, done=_DONE, chars=_MAX_MEMORY_CHARS, recalled=_MAX_RECALLED)
+    builtin.__doc__ = function.__doc__.format(chars=_MAX_MEMORY_CHARS, recalled=_MAX_RECALLED)
     builtin._smol_header = header
     return builtin
 
@@ -270,11 +270,11 @@ def view(path: str | _os.PathLike) -> None:
     absolute = _os.path.abspath(path)
     _view(path, absolute)
 
-def _asked(function, method, params):
+def _asked(method, params):
     try:
         return _ask(method, params)
     except (TypeError, ValueError) as exc:
-        raise type(exc)(f"{function}: {exc}") from None
+        raise type(exc)(f"{method}: {exc}") from None
 
 @_builtin
 def remember(text: str, project: bool = True) -> int:
@@ -282,13 +282,13 @@ def remember(text: str, project: bool = True) -> int:
     The memory is for this project, or global with project=False."""
     text = _str("remember", "text", text)
     project = bool(project)
-    return _asked("remember", "remember", {"text": text, "project": project})
+    return _asked("remember", {"text": text, "project": project})
 
 @_builtin
 def recall(query: str = "") -> list[tuple[int, str]]:
     """(id, text) of up to {recalled} memories: those that match any word of query, best first, or the newest if none match."""
     query = _str("recall", "query", query)
-    found = _asked("recall", "recall", {"query": query})
+    found = _asked("recall", {"query": query})
     return [(id, text) for id, text in found]
 
 @_builtin
@@ -300,70 +300,7 @@ def forget(id: int) -> None:
     # The agent keeps ids in 64 bits, so a larger one names no memory
     if not -2**63 <= id < 2**63:
         raise ValueError(f"forget: {_NO_MEMORY}")
-    _asked("forget", "forget", {"id": id})
-
-def _handed(function, result):
-    error = result.get("error")
-    if error is None:
-        return result["answer"]
-    return RuntimeError(f"{function}: {error}")
-
-def agent(name: str, task: str) -> None:
-    """Sends task to the agent with this name, starting one for a new name, and returns at once.
-    An agent at work gets the task after its current call.
-
-    - A new name starts a new agent with your files, built-in functions, MCP servers, skills and instructions, but not your Python session or this conversation.
-    - An agent at work adds task to what it is doing, and one that has answered continues its conversation with it.
-    - Up to {agents} agents work at a time, and the rest wait for a slot.
-    - Answers come from agent.wait(), or as an "[{done}]" message after your next call.
-    - Agents started this way cannot call agent(), remember() or forget()."""
-    name = _str("agent", "name", name)
-    task = _str("agent", "task", task)
-    if not name.strip():
-        raise ValueError("agent: name is empty")
-    if not task.strip():
-        raise ValueError("agent: task is empty")
-    _asked("agent", "send", {"name": name, "task": task})
-
-def _wait(*names: str, timeout: float | None = None) -> dict[str, str | RuntimeError]:
-    """The answers of the named agents, or of all not yet taken, once they end or after timeout seconds.
-    Returns early when the user sends a message, and prints what each one still at work is doing.
-
-    - Without names it waits for every agent at work, and returns their answers with the earlier ones not yet taken.
-    - A named agent that has answered gives its latest answer, again if it was taken.
-    - After timeout seconds, or once the user sends a message, which comes after your current call, it returns the answers so far and prints what each agent it waits for and still at work is doing.
-    - An agent that failed or was stopped gives a RuntimeError in place of its answer.
-    - An answer taken here comes in no "[{done}]" message."""
-    for name in names:
-        _str("agent.wait", "name", name)
-    if timeout is not None:
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-            kind = type(timeout).__name__
-            raise TypeError(f"agent.wait: timeout must be a number or None, not {kind}")
-        if not timeout >= 0:
-            raise ValueError(f"agent.wait: timeout must be 0 or more, not {timeout}")
-        # JSON has no infinity, and waiting that long is waiting until they end
-        timeout = None if timeout == float("inf") else float(timeout)
-
-    waited = _asked("agent.wait", "wait", {"names": list(names), "timeout": timeout})
-    for name, status in waited["working"]:
-        print(f"{name}: {status}")
-    return {name: _handed("agent.wait", result) for name, result in waited["answers"]}
-
-def _stop(name: str) -> None:
-    """Interrupts the agent, as Esc does; it keeps its conversation for the next task.
-
-    Interrupts the task the agent with this name works on and returns once it has stopped, and no "[{done}]" message comes for it; an agent not at work stays as it is."""
-    name = _str("agent.stop", "name", name)
-    _asked("agent.stop", "stop", {"name": name})
-
-agent = _builtin(agent)
-
-# Under agent, where the code's own wait or stop can't hide them
-for _function in [_wait, _stop]:
-    _function.__name__ = _function.__name__.removeprefix("_")
-    _function.__qualname__ = f"agent.{_function.__name__}"
-    setattr(agent, _function.__name__, _builtin(_function))
+    _asked("forget", {"id": id})
 
 @_builtin
 def help(request: object) -> None:
@@ -431,29 +368,14 @@ def help(request: object) -> None:
     doc = source or _inspect.getdoc(target)
     if doc:
         parts.append(doc)
-    # A builtin lists the ones under it, as agent does
-    if hasattr(target, "_smol_header"):
-        for member in vars(target).values():
-            if callable(member) and hasattr(member, "_smol_header"):
-                summary = _inspect.getdoc(member).split("\n\n")[0]
-                indented = summary.replace("\n", "\n    ")
-                parts.append(f"\n{member._smol_header}\n    {indented}")
 
     text = "\n".join(parts)
     print(text, limit=None)
 
-# _MAIN_AGENT is false in the workers of agents that agent() starts, which only recall memories
-_MEMORY = [remember, recall, forget] if _MAIN_AGENT else [recall]
-_BUILTINS = [edit, ls, grep, fetch, view, *_MEMORY, help]
-if _MAIN_AGENT:
-    _BUILTINS[-1:-1] = [agent, agent.wait, agent.stop]
-
 _FUNCTIONS = []
-for _function in _BUILTINS:
+for _function in [edit, ls, grep, fetch, view, remember, recall, forget, help]:
     _name = _function.__qualname__
     _header = _function._smol_header
     _summary = _inspect.getdoc(_function).split("\n\n")[0]
     _FUNCTIONS.append((_name, _header, _summary))
-    # The ones under another come with it
-    if "." not in _name:
-        vars(_builtins)[_name] = _function
+    vars(_builtins)[_name] = _function

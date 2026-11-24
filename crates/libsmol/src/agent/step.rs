@@ -1,4 +1,3 @@
-use crate::agent::delegate::Records;
 use crate::agent::{generate, retry, step_counts, Event, Failure, Streamed, Turn, MAX_RETRIES};
 use crate::model::{Finish, ModelError, Purpose, Sealed, StreamDelta, Unread, MAX_NAME_CHARS};
 use crate::prompt::TOOL;
@@ -41,20 +40,12 @@ impl Turn<'_> {
                         let thought = reply.reasoning.get_or_insert_with(String::new);
                         thought.push_str(text);
                         if !text.is_empty() {
-                            let streamed = Streamed {
-                                added: text,
-                                whole: thought,
-                            };
-                            shown(Event::Thought(streamed));
+                            shown(Event::Thought(text));
                         }
                     }
                     StreamDelta::Content(text) => {
                         reply.text.push_str(text);
-                        let streamed = Streamed {
-                            added: text,
-                            whole: &reply.text,
-                        };
-                        shown(Event::Text(streamed));
+                        shown(Event::Text(text));
                     }
                     StreamDelta::CallCode(code) => reply.push_code(code, &mut shown),
                     StreamDelta::CallEnd(ended) => reply.end_call(ended, &mut shown),
@@ -130,7 +121,7 @@ impl Turn<'_> {
                     break step;
                 }
                 Failure::Model(error) => {
-                    // The error is logged only by the line that ends the turn or the agent
+                    // The error is logged only by the line that ends the turn
                     let counted = step_counts(&step);
                     warn!("step: failed {counted}");
                     self.sink.event(Event::StepFailed(&step));
@@ -157,22 +148,13 @@ impl Turn<'_> {
 
             let started = Instant::now();
             let call = &step.calls[index];
-            self.sink.event(Event::Run(index, call));
+            self.sink.event(Event::Run(index));
 
-            let views = self.sink.tasks(index);
-            let records = Records::default();
-            let mut serving = self.agent.serving(self.servers, views, &records);
             let code = &call.code;
             let mut shown = |output: &str| self.sink.event(Event::Output(index, call, output));
-            let evaluating = self
-                .worker
-                .evaluate(code, self.servers, &mut shown, &mut *serving);
+            let evaluating = self.worker.evaluate(code, self.servers, &mut shown);
             let evaluated = evaluating.await;
             step.usage.duration += started.elapsed().as_secs_f64();
-            // Every call that could still change them has ended with the code
-            let mut recorded = records.lock().expect("records");
-            let agents = mem::take(&mut *recorded);
-            drop(recorded);
 
             let call = &mut step.calls[index];
             match evaluated {
@@ -193,7 +175,6 @@ impl Turn<'_> {
                     call.result = Some(CodeResult {
                         printed,
                         media: output.media,
-                        agents,
                     });
                     call.error = error;
 
@@ -408,7 +389,7 @@ mod tests {
         let executed = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&executed);
         let on_event = Box::new(move |event: Event| {
-            if let Event::Run(index, _) = event {
+            if let Event::Run(index) = event {
                 seen.lock().expect("executed").push(index);
             }
         });

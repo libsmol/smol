@@ -1,4 +1,4 @@
-use crate::prompt::{self, EMPTY_MEMORY, NESTED, NO_MEMORY};
+use crate::prompt::{self, EMPTY_MEMORY, NO_MEMORY};
 use crate::utils::{folded, Reply};
 use crate::worker::MemoryCall;
 use jieba_rs::Jieba;
@@ -64,15 +64,13 @@ impl Memories {
         }
     }
 
-    /// Replies as `MemoryCall` documents, and only to recalls unless `writable`
-    pub(crate) async fn answer(&self, call: MemoryCall, writable: bool) -> Reply {
+    /// Replies as `MemoryCall` documents
+    pub(crate) async fn answer(&self, call: MemoryCall) -> Reply {
         match call {
             MemoryCall::Recall { query } => {
                 let found = self.recall(&query).await?;
                 Ok(json!(found))
             }
-            // The worker leaves out what it can't call, but the code can still ask
-            _ if !writable => Err(NESTED.to_owned()),
             MemoryCall::Remember { text, project } => {
                 let id = self.remember(&text, project).await?;
                 Ok(Value::from(id))
@@ -462,7 +460,7 @@ mod tests {
             let refused = here.forget(theirs).await;
             let forgotten = [here.forget(own).await, here.forget(shared).await];
             let again = here.forget(own).await;
-            let answered = here.answer(MemoryCall::Forget { id: own }, true).await;
+            let answered = here.answer(MemoryCall::Forget { id: own }).await;
             let left = there.recall("").await.expect("recall");
             let searched = here.recall("Deploys").await.expect("recall");
             (refused, forgotten, again, answered, left, searched, theirs)

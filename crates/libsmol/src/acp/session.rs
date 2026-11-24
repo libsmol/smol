@@ -2,9 +2,7 @@ use crate::acp::mcp::McpPool;
 use crate::acp::rpc::{Notice, Peer, SessionPeer};
 use crate::acp::translator::Translator;
 use crate::acp::{rfc3339, task_of, to_value, App};
-use crate::agent::{
-    title_of, Agent, Asking, Brief, Event, Nudging, Place, Queue, Sink, Task, TaskViews, Team,
-};
+use crate::agent::{title_of, Agent, Asking, Brief, Event, Sink, Task};
 use crate::config::{self, AgentConfig, McpConfig, Models};
 use crate::history::{Lock, Record, SessionMeta, Settings};
 use crate::spawn::{run_shell, Process};
@@ -31,7 +29,6 @@ use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot::{self, error::TryRecvError};
-use tokio::sync::Notify;
 use tokio::task::{self, AbortHandle, JoinHandle};
 use tokio::time;
 use tracing::{error, info, warn};
@@ -75,7 +72,6 @@ pub(crate) struct Opening {
     pub(crate) agent: AgentConfig,
     pub(crate) app: Arc<App>,
     pub(crate) interrupt: Interrupt,
-    pub(crate) enqueued: Arc<Notify>,
     pub(crate) memories: Memories,
 }
 
@@ -92,11 +88,9 @@ struct Session {
     _lock: Option<Lock>,
 }
 
-/// Lent to the agent during a turn to show events and save
+/// Lent to the agent during a turn to show events, save and take what the client queues
 struct Keeper {
     meta: SessionMeta,
-    /// Saved with the session
-    team: Arc<Team>,
     app: Arc<App>,
     titling: Option<Titling>,
     /// The error of the last save, if it failed
@@ -126,12 +120,6 @@ impl Drop for Titling {
     }
 }
 
-/// The messages the client queues during a turn, which the session's agent takes as task updates
-struct ClientQueue {
-    peer: SessionPeer,
-    enqueued: Arc<Notify>,
-}
-
 /// Only `Router` holds the sender of `inbox`, and dropping it closes the session
 pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>) {
     let Opening {
@@ -144,7 +132,6 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
         agent,
         app,
         interrupt,
-        enqueued,
         memories,
     } = opening;
 
@@ -164,16 +151,9 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             false => Record {
                 meta: SessionMeta::new(session.clone(), Settings::default()),
                 memory: AgentMemory::default(),
-                agents: Vec::new(),
             },
         };
-        let Record {
-            mut meta,
-            memory,
-            agents,
-        } = record;
-        // Agents the code started in earlier turns take further tasks
-        let team = Arc::new(Team::restored(agents));
+        let Record { mut meta, memory } = record;
         let peer = SessionPeer::new(Arc::clone(&app.peer), &meta.id);
 
         let (settings, mut notices) = meta.settings.resumed(&cwd, &models, &agent);
@@ -210,9 +190,8 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
         // Servers need neither the venv nor the worker, so they connect while those start
         let pool = McpPool::new(agent.servers, &meta.settings, &copies, peer.clone());
         let window = built.context_window();
-        let mut translator = Translator::new(peer.clone(), window, cwd.clone(), copies.clone());
-        let agents = team.records();
-        translator.replay(&memory, &agents);
+        let mut translator = Translator::new(peer.clone(), window, copies.clone());
+        translator.replay(&memory);
 
         let project = app.store.project(&cwd);
         let venv = Venv::open(&project, &cwd).await;
@@ -229,21 +208,10 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             &agent.access,
         );
         let workplace = opening.map_err(Error::Python)?;
-        let workplace = Arc::new(workplace);
-
-        let queue = ClientQueue {
-            peer: peer.clone(),
-            enqueued,
-        };
-        let place = Place::Main {
-            team: Arc::clone(&team),
-            queue: Arc::new(queue),
-        };
 
         // No restart notice again when no code has run since the last restart
         let ran = memory.ran_code();
-        let rank = place.rank();
-        let launching = Worker::new(&interrupt, Arc::clone(&workplace), &[], rank, ran);
+        let launching = Worker::new(&interrupt, workplace, memories, ran);
         let worker = launching.await?;
 
         let response = match loading {
@@ -285,13 +253,9 @@ pub(crate) async fn open(opening: Opening, mut inbox: UnboundedReceiver<Message>
             model: Arc::from(built),
             brief,
             interrupt,
-            workplace,
-            memories,
-            place,
         };
         let keeper = Keeper {
             meta,
-            team,
             app: Arc::clone(&app),
             titling: None,
             unsaved: None,
@@ -416,7 +380,7 @@ impl Session {
         let asked = asked.unwrap_or_default();
         let mentions = prompt.task.as_ref().map(|task| task.mentions.as_slice());
         let mentions = mentions.unwrap_or_default();
-        let cwd = &self.agent.workplace.cwd;
+        let cwd = &self.worker.workplace().cwd;
         let named = mentions.iter().filter_map(|mention| mention.name(cwd));
         let attached: Vec<String> = named.collect();
         let worded = !asked.trim().is_empty() || !attached.is_empty();
@@ -483,7 +447,7 @@ impl Session {
         let translator = &mut self.keeper.translator;
         let id = translator.shell(&shell.command);
         let mut shown = |output: &str| translator.shell_output(&id, output);
-        let cwd = &self.agent.workplace.cwd;
+        let cwd = &self.worker.workplace().cwd;
         let (ran, left) = run_shell(&shell.command, cwd, interrupt, &mut shown).await;
         self.shell_left.extend(left);
 
@@ -515,7 +479,7 @@ impl Session {
             // and rewrites the saved session
             (MODEL_OPTION, _, SessionConfigOptionValue::ValueId { value }) => {
                 if *value.0 != keeper.meta.settings.model {
-                    let copies = &self.agent.workplace.copies;
+                    let copies = &self.worker.workplace().copies;
                     let model = self.models.make(&value.0, None, copies)?;
                     let window = model.context_window();
                     self.agent.model = Arc::from(model);
@@ -533,7 +497,7 @@ impl Session {
 
                 let current = keeper.meta.settings.current_effort(&self.models);
                 if current != Some(effort) {
-                    let copies = &self.agent.workplace.copies;
+                    let copies = &self.worker.workplace().copies;
                     let model = self.models.make(name, Some(effort), copies)?;
                     self.agent.model = Arc::from(model);
                     keeper.meta.settings.effort = Some(effort.to_owned());
@@ -592,8 +556,7 @@ impl Keeper {
         }
 
         self.meta.update_title(memory);
-        let agents = self.team.records();
-        let stored = self.app.store.save(memory, &agents, &mut self.meta);
+        let stored = self.app.store.save(memory, &mut self.meta);
         let error = stored.as_ref().err().map(Error::to_string);
         // The same error is reported only once
         if error != self.unsaved {
@@ -623,21 +586,10 @@ impl Sink for Keeper {
         self.save(memory);
     }
 
-    fn tasks(&mut self, index: usize) -> Box<dyn TaskViews> {
-        self.translator.tasks(index)
-    }
-}
-
-impl Queue for ClientQueue {
-    fn queued(&self) -> Asking<'_> {
+    fn queued(&mut self) -> Asking<'_> {
+        let peer = &self.peer;
         Box::pin(async move {
-            // The notices of the messages this takes would otherwise wake a later wait for none
-            select! {
-                biased;
-                () = self.enqueued.notified() => {}
-                () = future::ready(()) => {}
-            }
-            let Some(result) = self.peer.queued().await else {
+            let Some(result) = peer.queued().await else {
                 return Vec::new();
             };
             let Ok(queued) = serde_json::from_value::<Queued<ContentBlock>>(result) else {
@@ -651,10 +603,6 @@ impl Queue for ClientQueue {
             }
             tasks
         })
-    }
-
-    fn enqueued(&self) -> Nudging<'_> {
-        Box::pin(self.enqueued.notified())
     }
 }
 
@@ -1062,11 +1010,11 @@ mod tests {
         });
         let running = async {
             let mut connection = Connection::open(&dir, &api, "");
-            let own = here.answer(remember("Tests run with pytest", true), true);
+            let own = here.answer(remember("Tests run with pytest", true));
             let own = own.await.expect("remember");
-            let shared = here.answer(remember("Prefers résumé over CV", false), true);
+            let shared = here.answer(remember("Prefers résumé over CV", false));
             let shared = shared.await.expect("remember");
-            let theirs = elsewhere.answer(remember("Builds with make", true), true);
+            let theirs = elsewhere.answer(remember("Builds with make", true));
             theirs.await.expect("remember");
 
             let session = connection.new_session().await;

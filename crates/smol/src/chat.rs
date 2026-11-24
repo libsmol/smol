@@ -298,10 +298,6 @@ impl Session {
         Ok(number)
     }
 
-    pub(crate) fn notify_queued(&self) {
-        self.client.notify_queued(&self.id);
-    }
-
     /// Gives the running turn the messages queued for it, which may be none
     pub(crate) fn answer(&mut self, asked: Asked, texts: impl IntoIterator<Item = String>) {
         let mut prompts = Vec::new();

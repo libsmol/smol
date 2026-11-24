@@ -1,5 +1,5 @@
 use crate::config::{AgentConfig, McpConfig, Models};
-use crate::steps::{AgentMemory, AgentRecord, MemoryStep};
+use crate::steps::{AgentMemory, MemoryStep};
 use crate::utils::{folded, new_id};
 use crate::{Error, Result};
 use reaper::{path_cause, tilde};
@@ -187,12 +187,10 @@ impl Settings {
 
 /// What a session's file holds
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Record<M = SessionMeta, A = AgentMemory, G = Vec<AgentRecord>> {
+pub(crate) struct Record<M = SessionMeta, A = AgentMemory> {
     /// Must come first because `read_meta` only reads the start
     pub(crate) meta: M,
     pub(crate) memory: A,
-    /// The agents that `agent()` started
-    pub(crate) agents: G,
 }
 
 pub(crate) struct HistoryStore {
@@ -225,19 +223,13 @@ impl HistoryStore {
     }
 
     /// Even when saving fails, `meta` already carries the new time
-    pub(crate) fn save(
-        &self,
-        memory: &AgentMemory,
-        agents: &[AgentRecord],
-        meta: &mut SessionMeta,
-    ) -> Result<()> {
+    pub(crate) fn save(&self, memory: &AgentMemory, meta: &mut SessionMeta) -> Result<()> {
         let path = self.file(&meta.settings.cwd, &meta.id)?;
         meta.updated_at = now();
 
         let record = Record {
             meta: &*meta,
             memory,
-            agents,
         };
         let json = serde_json::to_string(&record).map_err(|e| failed(&path, &e))?;
 
@@ -334,7 +326,25 @@ impl HistoryStore {
             return Err(missing());
         }
 
-        let record = serde_json::from_str(&text).map_err(|e| failed(&path, &e))?;
+        let mut record: Record = serde_json::from_str(&text).map_err(|e| failed(&path, &e))?;
+
+        // Done steps that only agents filled go, and summaries keep counting what they kept
+        let agents_only =
+            |step: &MemoryStep| matches!(step, MemoryStep::Done(done) if done.programs.is_empty());
+        let mut since: Vec<bool> = Vec::new();
+        for step in &mut record.memory.steps {
+            match step {
+                MemoryStep::Summary(summary) => {
+                    let cut = since.len().saturating_sub(summary.kept);
+                    since.drain(..cut);
+                    let dropped = since.iter().filter(|gone| **gone).count();
+                    summary.kept -= dropped;
+                }
+                _ => since.push(agents_only(step)),
+            }
+        }
+        record.memory.steps.retain(|step| !agents_only(step));
+
         Ok(record)
     }
 
@@ -467,7 +477,7 @@ pub(crate) mod tests {
     ) -> SessionMeta {
         let mut meta = SessionMeta::new(id.to_owned(), settings.clone());
         meta.update_title(memory);
-        store.save(memory, &[], &mut meta).expect("save");
+        store.save(memory, &mut meta).expect("save");
         meta
     }
 
@@ -498,23 +508,16 @@ pub(crate) mod tests {
         let leftover = names.filter(|entry| entry.path().to_string_lossy().ends_with(".tmp"));
         assert_eq!(leftover.count(), 0);
 
-        // The chosen title is saved under `name` among the settings, as 0.7.0 saved it,
-        // and the agents beside the conversation
+        // The chosen title is saved under `name` among the settings, as 0.7.0 saved it
         let mut named = SessionMeta::new("a1".to_owned(), settings.clone());
         named.model_title = "Clean up the date helpers".to_owned();
-        let agent = AgentRecord {
-            name: "cafés".to_owned(),
-            ..AgentRecord::default()
-        };
-        let agents = [agent];
         named.update_title(&memory);
-        store.save(&memory, &agents, &mut named).expect("save");
+        store.save(&memory, &mut named).expect("save");
         let raw = fs::read_to_string(project.join("a1.json")).expect("read");
         let kept = r#""mcp":{"fake":false},"name":"Clean up the date helpers","created_at""#;
         assert!(raw.contains(kept), "{raw}");
         let record = store.load(cwd, "a1").expect("load");
         assert_eq!(record.meta.model_title, "Clean up the date helpers");
-        assert_eq!(record.agents, agents);
         let listed = store.list(Some(cwd)).expect("list");
         let titles: Vec<&str> = listed.iter().map(|meta| meta.title.as_str()).collect();
         assert!(titles.contains(&"Clean up the date helpers"), "{titles:?}");
@@ -568,6 +571,50 @@ pub(crate) mod tests {
         fs::write(project.join("b3.json"), older).expect("write");
         let refused = store.load(cwd, "b3").expect_err("format");
         assert!(matches!(refused, Error::SessionNotFound(_)), "{refused}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sessions saved while `agent()` existed still open, without what only agents left
+    #[test]
+    fn agents_dropped() {
+        let dir = temp_dir("agents");
+        let store = HistoryStore::new(&dir);
+        let cwd = Path::new("/work");
+        let saved = r#"{"meta":{"format":9,"id":"c1","title":"t","cwd":"/work","created_at":1.0,"updated_at":2.0},
+            "memory":{"steps":[
+                {"type":"task","text":"Count the cafés"},
+                {"type":"action","calls":[{"code":"agent('a', 'Count')","result":{"agents":[{"name":"a","number":0}]}}],"usage":{"duration":1.0}},
+                {"type":"done","agents":[{"name":"a","answer":"3 cafés"}]},
+                {"type":"done","agents":[{"name":"b","answer":"naïve"}],"programs":[{"pid":7,"command":"sleep 1"}]},
+                {"type":"summary","summary":"Counted the cafés","kept":3,"usage":{"duration":2.0}}
+            ]},
+            "agents":[{"name":"a","memory":{"steps":[]},"tasks":[{"task":"Count","start":0,"answer":"3 cafés"}]}]}"#;
+        let project = store.project(cwd);
+        fs::create_dir_all(&project).expect("dir");
+        fs::write(project.join("c1.json"), saved).expect("write");
+
+        let steps = store.load(cwd, "c1").expect("load").memory.steps;
+        let mut kinds = Vec::new();
+        for step in &steps {
+            let kind = match step {
+                MemoryStep::Task(_) => "task",
+                MemoryStep::Action(_) => "action",
+                MemoryStep::Done(_) => "done",
+                MemoryStep::Summary(_) => "summary",
+                _ => "other",
+            };
+            kinds.push(kind);
+        }
+        assert_eq!(kinds, ["task", "action", "done", "summary"]);
+        let MemoryStep::Done(done) = &steps[2] else {
+            panic!("{steps:?}");
+        };
+        assert_eq!(done.programs[0].command, "sleep 1");
+        let MemoryStep::Summary(summary) = &steps[3] else {
+            panic!("{steps:?}");
+        };
+        assert_eq!(summary.kept, 2);
 
         fs::remove_dir_all(&dir).ok();
     }

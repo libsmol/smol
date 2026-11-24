@@ -6,8 +6,6 @@ pub const NOTICE: &str = "_smol/notice";
 pub const MCP: &str = "_smol/mcp";
 /// Declared by the client in `_meta` and asked by the agent during a turn
 pub const QUEUED: &str = "_smol/queued";
-/// Sent by a client that declared `QUEUED` when it queues a message
-pub const ENQUEUED: &str = "_smol/enqueued";
 /// Declared by a client that shows the images a reply writes in Markdown
 pub const IMAGES: &str = "_smol/images";
 /// Declared by the client, sent to it when programs the code left running end while no turn runs,
@@ -19,24 +17,13 @@ pub const PROGRAMS: &str = "_smol/programs";
 pub const UPDATE: &str = "_smol/update";
 /// Replied to like a prompt, and marks its tool calls with `true`
 pub const SHELL: &str = "_smol/shell";
-/// Marks the tool calls of the tasks the code sends agents, whose `rawInput` is what they were given
-pub const AGENT: &str = "_smol/agent";
-/// Set on an update of a call's tool call to the names of the agents its code waits for, and to none
-/// once it stops waiting
-pub const WAITING: &str = "_smol/waiting";
 pub const MEMORIES: &str = "_smol/memories";
 pub const FORGET: &str = "_smol/forget";
 
 /// Starts the id of each MCP server's boolean config option
 pub const MCP_PREFIX: &str = "mcp.";
 
-// Keys in the `rawInput` of `AGENT` calls
-pub const TASK: &str = "task";
-pub const NAME: &str = "name";
-
 // Keys in `_meta`, besides those of `Measured`
-/// The id of the call running the code, on `AGENT` calls
-pub const PARENT: &str = "parent";
 /// How a shell command ended, as a string
 pub const ERROR: &str = "error";
 
@@ -131,11 +118,11 @@ pub struct Queued<B> {
     pub prompts: Vec<Vec<B>>,
 }
 
-/// What the `_meta` of usage updates, agent calls and shell ends tells of their usage and end
+/// What the `_meta` of usage updates and shell ends tells of their usage and end
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Measured {
-    /// Seconds, on agent calls and the usage updates of steps and compactions
+    /// Seconds, on the usage updates of steps and compactions
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
     /// Seconds since the first token
@@ -148,9 +135,6 @@ pub struct Measured {
     /// Tokens, on usage updates sent while a reply is generating
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_output: Option<u64>,
-    /// On agent calls
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub steps: Option<u64>,
     #[serde(default, skip_serializing_if = "Not::not")]
     pub interrupted: bool,
 }

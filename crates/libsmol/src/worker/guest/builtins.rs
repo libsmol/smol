@@ -109,7 +109,7 @@ fn call_tool<'py>(
     asked(py, call)
 }
 
-/// The calls of `agent()`, its handles and the memory functions, by the method the agent reads
+/// The calls of the memory functions, by the method the agent reads
 #[pyfunction]
 fn ask<'py>(
     py: Python<'py>,

@@ -1,12 +1,11 @@
-use crate::agent::MAX_PARALLEL_AGENTS;
-use crate::prompt::{DONE, NO_MEMORY, PRINT_CUT, SURROGATE};
+use crate::prompt::{NO_MEMORY, PRINT_CUT, SURROGATE};
 use crate::tools::memories::{MAX_MEMORY_CHARS, MAX_RECALLED};
 use crate::tools::ToolError;
 use crate::utils::{block_on, Waiting};
 use crate::worker::guest::builtins::{builtins, value_error};
 use crate::worker::{
     controlled, end_marker, greeting, FromWorker, Function, HostCall, HostNote, Message, ToWorker,
-    WorkerCall, WorkerNote, CONTROL_ENV, COPIES_ENV, MAIN_ENV, MAX_PRINT_CHARS, WORKER_ARG,
+    WorkerCall, WorkerNote, CONTROL_ENV, COPIES_ENV, MAX_PRINT_CHARS, WORKER_ARG,
 };
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
 use pyo3::prelude::*;
@@ -73,7 +72,6 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
     // Programs the code starts would inherit these, and they must go before any thread starts
     let control: String = taken(&environ, CONTROL_ENV)?.extract()?;
     let copies: OsString = taken(&environ, COPIES_ENV)?.extract()?;
-    let main: String = taken(&environ, MAIN_ENV)?.extract()?;
 
     // Taken before any code can close fd 1
     // Python's os makes it because a Windows fd belongs to the C runtime that opened it
@@ -114,13 +112,10 @@ fn serve(py: Python<'_>, venv: &Path) -> PyResult<()> {
         globals.set_item(name, function)?;
     }
     globals.set_item("_OUTPUT", output)?;
-    globals.set_item("_MAIN_AGENT", !main.is_empty())?;
-    globals.set_item("_MAX_AGENTS", MAX_PARALLEL_AGENTS)?;
     globals.set_item("_MAX_RECALLED", MAX_RECALLED)?;
     globals.set_item("_MAX_MEMORY_CHARS", MAX_MEMORY_CHARS)?;
     globals.set_item("_MAX_PRINT_CHARS", MAX_PRINT_CHARS)?;
     globals.set_item("_PRINT_CUT", PRINT_CUT)?;
-    globals.set_item("_DONE", DONE)?;
     globals.set_item("_NO_MEMORY", NO_MEMORY)?;
 
     let builtin = py.import("builtins")?;

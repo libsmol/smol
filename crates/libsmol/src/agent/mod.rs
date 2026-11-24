@@ -5,15 +5,14 @@ use crate::model::{
 };
 use crate::prompt;
 use crate::steps::{
-    bytes, estimate, AgentMemory, AgentStep, Call, Content, Ending, MemoryStep, StepError,
-    SummaryStep, TaskStep, Usage,
+    bytes, estimate, AgentMemory, AgentStep, Call, Content, MemoryStep, StepError, SummaryStep,
+    TaskStep, Usage,
 };
 use crate::tools::attach::{attach, Mention};
-use crate::tools::memories::{Digest, Memories};
+use crate::tools::memories::Digest;
 use crate::utils::Interrupt;
-use crate::worker::host::{Added, Called, Calling, Rank, Serving, Worker};
+use crate::worker::host::{Added, Worker};
 use crate::worker::workplace::Workplace;
-use crate::worker::{AgentCall, Service};
 use crate::{Error, Result};
 use reaper::wire::Program;
 use std::fs;
@@ -28,12 +27,7 @@ use tokio::{task, time};
 use tracing::{info, warn};
 
 mod compact;
-mod delegate;
 mod step;
-
-pub(crate) use crate::agent::delegate::{Records, Team};
-
-pub(crate) use crate::agent::delegate::MAX_PARALLEL_AGENTS;
 
 const MAX_TITLING_CHARS: usize = 2000;
 const MAX_RETRIES: u32 = 3;
@@ -45,13 +39,15 @@ const RETRY_WAIT: Duration = match cfg!(test) {
 /// Only what happens live in a turn, as the display replays saved steps itself
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Event<'a> {
-    Thought(Streamed<'a>),
-    Text(Streamed<'a>),
+    /// What arrived of the reasoning
+    Thought(&'a str),
+    /// What arrived of the text
+    Text(&'a str),
     /// Code streamed for the call at this index, once it isn't blank
     Code(usize, Streamed<'a>),
     /// A call with no readable code, shown as soon as it arrives
     Unread(usize, &'a Call),
-    Run(usize, &'a Call),
+    Run(usize),
     /// Clipped output so far of the call at this index
     Output(usize, &'a Call, &'a str),
     /// A call ended, also one with no readable code that never ran
@@ -70,7 +66,7 @@ pub(crate) enum Event<'a> {
     Programs(&'a [Program]),
 }
 
-/// What arrived since the last event for it, and all of it so far in this reply
+/// What arrived since the last event for it, and all of it so far in this call
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Streamed<'a> {
     pub(crate) added: &'a str,
@@ -83,80 +79,20 @@ pub(crate) trait Sink: Send {
     /// Must be called for every added step or an exit midway loses steps
     fn saved(&mut self, memory: &AgentMemory);
 
-    /// Shows the agents that the code of the call at `index` starts
-    fn tasks(&mut self, index: usize) -> Box<dyn TaskViews>;
+    /// What the user queued while the turn ran, which is already taken off the client's queue
+    fn queued(&mut self) -> Asking<'_>;
 }
 
 pub(crate) type Asking<'a> = Pin<Box<dyn Future<Output = Vec<Task>> + Send + 'a>>;
-pub(crate) type Nudging<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
-/// What the user queues while a turn of the session's agent runs
-pub(crate) trait Queue: Send + Sync {
-    /// The returned messages are already taken off the client's queue
-    fn queued(&self) -> Asking<'_>;
-
-    /// Resolves once the client has queued a message for `queued` to return
-    fn enqueued(&self) -> Nudging<'_>;
-}
-
-/// Tasks are numbered from 1 within the call that sends them
-pub(crate) trait TaskViews: Send + Sync {
-    fn open(&self, number: usize, name: &str, task: &str) -> Box<dyn TaskView>;
-
-    /// The agents the call's code waits for, none once it stops waiting
-    fn waiting(&self, names: &[String]);
-}
-
-pub(crate) trait TaskView: Send {
-    fn shown(&mut self, status: &Status);
-
-    /// `steps` are those the task added to its agent's conversation
-    fn close(&mut self, end: &Ending, steps: &[MemoryStep]);
-}
-
-/// What an agent started by `agent()` is doing now,
-/// and the end of what it is writing or printing for that
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Status {
-    pub(crate) doing: String,
-    pub(crate) preview: String,
-    /// Steps it has finished
-    pub(crate) steps: usize,
-    /// What the requests of those steps and of compaction cost
-    pub(crate) usage: Usage,
-    /// When it got a slot to run in
-    pub(crate) since: Option<Instant>,
-}
-
-pub(crate) struct Unseen;
-
-impl TaskViews for Unseen {
-    fn open(&self, _: usize, _: &str, _: &str) -> Box<dyn TaskView> {
-        Box::new(Unseen)
-    }
-
-    fn waiting(&self, _: &[String]) {}
-}
-
-impl TaskView for Unseen {
-    fn shown(&mut self, _: &Status) {}
-
-    fn close(&mut self, _: &Ending, _: &[MemoryStep]) {}
-}
-
-/// Input and output tokens as log lines show them, or - when the provider gave none
-fn logged_tokens(usage: &Usage) -> String {
-    match usage.tokens {
-        Some(tokens) => format!("{}/{}", tokens.input_tokens, tokens.output_tokens),
-        None => "-".to_owned(),
-    }
-}
-
-/// What a step's log line ends with
+/// What a step's log line ends with, with - for tokens the provider didn't give
 fn step_counts(step: &AgentStep) -> String {
     let calls = step.calls.len();
     let seconds = step.usage.duration;
-    let tokens = logged_tokens(&step.usage);
+    let tokens = match step.usage.tokens {
+        Some(tokens) => format!("{}/{}", tokens.input_tokens, tokens.output_tokens),
+        None => "-".to_owned(),
+    };
     format!("[calls={calls}, tokens={tokens}, elapsed={seconds:.1}s]")
 }
 
@@ -165,19 +101,14 @@ pub(crate) struct Task {
     pub(crate) mentions: Vec<Mention>,
 }
 
-#[derive(Clone)]
 pub(crate) struct Agent {
     pub(crate) model: Arc<dyn Model>,
     pub(crate) brief: Brief,
     pub(crate) interrupt: Interrupt,
-    /// Every worker of the session runs in it
-    pub(crate) workplace: Arc<Workplace>,
-    pub(crate) memories: Memories,
-    pub(crate) place: Place,
 }
 
 /// What the session learned when it opened, which the system prompt shows
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct Brief {
     pub(crate) instructions: Vec<String>,
     pub(crate) skills: Vec<Skill>,
@@ -185,42 +116,6 @@ pub(crate) struct Brief {
     pub(crate) images_shown: bool,
     /// The client declared `_smol/background`, so programs that end after an answer get a turn
     pub(crate) background: bool,
-}
-
-pub(crate) type Delegating<'a> = dyn FnMut(AgentCall) -> Calling + Send + 'a;
-
-#[derive(Clone)]
-pub(crate) enum Place {
-    /// The session's own agent, with the agents its code started and what the user queues meanwhile
-    Main {
-        team: Arc<Team>,
-        queue: Arc<dyn Queue>,
-    },
-    /// Started by `agent()`, which it can't call itself, with what the code sends it meanwhile
-    Delegated { queue: Arc<dyn Queue> },
-}
-
-impl Place {
-    pub(crate) fn team(&self) -> Option<&Arc<Team>> {
-        match self {
-            Place::Main { team, .. } => Some(team),
-            Place::Delegated { .. } => None,
-        }
-    }
-
-    /// What arrives for the task at work
-    pub(crate) fn queue(&self) -> &dyn Queue {
-        match self {
-            Place::Main { queue, .. } | Place::Delegated { queue } => queue.as_ref(),
-        }
-    }
-
-    pub(crate) fn rank(&self) -> Rank {
-        match self {
-            Place::Main { .. } => Rank::Main,
-            Place::Delegated { .. } => Rank::Delegated,
-        }
-    }
 }
 
 struct Turn<'a> {
@@ -244,13 +139,13 @@ impl Agent {
         sink: &mut dyn Sink,
     ) -> Result<Option<String>> {
         let takes = |kind| self.model.takes(kind);
+        let workplace = worker.workplace();
         let system = prompt::system(
             worker.functions(),
             servers,
             &self.brief,
-            &self.workplace.cwd,
-            self.workplace.writable(),
-            &self.place,
+            &workplace.cwd,
+            workplace.writable(),
             &takes,
         );
 
@@ -262,76 +157,20 @@ impl Agent {
             system,
             sink,
         };
-        let ran = turn.run(task).await;
-        // However the turn ends, no agent its code started keeps working
-        turn.stopped().await;
-        ran
-    }
-
-    /// Answers what the code of one call asks of the agent,
-    /// and lists each task it sends in `records`
-    pub(crate) fn serving<'a>(
-        &'a self,
-        servers: &'a [&'a Added],
-        views: Box<dyn TaskViews>,
-        records: &'a Records,
-    ) -> Box<Serving<'a>> {
-        let mut delegate = self.delegate(servers, views, records);
-        let writable = self.place.rank() == Rank::Main;
-        let serving =
-            move |service: Service| serve(service, &mut *delegate, &self.memories, writable);
-        Box::new(serving)
-    }
-
-    /// Reading files and copying images and videos stays off the async runtime
-    async fn attached(&self, task: Task) -> TaskStep {
-        let cwd = self.workplace.cwd.clone();
-        let copies = self.workplace.copies.clone();
-        let mentions = task.mentions;
-        let attaching = move || {
-            let attached = mentions
-                .iter()
-                .map(|mention| attach(mention, &cwd, &copies));
-            attached.collect()
-        };
-        let files = task::spawn_blocking(attaching).await.expect("attach");
-
-        TaskStep {
-            text: task.text,
-            files,
-        }
-    }
-}
-
-/// Hands calls to `agent()` and its handles to `delegate` and answers the memory functions
-pub(crate) fn serve(
-    service: Service,
-    delegate: &mut Delegating<'_>,
-    memories: &Memories,
-    writable: bool,
-) -> Calling {
-    match service {
-        Service::Agent(call) => delegate(call),
-        Service::Memory(call) => {
-            let memories = memories.clone();
-            Box::pin(async move {
-                let reply = memories.answer(call, writable).await;
-                Called::from(reply)
-            })
-        }
+        turn.run(task).await
     }
 }
 
 impl Turn<'_> {
     async fn run(&mut self, task: Option<Task>) -> Result<Option<String>> {
         if let Some(task) = task {
-            let task = self.agent.attached(task).await;
+            let task = attached(task, self.worker.workplace()).await;
             if task.text.trim().is_empty() && task.files.is_empty() {
                 return Err(Error::Refused("empty".to_owned()));
             }
 
             // The task text survives compaction verbatim, so one over half the window can never fit
-            let copies = &self.agent.workplace.copies;
+            let copies = &self.worker.workplace().copies;
             if let Some(window) = self.agent.model.context_window() {
                 // Image and video estimates run high, so only text counts toward refusing
                 let text_only = |_: MediaKind| false;
@@ -385,51 +224,31 @@ impl Turn<'_> {
             match &step.error {
                 None => info!("step: done {counted}"),
                 Some(StepError::Interrupted) => info!("step: interrupted {counted}"),
-                Some(StepError::Stopped) => info!("step: stopped {counted}"),
                 Some(error) => warn!("step: failed, {error} {counted}"),
             }
             self.sink.event(Event::StepEnd(step));
             self.sink.saved(self.memory);
 
-            // An answer ends the turn only once no agent works,
-            // while programs the code left running never hold it open
-            let (updates, done, exited) = loop {
-                // An interrupt that arrives after the answer still ends the turn as interrupted
-                if self.agent.interrupt.triggered() {
-                    return Ok(None);
-                }
+            // An interrupt that arrives after the answer still ends the turn as interrupted
+            if self.agent.interrupt.triggered() {
+                return Ok(None);
+            }
+            // Programs that end after an answer go to the session, which takes them up between turns
+            if answer.is_some() {
+                return Ok(answer);
+            }
 
-                // Read before collecting, so an agent that ends in between is still collected
-                let team = self.agent.place.team();
-                let running = team.is_some_and(|team| team.running());
-                let done = self.ended();
-                let exited = self.worker.ended().await;
-                let programs = self.worker.running();
-                self.sink.event(Event::Programs(&programs));
-                if answer.is_none() || !done.is_empty() || exited.is_some() {
-                    let updates = self.queued().await;
-                    break (updates, done, exited);
-                }
-                if !running {
-                    return Ok(answer);
-                }
-
-                let updates = self.news().await;
-                if !updates.is_empty() {
-                    break (updates, done, None);
-                }
-            };
-
-            let finished = !done.is_empty() || exited.is_some();
-            let received = !updates.is_empty() || finished;
+            let done = self.worker.ended().await;
+            let programs = self.worker.running();
+            self.sink.event(Event::Programs(&programs));
+            let updates = self.queued().await;
+            let received = !updates.is_empty() || done.is_some();
             for update in updates {
-                let update = self.agent.attached(update).await;
+                let update = attached(update, self.worker.workplace()).await;
                 self.memory.steps.push(MemoryStep::Update(update));
             }
-            if finished {
-                let mut step = exited.unwrap_or_default();
-                step.agents = done;
-                self.memory.steps.push(MemoryStep::Done(step));
+            if let Some(done) = done {
+                self.memory.steps.push(MemoryStep::Done(done));
             }
             if received {
                 self.sink.saved(self.memory);
@@ -439,13 +258,32 @@ impl Turn<'_> {
 
     /// Stays interruptible when the client never replies
     async fn queued(&mut self) -> Vec<Task> {
-        let asking = self.agent.place.queue().queued();
+        let asking = self.sink.queued();
         select! {
             // The client already dequeued these, so they win over a cancel arriving with them
             biased;
             updates = asking => updates,
             () = self.agent.interrupt.wait() => Vec::new(),
         }
+    }
+}
+
+/// Reading files and copying images and videos stays off the async runtime
+async fn attached(task: Task, workplace: &Workplace) -> TaskStep {
+    let cwd = workplace.cwd.clone();
+    let copies = workplace.copies.clone();
+    let mentions = task.mentions;
+    let attaching = move || {
+        let attached = mentions
+            .iter()
+            .map(|mention| attach(mention, &cwd, &copies));
+        attached.collect()
+    };
+    let files = task::spawn_blocking(attaching).await.expect("attach");
+
+    TaskStep {
+        text: task.text,
+        files,
     }
 }
 
@@ -634,32 +472,28 @@ pub(crate) async fn title_of(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::agent::{
-        Agent, Asking, Brief, Event, Nudging, Place, Queue, Sink, Streamed, Task, TaskViews, Turn,
-        Unseen,
-    };
+    use crate::agent::{Agent, Asking, Brief, Event, Sink, Task, Turn};
     use crate::config::{Access, Kind};
     use crate::model::{
         ChatMessage, Finish, Finished, Generating, MediaKind, Model, ModelError, Purpose, Sealed,
         StreamDelta, TokenUsage, Unread,
     };
     use crate::prompt::RESTARTED;
-    use crate::steps::AgentMemory;
+    use crate::steps::{AgentMemory, MemoryStep};
     use crate::tests::{content, temp_dir, Temp};
     use crate::tools::attach::tests::mentioned;
     use crate::tools::memories::Memories;
     use crate::utils::{block_on, Interrupt};
-    use crate::worker::host::tests::unserved;
-    use crate::worker::host::{Rank, Worker};
+    use crate::worker::host::Worker;
     use crate::worker::workplace::tests::opened;
     use crate::Result;
     use serde_json::Value;
     use std::collections::VecDeque;
     use std::future;
+    use std::mem;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-    use tokio::{task, time};
+    use tokio::task;
 
     /// Tool name and raw arguments of a call with no readable code
     pub(crate) type Unreadable = (&'static str, &'static str);
@@ -793,18 +627,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// The first piece of a stream, which is all of it so far
-    pub(crate) fn streamed(text: &str) -> Streamed<'_> {
-        Streamed {
-            added: text,
-            whole: text,
-        }
-    }
-
     pub(crate) struct Probe {
         events: Box<dyn FnMut(Event) + Send>,
         /// Step count at each save
         pub(crate) saves: Vec<usize>,
+        /// What the user queues, all taken at the first ask
+        pub(crate) queued: Vec<Task>,
     }
 
     impl Sink for Probe {
@@ -816,36 +644,9 @@ pub(crate) mod tests {
             self.saves.push(memory.steps.len());
         }
 
-        fn tasks(&mut self, _: usize) -> Box<dyn TaskViews> {
-            Box::new(Unseen)
-        }
-    }
-
-    type Updates = Box<dyn FnMut() -> Vec<Task> + Send>;
-
-    #[derive(Default)]
-    pub(crate) struct Pending {
-        pub(crate) updates: Mutex<Option<Updates>>,
-        /// How long until the client says once that it queued a message
-        pub(crate) nudge: Mutex<Option<Duration>>,
-    }
-
-    impl Queue for Pending {
-        fn queued(&self) -> Asking<'_> {
-            let mut updates = self.updates.lock().expect("updates");
-            let queued = match updates.as_mut() {
-                Some(take) => take(),
-                None => Vec::new(),
-            };
-            Box::pin(async move { queued })
-        }
-
-        fn enqueued(&self) -> Nudging<'_> {
-            let nudge = self.nudge.lock().expect("nudge").take();
-            match nudge {
-                Some(wait) => Box::pin(time::sleep(wait)),
-                None => Box::pin(future::pending()),
-            }
+        fn queued(&mut self) -> Asking<'_> {
+            let taken = mem::take(&mut self.queued);
+            Box::pin(future::ready(taken))
         }
     }
 
@@ -853,7 +654,6 @@ pub(crate) mod tests {
         pub(crate) agent: Agent,
         pub(crate) worker: Worker,
         pub(crate) probe: Probe,
-        pub(crate) queue: Arc<Pending>,
     }
 
     impl Tested {
@@ -905,19 +705,6 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn main_place() -> Place {
-        Place::Main {
-            team: Arc::default(),
-            queue: Arc::new(Pending::default()),
-        }
-    }
-
-    pub(crate) fn delegated_place() -> Place {
-        Place::Delegated {
-            queue: Arc::new(Pending::default()),
-        }
-    }
-
     pub(crate) fn scripted(
         model: impl Model + 'static,
         events: Box<dyn FnMut(Event) + Send>,
@@ -925,40 +712,25 @@ pub(crate) mod tests {
         let interrupt = Interrupt::default();
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let dir = temp_dir("session");
-        let workplace = Arc::new(opened(&cwd, &dir, &Access::default()));
-        let restarted = false;
-        let starting = Worker::new(
-            &interrupt,
-            Arc::clone(&workplace),
-            &[],
-            Rank::Main,
-            restarted,
-        );
-        let worker = block_on(starting).expect("worker");
+        let workplace = opened(&cwd, &dir, &Access::default());
         let memories = Memories::new(&dir, &cwd);
+        let starting = Worker::new(&interrupt, workplace, memories, false);
+        let worker = block_on(starting).expect("worker");
 
-        let queue = Arc::new(Pending::default());
-        let place = Place::Main {
-            team: Arc::default(),
-            queue: Arc::clone(&queue) as Arc<dyn Queue>,
-        };
         let agent = Agent {
             model: Arc::new(model),
             brief: Brief::default(),
             interrupt,
-            workplace,
-            memories,
-            place,
         };
         let probe = Probe {
             events,
             saves: Vec::new(),
+            queued: Vec::new(),
         };
         let value = Tested {
             agent,
             worker,
             probe,
-            queue,
         };
         Temp { value, dir }
     }
@@ -988,9 +760,8 @@ pub(crate) mod tests {
         let replies = vec![Ok(called("print('reading the orders again')"))];
         let mut run = recorded(replies, None, Box::new(|_| {}));
         let mut ignore = |_: &str| {};
-        let mut none = unserved;
         let code = "import os\nos._exit(1)";
-        let exiting = run.agent.worker.evaluate(code, &[], &mut ignore, &mut none);
+        let exiting = run.agent.worker.evaluate(code, &[], &mut ignore);
         block_on(exiting).expect("evaluate");
 
         let mut memory = AgentMemory::default();
@@ -1007,6 +778,36 @@ pub(crate) mod tests {
             RESTARTED,
             "eval:\nprint('reading the orders again')",
             "reading the orders again",
+        ];
+        assert_eq!(second, expected);
+    }
+
+    /// What the user queued while code ran follows that step and reaches the next request
+    #[test]
+    fn updates_follow_step() {
+        let replies = vec![Ok(called("print('2 cafés')")), Ok(reply("Done"))];
+        let mut run = recorded(replies, None, Box::new(|_| {}));
+        let update = Task {
+            text: "Also count the naïve ones".to_owned(),
+            mentions: Vec::new(),
+        };
+        run.agent.probe.queued.push(update);
+
+        let mut memory = AgentMemory::default();
+        let answer = run.agent.turn(&mut memory, "Count the cafés").expect("run");
+        assert_eq!(answer.as_deref(), Some("Done"));
+        let MemoryStep::Update(taken) = &memory.steps[2] else {
+            panic!("{:?}", memory.steps);
+        };
+        assert_eq!(taken.text, "Also count the naïve ones");
+
+        let requests = run.requests.lock().expect("requests");
+        let second: Vec<String> = requests[1][1..].iter().map(content).collect();
+        let expected = [
+            "Count the cafés",
+            "eval:\nprint('2 cafés')",
+            "2 cafés",
+            "Also count the naïve ones",
         ];
         assert_eq!(second, expected);
     }

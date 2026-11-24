@@ -17,7 +17,7 @@ use agent_client_protocol_schema::v1::{
 };
 use agent_client_protocol_schema::ProtocolVersion;
 use reaper::cause;
-use reaper::wire::{self, Addressed, BACKGROUND, ENQUEUED, FORGET, MEMORIES, SHELL};
+use reaper::wire::{self, Addressed, BACKGROUND, FORGET, MEMORIES, SHELL};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -33,7 +33,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio::sync::Notify;
 use tokio::task::{self, JoinHandle};
 use tokio::time;
 use tracing::{error, error_span, info, Event, Instrument, Span, Subscriber};
@@ -199,14 +198,6 @@ pub(crate) async fn serve(mut input: Lines, app: Arc<App>) -> Result<()> {
                     session.interrupt.cancel(session.received);
                 }
             }
-            None if method == ENQUEUED => {
-                let Ok(enqueued) = serde_json::from_value::<Addressed>(params) else {
-                    continue;
-                };
-                if let Ok(session) = router.handle(&enqueued.session_id) {
-                    session.enqueued.notify_one();
-                }
-            }
             None => {}
         }
     };
@@ -238,7 +229,6 @@ struct Router {
 struct Handle {
     sender: UnboundedSender<Message>,
     interrupt: Interrupt,
-    enqueued: Arc<Notify>,
     /// Prompts and commands received so far, and a cancel covers every turn up to this count
     received: u64,
     /// The session task is instrumented with it too, which puts the session id on every log line
@@ -453,7 +443,6 @@ impl Router {
             None => self.closing.remove(&session),
         };
         let interrupt = Interrupt::default();
-        let enqueued = Arc::new(Notify::new());
         let memories = Memories::new(&self.app.config, &cwd);
         let (sender, inbox) = mpsc::unbounded_channel();
         let opening = Opening {
@@ -466,7 +455,6 @@ impl Router {
             agent,
             app: Arc::clone(&self.app),
             interrupt: interrupt.clone(),
-            enqueued: Arc::clone(&enqueued),
             memories: memories.clone(),
         };
 
@@ -476,7 +464,6 @@ impl Router {
         let handle = Handle {
             sender,
             interrupt,
-            enqueued,
             received: 0,
             span,
             task,
@@ -637,7 +624,6 @@ mod tests {
             let opened = Handle {
                 sender,
                 interrupt: interrupt.clone(),
-                enqueued: Arc::default(),
                 received: 0,
                 span: Span::none(),
                 task: old,
@@ -728,7 +714,6 @@ mod tests {
             let opened = Handle {
                 sender,
                 interrupt: Interrupt::default(),
-                enqueued: Arc::default(),
                 received: 0,
                 span: Span::none(),
                 task: old,

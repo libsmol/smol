@@ -40,7 +40,7 @@ pub(crate) mod web;
 const POLL_EVERY: Duration = Duration::from_millis(30);
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-pub(crate) const SPIN_EVERY: Duration = Duration::from_millis(80);
+const SPIN_EVERY: Duration = Duration::from_millis(80);
 
 /// Terminals draw DIM differently and some ignore it entirely
 pub(crate) const DIM: Style = Style::new().fg(theme::COMMENT);

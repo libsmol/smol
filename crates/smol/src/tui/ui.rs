@@ -2,7 +2,7 @@ use crate::client::tool_count;
 use crate::conversation::Stats;
 use crate::tui::app::App;
 use crate::tui::picture;
-use crate::tui::render::{kept_rows, Target};
+use crate::tui::render::{one_line, wrap_ranges, Target};
 use crate::tui::{
     clipped, fitted, kilo, spinner, theme, ACCENT, BOLD, BORDER, DIM, HEADING, RED, STRONG, YELLOW,
 };
@@ -12,8 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui_textarea::TextArea;
+use reaper::tilde;
 use reaper::wire::{McpState, McpStatus};
-use reaper::{one_line, tilde};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -221,18 +221,8 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let title = Span::styled(title, HEADING);
     block = block.title(title);
 
-    let conversation_inner = block.inner(conversation);
-    // The rows on screen depend on how many these take, so they come from the previous frame's
-    let pinned = app.transcript.pinned(
-        talk,
-        conversation_inner.width,
-        usize::from(conversation_inner.height),
-    );
-    let height = u16::try_from(pinned.len()).unwrap_or(u16::MAX);
-    let heights = [Constraint::Fill(1), Constraint::Length(height)];
-    let [inner, pinned_area] = Layout::vertical(heights).areas(conversation_inner);
+    let inner = block.inner(conversation);
     app.messages_area = inner;
-    app.pinned_area = pinned_area;
 
     let mut progress = Vec::new();
     if let Some(run) = &app.session.run {
@@ -252,7 +242,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             None => String::new(),
         };
 
-        let helping = talk.awaited();
         let label = match (run.interrupting, left, writing) {
             (true, _, _) => "interrupting…".to_owned(),
             (false, Some(left), _) => {
@@ -260,13 +249,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
                 format!("retrying in {wait}s")
             }
             (false, None, _) if talk.shelling() => format!("running · {seconds}s"),
-            (false, None, _) if helping > 0 => {
-                let agents = match helping {
-                    1 => "sub-agent",
-                    _ => "sub-agents",
-                };
-                format!("waiting for {helping} {agents} · {seconds}s")
-            }
             (false, None, false) => format!("thinking · {seconds}s{estimated}"),
             (false, None, true) => format!("working · {seconds}s{estimated}"),
         };
@@ -277,7 +259,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         }
         let italic = DIM.add_modifier(Modifier::ITALIC);
         let mut line = vec![Span::styled(spinner, ACCENT)];
-        for (text, style) in theme::shimmer(&label, italic, theme::PURPLE, started) {
+        for (text, style) in theme::shimmer(&label, italic, started) {
             line.push(Span::styled(text, style));
         }
         progress.push(Line::from(line));
@@ -343,8 +325,18 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let marks = "❯ ".width() + QUEUED.width();
         let room = width.saturating_sub(marks).max(1);
         for message in &app.queued {
-            let rows = kept_rows(message.trim(), room, 1);
-            let (first, _) = rows.into_iter().next().unwrap_or_default();
+            let message = message.trim();
+            let rows = wrap_ranges(message, room);
+            let first = rows
+                .first()
+                .map_or("", |(range, _)| &message[range.clone()]);
+            let first = match rows.len() > 1 {
+                true => {
+                    let marked = format!("{first}…");
+                    clipped(&marked, room)
+                }
+                false => first.to_owned(),
+            };
             let text = format!("❯ {first}{QUEUED}");
             queued.push(Line::styled(text, DIM));
         }
@@ -352,7 +344,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         let height = usize::from(inner.height);
         let total = rows.len() + progress.len() + queued.len();
         let anchored = anchor.map(|anchor| rows.row_at(anchor));
-        let (top, scrolled) = app.viewport.settle(total, height, anchored);
+        let top = app.viewport.settle(total, height, anchored);
 
         let lines = rows
             .iter()
@@ -369,8 +361,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
         }
         let paragraph = Paragraph::new(visible).block(block);
         frame.render_widget(paragraph, conversation);
-        let pinned: Vec<Line> = pinned.into_iter().map(|row| row.line).collect();
-        frame.render_widget(Paragraph::new(pinned), pinned_area);
 
         let inside = conversation.inner(Margin::new(1, 0));
         let fills = rows.iter().map(|row| row.fill).skip(top).take(height);
@@ -417,9 +407,6 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
             let buffer = frame.buffer_mut();
             selection.highlight(rows, top, inner, buffer);
         }
-
-        // After `rows`, which forgets the view when it lays everything out again
-        app.transcript.view(top..top + height, scrolled);
     }
 
     let draft = &mut app.draft;

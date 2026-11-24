@@ -22,9 +22,6 @@ pub(crate) enum StepError {
     Cut,
     #[error("interrupted")]
     Interrupted,
-    /// The agent that assigned the task interrupted it with `agent.stop()`
-    #[error("stopped")]
-    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
@@ -41,16 +38,13 @@ pub(crate) enum CallError {
     /// none when the worker was killed or never got the code
     #[error("interrupted")]
     Interrupted(Option<String>),
-    /// The agent that assigned the task interrupted it with `agent.stop()`
-    #[error("stopped")]
-    Stopped(Option<String>),
 }
 
 impl CallError {
     /// Where interrupted code stopped, as the worker reported it
     pub(crate) fn stopped_at(&self) -> Option<&str> {
         match self {
-            CallError::Interrupted(at) | CallError::Stopped(at) => at.as_deref(),
+            CallError::Interrupted(at) => at.as_deref(),
             _ => None,
         }
     }
@@ -134,80 +128,6 @@ pub(crate) struct CodeResult {
     pub(crate) printed: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) media: Vec<(String, Media)>,
-    /// The tasks the code sent to agents with `agent()`, shown on replay and never sent to the model
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) agents: Vec<Sent>,
-}
-
-/// A task that the code sent with `agent()`, as the call that sent it records it
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Sent {
-    pub(crate) name: String,
-    /// Its place among the tasks of its agent
-    pub(crate) number: usize,
-}
-
-/// An agent that `agent()` started, with its whole conversation and the tasks it was sent
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct AgentRecord {
-    pub(crate) name: String,
-    pub(crate) memory: AgentMemory,
-    pub(crate) tasks: Vec<AgentTask>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct AgentTask {
-    pub(crate) task: String,
-    /// Where its steps start in the agent's conversation, which run to the next task's start
-    pub(crate) start: usize,
-    /// Saved beside the others as one key named after how it ended
-    #[serde(flatten)]
-    pub(crate) end: Ending,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Ending {
-    Answer(String),
-    Error(String),
-    /// Braces let it flatten into an `interrupted` key
-    Interrupted {},
-    /// `agent.stop()` ended it
-    Stopped {},
-    /// Aborted or panicked before it ended
-    Unfinished {},
-    /// A task keeps this record until it ends, or for good if libsmol exits first
-    Running {},
-}
-
-impl AgentRecord {
-    /// The steps of its task numbered `number`
-    pub(crate) fn steps(&self, number: usize) -> &[MemoryStep] {
-        let steps = &self.memory.steps;
-        let start = self.tasks[number].start;
-        let next = self.tasks.get(number + 1);
-        let end = next.map_or(steps.len(), |next| next.start);
-        &steps[start.min(end)..end]
-    }
-}
-
-impl AgentTask {
-    pub(crate) fn running(&self) -> bool {
-        self.end == (Ending::Running {})
-    }
-}
-
-impl Ending {
-    /// The answer, or the error the code gets instead
-    pub(crate) fn outcome(&self) -> Result<&str, &str> {
-        match self {
-            Ending::Answer(answer) => Ok(answer),
-            Ending::Error(error) => Err(error),
-            Ending::Interrupted {} => Err(prompt::INTERRUPTED_BY_USER),
-            Ending::Stopped {} => Err(prompt::STOPPED_BY_CODE),
-            Ending::Unfinished {} | Ending::Running {} => Err(prompt::UNFINISHED),
-        }
-    }
 }
 
 impl AgentStep {
@@ -291,12 +211,11 @@ pub(crate) struct ShellStep {
     pub(crate) end: Exit,
 }
 
-/// Agents whose tasks ended before the code took their answers,
-/// and programs the code left running that ended, with what was printed since the last call
+/// Programs the code left running that ended, with what was printed since the last call
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DoneStep {
-    pub(crate) agents: Vec<Returned>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Done steps that old sessions saved for agents alone lack it
+    #[serde(default)]
     pub(crate) programs: Vec<Program>,
     /// Already truncated
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -304,15 +223,6 @@ pub(crate) struct DoneStep {
     /// Taken while no turn ran, as a message of its own
     #[serde(default, skip_serializing_if = "Not::not")]
     pub(crate) idle: bool,
-}
-
-/// An agent whose task ended before the code took its answer
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Returned {
-    pub(crate) name: String,
-    /// Saved beside the name as one key named after how it ended
-    #[serde(flatten)]
-    pub(crate) end: Ending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -741,23 +651,6 @@ pub(crate) fn estimate(bytes: usize) -> u64 {
     (bytes / BYTES_PER_TOKEN) as u64
 }
 
-/// What the requests of `steps` cost, compaction included, and how many steps were taken
-pub(crate) fn spent(steps: &[MemoryStep]) -> (Usage, usize) {
-    let mut total = Usage::default();
-    let mut taken = 0;
-    for step in steps {
-        match step {
-            MemoryStep::Action(action) => {
-                total.add(&action.usage);
-                taken += 1;
-            }
-            MemoryStep::Summary(summary) => total.add(&summary.usage),
-            _ => {}
-        }
-    }
-    (total, taken)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::config::Kind;
@@ -809,40 +702,6 @@ pub(crate) mod tests {
             calls: vec![call],
             ..AgentStep::default()
         }
-    }
-
-    /// An agent keeps the saved format, with each task's end beside it, and the steps of a task
-    /// run to where the next one starts, while a call names the tasks it sent
-    #[test]
-    fn agents_saved() {
-        let saved = r#"{"name": "cafés", "memory": {"steps": [
-            {"type": "task", "text": "Count the cafés"},
-            {"type": "restarted"},
-            {"type": "task", "text": "Spell naïve"}
-        ]}, "tasks": [
-            {"task": "Count the cafés", "start": 0, "answer": "3 cafés"},
-            {"task": "Spell naïve", "start": 2, "error": "model: http 503: busy"},
-            {"task": "Read the résumé", "start": 3, "interrupted": {}}
-        ]}"#;
-        let record: AgentRecord = serde_json::from_str(saved).expect("deserialize");
-        let ends: Vec<&Ending> = record.tasks.iter().map(|task| &task.end).collect();
-        let answered = Ending::Answer("3 cafés".to_owned());
-        let failed = Ending::Error("model: http 503: busy".to_owned());
-        assert_eq!(ends, [&answered, &failed, &Ending::Interrupted {}]);
-        let counts: Vec<usize> = (0..3).map(|number| record.steps(number).len()).collect();
-        assert_eq!(counts, [2, 1, 0]);
-
-        let again = serde_json::to_value(&record).expect("serialize");
-        let saved: serde_json::Value = serde_json::from_str(saved).expect("parse");
-        assert_eq!(again, saved);
-
-        let called = r#"{"agents": [{"name": "cafés", "number": 2}]}"#;
-        let result: CodeResult = serde_json::from_str(called).expect("deserialize");
-        let sent = Sent {
-            name: "cafés".to_owned(),
-            number: 2,
-        };
-        assert_eq!(result.agents, [sent]);
     }
 
     /// Steps saved before interrupts kept where the code stopped

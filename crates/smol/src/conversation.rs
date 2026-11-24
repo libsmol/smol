@@ -3,17 +3,12 @@ use agent_client_protocol_schema::v1::{
     ContentBlock, Meta, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
 };
 use anyhow::Result;
-use reaper::wire::{
-    Measured, Notice, AGENT, BACKGROUND, ERROR, NAME, PARENT, SHELL, TASK, UPDATE, WAITING,
-};
+use reaper::wire::{Measured, Notice, BACKGROUND, ERROR, SHELL, UPDATE};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeSet;
 use std::mem;
 use std::ops::AddAssign;
 use std::time::{Duration, Instant};
-
-pub(crate) const HUES: usize = 8;
 
 pub(crate) enum Entry {
     Info(String),
@@ -37,21 +32,6 @@ impl Entry {
             _ => None,
         }
     }
-
-    fn step_mut(&mut self) -> Option<&mut Step> {
-        match self {
-            Entry::Step(step) => Some(step),
-            _ => None,
-        }
-    }
-}
-
-/// Whether a step is settled or held, at that index, or is the live one
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Spot {
-    Settled(usize),
-    Held(usize),
-    Live,
 }
 
 pub(crate) struct Shell {
@@ -111,10 +91,6 @@ impl Tokens {
         let output = measured.output_tokens?;
         Some(Self { input, output })
     }
-
-    pub(crate) fn is_zero(&self) -> bool {
-        self.input + self.output == 0
-    }
 }
 
 impl AddAssign for Tokens {
@@ -140,10 +116,7 @@ pub(crate) struct Conversation {
     stats: Stats,
     task_id: Option<String>,
     retry_at: Option<Instant>,
-    /// Settled entries with agents at work
-    lively: BTreeSet<usize>,
-    /// Grows with every change to `held` or `live`, except agent updates that leave their call
-    /// with agents at work, which grow only the call's
+    /// Grows with every change to `held` or `live`
     revision: u64,
 }
 
@@ -220,75 +193,6 @@ impl Conversation {
         asked && !stepped && self.live.is_none()
     }
 
-    /// Agents still queued or running, wherever the call that started them is
-    fn helping(&self) -> usize {
-        let working = self.working();
-        working.iter().map(|(_, step)| step.helping()).sum()
-    }
-
-    /// Agents the turn waits for, which are those the running code waits for
-    /// or, after an answer, every one still at work
-    pub(crate) fn awaited(&self) -> usize {
-        if let Some(step) = &self.live {
-            let waited: Vec<&String> = step.calls().flat_map(|call| &call.waiting).collect();
-            let awaited = |helper: &&Helper| {
-                let named = helper.name.as_ref();
-                helper.waiting() && named.is_some_and(|name| waited.contains(&name))
-            };
-            return self.helpers().filter(awaited).count();
-        }
-
-        // A message the turn took after the answer is what the model works on next
-        let Some((Entry::Step(last), after)) = self.held.split_first() else {
-            return 0;
-        };
-        if after.iter().any(|entry| matches!(entry, Entry::Task(_))) {
-            return 0;
-        }
-
-        let mut said = false;
-        for item in &last.items {
-            match item {
-                Item::Call(_) => return 0,
-                Item::Message { text, .. } => said |= !text.trim().is_empty(),
-                Item::Thought(_) | Item::Notice(_) => {}
-            }
-        }
-        match said && !last.interrupted {
-            true => self.helping(),
-            false => 0,
-        }
-    }
-
-    /// Every task the code sent an agent, oldest first
-    fn helpers(&self) -> impl Iterator<Item = &Helper> {
-        let steps = self
-            .entries
-            .iter()
-            .chain(&self.held)
-            .filter_map(Entry::step);
-        steps.chain(&self.live).flat_map(Step::helpers)
-    }
-
-    /// The steps that may hold agents at work, oldest first
-    pub(crate) fn working(&self) -> Vec<(Spot, &Step)> {
-        let mut steps = Vec::new();
-        for index in &self.lively {
-            if let Some(Entry::Step(step)) = self.entries.get(*index) {
-                steps.push((Spot::Settled(*index), step));
-            }
-        }
-        for (index, entry) in self.held.iter().enumerate() {
-            if let Entry::Step(step) = entry {
-                steps.push((Spot::Held(index), step));
-            }
-        }
-        if let Some(step) = &self.live {
-            steps.push((Spot::Live, step));
-        }
-        steps
-    }
-
     pub(crate) fn writing(&self) -> bool {
         let Some(step) = &self.live else {
             return false;
@@ -339,15 +243,10 @@ impl Conversation {
 
     /// Returns true when a step ended
     pub(crate) fn update(&mut self, update: &SessionUpdate) -> bool {
-        // Updates of agents' tasks keep revisions of their own, which their arm sorts out,
-        // and a retry notice is followed by a usage update that withdraws the estimate
-        match update {
-            SessionUpdate::ToolCallUpdate(_) => {}
-            SessionUpdate::UsageUpdate(_) => self.revision += 1,
-            _ => {
-                self.revision += 1;
-                self.retry_at = None;
-            }
+        self.revision += 1;
+        // A retry notice is followed by a usage update that withdraws the estimate
+        if !matches!(update, SessionUpdate::UsageUpdate(_)) {
+            self.retry_at = None;
         }
 
         match update {
@@ -408,110 +307,7 @@ impl Conversation {
             }
 
             SessionUpdate::ToolCallUpdate(call) => {
-                // An agent the code started keeps updating after the step of its call has ended
                 let id = &*call.tool_call_id.0;
-                let mut place = None;
-                let mut named = None;
-                let mut taken = Vec::new();
-                for (spot, step) in self.working() {
-                    for (at, item) in step.items.iter().enumerate() {
-                        let Item::Call(started) = item else {
-                            continue;
-                        };
-                        for (index, helper) in started.helpers.iter().enumerate() {
-                            if helper.id == id {
-                                place = Some((spot, at, index));
-                                named = helper.name.clone().filter(|_| helper.started.is_none());
-                            }
-                            if helper.state() == State::Running {
-                                taken.push(helper.hue);
-                            }
-                        }
-                    }
-                }
-
-                // An agent keeps the hue of its earlier tasks, which only a task yet to start looks for
-                let same = |helper: &&Helper| helper.started.is_some() && helper.name == named;
-                let earlier = match named {
-                    Some(_) => self.helpers().filter(same).last().map(|helper| helper.hue),
-                    None => None,
-                };
-                if let Some((spot, at, index)) = place {
-                    let step = match spot {
-                        Spot::Settled(entry) => {
-                            self.entries.get_mut(entry).and_then(Entry::step_mut)
-                        }
-                        Spot::Held(entry) => self.held.get_mut(entry).and_then(Entry::step_mut),
-                        Spot::Live => self.live.as_mut(),
-                    };
-                    let Some(step) = step else {
-                        return false;
-                    };
-                    let Some(Item::Call(started)) = step.items.get_mut(at) else {
-                        return false;
-                    };
-                    let helper = &mut started.helpers[index];
-
-                    let fields = &call.fields;
-                    if let Some(status) = fields.status {
-                        // The hue of its agent's earlier tasks or at its place in its call,
-                        // or the lowest free one when a running agent holds that
-                        if status == ToolCallStatus::InProgress && helper.started.is_none() {
-                            let wanted = earlier.unwrap_or(index % HUES);
-                            let free = (0..HUES).find(|hue| !taken.contains(hue));
-                            helper.hue = match taken.contains(&wanted) {
-                                true => free.unwrap_or(wanted),
-                                false => wanted,
-                            };
-                            helper.started = Some(Instant::now());
-                        }
-                        helper.status = status;
-                    }
-
-                    // A preview follows the status, and the last update holds only the answer or error
-                    if let Some(content) = &fields.content {
-                        let (texts, _) = contents(content);
-                        let mut texts = texts.into_iter();
-                        helper.text = texts.next().unwrap_or_default();
-                        helper.preview = texts.collect();
-                    }
-
-                    let measured = measured(call.meta.as_ref());
-                    if measured.interrupted {
-                        helper.interrupted = true;
-                    }
-                    let tokens = Tokens::of(&measured);
-                    if tokens.is_some() {
-                        helper.tokens = tokens;
-                    }
-
-                    // Every update carries its usage so far, so only the last one counts
-                    let ended = matches!(
-                        fields.status,
-                        Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
-                    );
-                    if ended {
-                        if let Some(steps) = measured.steps {
-                            let duration = measured.duration.unwrap_or_default();
-                            helper.totals = Some(Totals { steps, duration });
-                        }
-                    }
-
-                    started.revision += 1;
-                    let waiting = started.helpers.iter().any(Helper::waiting);
-                    match spot {
-                        Spot::Settled(entry) if step.helping() == 0 => {
-                            self.lively.remove(&entry);
-                        }
-                        // The call's rows are drawn on their own only while its agents are at work
-                        Spot::Held(_) | Spot::Live if !waiting => self.revision += 1,
-                        _ => {}
-                    }
-                    return false;
-                }
-
-                self.revision += 1;
-                self.retry_at = None;
                 let mut running = None;
                 for entry in self.held.iter_mut().rev() {
                     if let Entry::Shell(shell) = entry {
@@ -591,16 +387,8 @@ impl Conversation {
         self.held.push(Entry::Step(step));
     }
 
-    /// Moves the held entries to the settled ones, which still follow the agents at work in them
     fn settle(&mut self) {
-        for entry in self.held.drain(..) {
-            if let Entry::Step(step) = &entry {
-                if step.helping() > 0 {
-                    self.lively.insert(self.entries.len());
-                }
-            }
-            self.entries.push(entry);
-        }
+        self.entries.append(&mut self.held);
     }
 
     pub(crate) fn notice(&mut self, notice: &Notice) {
@@ -677,17 +465,7 @@ impl Conversation {
             self.stats.turns = self.stats.turns.saturating_sub(1);
         }
 
-        // Agents at work when the turn fails are never updated again, as when the agent exited
         let mut text = format!("{error:#}");
-        for index in mem::take(&mut self.lively) {
-            if let Some(Entry::Step(step)) = self.entries.get_mut(index) {
-                step.abandon(&text);
-            }
-        }
-        let held = self.held.iter_mut().filter_map(Entry::step_mut);
-        for step in held.chain(&mut self.live) {
-            step.abandon(&text);
-        }
 
         // When the request still fails after every retry,
         // the last attempt's stream is discarded too and the retry count joins the error
@@ -748,15 +526,6 @@ pub(crate) enum Item {
     Notice(String),
 }
 
-impl Item {
-    fn call(&self) -> Option<&Call> {
-        match self {
-            Item::Call(call) => Some(call),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct Retry {
     pub(crate) text: String,
@@ -774,50 +543,6 @@ pub(crate) struct Call {
     pub(crate) attachments: Vec<Attachment>,
     /// Retries of the request that compaction makes
     pub(crate) retries: Vec<Retry>,
-    /// The tasks its code sent agents, in the order it sent them
-    pub(crate) helpers: Vec<Helper>,
-    /// The agents its code waits for
-    pub(crate) waiting: Vec<String>,
-    /// Grows with every update of one of its agents
-    pub(crate) revision: u64,
-}
-
-#[derive(Debug)]
-pub(crate) struct Helper {
-    pub(crate) id: String,
-    pub(crate) task: String,
-    /// The agent's, which older sessions may lack
-    pub(crate) name: Option<String>,
-    pub(crate) status: ToolCallStatus,
-    /// What it is doing while it runs, then its answer or why it failed
-    pub(crate) text: String,
-    /// The end of what it is writing or printing while it runs
-    pub(crate) preview: String,
-    pub(crate) interrupted: bool,
-    /// Unknown on replay, which reports the duration instead
-    pub(crate) started: Option<Instant>,
-    /// Its agent's, or chosen at its start from the hues no running agent holds,
-    /// which no later frame can work out
-    pub(crate) hue: usize,
-    /// So far
-    pub(crate) tokens: Option<Tokens>,
-    /// Known once it ends
-    pub(crate) totals: Option<Totals>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Totals {
-    pub(crate) steps: u64,
-    pub(crate) duration: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum State {
-    Running,
-    Queued,
-    Done,
-    Failed,
-    Interrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -834,22 +559,6 @@ pub(crate) struct Parts<'a> {
     pub(crate) outputs: &'a [String],
     pub(crate) attachments: &'a [Attachment],
     pub(crate) error: Option<&'a str>,
-}
-
-impl Helper {
-    pub(crate) fn state(&self) -> State {
-        match (self.status, self.interrupted) {
-            (ToolCallStatus::InProgress, _) => State::Running,
-            (ToolCallStatus::Pending, _) => State::Queued,
-            (ToolCallStatus::Completed, _) => State::Done,
-            (_, true) => State::Interrupted,
-            (_, false) => State::Failed,
-        }
-    }
-
-    pub(crate) fn waiting(&self) -> bool {
-        matches!(self.state(), State::Running | State::Queued)
-    }
 }
 
 impl Call {
@@ -899,46 +608,14 @@ impl Step {
             }
 
             SessionUpdate::ToolCall(call) => {
-                let id = call.tool_call_id.0.to_string();
-
-                // An agent the code started belongs under the call running that code
-                let meta = call.meta.as_ref();
-                let marked = meta.is_some_and(|meta| meta.contains_key(AGENT));
-                let parent = meta.and_then(|meta| meta.get(PARENT));
-                let parent = parent.and_then(Value::as_str).filter(|_| marked);
-                if let Some(owner) = parent.and_then(|parent| self.call_mut(parent)) {
-                    let asked = call.raw_input.as_ref();
-                    let given = |key: &str| asked.and_then(|asked| asked.get(key));
-                    let given = |key: &str| given(key).and_then(Value::as_str);
-                    let task = given(TASK).unwrap_or_default();
-                    let name = given(NAME).map(str::to_owned);
-                    owner.helpers.push(Helper {
-                        id,
-                        task: task.to_owned(),
-                        name,
-                        status: call.status,
-                        text: String::new(),
-                        preview: String::new(),
-                        interrupted: false,
-                        started: None,
-                        hue: 0,
-                        tokens: None,
-                        totals: None,
-                    });
-                    return;
-                }
-
                 let (content, attachments) = contents(&call.content);
                 let call = Call {
-                    id,
+                    id: call.tool_call_id.0.to_string(),
                     title: call.title.clone(),
                     status: call.status,
                     content,
                     attachments,
                     retries: Vec::new(),
-                    helpers: Vec::new(),
-                    waiting: Vec::new(),
-                    revision: 0,
                 };
                 self.items.push(Item::Call(call));
             }
@@ -953,30 +630,11 @@ impl Step {
                     if let Some(content) = &fields.content {
                         (call.content, call.attachments) = contents(content);
                     }
-                    let waiting = update.meta.as_ref().and_then(|meta| meta.get(WAITING));
-                    if let Some(Value::Array(names)) = waiting {
-                        let names = names.iter().filter_map(Value::as_str);
-                        call.waiting = names.map(str::to_owned).collect();
-                    }
                 }
             }
 
             _ => {}
         }
-    }
-
-    /// Tasks its code sent that are still queued or running
-    fn helping(&self) -> usize {
-        self.helpers().filter(|helper| helper.waiting()).count()
-    }
-
-    pub(crate) fn calls(&self) -> impl Iterator<Item = &Call> {
-        self.items.iter().filter_map(Item::call)
-    }
-
-    /// The tasks its code sent
-    fn helpers(&self) -> impl Iterator<Item = &Helper> {
-        self.calls().flat_map(|call| &call.helpers)
     }
 
     fn call_mut(&mut self, id: &str) -> Option<&mut Call> {
@@ -993,23 +651,6 @@ impl Step {
     /// Notices such as a restart didn't come from the request stream and are kept
     fn discard(&mut self) {
         self.items.retain(|item| matches!(item, Item::Notice(_)));
-    }
-
-    /// Ends the agents its code started that are still at work as failed with `reason`
-    fn abandon(&mut self, reason: &str) {
-        for item in &mut self.items {
-            let Item::Call(call) = item else {
-                continue;
-            };
-            for helper in &mut call.helpers {
-                if helper.waiting() {
-                    helper.status = ToolCallStatus::Failed;
-                    helper.text = reason.to_owned();
-                    helper.preview.clear();
-                    call.revision += 1;
-                }
-            }
-        }
     }
 
     /// The answer follows the last call or notice

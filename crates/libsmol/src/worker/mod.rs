@@ -12,8 +12,6 @@ pub(crate) mod workplace;
 /// Holds the `address/token` the agent listens on
 pub(crate) const CONTROL_ENV: &str = "SMOL_CONTROL";
 pub(crate) const COPIES_ENV: &str = "SMOL_COPIES";
-/// Holds `on` in the session's own worker, and is unset in those of agents that `agent()` starts
-pub(crate) const MAIN_ENV: &str = "SMOL_MAIN";
 /// Starts libsmol's executable as a session's worker, followed by the venv it runs as
 pub(crate) const WORKER_ARG: &str = "--worker";
 /// The worker cuts each `print()` to it
@@ -93,7 +91,7 @@ pub(crate) enum HostCall {
     Run {
         code: String,
     },
-    /// `name` is the one the session's first worker chose, which the worker picks itself when None
+    /// `name` is the one a worker chose before a restart, and the worker picks it itself when None
     AddServer {
         source: String,
         name: Option<String>,
@@ -157,14 +155,6 @@ pub(crate) enum WorkerCall {
         called: String,
     },
     #[serde(untagged)]
-    Service(Service),
-}
-
-/// What the agent answers itself rather than the worker
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum Service {
-    Agent(AgentCall),
     Memory(MemoryCall),
 }
 
@@ -178,29 +168,6 @@ pub(crate) enum MemoryCall {
     Recall { query: String },
     /// Answered with null
     Forget { id: i64 },
-}
-
-/// A call to `agent()`, `agent.wait()` or `agent.stop()`, which name agents
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub(crate) enum AgentCall {
-    /// Answered with null at once
-    Send(Asked),
-    /// Answered once the agents end or after `timeout` seconds with `{"answers", "working"}`,
-    /// `[name, {"answer"} or {"error"}]` for each that ended and `[name, status]` for the rest
-    Wait {
-        names: Vec<String>,
-        timeout: Option<f64>,
-    },
-    /// Answered with null once it has stopped
-    Stop { name: String },
-}
-
-/// A task for the agent named `name`
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Asked {
-    pub(crate) name: String,
-    pub(crate) task: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

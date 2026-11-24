@@ -89,7 +89,7 @@ _MODULES = frozenset(_sys.builtin_module_names) | _sys.stdlib_module_names
 
 def _server(source, name, description, tools):
     builtins = vars(_builtins)
-    # Workers after the first get the name it chose, which their own builtins might not lead to
+    # A restarted worker gets the name chosen before, as builtins the code changed may have decided it
     if name is None:
         name = _identifier(source)
         builtin = name in builtins and not isinstance(builtins[name], _Server)

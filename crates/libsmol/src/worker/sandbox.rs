@@ -461,11 +461,11 @@ pub(crate) fn sweep() {
 pub(crate) mod tests {
     use crate::config::Access;
     use crate::tests::{temp_dir, write_file};
+    use crate::tools::memories::Memories;
     #[cfg(target_os = "linux")]
     use crate::utils::new_id;
     use crate::utils::{block_on, Interrupt};
-    use crate::worker::host::tests::unserved;
-    use crate::worker::host::{Rank, Worker};
+    use crate::worker::host::Worker;
     #[cfg(target_os = "linux")]
     use crate::worker::sandbox::landlock_abi;
     use crate::worker::sandbox::{PIP_CACHE_ENV, SCRATCH};
@@ -481,23 +481,17 @@ pub(crate) mod tests {
     use std::os::unix::net::SocketAddr;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::net::UnixListener;
-    use std::sync::Arc;
 
     fn evaluated(workplace: Workplace, code: &str) -> String {
         let interrupt = Interrupt::default();
-        let restarted = false;
-        let starting = Worker::new(
-            &interrupt,
-            Arc::new(workplace),
-            &[],
-            Rank::Delegated,
-            restarted,
-        );
+        // `opened` keeps the copies in the config folder
+        let config = workplace.copies.parent().expect("config");
+        let memories = Memories::new(config, &workplace.cwd);
+        let starting = Worker::new(&interrupt, workplace, memories, false);
         let mut worker = block_on(starting).expect("worker");
 
         let mut ignore = |_: &str| {};
-        let mut none = unserved;
-        let evaluating = worker.evaluate(code, &[], &mut ignore, &mut none);
+        let evaluating = worker.evaluate(code, &[], &mut ignore);
         let output = block_on(evaluating).expect("evaluate");
         let printed = output.printed.shown(usize::MAX);
         assert_eq!(output.error, None, "{printed}");

@@ -1,19 +1,15 @@
-use crate::conversation::{Call, Entry, Helper, Item, Retry, ShellEnd, State, Step, Tokens};
+use crate::conversation::{Entry, Item, Retry, ShellEnd, Step};
 use crate::tui::highlight;
 use crate::tui::markdown::{self, Block, Kind, LINK};
 use crate::tui::picture::{self, Source};
-use crate::tui::theme::HELPERS;
-use crate::tui::transcript::Group;
-use crate::tui::{
-    clipped, joined, spinner, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG, YELLOW,
-};
+use crate::tui::{joined, spinner, theme, Spans, ACCENT, BOLD, BORDER, DIM, RED, STRONG, YELLOW};
 use pulldown_cmark::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use reaper::one_line;
+use std::env;
 use std::ops::Range;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
 const CODE_HEAD: usize = 8;
@@ -21,9 +17,6 @@ const OUTPUT_HEAD: usize = 6;
 const TASK_HEAD: usize = 4;
 const TASK_TAIL: usize = 2;
 const MAX_THOUGHT_ROWS: usize = 3;
-const MAX_PREVIEW_ROWS: usize = 4;
-const MAX_TITLE_ROWS: usize = 2;
-const MAX_TITLE_COLUMNS: usize = 80;
 const MIN_CELL_COLUMNS: usize = 6;
 const MIN_RENDER_COLUMNS: usize = 8;
 
@@ -109,30 +102,6 @@ const RETRY: Mark = Mark {
     rest: "    ",
     style: Style::new().fg(theme::ORANGE),
 };
-/// Agents sit under a branch, and their wrapped rows line up after the status symbol
-const HELPER: Mark = Mark {
-    first: "  │   ",
-    rest: "  │     ",
-    style: DIM,
-};
-const LAST_HELPER: Mark = Mark {
-    first: "      ",
-    rest: "        ",
-    style: DIM,
-};
-const PINNED: Mark = Mark {
-    first: "  ├ ",
-    rest: "  │   ",
-    style: DIM,
-};
-const LAST_PINNED: Mark = Mark {
-    first: "  ╰ ",
-    rest: "      ",
-    style: DIM,
-};
-
-const PULSE: [char; 5] = ['✢', '✳', '✶', '✻', '✽'];
-const PULSE_EVERY: Duration = Duration::from_millis(240);
 
 #[derive(Debug, Default)]
 pub(crate) struct Row {
@@ -161,10 +130,9 @@ pub(crate) enum Target {
 pub(crate) struct Render {
     width: usize,
     expanded: bool,
-    /// Where relative image paths start, and what agents' tasks write as `.`
+    /// Where relative image paths start, and what the commands of programs write as `.`
     pub(crate) cwd: PathBuf,
     pub(crate) rows: Vec<Row>,
-    pub(crate) groups: Vec<Group>,
 }
 
 impl Render {
@@ -174,7 +142,6 @@ impl Render {
             expanded,
             cwd: PathBuf::new(),
             rows: Vec::new(),
-            groups: Vec::new(),
         }
     }
 
@@ -298,10 +265,6 @@ impl Render {
                     }
 
                     // Continuation rows with a bar look like code, so multi-line outputs go last
-                    if !call.helpers.is_empty() {
-                        self.helpers(call);
-                    }
-
                     let count = parts.attachments.len() + parts.outputs.len();
                     let mut drawn = 0;
                     let mut branch = || {
@@ -374,219 +337,6 @@ impl Render {
 
         let line = parts.join(" · ");
         self.push_status(BODY, vec![(line, DIM)]);
-    }
-
-    /// Each agent the call's code started under a summary of them, as rows that are drawn again
-    /// on their own while the agents are at work
-    pub(crate) fn helpers(&mut self, call: &Call) {
-        // The call's outputs and error follow its agents
-        let parts = call.parts();
-        let shown = parts.attachments.len() + parts.outputs.len();
-        let (head, row) = match shown > 0 || parts.error.is_some() {
-            true => (BRANCH, HELPER),
-            false => (LAST_BRANCH, LAST_HELPER),
-        };
-
-        let helpers: Vec<&Helper> = call.helpers.iter().collect();
-        let summary = summary(&helpers, None);
-        let start = self.rows.len();
-        self.push_status(head, vec![(summary, DIM)]);
-
-        for (index, helper) in helpers.iter().enumerate() {
-            self.helper(helper, row);
-            let stated = self.expanded && helper.totals.is_some();
-            if stated && index + 1 < helpers.len() {
-                let body = Mark {
-                    first: row.rest,
-                    ..row
-                };
-                self.push_lines(body, &[Vec::new()]);
-            }
-        }
-
-        if helpers.iter().any(|helper| helper.waiting()) {
-            self.groups.push(Group {
-                call: call.id.clone(),
-                entry: None,
-                rows: start..self.rows.len(),
-                drawn: call.revision,
-            });
-        }
-    }
-
-    /// The agents at work at the bottom of a conversation `height` rows tall, under a summary
-    pub(crate) fn pinned(&mut self, helpers: &[&Helper], height: usize) {
-        if helpers.is_empty() {
-            return;
-        }
-        self.rows.push(Row::default());
-
-        let first = helpers.iter().filter_map(|helper| helper.started).min();
-        let seconds = first.map(|first| first.elapsed().as_secs());
-        let summary = summary(helpers, seconds);
-        let running = helpers
-            .iter()
-            .filter(|helper| helper.state() == State::Running);
-        let colors: Vec<Color> = running.map(|helper| HELPERS[helper.hue]).collect();
-        let (symbol, tint) = match first {
-            Some(first) if !colors.is_empty() => {
-                let elapsed = first.elapsed();
-                let turn = elapsed.as_secs() as usize;
-                let color = colors[turn % colors.len()];
-                let frames = elapsed.as_millis() / PULSE_EVERY.as_millis();
-                let pulse = PULSE[frames as usize % PULSE.len()];
-                (pulse, Style::new().fg(color))
-            }
-            _ => ('◌', DIM),
-        };
-        let symbol = format!("{symbol} ");
-        // Its symbol lines up with the spinner of the progress line above
-        self.push_status(BODY, vec![(symbol, tint), (summary, DIM)]);
-
-        // A third of the screen holds the blank row, the summary and the agents,
-        // and those past it are only counted
-        let fit = (height / 3).saturating_sub(2).max(1);
-        let largest = MAX_TITLE_ROWS + MAX_PREVIEW_ROWS + 1;
-        let full = helpers.len() * largest <= fit;
-        let listed = match helpers.len() > fit {
-            true => fit - 1,
-            false => helpers.len(),
-        };
-        for (index, helper) in helpers.iter().take(listed).enumerate() {
-            let row = match index + 1 == helpers.len() {
-                true => LAST_PINNED,
-                false => PINNED,
-            };
-            let (symbol, tint) = signal(helper);
-            let row = Mark { style: tint, ..row };
-            if full {
-                self.helper(helper, row);
-                continue;
-            }
-
-            let symbol = format!("{symbol} ");
-            let tag = tag(helper);
-            let taken = row.first.width() + symbol.width() + tag.width();
-            let room = self.width.saturating_sub(taken);
-            // What it is doing takes at most half the row and the title fits in the rest
-            let status = status(helper, room / 2);
-            let used = spans_width(&status) + " · ".width();
-            let left = room.saturating_sub(used);
-            let task = one_line(&helper.task, &self.cwd);
-            let title = clipped(&task, left);
-
-            let mut spans = vec![
-                (symbol, tint),
-                (tag, DIM),
-                (title, Style::new()),
-                (" · ".to_owned(), DIM),
-            ];
-            spans.extend(status);
-            self.push_status(row, spans);
-        }
-        if listed < helpers.len() {
-            let more = format!("+{} more", helpers.len() - listed);
-            self.push_status(LAST_PINNED, vec![(more, DIM)]);
-        }
-    }
-
-    /// An agent's title, then what it is doing while it works, why it failed,
-    /// or when expanded the start of its answer
-    fn helper(&mut self, helper: &Helper, row: Mark) {
-        let body = Mark {
-            first: row.rest,
-            ..row
-        };
-        // Titles and status rows both start after the symbol
-        let room = self.width.saturating_sub(body.first.width());
-        let limit = room.min(MAX_TITLE_COLUMNS);
-
-        let (symbol, tint) = signal(helper);
-        let status = status(helper, room);
-
-        let symbol = format!("{symbol} ");
-        let tag = tag(helper);
-        // Titles wrap before the tag goes in front, so its width comes off every row
-        let limit = limit.saturating_sub(tag.width()).max(1);
-        let first = [
-            Span::styled(row.first, row.style),
-            Span::styled(symbol, tint),
-            Span::styled(tag, DIM),
-        ];
-        let rest = [Span::styled(row.rest, row.style)];
-        let width = first.iter().map(Span::width).sum();
-        let rest_width = row.rest.width();
-
-        let most = match (self.expanded, helper.waiting()) {
-            (true, _) => usize::MAX,
-            (false, true) => MAX_TITLE_ROWS,
-            (false, false) => 1,
-        };
-        let task = one_line(&helper.task, &self.cwd);
-        let titles = kept_rows(&task, limit, most);
-        for (at, (title, joint)) in titles.into_iter().enumerate() {
-            let (lead, mark_width) = match at {
-                0 => (&first[..], width),
-                _ => (&rest[..], rest_width),
-            };
-            let mut line = lead.to_vec();
-            line.push(Span::raw(title));
-            self.rows.push(Row {
-                line: Line::from(line),
-                mark_width,
-                joint,
-                ..Row::default()
-            });
-        }
-
-        if !helper.preview.is_empty() {
-            let bar = [
-                Span::styled(body.rest, body.style),
-                Span::styled("│ ", tint),
-            ];
-            let width = bar.iter().map(Span::width).sum();
-            let lines = highlight::plain(&helper.preview, DIM);
-            let start = self.rows.len();
-            for line in &lines {
-                self.push_rows(&bar, &bar, width, line, &[]);
-            }
-
-            let excess = (self.rows.len() - start).saturating_sub(MAX_PREVIEW_ROWS);
-            self.rows.drain(start..start + excess);
-            // Copying must not join the first kept row onto the title above
-            if let Some(first) = self.rows.get_mut(start) {
-                first.joint = None;
-            }
-        }
-
-        match (self.expanded, helper.state()) {
-            (true, State::Done) => {
-                let start = self.rows.len();
-                self.markdown(body, helper.text.trim());
-                let hidden = (self.rows.len() - start).saturating_sub(MAX_PREVIEW_ROWS);
-                if hidden > 0 {
-                    self.rows.truncate(start + MAX_PREVIEW_ROWS);
-                    let more = format!("… +{hidden} lines");
-                    self.push_status(body, vec![(more, DIM)]);
-                }
-            }
-            (true, State::Failed) => self.wrap(body, helper.text.trim(), RED),
-            (false, State::Failed) => self.push_lines(body, &[status]),
-            (_, State::Done | State::Interrupted) => {}
-            (_, State::Running | State::Queued) => self.push_status(body, status),
-        }
-
-        if let Some(totals) = helper.totals.filter(|_| self.expanded) {
-            let mut stats = vec![
-                format!("{} steps", totals.steps),
-                format!("{:.1}s", totals.duration),
-            ];
-            if let Some(tokens) = helper.tokens {
-                stats.push(tokens.to_string());
-            }
-            let stats = stats.join(" · ");
-            self.push_status(body, vec![(stats, DIM)]);
-        }
     }
 
     fn paragraph(&mut self, mark: Mark, text: &str, style: Style) {
@@ -1012,101 +762,52 @@ fn bold(spans: &[(String, Style)]) -> Spans {
     styled
 }
 
+/// The text on one line, with `cwd` as `.` and paths in it relative, and the home directory as `~`
+pub(crate) fn one_line(text: &str, cwd: &Path) -> String {
+    let cwd = cwd.display().to_string();
+    let mut text = shortened(text, &cwd, ".", "");
+    if let Some(home) = env::home_dir() {
+        let home = home.display().to_string();
+        let inside = format!("~{MAIN_SEPARATOR}");
+        text = shortened(&text, &home, "~", &inside);
+    }
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    words.join(" ")
+}
+
+/// Writes `root` as `name` and paths in it starting with `inside`,
+/// except where `root` only begins or ends a longer path or word
+fn shortened(text: &str, root: &str, name: &str, inside: &str) -> String {
+    // An empty root would match at every position and never advance
+    if root.is_empty() {
+        return text.to_owned();
+    }
+
+    let pathy = |c: char| c.is_alphanumeric() || matches!(c, '/' | '\\' | '.' | '-' | '_' | '~');
+    let mut kept = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(root) {
+        let (before, after) = (&rest[..at], &rest[at + root.len()..]);
+        kept.push_str(before);
+        let joined = before.chars().next_back().is_some_and(pathy);
+        rest = after;
+        match after.chars().next() {
+            _ if joined => kept.push_str(root),
+            Some(MAIN_SEPARATOR) => {
+                kept.push_str(inside);
+                rest = &after[MAIN_SEPARATOR.len_utf8()..];
+            }
+            Some(next) if pathy(next) => kept.push_str(root),
+            _ => kept.push_str(name),
+        }
+    }
+    kept.push_str(rest);
+    kept
+}
+
 fn spans_width(spans: &[(String, Style)]) -> usize {
     spans.iter().map(|(text, _)| text.width()).sum()
-}
-
-/// The symbol of the state an agent is in, in the style its rows take
-fn signal(helper: &Helper) -> (char, Style) {
-    match helper.state() {
-        State::Queued => ('◌', DIM),
-        State::Running => {
-            let since = helper.started.unwrap_or_else(Instant::now);
-            (spinner(since), Style::new().fg(HELPERS[helper.hue]))
-        }
-        State::Done => ('◆', ANSWER.style),
-        State::Interrupted => ('✗', DIM),
-        State::Failed => ('✗', RED),
-    }
-}
-
-/// What an agent is doing while it waits or runs, or why it failed, in at most `width` columns
-fn status(helper: &Helper, width: usize) -> Spans {
-    match helper.state() {
-        State::Queued => vec![(clipped("queued", width), DIM)],
-        State::Running => {
-            let since = helper.started.unwrap_or_else(Instant::now);
-            let seconds = since.elapsed().as_secs();
-            let doing = format!("{} · {seconds}s", helper.text.trim());
-            let doing = clipped(&doing, width);
-            theme::shimmer(&doing, THINKING, HELPERS[helper.hue], since)
-        }
-        State::Done | State::Interrupted => Vec::new(),
-        State::Failed => {
-            let mut lines = helper.text.lines().map(str::trim);
-            let error = lines.find(|line| !line.is_empty()).unwrap_or_default();
-            vec![(clipped(error, width), RED)]
-        }
-    }
-}
-
-/// How many agents are in each state, how long since the first started, and their tokens so far
-fn summary(helpers: &[&Helper], seconds: Option<u64>) -> String {
-    let states = [
-        (State::Running, "running"),
-        (State::Queued, "queued"),
-        (State::Done, "done"),
-        (State::Failed, "failed"),
-        (State::Interrupted, "interrupted"),
-    ];
-    let mut parts = vec!["sub-agents".to_owned()];
-    for (state, name) in states {
-        let count = helpers.iter().filter(|helper| helper.state() == state);
-        let count = count.count();
-        if count > 0 {
-            parts.push(format!("{count} {name}"));
-        }
-    }
-
-    if let Some(seconds) = seconds {
-        parts.push(format!("{seconds}s"));
-    }
-    let mut tokens = Tokens::default();
-    for spent in helpers.iter().filter_map(|helper| helper.tokens) {
-        tokens += spent;
-    }
-    if !tokens.is_zero() {
-        parts.push(tokens.to_string());
-    }
-
-    parts.join(" · ")
-}
-
-/// The name an agent goes by, which comes before its title
-fn tag(helper: &Helper) -> String {
-    match &helper.name {
-        Some(name) => format!("{name} "),
-        None => String::new(),
-    }
-}
-
-/// The rows `text` wraps into at `width`, with what joins each to the one before, at most `most`
-/// of them and the last ending in … when more were cut
-pub(crate) fn kept_rows(text: &str, width: usize, most: usize) -> Vec<(String, Option<String>)> {
-    let mut ranges = wrap_ranges(text, width);
-    let cut = ranges.len() > most;
-    ranges.truncate(most);
-
-    let mut rows = Vec::new();
-    for (range, joint) in ranges {
-        let row = text[range].to_owned();
-        rows.push((row, joint));
-    }
-    if let Some((last, _)) = rows.last_mut().filter(|_| cut) {
-        let marked = format!("{last}…");
-        *last = clipped(&marked, width);
-    }
-    rows
 }
 
 pub(crate) fn wrap_ranges(text: &str, width: usize) -> Vec<(Range<usize>, Option<String>)> {
