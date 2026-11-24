@@ -40,6 +40,11 @@ but their files stay in `~/.smol/projects` untouched.
 - The system prompt says the user sees the answer rendered as Markdown, and in
   terminals that draw images, how to show one, as `view()` shows it only to
   the model. It no longer explains how the value of the last expression shows.
+- The memory rules are shorter and add that corrections the user states are
+  worth remembering, that secrets are not, and that what the user says now
+  overrides memories. On 17 memory tasks deepseek kept the memories right in
+  29 of 34 runs, as before, and told to run the tests another way this once,
+  deepseek and grok followed the request and kept the memory in all runs.
 
 ## 0.13.0 - 2026-11-21
 

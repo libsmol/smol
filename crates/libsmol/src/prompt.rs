@@ -27,14 +27,14 @@ pub(crate) const UPDATE: &str = "Task update";
 const RULES: &str = "- Never make up data or functions; check unfamiliar ones with `help()`.
 - Do the task instead of describing it.
 - Report only results you obtained, and say what failed or is uncertain.";
-const OUTLASTING: &str = "Memories outlast the session: project ones reach this project's later sessions, global ones every session.";
+const OUTLASTING: &str = "Memories carry over to later sessions: project ones in this project, global ones in every project.";
 const REMEMBERING: &str = "## Rules
 
-- `remember()` what the user asks you to, the lasting preferences they state, and what took you tries to find out, such as how to build or test.
-- Skip progress, results, what is installed and what the code does: they are in the files or go stale.
-- Write each as one instruction a later session can follow without this conversation, in the user's language, as soon as you learn it.
+- `remember()` what the user asks you to, lasting preferences and corrections they state, and what took you tries to find out, such as how to build or test.
+- Skip secrets, and progress, results, what is installed and what the code does, which are in the files or go stale.
+- Save each in the user's language as soon as you learn it, as one instruction a later session can follow on its own.
 - Make it global (`project=False`) if it is about the user, project if it is about this project.
-- Trust what you see over memories: `forget()` any memory, listed or recalled, that is wrong, outdated, repeated or against these rules, and save the correct one, if any.";
+- What the user says now and what you see override memories: `forget()` any memory, listed or recalled, that is wrong, outdated, repeated or against these rules, and save the correction, if any.";
 
 const RENDERED: &str = "The user sees your text rendered as Markdown";
 /// Only for clients that declared `_smol/images`
