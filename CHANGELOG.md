@@ -7,7 +7,7 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
-## Unreleased
+## 0.14.1 - 2026-11-25
 
 - The system prompt opens with "You complete tasks by running Python code with
   `eval`, your only tool." Models had called `remember` and `recall` as tools
