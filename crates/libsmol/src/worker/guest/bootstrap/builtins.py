@@ -109,8 +109,8 @@ def _path(function, name, value):
 
 @_builtin
 def edit(path: str | _os.PathLike, old: str, new: str) -> None:
-    """Replaces old with new in a text file; create new files with open().
-    Raises ValueError and leaves the file unchanged unless old appears exactly once."""
+    """Replaces old with new in a UTF-8 text file; unless old appears exactly once, raises ValueError and changes nothing.
+    Create files with open()."""
     path = _path("edit", "path", path)
     old = _str("edit", "old", old)
     new = _str("edit", "new", new)
@@ -160,8 +160,8 @@ def edit(path: str | _os.PathLike, old: str, new: str) -> None:
 
 @_builtin
 def ls(path: str | _os.PathLike = ".", recursive: bool = False) -> list[str]:
-    """Sorted paths relative to path: ls('src') returns 'a.py', not 'src/a.py'.
-    Directories end with /. recursive=True skips .gitignore'd paths.
+    """Sorted paths relative to path, so ls('src') gives 'a.py'; directories end with /.
+    recursive=True skips .git and .gitignore'd paths.
 
     Lists directory path as sorted paths relative to it, directories ending with /; recursive=True lists everything below it, skipping .git and .gitignore'd paths and not entering symbolic links."""
     path = "." if path is None else _path("ls", "path", path)
@@ -220,10 +220,9 @@ class _Found(list):
 
 @_builtin
 def grep(pattern: str, path: str | _os.PathLike = ".", glob: str | None = None, context: int = 0) -> list[tuple[str, int, str]]:
-    """(path, line number from 1, line) for each matching line, printed grouped by file.
-    context=N also prints the N lines before and after each match.
-    pattern is a Rust regex without lookaround or backreferences.
-    Skips .gitignore'd and binary files.
+    """(path, line from 1, text) per matching line, with paths open() takes, so grep('x', 'src') gives 'src/a.py'.
+    Prints grouped by file, plus context=N lines around each match.
+    Rust regex without lookaround or backreferences; skips .git, .gitignore'd and binary files.
 
     Searches a file, or every file below a directory, for a Rust regex.
     - Its syntax is that of Python re, without lookaround or backreferences; (?i) ignores case.
@@ -254,17 +253,15 @@ def grep(pattern: str, path: str | _os.PathLike = ".", glob: str | None = None, 
 
 @_builtin
 def fetch(url: str) -> str:
-    """The page as Markdown.
-
-    Returns a web page: HTML as Markdown, other text as it is; binary content raises an error."""
+    """HTML as Markdown, other text as it is; binary content raises an error."""
     url = _str("fetch", "url", url)
     return _fetch(url)
 
 @_builtin
 def view(path: str | _os.PathLike) -> None:
-    """Shows you an image or video file by adding it to this call's result.
+    """Shows you an image or video file in this call's result.
 
-    Adds a PNG, JPEG, GIF or WebP image, or an MP4, WebM or MOV video, to this call's result for you to see."""
+    Takes a PNG, JPEG, GIF or WebP image, or an MP4, WebM or MOV video."""
     path = _path("view", "path", path)
     # The code may have changed directory but the label is relative to the session directory
     absolute = _os.path.abspath(path)
@@ -278,15 +275,14 @@ def _asked(method, params):
 
 @_builtin
 def remember(text: str, project: bool = True) -> int:
-    """Saves text of at most {chars} characters as a memory and returns its id.
-    The memory is for this project, or global with project=False."""
+    """Saves a memory of at most {chars} characters for this project, or global with project=False, and returns its id."""
     text = _str("remember", "text", text)
     project = bool(project)
     return _asked("remember", {"text": text, "project": project})
 
 @_builtin
 def recall(query: str = "") -> list[tuple[int, str]]:
-    """(id, text) of up to {recalled} memories: those that match any word of query, best first, or the newest if none match."""
+    """Up to {recalled} (id, text) of this project's and global memories that match any word of query, best first; the newest if none match."""
     query = _str("recall", "query", query)
     found = _asked("recall", {"query": query})
     return [(id, text) for id, text in found]
@@ -304,7 +300,7 @@ def forget(id: int) -> None:
 
 @_builtin
 def help(request: object) -> None:
-    """Prints the signature and docs of a function, class, module or MCP server.
+    """Prints the signature and docs of an object or dotted name such as 'json.loads', MCP servers included.
     For functions and classes you defined, also prints their code.
 
     Prints the signature and documentation of an object, or of the function, module or MCP server a dotted name refers to; modules also list their public members, and functions and classes your code defined in an earlier call also show that code."""

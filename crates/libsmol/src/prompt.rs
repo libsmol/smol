@@ -31,14 +31,14 @@ const OUTLASTING: &str = "Memories carry over to later sessions: project ones in
 const REMEMBERING: &str = "## Rules
 
 - `remember()` what the user asks you to, lasting preferences and corrections they state, and what took you tries to find out, such as how to build or test.
-- Skip secrets, and progress, results, what is installed and what the code does, which are in the files or go stale.
+- Skip secrets, progress, results, what is installed and what the code does: they must not be kept, are in the files or go stale.
 - Save each in the user's language as soon as you learn it, as one instruction a later session can follow on its own.
 - Make it global (`project=False`) if it is about the user, project if it is about this project.
 - What the user says now and what you see override memories: `forget()` any memory, listed or recalled, that is wrong, outdated, repeated or against these rules, and save the correction, if any.";
 
 const RENDERED: &str = "The user sees your text rendered as Markdown";
 /// Only for clients that declared `_smol/images`
-const SHOWN_IMAGES: &str = "images included: to show one, put `![alt](path)` on a line of its own, as `view()` shows it only to you";
+const SHOWN_IMAGES: &str = "images included: show one with `![alt](path)` on its own line, as `view()` shows it only to you";
 
 pub(crate) const PROGRAM_DONE: &str = "Program done";
 
@@ -73,11 +73,9 @@ const VIEW: &str = "view";
 /// None leaves view() out of the prompt
 fn view_summary(image: bool, video: bool) -> Option<&'static str> {
     match (image, video) {
-        (true, true) => {
-            Some("Shows you an image or video file by adding it to this call's result.")
-        }
-        (true, false) => Some("Shows you an image file by adding it to this call's result."),
-        (false, true) => Some("Shows you a video file by adding it to this call's result."),
+        (true, true) => Some("Shows you an image or video file in this call's result."),
+        (true, false) => Some("Shows you an image file in this call's result."),
+        (false, true) => Some("Shows you a video file in this call's result."),
         (false, false) => None,
     }
 }
@@ -152,14 +150,16 @@ pub(crate) fn system(
         false => format!("{RENDERED}."),
     };
     // Only a client that declared `_smol/background` hands the programs that end after an answer a turn
-    let (answering, programs) = match brief.background {
+    let (answering, ending, programs) = match brief.background {
         true => (
-            format!("A reply without a tool call is your answer. It ends the task, unless a program you started is still running: then its `[{PROGRAM_DONE}]` message brings you back to finish."),
-            "- While a call runs, the user can only wait and can't talk to you. Run slow commands in the background and answer instead of waiting for them or checking on them.".to_owned(),
+            "is your answer",
+            format!("\n- Your answer ends the task unless a background program you started still runs: when it ends, you receive a `[{PROGRAM_DONE}]` message and finish the task."),
+            "- While a call runs, the user can only wait and can't talk to you, so run slow commands in the background and answer instead of waiting for or checking on them.".to_owned(),
         ),
         false => (
-            "A reply without a tool call is your answer and ends the task.".to_owned(),
-            format!("- Calls have no time limit, so wait for a command by running it in the call.\n- A program you don't wait for keeps running. When it ends, you get a `[{PROGRAM_DONE}]` message, with the user's next message if you have already answered."),
+            "is your answer and ends the task",
+            String::new(),
+            format!("- Calls have no time limit, so wait for commands in the call.\n- A program you don't wait for keeps running; when it ends, you receive a `[{PROGRAM_DONE}]` message, with the user's next message if you have already answered."),
         ),
     };
 
@@ -186,7 +186,7 @@ pub(crate) fn system(
                 places.push(place);
             }
             let places = places.join(", ");
-            format!("\n- Sandbox: writing outside {places}, the venv and `$TMPDIR` (used by `tempfile`), or reading some private files, raises `PermissionError`. If a tool fails because it cannot write its cache, rerun it with the cache in `$TMPDIR`.")
+            format!("\n- Sandbox: writing outside {places}, the venv and `$TMPDIR` (used by `tempfile`), or reading some private files, raises `PermissionError`; if a tool can't write its cache, rerun it with the cache in `$TMPDIR`.")
         }
         None => String::new(),
     };
@@ -203,7 +203,7 @@ pub(crate) fn system(
         let shown = lines.len();
         let heading = match memories.global > shown {
             true => format!(
-                "Global memories, the newest {shown} of {} (`recall()` finds the rest):",
+                "Global memories, newest {shown} of {} (`recall()` finds the rest):",
                 memories.global
             ),
             false => "Global memories:".to_owned(),
@@ -218,7 +218,7 @@ pub(crate) fn system(
         count => Some(format!("{count} memories")),
     };
     if let Some(counted) = counted {
-        let here = format!("This project has {counted} of its own, not listed here; before you start a task, `recall()` its key words.");
+        let here = format!("This project has {counted} of its own, not listed here; before starting a task, `recall()` its key words.");
         kept.push(here);
     }
     kept.push(REMEMBERING.to_owned());
@@ -230,11 +230,10 @@ pub(crate) fn system(
 
 # How to reply
 
-Each reply either calls `{TOOL}` or answers.
+A reply that calls `{TOOL}` runs code; one without a tool call {answering}.
 
-- Calls run in order, and a failed one skips the rest.
-- {answering}
-- If the user writes while you work, answer them in the text of your next reply, follow what they say and keep working, unless they tell you to stop.
+- A reply can hold several `{TOOL}` calls; they run in order, and a failed one skips the rest.{ending}
+- If the user writes while you work, answer them in your next reply's text, follow what they say and keep working, unless they tell you to stop.
 - {rendered}
 
 # Rules
@@ -245,13 +244,13 @@ Each reply either calls `{TOOL}` or answers.
 
 - All calls share one Python session, which keeps variables, functions and imports.
 {programs}
-- A call returns what it printed plus the value of each top-level expression that is not `None`.
+- A call returns what it printed plus the value of each top-level expression that isn't `None`.
 - Output over {MAX_OBSERVATION_CHARS} characters, or one `print()` over {MAX_PRINT_CHARS}, is cut in the middle; variables keep their full values.
-- Do as much as you can per call, and print only what you need: read large or many files in parts, or search them with `grep()`.
+- Do as much as you can per call and print only what you need: read large or many files in parts, or search them with `grep()`.
 
 # Functions
 
-These need no import. What is listed here is a summary; `help()` prints the rest.
+These need no import; this is a summary, and `help()` prints the rest.
 
 ## Built-in
 

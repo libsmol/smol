@@ -29,22 +29,33 @@ but their files stay in `~/.smol/projects` untouched.
   right away and went on in 2 of 2 runs and grok in 1 of 1, and all 18 runs of
   the six mid-task update tasks passed.
 - With a client that hands programs that end a turn of their own, as smol
-  does, the system prompt says the user can only wait while a call runs, that
-  slow commands go in the background without waiting for or checking on them,
-  and that an answer given while a program still runs doesn't end the task, as
-  its `[Program done]` message brings the model back to finish it. Asked to run
-  a one-minute benchmark and report its score, deepseek and grok answered first
-  and reported the score once it ended in 5 of 6 runs, where every earlier
-  wording made them wait or poll; three short scripts run one after another
-  still ran in the call. Other clients keep the rule to wait in the call.
+  does, the system prompt says the user can only wait while a call runs, so
+  slow commands go in the background and the model answers instead of waiting
+  for or checking on them, and that an answer given while a background program
+  still runs doesn't end the task, as its `[Program done]` message brings the
+  model back to finish it. Asked to run a one-minute benchmark and report its
+  score, deepseek and grok answered first and reported the score once it ended
+  in 13 of 20 runs, against about half with the wordings tried before; three
+  short scripts run one after another still ran in the call. Other clients
+  keep the rule to wait in the call.
+- The system prompt opens its reply rules with one sentence on what a reply
+  with and without a tool call does, says a reply can hold several calls, and
+  says the rest in fewer words.
+- The built-in functions' docs say that `grep()` gives paths `open()` takes,
+  which hold the folder searched where `ls()` leaves it out, that `fetch()`
+  returns text other than HTML as it is, that `recall()` searches this
+  project's and global memories, that `help()` takes dotted names, and that
+  `edit()` works on UTF-8 files, in fewer lines than before.
 - The system prompt says the user sees the answer rendered as Markdown, and in
   terminals that draw images, how to show one, as `view()` shows it only to
   the model. It no longer explains how the value of the last expression shows.
 - The memory rules are shorter and add that corrections the user states are
   worth remembering, that secrets are not, and that what the user says now
-  overrides memories. On 17 memory tasks deepseek kept the memories right in
-  29 of 34 runs, as before, and told to run the tests another way this once,
-  deepseek and grok followed the request and kept the memory in all runs.
+  overrides memories. On 18 memory tasks deepseek and grok kept the memories
+  right in 78 of 90 runs, against 42 of 51 on 17 of them with the rules
+  before, and told to
+  run the tests another way this once, they followed the request in all 14 runs
+  and kept the memory in 13.
 
 ## 0.13.0 - 2026-11-21
 
