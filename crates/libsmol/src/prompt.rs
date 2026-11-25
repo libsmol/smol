@@ -226,7 +226,7 @@ pub(crate) fn system(
 
     let date = Utc::now().format("%Y-%m-%d");
     format!(
-        "You complete tasks by running Python code with the `{TOOL}` tool.
+        "You complete tasks by running Python code with `{TOOL}`, your only tool.
 
 # How to reply
 

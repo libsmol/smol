@@ -7,6 +7,14 @@ Sessions are saved with a format number. A release that changes the format says 
 here; sessions saved in an older format are no longer listed and can't be resumed,
 but their files stay in `~/.smol/projects` untouched.
 
+## Unreleased
+
+- The system prompt opens with "You complete tasks by running Python code with
+  `eval`, your only tool." Models had called `remember` and `recall` as tools
+  of their own in 25 of 2839 evaluation sessions. Side by side with the opening
+  before it on 88 tasks each, results stayed the same within noise, and no call
+  named a missing tool.
+
 ## 0.14.0 - 2026-11-25
 
 - `agent()`, `agent.wait()` and `agent.stop()` are gone, and with them the
